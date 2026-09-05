@@ -2555,6 +2555,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         essential_query_rank: usize,
         essential_term: u32,
         essential_weight: f32,
+        essential_window_bound: f32,
         num_query_terms: usize,
         total_non_essential_bound: f64,
         total_sum_upper_bound_factor: f64,
@@ -2607,7 +2608,65 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             });
         }
 
-        for i in (0..non_essential.len()).rev() {
+        // When the essential window bound plus every optional except the
+        // strongest still cannot beat the floor, that strongest optional is
+        // required. Intersect it with the already-decoded buffer; do not
+        // leapfrog the essential posting.
+        let best_optional = non_essential.len().checked_sub(1);
+        let require_best = best_optional.is_some_and(|best| {
+            essential_window_bound.is_finite() && essential_window_bound > 0.0 && {
+                let remaining_without_best = if best == 0 {
+                    0.0
+                } else {
+                    non_essential[best - 1].prefix_bound
+                };
+                remaining_without_best.is_finite()
+                    && exclusive_cannot_compete(
+                        essential_window_bound,
+                        remaining_without_best,
+                        self.threshold,
+                        total_sum_upper_bound_factor,
+                    )
+            }
+        });
+        if let (true, Some(best)) = (require_best, best_optional) {
+            let query_rank = non_essential[best].query_rank;
+            let query_weight = non_essential[best].posting.query_weight;
+            let term_index = non_essential[best].posting.term_index();
+            let probe = &mut non_essential[best].posting;
+            live.retain_mut(|hit| {
+                if probe.doc().is_some_and(|d| d.doc_id() < hit.doc) {
+                    probe.next(hit.doc);
+                }
+                let Some(d) = probe.doc() else {
+                    return false;
+                };
+                if d.doc_id() != hit.doc {
+                    return false;
+                }
+                let norm_addend =
+                    norm_k_ref.map(|(norms, cache)| cache[norms[hit.doc as usize] as usize]);
+                let contribution = match norm_addend {
+                    Some(addend) => query_weight * bm25_doc_weight_with_norm(d.frequency(), addend),
+                    None => probe.score(
+                        &self.scorer,
+                        d.frequency(),
+                        self.documents.scoring_num_tokens(hit.doc as u32),
+                    ),
+                };
+                hit.partial += contribution;
+                hit.scores_by_query_rank[query_rank] = contribution;
+                hit.freqs.push((term_index, d.frequency()));
+                true
+            });
+        }
+
+        let optional_end = if require_best {
+            non_essential.len().saturating_sub(1)
+        } else {
+            non_essential.len()
+        };
+        for i in (0..optional_end).rev() {
             let threshold = self.threshold;
             let prefix_bound = non_essential[i].prefix_bound;
             live.retain(|hit| {
@@ -2855,6 +2914,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let essential_query_rank = clauses[first_essential].query_rank;
                 let essential_term = clauses[first_essential].posting.term_index();
                 let essential_weight = clauses[first_essential].posting.query_weight;
+                let essential_window_bound = clauses[first_essential].bound;
                 if clauses[first_essential]
                     .posting
                     .doc()
@@ -2878,6 +2938,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         essential_query_rank,
                         essential_term,
                         essential_weight,
+                        essential_window_bound,
                         num_query_terms,
                         total_non_essential_bound,
                         total_sum_upper_bound_factor,
@@ -5552,6 +5613,52 @@ mod tests {
         assert_eq!(scored.load(Ordering::Relaxed), contributions.len());
         assert_eq!(wand.maxscore_single_essential_windows > 0, single_essential);
         assert_eq!(wand.maxscore_general_windows > 0, !single_essential);
+    }
+
+    #[test]
+    fn maxscore_first_required_keeps_winners_on_the_buffer() {
+        // Optional is non-essential once the floor sits between its bound and
+        // the essential bound. Promoting it to required must still keep the
+        // document that has both terms; the essential posting is not the
+        // leapfrog driver.
+        let postings = [
+            (0_u32, 0.3_f32, vec![0_u32]),
+            (1_u32, 0.4_f32, vec![0_u32, 1]),
+        ]
+        .into_iter()
+        .map(|(position, query_weight, docs)| {
+            PostingIterator::with_query_weight(
+                format!("t{position}"),
+                position,
+                position,
+                query_weight,
+                generate_posting_list(docs, query_weight, None, true),
+                2,
+            )
+        })
+        .collect::<Vec<_>>();
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        docs.append(1, 1);
+        let mut wand = Wand::new(
+            Operator::Or,
+            postings.into_iter(),
+            &docs,
+            CountingScorer {
+                scored: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+        wand.threshold = 0.45;
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(10)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].document, 0);
+        assert!(hits[0].freqs.iter().any(|(term, _)| *term == 0));
+        assert!(wand.maxscore_single_essential_windows > 0);
     }
 
     #[test]
