@@ -2441,21 +2441,34 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             let score = if self.operator == Operator::Or {
                 self.advance_all_tail(doc.doc_id(), None, None);
-                if params.phrase_slop.is_some()
-                    && !self.check_positions(params.phrase_slop.unwrap() as i32)?
-                {
-                    self.push_back_leads(doc.doc_id() + 1);
-                    continue;
+                if let Some(slop) = params.phrase_slop {
+                    let score = self.score_in_query_order(doc_length);
+                    if self.exclusive_score_cannot_beat_floor(score) {
+                        self.push_back_leads(doc.doc_id() + 1);
+                        continue;
+                    }
+                    if !self.check_positions(slop as i32)? {
+                        self.push_back_leads(doc.doc_id() + 1);
+                        continue;
+                    }
+                    score
+                } else {
+                    self.score_in_query_order(doc_length)
                 }
-                self.score_in_query_order(doc_length)
             } else {
                 self.advance_all_tail(doc.doc_id(), None, None);
-                if params.phrase_slop.is_some()
-                    && !self.check_positions(params.phrase_slop.unwrap() as i32)?
-                {
-                    continue;
+                if let Some(slop) = params.phrase_slop {
+                    let score = self.score_in_query_order(doc_length);
+                    if self.exclusive_score_cannot_beat_floor(score) {
+                        continue;
+                    }
+                    if !self.check_positions(slop as i32)? {
+                        continue;
+                    }
+                    score
+                } else {
+                    self.score_in_query_order(doc_length)
                 }
-                self.score_in_query_order(doc_length)
             };
 
             if candidates.insert(
@@ -3178,6 +3191,24 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         metrics.record_comparisons(num_comparisons);
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
+    }
+
+    /// Exclusive top-k floor: a finite BM25 total at or below `threshold`
+    /// cannot enter the heap, so phrase confirmation is wasted work.
+    ///
+    /// Fail-closed: `threshold == 0` (heap not full) never skips. Matches
+    /// the bulk conjunction A2 helper (`score_sum_cannot_compete`).
+    #[inline]
+    fn exclusive_score_cannot_beat_floor(&self, score: f32) -> bool {
+        self.threshold > 0.0
+            && score.is_finite()
+            && score_sum_cannot_compete(
+                score,
+                0.0,
+                self.threshold,
+                score_sum_upper_bound_factor(self.num_terms),
+                CompetitiveFloorMode::Exclusive,
+            )
     }
 
     /// Calculate the current document's score in query order.
@@ -6685,6 +6716,27 @@ mod tests {
         let off = phrase_search_docs(BulkAndMode::Off, &docs, build(), 10);
         assert_eq!(on, off);
         assert_eq!(on, vec![0, 1]);
+    }
+
+    #[test]
+    fn classic_phrase_score_skip_is_fail_closed_and_exclusive() {
+        let mut docs = DocSet::default();
+        docs.append(0, 8);
+        let postings = phrase_pair_postings(&docs, [&[0], &[0]], [1.0, 1.0]);
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+            .with_bulk_and_mode(BulkAndMode::Off);
+
+        wand.threshold = 0.0;
+        assert!(!wand.exclusive_score_cannot_beat_floor(0.0));
+        assert!(!wand.exclusive_score_cannot_beat_floor(1.0));
+        assert!(!wand.exclusive_score_cannot_beat_floor(f32::NAN));
+
+        wand.threshold = 2.0;
+        assert!(wand.exclusive_score_cannot_beat_floor(1.0));
+        assert!(wand.exclusive_score_cannot_beat_floor(2.0));
+        assert!(!wand.exclusive_score_cannot_beat_floor(2.0 + 1.0));
+        assert!(!wand.exclusive_score_cannot_beat_floor(f32::NAN));
+        assert!(!wand.exclusive_score_cannot_beat_floor(f32::INFINITY));
     }
 
     struct PanicQueryWeightScorer;
