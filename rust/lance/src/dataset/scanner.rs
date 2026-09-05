@@ -29,7 +29,7 @@ use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
-    ExecutionPlan, SendableRecordBatchStream,
+    ExecutionPlan, ExecutionPlanProperties, SendableRecordBatchStream,
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     display::DisplayableExecutionPlan,
     limit::GlobalLimitExec,

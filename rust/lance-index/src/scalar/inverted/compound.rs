@@ -326,6 +326,8 @@ pub(super) trait ComposableScorer: Send {
 /// One confirmed hit produced by [`ComposableScorer::collect_confirmed_window`].
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ConfirmedHit {
+    /// Iterator id at emit time. The collector maps [`Self::document_key`].
+    #[allow(dead_code)]
     pub doc: u64,
     pub document_key: u64,
     pub score: f32,
