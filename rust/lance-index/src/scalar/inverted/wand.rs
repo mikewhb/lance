@@ -5072,10 +5072,10 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
     }
 
     fn seek(&mut self, target: u64) {
-        self.up_to = None;
         self.and_max_score = f32::INFINITY;
         self.and_last_doc = None;
         if self.operator == Operator::And {
+            self.up_to = None;
             for posting in &mut self.lead {
                 if posting.doc().is_some_and(|doc| doc.doc_id() < target) {
                     posting.next(target);
@@ -5083,6 +5083,13 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
             }
             return;
         }
+
+        // Deliberately keep `up_to`. `next` already refreshes the block-max
+        // window as soon as the candidate it picks crosses `up_to`, and the
+        // iterators this seek moves only move forward, which makes each
+        // clause's window bound tighter rather than looser. Discarding the
+        // window here just forced a rebuild on every `WandCursor::advance`,
+        // i.e. once per candidate document on the compound path.
 
         // `WandCursor::advance` seeks once per candidate document, so an
         // allocation here is charged to every document a compound query
