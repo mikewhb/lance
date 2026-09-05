@@ -4646,6 +4646,8 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     wand: Wand<'a, Arc<MemBM25Scorer>, D>,
     phrase_slop: Option<u32>,
     wand_factor: f32,
+    sticky_floor: f32,
+    window_floor: f32,
     cost: usize,
     global_score_upper_bound: OnceCell<Option<f32>>,
     current_doc: Option<DocInfo>,
@@ -4683,6 +4685,8 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                 .with_floor_mode(CompetitiveFloorMode::Inclusive),
             phrase_slop: params.phrase_slop,
             wand_factor: params.wand_factor,
+            sticky_floor: f32::NEG_INFINITY,
+            window_floor: f32::NEG_INFINITY,
             cost,
             global_score_upper_bound: OnceCell::new(),
             current_doc: None,
@@ -4825,10 +4829,33 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             ));
         }
         let floor = min_score * self.wand_factor;
-        if floor > self.wand.threshold {
-            self.wand.threshold = floor;
+        if floor > self.sticky_floor {
+            self.sticky_floor = floor;
         }
+        self.apply_effective_threshold();
         Ok(())
+    }
+
+    pub(super) fn set_window_min_competitive_score(
+        &mut self,
+        min_score: Option<f32>,
+    ) -> Result<()> {
+        if let Some(min_score) = min_score {
+            if min_score.is_nan() {
+                return Err(Error::invalid_input(
+                    "minimum competitive FTS score cannot be NaN",
+                ));
+            }
+            self.window_floor = min_score * self.wand_factor;
+        } else {
+            self.window_floor = f32::NEG_INFINITY;
+        }
+        self.apply_effective_threshold();
+        Ok(())
+    }
+
+    fn apply_effective_threshold(&mut self) {
+        self.wand.threshold = self.sticky_floor.max(self.window_floor).max(0.0);
     }
 }
 

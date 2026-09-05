@@ -3253,16 +3253,38 @@ impl Scanner {
             plan = Arc::new(StrictBatchSizeExec::new(plan, self.get_batch_size()));
         }
 
-        let optimizer = get_physical_optimizer();
-        let mut options = ConfigOptions::default();
-        options.execution.target_partitions = self
-            .target_parallelism
-            .unwrap_or_else(get_num_compute_intensive_cpus);
-        for rule in optimizer.rules {
-            plan = rule.optimize(plan, &options)?;
+        // Score-only FTS (no user columns, no refine, no KNN/agg/sort) is already
+        // a single-partition source plus Limit/Projection. The physical optimizer
+        // does not rewrite that shape, but walking EnforceDistribution on every
+        // query is a large fraction of the 250–350µs Wikipedia planning floor.
+        // Skip only when the plan is already one output partition:
+        // EnforceDistribution is what keeps SinglePartition FTS execs from
+        // consuming round-robin partition 0 and silently dropping the rest.
+        let skip_physical_optimizer = self.is_score_only_fts_scan(&filter_plan)
+            && plan.output_partitioning().partition_count() == 1;
+        if !skip_physical_optimizer {
+            let optimizer = get_physical_optimizer();
+            let mut options = ConfigOptions::default();
+            options.execution.target_partitions = self
+                .target_parallelism
+                .unwrap_or_else(get_num_compute_intensive_cpus);
+            for rule in optimizer.rules {
+                plan = rule.optimize(plan, &options)?;
+            }
         }
 
         Ok(plan)
+    }
+
+    fn is_score_only_fts_scan(&self, filter_plan: &FilterPlan) -> bool {
+        self.nearest.is_none()
+            && self.full_text_query.is_some()
+            && self.aggregate.is_none()
+            && self.ordering.is_none()
+            && !self.strict_batch_size
+            && !self.projection_plan.must_add_row_offset
+            && !self.projection_plan.physical_projection.has_data_fields()
+            && !filter_plan.has_refine()
     }
 
     // Check if a filter plan references version columns

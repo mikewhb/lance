@@ -274,6 +274,14 @@ pub(super) trait ComposableScorer: Send {
     }
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()>;
 
+    /// Raise or clear a range-local floor that is valid only for the current
+    /// shallow window. Unlike [`Self::set_min_competitive_score`], this may
+    /// drop when the window ends. The default keeps the sticky floor only.
+    fn set_window_min_competitive_score(&mut self, min_score: Option<f32>) -> Result<()> {
+        let _ = min_score;
+        Ok(())
+    }
+
     /// Conservative score upper bound for the current approximation without
     /// running two-phase confirmation. `None` disables doc-local pruning.
     fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
@@ -315,6 +323,37 @@ fn sum_global_score_upper_bounds(children: &[BoxScorer<'_>]) -> Option<f32> {
             .upper;
         combined.is_finite().then_some(combined)
     })
+}
+
+/// Greatest finite non-negative required score whose `f32` sum with
+/// `optional_upper` stays strictly below an inclusive parent floor.
+///
+/// Non-negative finite `f32` values have the same order as their bit
+/// patterns, and adding a finite non-negative optional upper is monotonic.
+/// Binary search therefore proves the returned exclusive child floor cannot
+/// discard a required score that, with the optional upper, still ties the heap.
+fn required_floor_after_optional(min_score: f32, optional_upper: f32) -> Option<f32> {
+    if !min_score.is_finite()
+        || min_score <= 0.0
+        || !optional_upper.is_finite()
+        || optional_upper < 0.0
+    {
+        return None;
+    }
+
+    let mut lower_bits = 0_u32;
+    let mut upper_bits = min_score.to_bits();
+    while lower_bits < upper_bits {
+        let midpoint = lower_bits + (upper_bits - lower_bits).div_ceil(2);
+        let required_score = f32::from_bits(midpoint);
+        if required_score + optional_upper < min_score {
+            lower_bits = midpoint;
+        } else {
+            upper_bits = midpoint - 1;
+        }
+    }
+    let child_floor = f32::from_bits(lower_bits);
+    (child_floor.is_finite() && child_floor > 0.0).then_some(child_floor)
 }
 
 /// Posting-payload-independent metadata for one semantic leaf in a staged
@@ -783,6 +822,10 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
         self.set_min_competitive_score(min_score)
     }
 
+    fn set_window_min_competitive_score(&mut self, min_score: Option<f32>) -> Result<()> {
+        self.set_window_min_competitive_score(min_score)
+    }
+
     fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
         self.current_score().map(Some)
     }
@@ -820,6 +863,7 @@ pub(super) struct MaterializedScorer {
     index: Option<usize>,
     shallow: Option<ShallowRange>,
     min_competitive_score: f32,
+    window_min_competitive_score: f32,
     scores_non_negative: bool,
     #[cfg(test)]
     bound_score_visits: usize,
@@ -853,6 +897,7 @@ impl MaterializedScorer {
             index: None,
             shallow: None,
             min_competitive_score: f32::NEG_INFINITY,
+            window_min_competitive_score: f32::NEG_INFINITY,
             scores_non_negative,
             #[cfg(test)]
             bound_score_visits,
@@ -923,9 +968,14 @@ impl MaterializedScorer {
         row_index / self.block_size
     }
 
+    fn effective_min_competitive_score(&self) -> f32 {
+        self.min_competitive_score
+            .max(self.window_min_competitive_score)
+    }
+
     fn skip_non_competitive_block(&self, row_index: usize) -> Result<Option<usize>> {
         let block_index = self.block_index(row_index);
-        if self.block_bounds_at(block_index)?.upper < self.min_competitive_score {
+        if self.block_bounds_at(block_index)?.upper < self.effective_min_competitive_score() {
             Ok(Some(self.block_end(block_index)))
         } else {
             Ok(None)
@@ -1030,6 +1080,20 @@ impl ComposableScorer for MaterializedScorer {
         }
         if min_score > self.min_competitive_score {
             self.min_competitive_score = min_score;
+        }
+        Ok(())
+    }
+
+    fn set_window_min_competitive_score(&mut self, min_score: Option<f32>) -> Result<()> {
+        if let Some(min_score) = min_score {
+            if min_score.is_nan() {
+                return Err(Error::invalid_input(
+                    "minimum competitive FTS score cannot be NaN",
+                ));
+            }
+            self.window_min_competitive_score = min_score;
+        } else {
+            self.window_min_competitive_score = f32::NEG_INFINITY;
         }
         Ok(())
     }
@@ -1261,6 +1325,10 @@ impl ComposableScorer for RowAddressScorer<'_> {
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
         self.source.set_min_competitive_score(min_score)
+    }
+
+    fn set_window_min_competitive_score(&mut self, min_score: Option<f32>) -> Result<()> {
+        self.source.set_window_min_competitive_score(min_score)
     }
 
     fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
@@ -1815,6 +1883,13 @@ impl ComposableScorer for RowAddressMergeScorer<'_> {
         Ok(())
     }
 
+    fn set_window_min_competitive_score(&mut self, min_score: Option<f32>) -> Result<()> {
+        for source_index in self.active_sources.iter().copied() {
+            self.sources[source_index].set_window_min_competitive_score(min_score)?;
+        }
+        Ok(())
+    }
+
     fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
         self.current_source_mut()?.current_score_upper_bound()
     }
@@ -2344,6 +2419,21 @@ impl ComposableScorer for ScaleScorer<'_> {
         Ok(())
     }
 
+    fn set_window_min_competitive_score(&mut self, min_score: Option<f32>) -> Result<()> {
+        let child_floor = match min_score {
+            Some(min_score) => {
+                if min_score.is_nan() {
+                    return Err(Error::invalid_input(
+                        "minimum competitive MatchQuery score cannot be NaN",
+                    ));
+                }
+                exclusive_scaled_score_floor(min_score, self.factor)
+            }
+            None => None,
+        };
+        self.child.set_window_min_competitive_score(child_floor)
+    }
+
     fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
         Ok(self.child.current_score_upper_bound()?.map(|upper| {
             ScoreBounds { lower: 0.0, upper }
@@ -2845,6 +2935,13 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
         Ok(())
     }
 
+    fn set_window_min_competitive_score(&mut self, min_score: Option<f32>) -> Result<()> {
+        if self.children.len() == 1 {
+            self.children[0].set_window_min_competitive_score(min_score)?;
+        }
+        Ok(())
+    }
+
     fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
         let Some(current) = self.current else {
             return Ok(None);
@@ -3035,6 +3132,7 @@ impl ComposableScorer for BoostScorer<'_> {
 struct ReqOptBounds {
     up_to: u64,
     required: ScoreBounds,
+    optional: ScoreBounds,
     combined: ScoreBounds,
 }
 
@@ -3092,8 +3190,22 @@ impl<'a> ReqOptScorer<'a> {
         self.optional_is_required = required;
     }
 
+    fn push_translated_required_floor(&mut self) -> Result<()> {
+        let Some(optional_upper) = self.optional.global_score_upper_bound() else {
+            return Ok(());
+        };
+        if let Some(child_floor) =
+            required_floor_after_optional(self.min_competitive_score, optional_upper)
+        {
+            self.required.set_min_competitive_score(child_floor)?;
+        }
+        Ok(())
+    }
+
     fn exhaust(&mut self) -> Option<u64> {
         self.exhausted = true;
+        self.shallow_bounds = None;
+        let _ = self.clear_window_required_floor();
         self.set_current(None);
         None
     }
@@ -3145,10 +3257,48 @@ impl<'a> ReqOptScorer<'a> {
         let bounds = ReqOptBounds {
             up_to,
             required,
+            optional,
             combined,
         };
         self.shallow_bounds = Some(bounds);
         Ok(bounds)
+    }
+
+    fn apply_window_required_floor(&mut self, optional_window: ScoreBounds) -> Result<()> {
+        let child_floor = Self::usable_bounds(optional_window)
+            .then(|| {
+                required_floor_after_optional(self.min_competitive_score, optional_window.upper)
+            })
+            .flatten();
+        self.required.set_window_min_competitive_score(child_floor)
+    }
+
+    fn clear_window_required_floor(&mut self) -> Result<()> {
+        self.required.set_window_min_competitive_score(None)
+    }
+
+    /// Skip a landed MUST doc when even this window's optional upper cannot
+    /// reach the heap. The sticky MUST floor uses the list-wide optional max,
+    /// which is often much looser than the current block.
+    fn current_cannot_compete(&mut self, optional_window: ScoreBounds) -> Result<bool> {
+        if !self.min_competitive_score.is_finite() || self.min_competitive_score <= 0.0 {
+            return Ok(false);
+        }
+        if !Self::usable_bounds(optional_window) {
+            return Ok(false);
+        }
+        let Some(required_upper) = self.required.current_score_upper_bound()? else {
+            return Ok(false);
+        };
+        if !required_upper.is_finite() {
+            return Ok(false);
+        }
+        let cap = ScoreBounds {
+            lower: 0.0,
+            upper: required_upper.max(0.0),
+        }
+        .add(optional_window);
+        Ok(Self::usable_bounds(cap) && cap.upper < self.min_competitive_score)
     }
 
     fn position(&mut self, mut target: u64) -> Result<Option<u64>> {
@@ -3158,6 +3308,17 @@ impl<'a> ReqOptScorer<'a> {
 
         'search: loop {
             let bounds = self.shallow_bounds.filter(|bounds| target <= bounds.up_to);
+            if bounds.is_none() {
+                // A window floor is valid only for the shallow range that
+                // produced it. Crossing `up_to` without dropping that range
+                // used to leave a tighter optional upper installed, so the
+                // next MUST block could skip docs that become competitive
+                // once the new window's optional upper is larger.
+                if self.shallow_bounds.is_some() {
+                    self.shallow_bounds = None;
+                }
+                self.clear_window_required_floor()?;
+            }
 
             if self.min_competitive_score.is_finite()
                 && self.min_competitive_score > 0.0
@@ -3165,12 +3326,14 @@ impl<'a> ReqOptScorer<'a> {
                 && Self::usable_bounds(bounds.required)
                 && Self::usable_bounds(bounds.combined)
             {
+                self.apply_window_required_floor(bounds.optional)?;
                 if bounds.combined.upper < self.min_competitive_score {
                     if bounds.up_to == u64::MAX {
                         return Ok(self.exhaust());
                     }
                     target = bounds.up_to + 1;
                     self.shallow_bounds = None;
+                    self.clear_window_required_floor()?;
                     continue;
                 }
 
@@ -3184,6 +3347,7 @@ impl<'a> ReqOptScorer<'a> {
                     if required_doc > bounds.up_to {
                         target = required_doc;
                         self.shallow_bounds = None;
+                        self.clear_window_required_floor()?;
                         continue;
                     }
                     self.set_current(Some(required_doc));
@@ -3198,6 +3362,7 @@ impl<'a> ReqOptScorer<'a> {
                             }
                             target = bounds.up_to + 1;
                             self.shallow_bounds = None;
+                            self.clear_window_required_floor()?;
                             continue 'search;
                         };
                         if optional_doc > bounds.up_to {
@@ -3206,9 +3371,18 @@ impl<'a> ReqOptScorer<'a> {
                             }
                             target = bounds.up_to + 1;
                             self.shallow_bounds = None;
+                            self.clear_window_required_floor()?;
                             continue 'search;
                         }
                         if optional_doc == required_doc {
+                            if self.current_cannot_compete(bounds.optional)? {
+                                if required_doc == u64::MAX {
+                                    return Ok(self.exhaust());
+                                }
+                                target = required_doc + 1;
+                                self.set_current(None);
+                                continue 'search;
+                            }
                             return Ok(self.current);
                         }
                         let Some(next_required) = self.required.advance(optional_doc)? else {
@@ -3217,6 +3391,7 @@ impl<'a> ReqOptScorer<'a> {
                         if next_required > bounds.up_to {
                             target = next_required;
                             self.shallow_bounds = None;
+                            self.clear_window_required_floor()?;
                             continue 'search;
                         }
                         required_doc = next_required;
@@ -3227,6 +3402,24 @@ impl<'a> ReqOptScorer<'a> {
             let Some(required_doc) = self.required.advance(target)? else {
                 return Ok(self.exhaust());
             };
+            if let Some(bounds) = self
+                .shallow_bounds
+                .filter(|bounds| required_doc <= bounds.up_to)
+                && self.min_competitive_score.is_finite()
+                && self.min_competitive_score > 0.0
+            {
+                self.set_current(Some(required_doc));
+                self.set_optional_required(false);
+                if self.current_cannot_compete(bounds.optional)? {
+                    if required_doc == u64::MAX {
+                        return Ok(self.exhaust());
+                    }
+                    target = required_doc + 1;
+                    self.set_current(None);
+                    continue;
+                }
+                return Ok(self.current);
+            }
             self.set_current(Some(required_doc));
             self.set_optional_required(false);
             return Ok(self.current);
@@ -3297,6 +3490,7 @@ impl ComposableScorer for ReqOptScorer<'_> {
             return Ok(bounds.up_to);
         }
         self.shallow_bounds = None;
+        let _ = self.clear_window_required_floor();
         let mut up_to = self.required.advance_shallow(target)?;
         match self.ensure_optional_at_or_after(target)? {
             Some(optional_doc) if optional_doc <= target => {
@@ -3337,8 +3531,13 @@ impl ComposableScorer for ReqOptScorer<'_> {
         }
         if min_score > self.min_competitive_score {
             self.min_competitive_score = min_score;
+            self.push_translated_required_floor()?;
         }
         Ok(())
+    }
+
+    fn set_window_min_competitive_score(&mut self, min_score: Option<f32>) -> Result<()> {
+        self.required.set_window_min_competitive_score(min_score)
     }
 
     fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
@@ -3442,7 +3641,13 @@ impl<'a> BooleanScorer<'a> {
                         as BoxScorer<'a>,
                 )
             };
-            let required = Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>;
+            let required = if must.len() == 1 {
+                must.into_iter()
+                    .next()
+                    .expect("checked that the required scorer is present")
+            } else {
+                Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>
+            };
             let driver = if required.scores_non_negative()
                 && optional
                     .as_ref()
@@ -4947,6 +5152,10 @@ mod tests {
             self.inner.set_min_competitive_score(min_score)
         }
 
+        fn set_window_min_competitive_score(&mut self, min_score: Option<f32>) -> Result<()> {
+            self.inner.set_window_min_competitive_score(min_score)
+        }
+
         fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
             self.inner.current_score_upper_bound()
         }
@@ -5980,6 +6189,149 @@ mod tests {
             "lazy required-plus-optional scoring should reduce optional probes by at least 20%: \
              {optional_probes}/{eager_optional_probes}"
         );
+    }
+
+    #[test]
+    fn required_floor_after_optional_is_conservative() {
+        let child = required_floor_after_optional(2.1, 0.25).unwrap();
+        assert!(child + 0.25 < 2.1);
+        let next_child = f32::from_bits(child.to_bits() + 1);
+        assert!(next_child + 0.25 >= 2.1);
+        assert_eq!(required_floor_after_optional(1.0, 100.0), None);
+        assert_eq!(required_floor_after_optional(f32::INFINITY, 1.0), None);
+        assert_eq!(required_floor_after_optional(0.0, 0.25), None);
+    }
+
+    #[test]
+    fn reqopt_pushes_translated_floor_into_required() {
+        // High-df SHOULD: tiny optional upper bound. After the heap fills, MUST
+        // blocks whose own upper is below `floor - optional_upper` can be skipped.
+        let required_values = (0..128)
+            .map(|doc| {
+                let score = if doc < 96 { 0.5 } else { 2.0 };
+                (doc, score)
+            })
+            .collect::<Vec<_>>();
+        let required = Box::new(
+            MaterializedScorer::try_new(rows(&required_values))
+                .unwrap()
+                .with_block_size(32),
+        );
+        let (required, required_work) = instrumented(required);
+        let (optional, optional_work) = instrumented(materialized(&[(120, 0.25)]));
+        let mut scorer = ReqOptScorer::new(required, optional);
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(2.1);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results, rows(&[(120, 2.25)]));
+        let required_floors = required_work.floors.load(AtomicOrdering::Relaxed);
+        assert!(
+            required_floors >= 1,
+            "ReqOpt must push floor - optional_upper into MUST, got {required_floors} floor updates"
+        );
+        let required_advances = required_work.advances.load(AtomicOrdering::Relaxed);
+        assert!(
+            required_advances < 40,
+            "translated optional upper should let MUST skip the low-score prefix: {required_advances}"
+        );
+        assert_eq!(optional_work.confirmations.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reqopt_skips_docs_using_window_optional_upper() {
+        // Global SHOULD max is 3.0 (a later block). The current window only
+        // offers 0.15, so MUST docs that survive the sticky global floor
+        // still cannot compete here and must not be emitted.
+        let required_values = (0..64)
+            .map(|doc| {
+                let score = if doc < 32 { 1.5 } else { 4.0 };
+                (doc, score)
+            })
+            .collect::<Vec<_>>();
+        let required = Box::new(
+            MaterializedScorer::try_new(rows(&required_values))
+                .unwrap()
+                .with_block_size(32),
+        );
+        let mut optional_values = (0..32).map(|doc| (doc, 0.15)).collect::<Vec<_>>();
+        optional_values.push((200, 3.0));
+        let optional = Box::new(
+            MaterializedScorer::try_new(rows(&optional_values))
+                .unwrap()
+                .with_block_size(32),
+        );
+        let (required, required_work) = instrumented(required);
+        let (optional, optional_work) = instrumented(optional);
+        let mut scorer = ReqOptScorer::new(required, optional);
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(4.0);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results, rows(&[(32, 4.0)]));
+        let optional_advances = optional_work.advances.load(AtomicOrdering::Relaxed);
+        assert!(
+            optional_advances <= 4,
+            "window optional upper should skip the 1.5 MUST prefix without probing SHOULD: {optional_advances}"
+        );
+        let required_advances = required_work.advances.load(AtomicOrdering::Relaxed);
+        assert!(
+            required_advances < 40,
+            "prefix MUST docs that cannot compete in this window should not be re-walked: {required_advances}"
+        );
+    }
+
+    #[test]
+    fn reqopt_clears_window_floor_when_leaving_shallow_range() {
+        // Window 0 optional upper is 0.15, so a translated window floor sits
+        // near 4.5 once the heap holds 4.65. Window 1's optional upper is 3.0.
+        // A 2.0 MUST doc in that later block is competitive only after the
+        // window floor is cleared; keeping the first window's floor would
+        // skip the entire second block.
+        let mut required_values = (0..32).map(|doc| (doc, 4.5)).collect::<Vec<_>>();
+        required_values.extend((32..64).map(|doc| (doc, 2.0)));
+        let required = Box::new(
+            MaterializedScorer::try_new(rows(&required_values))
+                .unwrap()
+                .with_block_size(32),
+        );
+        let mut optional_values = (0..32).map(|doc| (doc, 0.15)).collect::<Vec<_>>();
+        optional_values.push((40, 3.0));
+        let optional = Box::new(
+            MaterializedScorer::try_new(rows(&optional_values))
+                .unwrap()
+                .with_block_size(32),
+        );
+        let mut scorer = ReqOptScorer::new(required, optional);
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(4.0);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results, rows(&[(40, 5.0)]));
+    }
+
+    #[test]
+    fn reqopt_window_prune_keeps_floor_ties() {
+        let required = materialized(&[(0, 1.85), (1, 1.0)]);
+        let optional = materialized(&[(0, 0.25), (1, 0.25)]);
+        let mut scorer = ReqOptScorer::new(required, optional);
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(2.1);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results, rows(&[(0, 2.1)]));
     }
 
     #[test]
