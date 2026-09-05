@@ -239,7 +239,11 @@ impl CompetitiveFloorMode {
 // skipping plus a slice-level merge over decompressed blocks, replacing the
 // per-doc `next()` leapfrog. Results are identical to the classic AND loop.
 // LANCE_FTS_BULK_AND accepts auto (default), on/1, or off/0. Auto enables the
-// bulk path only for its consistently faster two- and three-clause kernels.
+// bulk path for the 2- and 3-clause kernels, and for long dense conjunctions
+// whose shortest posting is at least `BULK_AND_AUTO_MIN_COST`. Selective 4+
+// lists stay on classic leapfrog: the generic merge pays a per-window setup
+// that loses when a rare term can skip.
+const BULK_AND_AUTO_MIN_COST: usize = 500_000;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BulkAndMode {
     #[default]
@@ -262,9 +266,12 @@ impl BulkAndMode {
         }
     }
 
-    const fn enabled_for(self, num_clauses: usize) -> bool {
+    const fn enabled_for(self, num_clauses: usize, min_cost: usize) -> bool {
         match self {
-            Self::Auto => matches!(num_clauses, 2 | 3),
+            Self::Auto => {
+                matches!(num_clauses, 2 | 3)
+                    || (num_clauses >= 6 && min_cost >= BULK_AND_AUTO_MIN_COST)
+            }
             Self::On => true,
             Self::Off => false,
         }
@@ -2384,7 +2391,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             && self
                 .bulk_and_mode_override
                 .unwrap_or_else(|| *BULK_AND_MODE)
-                .enabled_for(self.lead.len())
+                .enabled_for(self.lead.len(), self.lead[0].cost())
         {
             #[cfg(test)]
             {
@@ -5811,20 +5818,26 @@ mod tests {
     }
 
     #[rstest]
-    #[case::auto_one(BulkAndMode::Auto, 1, false)]
-    #[case::auto_two(BulkAndMode::Auto, 2, true)]
-    #[case::auto_three(BulkAndMode::Auto, 3, true)]
-    #[case::auto_four(BulkAndMode::Auto, 4, false)]
-    #[case::on_one(BulkAndMode::On, 1, true)]
-    #[case::on_five(BulkAndMode::On, 5, true)]
-    #[case::off_two(BulkAndMode::Off, 2, false)]
-    #[case::off_five(BulkAndMode::Off, 5, false)]
+    #[case::auto_one(BulkAndMode::Auto, 1, 0, false)]
+    #[case::auto_two(BulkAndMode::Auto, 2, 0, true)]
+    #[case::auto_three(BulkAndMode::Auto, 3, 0, true)]
+    #[case::auto_four(BulkAndMode::Auto, 4, 0, false)]
+    #[case::auto_four_huge(BulkAndMode::Auto, 4, usize::MAX, false)]
+    #[case::auto_five_huge(BulkAndMode::Auto, 5, usize::MAX, false)]
+    #[case::auto_six_below_floor(BulkAndMode::Auto, 6, BULK_AND_AUTO_MIN_COST - 1, false)]
+    #[case::auto_six_at_floor(BulkAndMode::Auto, 6, BULK_AND_AUTO_MIN_COST, true)]
+    #[case::auto_seven_at_floor(BulkAndMode::Auto, 7, BULK_AND_AUTO_MIN_COST, true)]
+    #[case::on_one(BulkAndMode::On, 1, 0, true)]
+    #[case::on_five(BulkAndMode::On, 5, 0, true)]
+    #[case::off_two(BulkAndMode::Off, 2, 0, false)]
+    #[case::off_five(BulkAndMode::Off, 5, usize::MAX, false)]
     fn test_bulk_and_mode_enabled_for(
         #[case] mode: BulkAndMode,
         #[case] num_clauses: usize,
+        #[case] min_cost: usize,
         #[case] expected: bool,
     ) {
-        assert_eq!(mode.enabled_for(num_clauses), expected);
+        assert_eq!(mode.enabled_for(num_clauses, min_cost), expected);
     }
 
     #[test]
