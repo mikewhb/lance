@@ -3845,6 +3845,38 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         continue;
                     };
 
+                    // Exact query-order score is already determined by window
+                    // frequencies and the gathered doc length. Compute it
+                    // before phrase confirm: a doc that cannot beat the
+                    // exclusive floor will be refused by `insert` whether or
+                    // not the phrase matches, so its `position_cursor` calls
+                    // are wasted. The helper widens outward, so a rejection
+                    // implies `score <= threshold <= kth`.
+                    let mut score = 0.0_f32;
+                    for &clause_index in &score_order {
+                        let win = &wins[clause_index];
+                        let posting = &self.lead[clause_index];
+                        let off = offs[clause_index];
+                        let freq = unsafe { *win.freqs.add(off as usize) };
+                        score += match norm_addend {
+                            Some(addend) => {
+                                posting.query_weight * bm25_doc_weight_with_norm(freq, addend)
+                            }
+                            None => posting.score(&self.scorer, freq, doc_length),
+                        };
+                    }
+                    if self.threshold > 0.0
+                        && score_sum_cannot_compete(
+                            score,
+                            0.0,
+                            self.threshold,
+                            score_sum_upper_bound_factor(num_lists),
+                            CompetitiveFloorMode::Exclusive,
+                        )
+                    {
+                        continue;
+                    }
+
                     if let Some(slop) = phrase_slop {
                         // Park every clause's iterator on this doc so
                         // `position_cursor` reads the right posting entry. The
@@ -3867,19 +3899,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         if !matched {
                             continue;
                         }
-                    }
-                    let mut score = 0.0_f32;
-                    for &clause_index in &score_order {
-                        let win = &wins[clause_index];
-                        let posting = &self.lead[clause_index];
-                        let off = offs[clause_index];
-                        let freq = unsafe { *win.freqs.add(off as usize) };
-                        score += match norm_addend {
-                            Some(addend) => {
-                                posting.query_weight * bm25_doc_weight_with_norm(freq, addend)
-                            }
-                            None => posting.score(&self.scorer, freq, doc_length),
-                        };
                     }
 
                     if candidates.insert(
@@ -5808,6 +5827,118 @@ mod tests {
         assert_eq!(mode.enabled_for(num_clauses), expected);
     }
 
+    #[test]
+    fn wand_search_default_floor_is_exclusive() {
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        let wand = Wand::new(Operator::And, std::iter::empty(), &docs, UnitScorer);
+        assert_eq!(wand.floor_mode, CompetitiveFloorMode::Exclusive);
+    }
+
+    #[test]
+    fn wand_cursor_uses_inclusive_floor() {
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        let posting = PostingIterator::new(
+            String::from("t"),
+            0,
+            0,
+            generate_posting_list(vec![0], 1.0, None, true),
+            docs.len(),
+        );
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+        let cursor = WandCursor::new(
+            Operator::And,
+            vec![posting],
+            &docs,
+            Arc::new(MemBM25Scorer::new(1, 1, std::collections::HashMap::new())),
+            &params,
+            &metrics,
+        );
+        assert_eq!(cursor.wand.floor_mode, CompetitiveFloorMode::Inclusive);
+    }
+
+    fn phrase_pair_postings(
+        docs: &DocSet,
+        clause_docs: [&[u32]; 2],
+        query_weights: [f32; 2],
+    ) -> Vec<PostingIterator> {
+        clause_docs
+            .into_iter()
+            .zip(query_weights)
+            .enumerate()
+            .map(|(term_pos, (doc_ids, query_weight))| {
+                let positions = doc_ids
+                    .iter()
+                    .map(|_| vec![5 + term_pos as u32])
+                    .collect::<Vec<_>>();
+                PostingIterator::with_query_weight(
+                    format!("t{term_pos}"),
+                    term_pos as u32,
+                    term_pos as u32,
+                    query_weight,
+                    generate_posting_list_with_positions(doc_ids.to_vec(), positions, 8.0, true),
+                    docs.len(),
+                )
+            })
+            .collect()
+    }
+
+    fn phrase_search_docs(
+        mode: BulkAndMode,
+        docs: &DocSet,
+        postings: Vec<PostingIterator>,
+        limit: usize,
+    ) -> Vec<u64> {
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), docs, UnitScorer)
+            .with_bulk_and_mode(mode);
+        let mut params = FtsSearchParams::default().with_limit(Some(limit));
+        params.phrase_slop = Some(0);
+        let mut rows = wand
+            .search(&params, &NoOpMetricsCollector)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.document)
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows
+    }
+
+    #[test]
+    fn bulk_phrase_drops_score_tie_with_kth_like_insert() {
+        // Four phrase-matching docs, identical UnitScorer scores. After the
+        // heap fills at k=2, later ties must stay out — Exclusive insert and
+        // the exact-score prune agree.
+        let mut docs = DocSet::default();
+        for doc_id in 0..4 {
+            docs.append(doc_id, 8);
+        }
+        let clause_docs: [&[u32]; 2] = [&[0, 1, 2, 3], &[0, 1, 2, 3]];
+        let build = || phrase_pair_postings(&docs, clause_docs, [1.0, 1.0]);
+        let on = phrase_search_docs(BulkAndMode::On, &docs, build(), 2);
+        let off = phrase_search_docs(BulkAndMode::Off, &docs, build(), 2);
+        assert_eq!(on, off);
+        assert_eq!(on, vec![0, 1]);
+        assert!(!on.contains(&2));
+        assert!(!on.contains(&3));
+    }
+
+    #[test]
+    fn bulk_phrase_exact_score_prune_fail_closed_on_non_finite_weight() {
+        // NaN query weight makes the exact score non-finite. The helper must
+        // not prune; both modes still confirm the phrase and agree on hits.
+        let mut docs = DocSet::default();
+        docs.append(0, 8);
+        docs.append(1, 8);
+        let clause_docs: [&[u32]; 2] = [&[0, 1], &[0, 1]];
+        let build = || phrase_pair_postings(&docs, clause_docs, [f32::NAN, 1.0]);
+        let on = phrase_search_docs(BulkAndMode::On, &docs, build(), 10);
+        let off = phrase_search_docs(BulkAndMode::Off, &docs, build(), 10);
+        assert_eq!(on, off);
+        assert_eq!(on, vec![0, 1]);
+    }
+
     struct PanicQueryWeightScorer;
 
     impl Scorer for PanicQueryWeightScorer {
@@ -7724,6 +7855,8 @@ mod tests {
     #[case::and_six_clauses(false, 0, 10, 6)]
     #[case::phrase_k10(true, 0, 10, 3)]
     #[case::phrase_k3(true, 0, 3, 3)]
+    #[case::phrase_k3_four_clauses(true, 0, 3, 4)]
+    #[case::phrase_k3_six_clauses(true, 0, 3, 6)]
     #[case::phrase_slop_three(true, 3, 10, 3)]
     #[case::phrase_two_clauses(true, 0, 10, 2)]
     #[case::phrase_four_clauses(true, 0, 10, 4)]
