@@ -1216,6 +1216,55 @@ async fn test_fts_combines_indexed_overlay_stale_and_unindexed_rows(
 
 #[rstest]
 #[tokio::test]
+async fn test_fts_score_only_combines_indexed_overlay_stale_and_unindexed_rows(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    // Score-only FTS can skip the physical optimizer. The skip is valid only
+    // when every plan node is already one partition. This shape unions
+    // unindexed fragments with overlay-stale rows (two 1-partition inputs),
+    // so EnforceDistribution must still coalesce that UnionExec.
+    let mut dataset = create_text_dataset(stable_row_ids).await;
+    build_text_fts_index_with_positions(&mut dataset).await;
+
+    let batch =
+        arrow_array::record_batch!(("id", Int32, [12]), ("text", Utf8, ["cherry mango"])).unwrap();
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let dataset = Dataset::write(
+        reader,
+        Arc::new(dataset),
+        Some(WriteParams {
+            mode: crate::dataset::write::WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let dataset = commit_overlay(
+        dataset,
+        "fts_score_only_combined_flat_paths",
+        0,
+        &[1],
+        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
+        vec![Arc::new(StringArray::from(vec![Some("cherry mango")]))],
+    )
+    .await;
+
+    let mut scan = dataset.scan();
+    scan.full_text_search(FullTextSearchQuery::new("mango".to_owned()))
+        .unwrap();
+    scan.empty_project().unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        batch.num_rows(),
+        3,
+        "score-only must keep the indexed, overlay-stale, and unindexed mango hits"
+    );
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_fts_overlay_row_level_masking_under_fast_search(
     #[values(false, true)] stable_row_ids: bool,
 ) {

@@ -1381,6 +1381,21 @@ impl TakeOperation {
     }
 }
 
+/// True when this node and every descendant already report one output partition.
+///
+/// FTS execs construct `Partitioning::RoundRobinBatch(1)` even when a child
+/// (for example a two-input `UnionExec` of unindexed fragments and overlay
+/// stale rows) has more partitions. `EnforceDistribution` is what coalesces
+/// those children; the score-only optimizer skip must not fire unless the
+/// whole tree is already single-partition.
+fn plan_tree_is_single_partition(plan: &dyn ExecutionPlan) -> bool {
+    plan.output_partitioning().partition_count() == 1
+        && plan
+            .children()
+            .into_iter()
+            .all(|child| plan_tree_is_single_partition(child.as_ref()))
+}
+
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
@@ -3253,15 +3268,16 @@ impl Scanner {
             plan = Arc::new(StrictBatchSizeExec::new(plan, self.get_batch_size()));
         }
 
-        // Score-only FTS (no user columns, no refine, no KNN/agg/sort) is already
-        // a single-partition source plus Limit/Projection. The physical optimizer
-        // does not rewrite that shape, but walking EnforceDistribution on every
-        // query is a large fraction of the 250–350µs Wikipedia planning floor.
-        // Skip only when the plan is already one output partition:
-        // EnforceDistribution is what keeps SinglePartition FTS execs from
-        // consuming round-robin partition 0 and silently dropping the rest.
+        // Score-only FTS (no user columns, no refine, no KNN/agg/sort) is often
+        // already a single-partition tree plus Limit/Projection. Walking
+        // EnforceDistribution on that shape is a large fraction of the
+        // 250–350µs Wikipedia planning floor. FTS execs advertise one *output*
+        // partition while still requiring SinglePartition *inputs*; skipping
+        // the optimizer is safe only when every node already reports one
+        // partition. A 1-partition root wrapping a UnionExec (unindexed +
+        // overlay-stale) would otherwise execute only child partition 0.
         let skip_physical_optimizer = self.is_score_only_fts_scan(&filter_plan)
-            && plan.output_partitioning().partition_count() == 1;
+            && plan_tree_is_single_partition(plan.as_ref());
         if !skip_physical_optimizer {
             let optimizer = get_physical_optimizer();
             let mut options = ConfigOptions::default();
@@ -7397,6 +7413,30 @@ mod test {
         let error = validate_fts_query_contract(&infinite_boost).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("BoostQuery negative_boost"));
+    }
+
+    #[test]
+    fn test_plan_tree_is_single_partition_rejects_multi_partition_child() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..2)) as ArrayRef],
+        )
+        .unwrap();
+        let left: Arc<dyn ExecutionPlan> =
+            Arc::new(crate::io::exec::testing::TestingExec::new(vec![
+                batch.clone(),
+            ]));
+        let right: Arc<dyn ExecutionPlan> =
+            Arc::new(crate::io::exec::testing::TestingExec::new(vec![batch]));
+        assert!(plan_tree_is_single_partition(left.as_ref()));
+        let union = UnionExec::try_new(vec![left, right]).unwrap();
+        assert_eq!(union.output_partitioning().partition_count(), 2);
+        assert!(!plan_tree_is_single_partition(union.as_ref()));
     }
 
     #[test]
@@ -14768,6 +14808,37 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .scan()
             .full_text_search(FullTextSearchQuery::new("s".to_owned()))
             .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_fold(
+                0usize,
+                |acc, batch| async move { Ok(acc + batch.num_rows()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(returned, total);
+    }
+
+    #[tokio::test]
+    async fn test_fts_score_only_multiple_unindexed_appends() {
+        // Score-only FTS skips the physical optimizer when the whole plan tree
+        // is already one partition. That skip must not drop unindexed appends.
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_fts_index().await.unwrap();
+        test_ds.append_data_with_range(400, 5400).await.unwrap();
+        test_ds.append_data_with_range(5400, 10400).await.unwrap();
+
+        let total = test_ds.dataset.count_rows(None).await.unwrap();
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .full_text_search(FullTextSearchQuery::new("s".to_owned()))
+            .unwrap()
+            .empty_project()
+            .unwrap();
+        let returned = scanner
             .try_into_stream()
             .await
             .unwrap()
