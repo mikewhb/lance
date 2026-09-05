@@ -5097,6 +5097,9 @@ pub(super) struct TermLeafScorer<'a, D: WandDocuments> {
     current_doc: Option<DocInfo>,
     current_document_key: Option<u64>,
     current_score: f32,
+    /// `false` when [`Self::position_next`] skipped BM25 because the
+    /// inclusive floor is still 0. [`Self::ensure_score`] fills it on demand.
+    score_ready: bool,
     shallow: Option<(u64, u64, f32)>,
     comparisons: usize,
     metrics_recorded: bool,
@@ -5124,6 +5127,7 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
             current_doc: None,
             current_document_key: None,
             current_score: 0.0,
+            score_ready: false,
             shallow: None,
             comparisons: 0,
             metrics_recorded: false,
@@ -5139,6 +5143,7 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
         self.current_doc = None;
         self.current_document_key = None;
         self.current_score = 0.0;
+        self.score_ready = false;
         self.shallow = None;
     }
 
@@ -5220,18 +5225,27 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
                 self.skip_dead_windows();
                 continue;
             };
-            let doc_length = self.documents.doc_length(&doc);
-            let score = self
-                .posting
-                .score(self.scorer.as_ref(), doc.frequency(), doc_length);
-            if !self.should_emit(score) {
-                self.posting.next(doc.doc_id().saturating_add(1));
-                self.skip_dead_windows();
-                continue;
-            }
+            // A zero inclusive floor accepts every non-negative BM25. Skip
+            // the score until a parent (ReqOpt prune, collector) asks — IU
+            // leapfrog advances MUST past many docs that never emit.
+            let (score, score_ready) = if self.threshold() > 0.0 {
+                let doc_length = self.documents.doc_length(&doc);
+                let score = self
+                    .posting
+                    .score(self.scorer.as_ref(), doc.frequency(), doc_length);
+                if !self.should_emit(score) {
+                    self.posting.next(doc.doc_id().saturating_add(1));
+                    self.skip_dead_windows();
+                    continue;
+                }
+                (score, true)
+            } else {
+                (0.0, false)
+            };
             self.current_doc = Some(doc);
             self.current_document_key = Some(document_key);
             self.current_score = score;
+            self.score_ready = score_ready;
             self.shallow = None;
             return Ok(Some(doc.doc_id()));
         }
@@ -5268,10 +5282,24 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
         self.cost
     }
 
-    pub(super) fn current_score(&self) -> Result<f32> {
-        self.current_doc
-            .map(|_| self.current_score)
-            .ok_or_else(|| Error::internal("term FTS scorer is not positioned on a document"))
+    fn ensure_score(&mut self) -> Result<f32> {
+        let Some(doc) = self.current_doc else {
+            return Err(Error::internal(
+                "term FTS scorer is not positioned on a document",
+            ));
+        };
+        if !self.score_ready {
+            let doc_length = self.documents.doc_length(&doc);
+            self.current_score =
+                self.posting
+                    .score(self.scorer.as_ref(), doc.frequency(), doc_length);
+            self.score_ready = true;
+        }
+        Ok(self.current_score)
+    }
+
+    pub(super) fn current_score(&mut self) -> Result<f32> {
+        self.ensure_score()
     }
 
     pub(super) fn advance_shallow(&mut self, target: u64) -> Result<u64> {

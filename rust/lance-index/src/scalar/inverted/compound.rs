@@ -3500,6 +3500,26 @@ impl<'a> ReqOptScorer<'a> {
         self.required.set_window_min_competitive_score(None)
     }
 
+    /// Prefer the parked optional's current upper over the shallow window.
+    /// A window sums every SHOULD block max; once both sides sit on the same
+    /// doc the exact (or current) optional contribution is tighter and still
+    /// conservative. Fall back to the window when optional is lazy or unbounded.
+    fn parked_optional_upper(&mut self, optional_window: ScoreBounds) -> Result<ScoreBounds> {
+        let Some(current) = self.current else {
+            return Ok(optional_window);
+        };
+        if self.optional.doc() != Some(current) {
+            return Ok(optional_window);
+        }
+        match self.optional.current_score_upper_bound()? {
+            Some(upper) if upper.is_finite() => Ok(ScoreBounds {
+                lower: 0.0,
+                upper: upper.max(0.0),
+            }),
+            _ => Ok(optional_window),
+        }
+    }
+
     /// Skip a landed MUST doc when even this window's optional upper cannot
     /// reach the heap. The sticky MUST floor uses the list-wide optional max,
     /// which is often much looser than the current block.
@@ -3507,7 +3527,8 @@ impl<'a> ReqOptScorer<'a> {
         if !self.min_competitive_score.is_finite() || self.min_competitive_score <= 0.0 {
             return Ok(false);
         }
-        if !Self::usable_bounds(optional_window) {
+        let optional_cap = self.parked_optional_upper(optional_window)?;
+        if !Self::usable_bounds(optional_cap) {
             return Ok(false);
         }
         let Some(required_upper) = self.required.current_score_upper_bound()? else {
@@ -3520,7 +3541,7 @@ impl<'a> ReqOptScorer<'a> {
             lower: 0.0,
             upper: required_upper.max(0.0),
         }
-        .add(optional_window);
+        .add(optional_cap);
         Ok(Self::usable_bounds(cap) && cap.upper < self.min_competitive_score)
     }
 
@@ -6756,6 +6777,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(results, rows(&[(0, 2.1)]));
+    }
+
+    #[test]
+    fn reqopt_uses_parked_optional_upper_when_tighter_than_window() {
+        // Window optional max is 10 (doc 1). Doc 0's exact optional is 0.1, so
+        // 1.0 + 0.1 cannot meet a 2.0 inclusive floor even though the window
+        // upper would allow it. Doc 1 (1.0 + 10.0) still enters.
+        let required = materialized(&[(0, 1.0), (1, 1.0)]);
+        let optional = materialized(&[(0, 0.1), (1, 10.0)]);
+        let mut scorer = ReqOptScorer::new(required, optional);
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(2.0);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results, rows(&[(1, 11.0)]));
     }
 
     fn reqopt_window_collect_fixture() -> (ReqOptScorer<'static>, ReqOptScorer<'static>) {
