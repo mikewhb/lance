@@ -2178,6 +2178,11 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // in play because their score upper bound could affect the decision for the
     // current candidate.
     tail: BinaryHeap<TailPosting>,
+    // Parking buffer for the tail entries a window refresh has to re-rank.
+    // `update_max_scores` and `seek` both need the old tail contents while
+    // pushing into a fresh `tail`, and both run once per candidate document on
+    // the compound path, so the buffer is kept instead of reallocated.
+    tail_scratch: Vec<TailPosting>,
     // Conservatively rounded sum of upper bounds for all iterators in `tail`.
     // It is maintained in f64 so candidate checks stay O(1) without allowing
     // repeated f32 add/subtract rounding to underestimate the remaining score.
@@ -2265,6 +2270,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             head,
             lead,
             tail: BinaryHeap::new(),
+            tail_scratch: Vec::new(),
             tail_max_score: 0.0,
             up_to: None,
             and_max_score: f32::INFINITY,
@@ -4181,7 +4187,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             narrow_up_to = narrow_up_to.min(posting.posting.block_end_doc());
         }
 
-        let mut tail_postings = std::mem::take(&mut self.tail).into_vec();
+        // Park the old tail contents in the reusable scratch buffer and give
+        // the heap its (now empty) allocation straight back, so the re-inserts
+        // at the end of this function push into retained capacity.
+        let mut tail_postings = std::mem::take(&mut self.tail_scratch);
+        let mut parked = std::mem::take(&mut self.tail).into_vec();
+        tail_postings.append(&mut parked);
+        self.tail = BinaryHeap::from(parked);
         for tail_posting in &mut tail_postings {
             tail_posting.posting.shallow_next(target);
         }
@@ -4199,7 +4211,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         self.head = BinaryHeap::from(head_postings);
 
         self.tail_max_score = 0.0;
-        for tail_posting in tail_postings {
+        for tail_posting in tail_postings.drain(..) {
             let posting = tail_posting.posting;
             let upper_bound = match posting.block_first_doc() {
                 Some(block_doc) if block_doc <= target => {
@@ -4212,6 +4224,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 self.push_head(evicted);
             }
         }
+        self.tail_scratch = tail_postings;
     }
 
     /// After the narrow window proved skippable, try widening the skip to the
@@ -5071,29 +5084,36 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
             return;
         }
 
-        let mut postings = std::mem::take(&mut self.head)
-            .into_vec()
-            .into_iter()
-            .map(|posting| posting.posting)
-            .chain(self.lead.drain(..))
-            .chain(
-                std::mem::take(&mut self.tail)
-                    .into_vec()
-                    .into_iter()
-                    .map(|posting| posting.posting),
-            )
-            .collect::<Vec<_>>();
+        // `WandCursor::advance` seeks once per candidate document, so an
+        // allocation here is charged to every document a compound query
+        // considers. Repartition everything back into `head` in place: reuse
+        // the head heap's own backing vector, and hand the emptied tail vector
+        // back so its capacity survives for the re-inserts that the next
+        // `update_max_scores` performs.
+        let mut head_postings = std::mem::take(&mut self.head).into_vec();
+        for posting in self.lead.drain(..) {
+            head_postings.push(HeadPosting::new(posting));
+        }
+        let mut tail_postings = std::mem::take(&mut self.tail).into_vec();
+        for tail_posting in tail_postings.drain(..) {
+            head_postings.push(HeadPosting::new(tail_posting.posting));
+        }
+        self.tail = BinaryHeap::from(tail_postings);
         self.tail_max_score = 0.0;
-        for posting in &mut postings {
-            if posting.doc().is_some_and(|doc| doc.doc_id() < target) {
-                posting.next(target);
+        for entry in &mut head_postings {
+            if entry.posting.doc().is_some_and(|doc| doc.doc_id() < target) {
+                entry.posting.next(target);
+                // The heap orders by this cached key, so it has to follow the
+                // iterator whenever the iterator actually moved.
+                entry.doc_id = entry
+                    .posting
+                    .doc()
+                    .map(|doc| doc.doc_id())
+                    .unwrap_or(TERMINATED_DOC_ID);
             }
         }
-        self.head = postings
-            .into_iter()
-            .filter(|posting| posting.doc().is_some())
-            .map(HeadPosting::new)
-            .collect();
+        head_postings.retain(|entry| entry.posting.doc().is_some());
+        self.head = BinaryHeap::from(head_postings);
     }
 
     fn compound_shallow_bound(&mut self, target: u64) -> (u64, f32) {
@@ -5570,6 +5590,77 @@ mod tests {
 
         assert_eq!(cursor.next().unwrap(), Some(0));
         assert_eq!(cursor.current_score().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn wand_cursor_advance_matches_sequential_next_across_blocks() {
+        // `advance` goes through `Wand::seek`, which repartitions every
+        // iterator back into the head heap. The heap orders by a cached doc id,
+        // so that key has to stay in step with any iterator the seek moved; a
+        // stale key silently reorders the heap and can drop candidates. Drive
+        // the same lists both ways and require identical docs and score bits.
+        let num_docs = 4 * crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE;
+        let strides = [1u32, 3, 7];
+        let build = || {
+            strides
+                .iter()
+                .enumerate()
+                .map(|(position, stride)| {
+                    let doc_ids = (0..num_docs as u32)
+                        .filter(|doc_id| doc_id % stride == 0)
+                        .collect::<Vec<_>>();
+                    PostingIterator::with_query_weight(
+                        format!("t{position}"),
+                        position as u32,
+                        position as u32,
+                        1.0 + position as f32,
+                        generate_posting_list(doc_ids, 2.0, None, true),
+                        num_docs,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs as u64 {
+            docs.append(doc_id, 1);
+        }
+        let scorer = Arc::new(MemBM25Scorer::new(
+            num_docs as u64,
+            num_docs,
+            std::collections::HashMap::new(),
+        ));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+
+        let mut sequential = WandCursor::new(
+            Operator::Or,
+            build(),
+            &docs,
+            scorer.clone(),
+            &params,
+            &metrics,
+        );
+        let mut expected = Vec::new();
+        while let Some(doc) = sequential.next().unwrap() {
+            expected.push((doc, sequential.current_score().unwrap().to_bits()));
+        }
+        assert!(
+            expected.len() > crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE,
+            "test must span several blocks, got {} docs",
+            expected.len()
+        );
+
+        // Seek to each candidate, including the gaps between them, so the seek
+        // lands both inside the current block and past a block boundary.
+        let mut seeking = WandCursor::new(Operator::Or, build(), &docs, scorer, &params, &metrics);
+        let mut actual = Vec::new();
+        let mut target = 0u64;
+        while let Some(doc) = seeking.advance(target).unwrap() {
+            actual.push((doc, seeking.current_score().unwrap().to_bits()));
+            target = doc + 1;
+        }
+        assert_eq!(actual, expected);
     }
 
     #[rstest]
