@@ -1002,7 +1002,7 @@ impl PostingIterator {
     }
 
     #[inline]
-    fn has_grouped_terms(&self) -> bool {
+    pub(super) fn has_grouped_terms(&self) -> bool {
         self.grouped_terms.is_some()
     }
 
@@ -5033,6 +5033,272 @@ impl<D: WandDocuments> Drop for WandCursor<'_, D> {
     }
 }
 
+/// Single-term compound leaf that talks to one [`PostingIterator`] directly.
+///
+/// Boolean IU queries wrap every Match leaf in a [`WandCursor`]. For one
+/// posting that machine is all bookkeeping: heap, head/lead/tail, window
+/// rebuild. This cursor keeps the same inclusive floor and block-max skip
+/// so a raised MUST floor still prunes, but `next`/`advance` are a posting
+/// step plus a score.
+pub(super) struct TermLeafScorer<'a, D: WandDocuments> {
+    posting: PostingIterator,
+    documents: &'a D,
+    scorer: Arc<MemBM25Scorer>,
+    wand_factor: f32,
+    sticky_floor: f32,
+    window_floor: f32,
+    cost: usize,
+    global_score_upper_bound: OnceCell<Option<f32>>,
+    current_doc: Option<DocInfo>,
+    current_document_key: Option<u64>,
+    current_score: f32,
+    shallow: Option<(u64, u64, f32)>,
+    comparisons: usize,
+    metrics_recorded: bool,
+    metrics: &'a dyn MetricsCollector,
+}
+
+impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
+    pub(super) fn new(
+        posting: PostingIterator,
+        documents: &'a D,
+        scorer: Arc<MemBM25Scorer>,
+        params: &FtsSearchParams,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Self {
+        let cost = posting.cost().min(documents.visible_cost_upper_bound());
+        Self {
+            posting,
+            documents,
+            scorer,
+            wand_factor: params.wand_factor,
+            sticky_floor: f32::NEG_INFINITY,
+            window_floor: f32::NEG_INFINITY,
+            cost,
+            global_score_upper_bound: OnceCell::new(),
+            current_doc: None,
+            current_document_key: None,
+            current_score: 0.0,
+            shallow: None,
+            comparisons: 0,
+            metrics_recorded: false,
+            metrics,
+        }
+    }
+
+    fn threshold(&self) -> f32 {
+        self.sticky_floor.max(self.window_floor).max(0.0)
+    }
+
+    fn clear_current(&mut self) {
+        self.current_doc = None;
+        self.current_document_key = None;
+        self.current_score = 0.0;
+        self.shallow = None;
+    }
+
+    fn record_metrics(&mut self) {
+        if !self.metrics_recorded {
+            self.metrics.record_comparisons(self.comparisons);
+            self.metrics_recorded = true;
+        }
+    }
+
+    fn skip_dead_windows(&mut self) {
+        let threshold = self.threshold();
+        if threshold <= 0.0 {
+            return;
+        }
+        loop {
+            let Some(doc) = self.posting.doc() else {
+                return;
+            };
+            let doc_id = doc.doc_id();
+            self.posting.shallow_next(doc_id);
+            let up_to = self.posting.block_end_doc();
+            let upper = conservative_score_sum(std::iter::once(
+                self.posting
+                    .window_max_score(Some(up_to), self.scorer.as_ref()),
+            ));
+            if !CompetitiveFloorMode::Inclusive.rejects_upper_bound(f64::from(upper), threshold) {
+                return;
+            }
+            let mut skip_to = if up_to < u32::MAX as u64 {
+                up_to + 1
+            } else {
+                doc_id + 1
+            };
+            if let Some((group_up_to, group_score)) =
+                self.posting.impact_group_bound(self.scorer.as_ref())
+                && group_up_to > up_to
+            {
+                let group_sum = conservative_score_sum(std::iter::once(group_score));
+                if CompetitiveFloorMode::Inclusive
+                    .rejects_upper_bound(f64::from(group_sum), threshold)
+                {
+                    skip_to = skip_to.max(group_up_to.saturating_add(1));
+                }
+            }
+            self.posting.next(skip_to);
+        }
+    }
+
+    /// Same emit rule as [`Wand::next`] on a one-clause inclusive cursor:
+    /// keep the document when the exact score meets the floor, and also when
+    /// rounding still cannot prove it is below the floor. The compound
+    /// collector applies the document-key tie-break.
+    fn should_emit(&self, score: f32) -> bool {
+        let threshold = self.threshold();
+        if CompetitiveFloorMode::Inclusive.accepts_score(score, threshold) {
+            return true;
+        }
+        !score_sum_cannot_compete(
+            score,
+            0.0,
+            threshold,
+            score_sum_upper_bound_factor(1),
+            CompetitiveFloorMode::Inclusive,
+        )
+    }
+
+    fn position_next(&mut self) -> Result<Option<u64>> {
+        self.skip_dead_windows();
+        loop {
+            let Some(doc) = self.posting.doc() else {
+                self.clear_current();
+                self.record_metrics();
+                return Ok(None);
+            };
+            self.comparisons += 1;
+            let Some(document_key) = self.documents.document_key(&doc) else {
+                self.posting.next(doc.doc_id().saturating_add(1));
+                self.skip_dead_windows();
+                continue;
+            };
+            let doc_length = self.documents.doc_length(&doc);
+            let score = self
+                .posting
+                .score(self.scorer.as_ref(), doc.frequency(), doc_length);
+            if !self.should_emit(score) {
+                self.posting.next(doc.doc_id().saturating_add(1));
+                self.skip_dead_windows();
+                continue;
+            }
+            self.current_doc = Some(doc);
+            self.current_document_key = Some(document_key);
+            self.current_score = score;
+            self.shallow = None;
+            return Ok(Some(doc.doc_id()));
+        }
+    }
+
+    pub(super) fn doc(&self) -> Option<u64> {
+        self.current_doc.map(|doc| doc.doc_id())
+    }
+
+    pub(super) fn document_key(&self) -> Option<u64> {
+        self.current_document_key
+    }
+
+    pub(super) fn next(&mut self) -> Result<Option<u64>> {
+        if let Some(doc) = self.current_doc {
+            self.posting.next(doc.doc_id().saturating_add(1));
+        }
+        self.clear_current();
+        self.position_next()
+    }
+
+    pub(super) fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.doc().is_some_and(|doc| doc >= target) {
+            return Ok(self.doc());
+        }
+        self.clear_current();
+        if self.posting.doc().is_some_and(|doc| doc.doc_id() < target) {
+            self.posting.next(target);
+        }
+        self.position_next()
+    }
+
+    pub(super) fn cost(&self) -> usize {
+        self.cost
+    }
+
+    pub(super) fn current_score(&self) -> Result<f32> {
+        self.current_doc
+            .map(|_| self.current_score)
+            .ok_or_else(|| Error::internal("term FTS scorer is not positioned on a document"))
+    }
+
+    pub(super) fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        self.posting.shallow_next(target);
+        let up_to = self.posting.block_end_doc().max(target);
+        let upper = conservative_score_sum(std::iter::once(
+            self.posting
+                .window_max_score(Some(up_to), self.scorer.as_ref()),
+        ));
+        self.shallow = Some((target, up_to, upper));
+        Ok(up_to)
+    }
+
+    pub(super) fn score_upper_bound(&self, up_to: u64) -> Result<f32> {
+        let (target, shallow_up_to, upper) = self.shallow.ok_or_else(|| {
+            Error::internal("score bound requires advance_shallow on the term FTS scorer")
+        })?;
+        if up_to < target || up_to > shallow_up_to {
+            return Err(Error::internal(format!(
+                "term FTS score bound up_to={up_to} is outside shallow range [{target}, {shallow_up_to}]"
+            )));
+        }
+        Ok(upper)
+    }
+
+    pub(super) fn global_score_upper_bound(&self) -> Option<f32> {
+        *self.global_score_upper_bound.get_or_init(|| {
+            if self.posting.has_grouped_terms() {
+                return None;
+            }
+            let upper = self.posting.global_upper_bound(self.scorer.as_ref());
+            (upper.is_finite() && upper >= 0.0).then_some(upper)
+        })
+    }
+
+    pub(super) fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        if min_score.is_nan() {
+            return Err(Error::invalid_input(
+                "minimum competitive FTS score cannot be NaN",
+            ));
+        }
+        let floor = min_score * self.wand_factor;
+        if floor > self.sticky_floor {
+            self.sticky_floor = floor;
+        }
+        Ok(())
+    }
+
+    pub(super) fn set_window_min_competitive_score(
+        &mut self,
+        min_score: Option<f32>,
+    ) -> Result<()> {
+        if let Some(min_score) = min_score {
+            if min_score.is_nan() {
+                return Err(Error::invalid_input(
+                    "minimum competitive FTS score cannot be NaN",
+                ));
+            }
+            self.window_floor = min_score * self.wand_factor;
+        } else {
+            self.window_floor = f32::NEG_INFINITY;
+        }
+        Ok(())
+    }
+}
+
+impl<D: WandDocuments> Drop for TermLeafScorer<'_, D> {
+    fn drop(&mut self) {
+        self.record_metrics();
+    }
+}
+
 impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
     fn compound_global_score_upper_bound(&self) -> Option<f32> {
         if self.lead.len() + self.head.len() + self.tail.len() != self.num_terms {
@@ -5668,6 +5934,359 @@ mod tests {
             target = doc + 1;
         }
         assert_eq!(actual, expected);
+    }
+
+    fn single_term_posting(doc_ids: Vec<u32>, query_weight: f32) -> PostingIterator {
+        let num_docs = doc_ids.iter().copied().max().unwrap_or(0) as usize + 1;
+        PostingIterator::with_query_weight(
+            "term".to_owned(),
+            0,
+            0,
+            query_weight,
+            generate_posting_list(doc_ids, query_weight.max(1.0), None, true),
+            num_docs,
+        )
+    }
+
+    #[test]
+    fn term_leaf_matches_wand_cursor_docs_and_score_bits() {
+        let num_docs = 4 * crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE;
+        let doc_ids = (0..num_docs as u32).step_by(3).collect::<Vec<_>>();
+        let build_posting = || single_term_posting(doc_ids.clone(), 1.5);
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs as u64 {
+            docs.append(doc_id, 1);
+        }
+        let scorer = Arc::new(MemBM25Scorer::new(
+            num_docs as u64,
+            num_docs,
+            std::collections::HashMap::new(),
+        ));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+
+        let mut cursor = WandCursor::new(
+            Operator::Or,
+            vec![build_posting()],
+            &docs,
+            scorer.clone(),
+            &params,
+            &metrics,
+        );
+        let mut expected = Vec::new();
+        while let Some(doc) = cursor.next().unwrap() {
+            expected.push((doc, cursor.current_score().unwrap().to_bits()));
+        }
+
+        let mut leaf = TermLeafScorer::new(build_posting(), &docs, scorer, &params, &metrics);
+        let mut actual = Vec::new();
+        while let Some(doc) = leaf.next().unwrap() {
+            actual.push((doc, leaf.current_score().unwrap().to_bits()));
+        }
+        assert_eq!(actual, expected);
+        assert!(
+            actual.len() > crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE,
+            "test must span several blocks, got {} docs",
+            actual.len()
+        );
+    }
+
+    #[test]
+    fn term_leaf_keeps_tie_when_score_equals_inclusive_floor() {
+        let posting = single_term_posting(vec![0, 1], 1.0);
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        docs.append(1, 1);
+        let scorer = Arc::new(MemBM25Scorer::new(2, 2, std::collections::HashMap::new()));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+        let mut leaf = TermLeafScorer::new(posting, &docs, scorer, &params, &metrics);
+        assert_eq!(leaf.next().unwrap(), Some(0));
+        let score = leaf.current_score().unwrap();
+        leaf.set_min_competitive_score(score).unwrap();
+        // The current doc is already emitted; the next doc with the same
+        // weight must still be returned because the compound floor is inclusive.
+        assert_eq!(leaf.next().unwrap(), Some(1));
+        assert_eq!(leaf.current_score().unwrap(), score);
+    }
+
+    fn collect_term_leaf_hits<D: WandDocuments>(
+        leaf: &mut TermLeafScorer<'_, D>,
+    ) -> Vec<(u64, u32)> {
+        let mut hits = Vec::new();
+        while let Some(doc) = leaf.next().unwrap() {
+            hits.push((doc, leaf.current_score().unwrap().to_bits()));
+        }
+        hits
+    }
+
+    fn collect_wand_cursor_hits<D: WandDocuments>(
+        cursor: &mut WandCursor<'_, D>,
+    ) -> Vec<(u64, u32)> {
+        let mut hits = Vec::new();
+        while let Some(doc) = cursor.next().unwrap() {
+            hits.push((doc, cursor.current_score().unwrap().to_bits()));
+        }
+        hits
+    }
+
+    struct HiddenDocs<'a> {
+        inner: &'a DocSet,
+        hidden: &'a [u64],
+    }
+
+    impl WandDocuments for HiddenDocs<'_> {
+        type Candidate = u64;
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn scoring_norms(&self) -> Option<&[u8]> {
+            self.inner.scoring_norms()
+        }
+
+        fn scoring_num_tokens(&self, doc_id: u32) -> u32 {
+            self.inner.scoring_num_tokens(doc_id)
+        }
+
+        fn doc_length(&self, doc: &DocInfo) -> u32 {
+            WandDocuments::doc_length(self.inner, doc)
+        }
+
+        fn document_key(&self, doc: &DocInfo) -> Option<u64> {
+            let key = WandDocuments::document_key(self.inner, doc)?;
+            (!self.hidden.contains(&key)).then_some(key)
+        }
+
+        fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+            let key = WandDocuments::document_key_for_doc_id(self.inner, doc_id)?;
+            (!self.hidden.contains(&key)).then_some(key)
+        }
+
+        fn candidate_from_key(&self, key: u64) -> Self::Candidate {
+            key
+        }
+
+        fn flat_documents(&self) -> Option<FlatDocuments<'_>> {
+            None
+        }
+
+        fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32 {
+            WandDocuments::flat_doc_length(self.inner, doc_id, document_key, compressed)
+        }
+    }
+
+    #[test]
+    fn term_leaf_advance_matches_wand_cursor_across_blocks() {
+        let num_docs = 4 * crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE;
+        let doc_ids = (0..num_docs as u32).step_by(3).collect::<Vec<_>>();
+        let build_posting = || single_term_posting(doc_ids.clone(), 1.5);
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs as u64 {
+            docs.append(doc_id, 1);
+        }
+        let scorer = Arc::new(MemBM25Scorer::new(
+            num_docs as u64,
+            num_docs,
+            std::collections::HashMap::new(),
+        ));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+
+        let mut cursor = WandCursor::new(
+            Operator::Or,
+            vec![build_posting()],
+            &docs,
+            scorer.clone(),
+            &params,
+            &metrics,
+        );
+        let mut leaf = TermLeafScorer::new(build_posting(), &docs, scorer, &params, &metrics);
+
+        let mut expected = Vec::new();
+        let mut actual = Vec::new();
+        let mut target = 0u64;
+        loop {
+            let cursor_doc = cursor.advance(target).unwrap();
+            let leaf_doc = leaf.advance(target).unwrap();
+            assert_eq!(leaf_doc, cursor_doc);
+            match cursor_doc {
+                Some(doc) => {
+                    assert_eq!(
+                        leaf.current_score().unwrap().to_bits(),
+                        cursor.current_score().unwrap().to_bits()
+                    );
+                    expected.push((doc, cursor.current_score().unwrap().to_bits()));
+                    actual.push((doc, leaf.current_score().unwrap().to_bits()));
+                    // Also land in the gap after this hit so both cursors seek
+                    // inside the current block and across a block boundary.
+                    target = doc + 1;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(actual, expected);
+        assert!(
+            actual.len() > crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE,
+            "test must span several blocks, got {} docs",
+            actual.len()
+        );
+    }
+
+    #[test]
+    fn term_leaf_matches_wand_cursor_after_raised_inclusive_floor() {
+        let num_docs = 3 * crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE;
+        let doc_ids = (0..num_docs as u32).step_by(2).collect::<Vec<_>>();
+        let build_posting = || single_term_posting(doc_ids.clone(), 1.0);
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs as u64 {
+            docs.append(doc_id, 1);
+        }
+        let scorer = Arc::new(MemBM25Scorer::new(
+            num_docs as u64,
+            num_docs,
+            std::collections::HashMap::new(),
+        ));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+
+        let mut cursor = WandCursor::new(
+            Operator::Or,
+            vec![build_posting()],
+            &docs,
+            scorer.clone(),
+            &params,
+            &metrics,
+        );
+        let first = cursor.next().unwrap().expect("fixture has hits");
+        let floor = cursor.current_score().unwrap();
+        drop(cursor);
+
+        let mut cursor = WandCursor::new(
+            Operator::Or,
+            vec![build_posting()],
+            &docs,
+            scorer.clone(),
+            &params,
+            &metrics,
+        );
+        let mut leaf = TermLeafScorer::new(build_posting(), &docs, scorer, &params, &metrics);
+        cursor.set_min_competitive_score(floor).unwrap();
+        leaf.set_min_competitive_score(floor).unwrap();
+
+        let expected = collect_wand_cursor_hits(&mut cursor);
+        let actual = collect_term_leaf_hits(&mut leaf);
+        assert_eq!(actual, expected);
+        assert!(
+            actual.iter().all(|(doc, _)| *doc >= first),
+            "raised floor must not rewind before the first equal-score hit"
+        );
+        assert!(!actual.is_empty(), "inclusive floor must keep the tie");
+    }
+
+    #[test]
+    fn term_leaf_and_wand_cursor_skip_the_same_hidden_docs() {
+        let doc_ids = vec![0, 1, 2, 3, 4];
+        let build_posting = || single_term_posting(doc_ids.clone(), 1.0);
+        let mut inner = DocSet::default();
+        for doc_id in 0..5u64 {
+            inner.append(doc_id, 1);
+        }
+        let hidden = [1u64, 3];
+        let docs = HiddenDocs {
+            inner: &inner,
+            hidden: &hidden,
+        };
+        let scorer = Arc::new(MemBM25Scorer::new(5, 5, std::collections::HashMap::new()));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+
+        let mut cursor = WandCursor::new(
+            Operator::Or,
+            vec![build_posting()],
+            &docs,
+            scorer.clone(),
+            &params,
+            &metrics,
+        );
+        let mut leaf = TermLeafScorer::new(build_posting(), &docs, scorer, &params, &metrics);
+        let expected = collect_wand_cursor_hits(&mut cursor);
+        let actual = collect_term_leaf_hits(&mut leaf);
+        assert_eq!(actual, expected);
+        let visible = actual.iter().map(|(doc, _)| *doc).collect::<Vec<_>>();
+        assert_eq!(visible, vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn term_leaf_rejects_nan_competitive_floor() {
+        let posting = single_term_posting(vec![0], 1.0);
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        let scorer = Arc::new(MemBM25Scorer::new(1, 1, std::collections::HashMap::new()));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+        let mut leaf = TermLeafScorer::new(posting, &docs, scorer, &params, &metrics);
+        let error = leaf.set_min_competitive_score(f32::NAN).unwrap_err();
+        assert!(
+            error.to_string().contains("minimum competitive FTS score"),
+            "{error}"
+        );
+        let error = leaf
+            .set_window_min_competitive_score(Some(f32::NAN))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("minimum competitive FTS score"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn term_leaf_matches_wand_cursor_when_block_max_is_below_floor() {
+        let block = crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE;
+        let doc_ids = (0..2 * block as u32).collect::<Vec<_>>();
+        let block_max_scores = vec![0.01_f32, 10.0];
+        let build_posting = || {
+            PostingIterator::with_query_weight(
+                "term".to_owned(),
+                0,
+                0,
+                1.0,
+                generate_posting_list(doc_ids.clone(), 10.0, Some(block_max_scores.clone()), true),
+                2 * block,
+            )
+        };
+        let mut docs = DocSet::default();
+        for doc_id in 0..2 * block as u64 {
+            docs.append(doc_id, 1);
+        }
+        let scorer = Arc::new(MemBM25Scorer::new(
+            2 * block as u64,
+            2 * block,
+            std::collections::HashMap::new(),
+        ));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+
+        let mut cursor = WandCursor::new(
+            Operator::Or,
+            vec![build_posting()],
+            &docs,
+            scorer.clone(),
+            &params,
+            &metrics,
+        );
+        let mut leaf = TermLeafScorer::new(build_posting(), &docs, scorer, &params, &metrics);
+        cursor.set_min_competitive_score(1.0).unwrap();
+        leaf.set_min_competitive_score(1.0).unwrap();
+
+        let expected = collect_wand_cursor_hits(&mut cursor);
+        let actual = collect_term_leaf_hits(&mut leaf);
+        assert_eq!(actual, expected);
+        assert!(
+            actual.first().is_some_and(|(doc, _)| *doc >= block as u64),
+            "both cursors must skip the first block whose stored max is 0.01, got {actual:?}"
+        );
     }
 
     #[rstest]

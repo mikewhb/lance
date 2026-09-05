@@ -31,7 +31,7 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        WandCursor, WandDocuments, score_sum_upper_bound_factor,
+        TermLeafScorer, WandCursor, WandDocuments, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -851,7 +851,13 @@ impl CompoundScorerPlan {
                             "compound FTS scorer references missing leaf index {index}"
                         ))
                     })?;
-                Ok(Box::new(ScaleScorer::try_new(leaf, *boost)?))
+                // Identity boost is a no-op. Skip the wrapper so a MUST/SHOULD
+                // leaf does not pay an extra vtable on every advance.
+                if *boost == 1.0 {
+                    Ok(leaf)
+                } else {
+                    Ok(Box::new(ScaleScorer::try_new(leaf, *boost)?))
+                }
             }
             Self::Boost {
                 positive,
@@ -1022,6 +1028,63 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
                 None => return Ok(WindowCollect { exhausted: true }),
             }
         }
+    }
+}
+
+impl<D: WandDocuments + Sync> ComposableScorer for TermLeafScorer<'_, D> {
+    fn doc(&self) -> Option<u64> {
+        self.doc()
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        self.document_key()
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        self.next()
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        self.advance(target)
+    }
+
+    fn cost(&self) -> usize {
+        self.cost()
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        self.current_score()
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        self.advance_shallow(target)
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        Ok(ScoreBounds {
+            lower: 0.0,
+            upper: self.score_upper_bound(up_to)?,
+        })
+    }
+
+    fn global_score_upper_bound(&self) -> Option<f32> {
+        TermLeafScorer::global_score_upper_bound(self)
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        self.set_min_competitive_score(min_score)
+    }
+
+    fn set_window_min_competitive_score(&mut self, min_score: Option<f32>) -> Result<()> {
+        self.set_window_min_competitive_score(min_score)
+    }
+
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        self.current_score().map(Some)
+    }
+
+    fn scores_non_negative(&self) -> bool {
+        true
     }
 }
 
@@ -4476,18 +4539,7 @@ where
     let mut leaf_scorers = leaves
         .into_iter()
         .map(|leaf| {
-            let scorer: BoxScorer<'_> = if leaf.postings.is_empty() {
-                Box::new(EmptyScorer)
-            } else {
-                Box::new(WandCursor::new(
-                    leaf.operator,
-                    leaf.postings,
-                    documents,
-                    leaf.scorer,
-                    leaf.params.as_ref(),
-                    metrics,
-                ))
-            };
+            let scorer: BoxScorer<'_> = box_leaf_scorer(leaf, documents, metrics);
             Some(scorer)
         })
         .collect::<Vec<_>>();
@@ -4498,6 +4550,41 @@ where
         ));
     }
     collector.collect_mapped(scorer.as_mut(), &mut map_document)
+}
+
+fn box_leaf_scorer<'a, D: WandDocuments + Sync>(
+    leaf: LoadedLeaf,
+    documents: &'a D,
+    metrics: &'a dyn MetricsCollector,
+) -> BoxScorer<'a> {
+    if leaf.postings.is_empty() {
+        return Box::new(EmptyScorer);
+    }
+    if leaf.postings.len() == 1
+        && leaf.params.phrase_slop.is_none()
+        && !leaf.postings[0].has_grouped_terms()
+    {
+        let posting = leaf
+            .postings
+            .into_iter()
+            .next()
+            .expect("checked that the leaf has one posting");
+        return Box::new(TermLeafScorer::new(
+            posting,
+            documents,
+            leaf.scorer,
+            leaf.params.as_ref(),
+            metrics,
+        ));
+    }
+    Box::new(WandCursor::new(
+        leaf.operator,
+        leaf.postings,
+        documents,
+        leaf.scorer,
+        leaf.params.as_ref(),
+        metrics,
+    ))
 }
 
 fn collect_loaded_partitions(
