@@ -2268,6 +2268,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
     maxscore_general_windows: usize,
+    #[cfg(test)]
+    maxscore_window_reopens: usize,
     documents: &'a D,
     scorer: S,
     // Shared cross-partition top-k floor. Each partition publishes its local
@@ -2357,6 +2359,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
             maxscore_general_windows: 0,
+            #[cfg(test)]
+            maxscore_window_reopens: 0,
             documents,
             scorer,
             shared_threshold: None,
@@ -3077,6 +3081,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 self.maxscore_general_windows += 1;
             }
             let mut inner_min = window_min;
+            // Set when the floor rose enough to invalidate this window's
+            // essential split: the outer window reopens here instead of after
+            // `window_max`, so the split is recomputed. No document is
+            // revisited -- the accumulator is drained before the break.
+            let mut resume_at = None;
             loop {
                 let mut next_essential_doc = TERMINATED_DOC_ID;
                 for clause in &clauses[first_essential..] {
@@ -3090,7 +3099,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 let inner_max =
                     window_max.min(inner_min.saturating_add(MAXSCORE_INNER_WINDOW as u64 - 1));
-
                 for (clause_idx, clause) in clauses.iter_mut().enumerate().skip(first_essential) {
                     clause.posting.collect_window_scores(
                         inner_min,
@@ -3255,17 +3263,64 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     break;
                 }
                 inner_min = inner_max + 1;
+                if self.essential_split_is_stale(&clauses, first_essential) {
+                    #[cfg(test)]
+                    {
+                        self.maxscore_window_reopens += 1;
+                    }
+                    resume_at = Some(inner_min);
+                    break;
+                }
             }
 
-            window_min = match window_max {
-                TERMINATED_DOC_ID => TERMINATED_DOC_ID,
-                max => max + 1,
+            window_min = match resume_at {
+                Some(doc) => doc,
+                None => match window_max {
+                    TERMINATED_DOC_ID => TERMINATED_DOC_ID,
+                    max => max + 1,
+                },
             };
         }
 
         metrics.record_comparisons(num_comparisons);
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
+    }
+
+    /// Would recomputing the essential split against the current floor demote
+    /// a clause this window still treats as essential?
+    ///
+    /// The split is decided once, when the window opens, from bounds measured
+    /// against the floor of that moment. The floor only rises, and a window
+    /// that opened at a zero floor opened with every clause essential -- which
+    /// streams each clause's whole posting range through the accumulator. Once
+    /// the floor has risen past the split boundary, demoting the densest
+    /// clauses replaces that streaming with a per-candidate lookup, so the
+    /// window is worth reopening rather than finishing under a partition the
+    /// floor has already invalidated.
+    ///
+    /// `bound` covers the whole window, so it stays a valid upper bound for
+    /// the part not yet visited; using it here is conservative in the safe
+    /// direction.
+    fn essential_split_is_stale(&self, clauses: &[MaxScoreClause], first_essential: usize) -> bool {
+        if self.threshold <= 0.0 {
+            return false;
+        }
+        // A window that opened at a zero floor never sorted its clauses, so
+        // the ascending order the split relies on has to be re-established.
+        let mut bounds = clauses
+            .iter()
+            .map(|clause| clause.bound)
+            .collect::<SmallVec<[f32; 8]>>();
+        bounds.sort_unstable_by(f32::total_cmp);
+        let mut prefix = 0.0_f64;
+        for (i, bound) in bounds.iter().enumerate() {
+            prefix += f64::from(*bound);
+            if prefix * score_sum_upper_bound_factor(i + 1) > f64::from(self.threshold) {
+                return i > first_essential;
+            }
+        }
+        bounds.len() > first_essential
     }
 
     /// Exclusive top-k floor: a finite BM25 total at or below `threshold`
@@ -6815,6 +6870,150 @@ mod tests {
         assert_eq!(scored.load(Ordering::Relaxed), contributions.len());
         assert_eq!(wand.maxscore_single_essential_windows > 0, single_essential);
         assert_eq!(wand.maxscore_general_windows > 0, !single_essential);
+    }
+
+    fn clauses_with_bounds(bounds: &[f32]) -> Vec<MaxScoreClause> {
+        bounds
+            .iter()
+            .enumerate()
+            .map(|(query_rank, bound)| MaxScoreClause {
+                posting: Box::new(PostingIterator::with_query_weight(
+                    format!("t{query_rank}"),
+                    query_rank as u32,
+                    query_rank as u32,
+                    1.0,
+                    generate_posting_list(vec![0], *bound, None, false),
+                    1,
+                )),
+                query_rank,
+                bound: *bound,
+                prefix_bound: 0.0,
+            })
+            .collect()
+    }
+
+    #[rstest]
+    // No floor proves nothing about any clause, so the split cannot be stale.
+    #[case::fail_closed_at_zero_floor(0.0, &[1.0, 2.0], 0, false)]
+    // The floor has risen past the smallest bound: that clause can now be
+    // completed per candidate instead of streamed.
+    #[case::smallest_becomes_demotable(5.0, &[1.0, 2.0], 0, true)]
+    // The floor still sits below every bound, so every clause stays essential.
+    #[case::floor_below_every_bound(0.5, &[1.0, 2.0], 0, false)]
+    // Every clause is demotable, which also means the rest of the window is
+    // skippable -- worth reopening to discover that.
+    #[case::all_become_demotable(5.0, &[1.0, 2.0], 1, true)]
+    // The split already matches what the current floor would produce.
+    #[case::split_already_current(2.5, &[1.0, 2.0], 1, false)]
+    // A window that opened at a zero floor never sorted its clauses, so the
+    // check must not assume ascending bounds.
+    #[case::handles_unsorted_bounds(5.0, &[2.0, 1.0], 0, true)]
+    fn essential_split_staleness_tracks_the_current_floor(
+        #[case] threshold: f32,
+        #[case] bounds: &[f32],
+        #[case] first_essential: usize,
+        #[case] expected: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 1);
+        let mut wand = Wand::new(Operator::Or, std::iter::empty(), &docs, UnitScorer);
+        wand.threshold = threshold;
+
+        let clauses = clauses_with_bounds(bounds);
+
+        assert_eq!(
+            wand.essential_split_is_stale(&clauses, first_essential),
+            expected
+        );
+    }
+
+    #[test]
+    fn maxscore_reopens_the_window_once_the_floor_invalidates_the_split() {
+        // A block holds a fixed number of postings, not a fixed doc range, so
+        // a sparse clause's block end can sit thousands of documents ahead.
+        // Once the dense clause is demoted it stops bounding the window, the
+        // window widens past one inner window, and a floor that keeps rising
+        // inside it can invalidate the split mid-window.
+        const TOTAL: u32 = 2 * MAXSCORE_INNER_WINDOW as u32;
+        let dense = PostingIterator::new(
+            "dense".to_owned(),
+            0,
+            0,
+            generate_contiguous_impact_posting_list_with_block_size(
+                TOTAL as usize,
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            TOTAL as usize,
+        );
+        // Two mid-weight clauses keep the window multi-essential, so it takes
+        // the general inner-window loop rather than the single-essential
+        // branch, and their block ends keep the window wide.
+        let sparse = |token: &str, rank: u32, stride: u32, freq: u32| {
+            let doc_ids = (1..TOTAL / stride).map(|i| i * stride).collect::<Vec<_>>();
+            let len = doc_ids.len();
+            PostingIterator::new(
+                token.to_owned(),
+                rank,
+                rank,
+                generate_impact_posting_list_with_freqs_and_block_size(
+                    doc_ids,
+                    vec![freq; len],
+                    vec![1; len],
+                    crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+                ),
+                TOTAL as usize,
+            )
+        };
+        // Ascending frequencies keep pushing the floor up while the wide
+        // window is consumed, which is what invalidates the split mid-window.
+        let riser = PostingIterator::new(
+            "riser".to_owned(),
+            3,
+            3,
+            generate_impact_posting_list_with_freqs_and_block_size(
+                vec![1000, 2000, 3000, 4000, 5000, 6000, 7000],
+                vec![50, 100, 200, 400, 800, 1600, 3200],
+                vec![1; 7],
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            TOTAL as usize,
+        );
+        let mut docs = DocSet::default();
+        for doc in 0..TOTAL {
+            docs.append(doc.into(), 1);
+        }
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            [
+                dense,
+                sparse("mid_a", 1, 500, 100),
+                sparse("mid_b", 2, 700, 120),
+                riser,
+            ]
+            .into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(3)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        // The three heaviest rare documents dominate everything else, so
+        // reopening the window must not drop them.
+        let mut winners = hits
+            .iter()
+            .map(|hit| hit.posting_doc_id)
+            .collect::<Vec<_>>();
+        winners.sort_unstable();
+        assert_eq!(winners, vec![5000, 6000, 7000]);
+        assert!(
+            wand.maxscore_window_reopens > 0,
+            "the risen floor should have reopened the window"
+        );
     }
 
     #[test]
