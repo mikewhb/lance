@@ -2899,6 +2899,24 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .unwrap_or(TERMINATED_DOC_ID);
 
         while window_min < TERMINATED_DOC_ID {
+            // A clause whose cursor and whose current block both end before the
+            // window start can neither bound this window nor answer for a
+            // candidate inside it. Only the clauses the accumulator streams get
+            // advanced, so a clause that earlier windows never had to touch can
+            // be left in that state -- and since it still bounds `window_max`,
+            // the window it produces is empty and the loop stops making
+            // progress. A real advance either brings it back into range or
+            // exhausts it.
+            for clause in &mut clauses {
+                if clause
+                    .posting
+                    .doc()
+                    .is_some_and(|doc| doc.doc_id() < window_min)
+                    && clause.posting.block_end_doc() < window_min
+                {
+                    clause.posting.next(window_min);
+                }
+            }
             clauses.retain(|clause| clause.posting.doc().is_some());
             if clauses.is_empty() {
                 break;
@@ -6925,6 +6943,50 @@ mod tests {
             wand.essential_split_is_stale(&clauses, first_essential),
             expected
         );
+    }
+
+    #[test]
+    fn maxscore_terminates_when_every_clause_falls_behind_the_window() {
+        // Plain lists report a block end at the end of the list, so a floor
+        // that demotes every clause skips the window wholesale without
+        // advancing any posting. The loop must stop once every clause sits
+        // behind the window instead of sliding the window to the end of the
+        // doc id space.
+        const TOTAL: u32 = 2 * MAXSCORE_INNER_WINDOW as u32;
+        let dense = PostingIterator::new(
+            "dense".to_owned(),
+            0,
+            0,
+            generate_posting_list((0..TOTAL).collect(), 1.0, None, false),
+            TOTAL as usize,
+        );
+        let rare = PostingIterator::new(
+            "rare".to_owned(),
+            1,
+            1,
+            generate_posting_list_with_freqs(vec![10], vec![1000], 1000.0, None, false),
+            TOTAL as usize,
+        );
+        let mut docs = DocSet::default();
+        for doc in 0..TOTAL {
+            docs.append(doc.into(), 1);
+        }
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            [dense, rare].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(1)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].posting_doc_id, 10);
     }
 
     #[test]
