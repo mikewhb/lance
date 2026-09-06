@@ -2263,6 +2263,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     #[cfg(test)]
     phrase_pair_prunes: usize,
     #[cfg(test)]
+    pair_score_prunes: usize,
+    #[cfg(test)]
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
     maxscore_general_windows: usize,
@@ -2349,6 +2351,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             lead_stream_and_searches: 0,
             #[cfg(test)]
             phrase_pair_prunes: 0,
+            #[cfg(test)]
+            pair_score_prunes: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
@@ -4080,6 +4084,32 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         LeadFollowerSeek::Match
     }
 
+    /// After the two rarest lists sit on `doc`, skip remaining dense
+    /// followers when even a conservative Exclusive upper cannot enter
+    /// the heap. `rest_block_max` is `lead[2..]` over the current window.
+    fn matched_pair_cannot_beat_floor(
+        &self,
+        lead_freq: u32,
+        doc_length: u32,
+        rest_block_max: f64,
+        num_lists: usize,
+    ) -> bool {
+        if self.threshold <= 0.0 || num_lists < 3 {
+            return false;
+        }
+        let Some(second) = self.lead.get(1).and_then(|posting| posting.doc()) else {
+            return false;
+        };
+        score_sum_cannot_compete(
+            self.lead[0].score(&self.scorer, lead_freq, doc_length),
+            f64::from(self.lead[1].score(&self.scorer, second.frequency(), doc_length))
+                + rest_block_max,
+            self.threshold,
+            score_sum_upper_bound_factor(num_lists),
+            CompetitiveFloorMode::Exclusive,
+        )
+    }
+
     /// Leftover-classic conjunction: the rare lead's decompressed block is
     /// the buffer, followers only `next(target)`. Unlike N-way bulk, this
     /// never decompresses a dense list just to slice-merge a window the rare
@@ -4164,7 +4194,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 continue;
             };
 
-            let others_block_max = self.lead[1..]
+            let others_bounds: SmallVec<[f64; 8]> = self.lead[1..]
                 .iter()
                 .map(|posting| {
                     f64::from(
@@ -4173,7 +4203,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             .score,
                     )
                 })
-                .sum::<f64>();
+                .collect();
+            let others_block_max = others_bounds.iter().copied().sum::<f64>();
+            let rest_block_max = others_bounds.iter().skip(1).copied().sum::<f64>();
             let freq_cannot_beat = if self.threshold > 0.0 && num_lists >= 2 {
                 std::array::from_fn(|frequency| {
                     score_sum_cannot_compete(
@@ -4208,7 +4240,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     frequency: freq,
                 }));
 
-                let first_followers = if phrase_pair_prune { 2 } else { num_lists };
+                let Some(parked) = self.lead[0].doc() else {
+                    pos += 1;
+                    continue;
+                };
+                let Some(document_key) = self.documents.document_key(&parked) else {
+                    pos += 1;
+                    continue;
+                };
+                let doc_length = self.documents.doc_length(&parked);
+
+                let split_followers = phrase_pair_prune || (num_lists >= 3 && self.threshold > 0.0);
+                let first_followers = if split_followers { 2 } else { num_lists };
                 match self.seek_lead_followers(1, first_followers, doc) {
                     LeadFollowerSeek::Exhausted => break 'window,
                     LeadFollowerSeek::Leap(next) => {
@@ -4221,6 +4264,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         continue;
                     }
                     LeadFollowerSeek::Match => {}
+                }
+
+                if self.matched_pair_cannot_beat_floor(freq, doc_length, rest_block_max, num_lists)
+                {
+                    #[cfg(test)]
+                    {
+                        self.pair_score_prunes += 1;
+                    }
+                    pos += 1;
+                    continue;
                 }
 
                 if phrase_pair_prune {
@@ -4245,17 +4298,22 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         }
                         LeadFollowerSeek::Match => {}
                     }
+                } else if split_followers {
+                    match self.seek_lead_followers(2, num_lists, doc) {
+                        LeadFollowerSeek::Exhausted => break 'window,
+                        LeadFollowerSeek::Leap(next) => {
+                            let next32 = u32::try_from(next).unwrap_or(u32::MAX);
+                            pos += lead_docs[pos + 1..].partition_point(|&id| id < next32) + 1;
+                            if next > win_end {
+                                target = next;
+                                continue 'window;
+                            }
+                            continue;
+                        }
+                        LeadFollowerSeek::Match => {}
+                    }
                 }
 
-                let Some(parked) = self.lead[0].doc() else {
-                    pos += 1;
-                    continue;
-                };
-                let Some(document_key) = self.documents.document_key(&parked) else {
-                    pos += 1;
-                    continue;
-                };
-                let doc_length = self.documents.doc_length(&parked);
                 let score = self.score_in_query_order(doc_length);
                 if let Some(slop) = phrase_slop {
                     if self.exclusive_score_cannot_beat_floor(score) {
@@ -9351,6 +9409,104 @@ mod tests {
         assert!(!off_bulk && !off_lead);
         assert!(!auto_bulk && auto_lead);
         assert!(!on.is_empty());
+        assert_eq!(auto, off);
+        assert_eq!(auto, on);
+    }
+
+    /// Leftover 4-clause AND: after top-k fills, Exclusive pair+rest
+    /// prunes dense follower seeks. Hit set still matches Off/On.
+    #[test]
+    fn lead_stream_pair_score_prune_matches_classic() {
+        let num_docs = (BLOCK_SIZE * 8 + 37) as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 32 + doc_id % 57);
+        }
+        let dense: Vec<u32> = (0..num_docs).collect();
+        let mid_dense: Vec<u32> = (0..num_docs).step_by(2).collect();
+        let mid_rare: Vec<u32> = (0..num_docs).step_by(8).collect();
+        let rare: Vec<u32> = (0..num_docs).step_by(40).collect();
+        let clauses = [rare, mid_rare, mid_dense, dense];
+        let min_cost = clauses.iter().map(|c| c.len()).min().unwrap();
+        let max_cost = clauses.iter().map(|c| c.len()).max().unwrap();
+        assert!(
+            min_cost > 0 && max_cost / min_cost >= BULK_AND_AUTO_SKEW_RATIO,
+            "expected leftover 4-clause (max/min={}/{})",
+            max_cost,
+            min_cost
+        );
+        // High-freq prefix fills top-k; later rare-pair docs score far
+        // below that floor so Exclusive pair+rest can prune.
+        let high_ids: std::collections::HashSet<u32> =
+            clauses[0].iter().copied().take(10).collect();
+
+        let build = || {
+            clauses
+                .iter()
+                .enumerate()
+                .map(|(term_pos, doc_ids)| {
+                    let freqs = doc_ids
+                        .iter()
+                        .map(|doc| {
+                            if term_pos < 2 && high_ids.contains(doc) {
+                                50
+                            } else {
+                                1
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let max_score = *freqs.iter().max().unwrap() as f32;
+                    PostingIterator::with_query_weight(
+                        format!("t{term_pos}"),
+                        term_pos as u32,
+                        term_pos as u32,
+                        1.0 + term_pos as f32 * 0.5,
+                        generate_posting_list_with_freqs(
+                            doc_ids.clone(),
+                            freqs,
+                            max_score,
+                            None,
+                            true,
+                        ),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let normalize = |result: Vec<DocCandidate<u64>>| {
+            let mut rows = result
+                .into_iter()
+                .map(|c| (c.posting_doc_id, c.doc_length, c.freqs, c.document))
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            rows
+        };
+        let run = |mode| {
+            let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode);
+            let rows = normalize(wand.search(&params, &NoOpMetricsCollector).unwrap());
+            (
+                rows,
+                wand.bulk_and_searches > 0,
+                wand.lead_stream_and_searches > 0,
+                wand.pair_score_prunes,
+            )
+        };
+
+        let (on, on_bulk, on_lead, on_prunes) = run(BulkAndMode::On);
+        let (off, off_bulk, off_lead, off_prunes) = run(BulkAndMode::Off);
+        let (auto, auto_bulk, auto_lead, auto_prunes) = run(BulkAndMode::Auto);
+        assert!(!on_lead && on_bulk);
+        assert!(!off_bulk && !off_lead);
+        assert!(!auto_bulk && auto_lead);
+        assert_eq!(on_prunes, 0);
+        assert_eq!(off_prunes, 0);
+        assert!(
+            auto_prunes > 0,
+            "lead-stream should prune leftover AND after the heap fills"
+        );
+        assert!(!auto.is_empty());
         assert_eq!(auto, off);
         assert_eq!(auto, on);
     }
