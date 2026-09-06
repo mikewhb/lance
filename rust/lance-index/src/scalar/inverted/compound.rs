@@ -3372,6 +3372,11 @@ struct ReqOptScorer<'a> {
     confirmed: bool,
     min_competitive_score: f32,
     shallow_bounds: Option<ReqOptBounds>,
+    /// Set once the heap floor passes the required clause's list-wide upper
+    /// bound: from then on no document can reach the heap on the required
+    /// clause alone, so the optional clause is mandatory for the rest of the
+    /// scan and the query is an intersection.
+    optional_globally_required: bool,
 }
 
 impl<'a> ReqOptScorer<'a> {
@@ -3391,6 +3396,7 @@ impl<'a> ReqOptScorer<'a> {
             confirmed: false,
             min_competitive_score: f32::NEG_INFINITY,
             shallow_bounds: None,
+            optional_globally_required: false,
         }
     }
 
@@ -3423,6 +3429,56 @@ impl<'a> ReqOptScorer<'a> {
             self.required.set_min_competitive_score(child_floor)?;
         }
         Ok(())
+    }
+
+    /// Promote the optional clause to required once the required clause's
+    /// list-wide upper bound can no longer reach the heap. The floor only ever
+    /// rises, so this decision is permanent.
+    fn promote_optional_if_required(&mut self) -> Result<()> {
+        if self.optional_globally_required || !self.min_competitive_score.is_finite() {
+            return Ok(());
+        }
+        let Some(required_upper) = self.required.global_score_upper_bound() else {
+            return Ok(());
+        };
+        if !required_upper.is_finite() || required_upper >= self.min_competitive_score {
+            return Ok(());
+        }
+        self.optional_globally_required = true;
+        // Window floors are scoped to a shallow range this path no longer
+        // tracks, so drop the one currently installed on the required child.
+        self.shallow_bounds = None;
+        self.clear_window_required_floor()
+    }
+
+    /// Intersect both sides directly. Used once the optional clause is known to
+    /// be mandatory, which makes the per-window bookkeeping pure overhead: the
+    /// required clause alone can no longer produce a competitive document, so
+    /// there is nothing for a required-only window to contribute.
+    fn position_intersection(&mut self, target: u64) -> Result<Option<u64>> {
+        // A window floor is only valid inside the shallow range that produced
+        // it, and this path seeks past that range freely. Leaving one
+        // installed would let the required child skip a block whose max score
+        // is below a floor computed for a different, denser window.
+        self.shallow_bounds = None;
+        self.clear_window_required_floor()?;
+        let Some(mut required_doc) = self.required.advance(target)? else {
+            return Ok(self.exhaust());
+        };
+        loop {
+            self.set_current(Some(required_doc));
+            self.set_optional_required(true);
+            let Some(optional_doc) = self.ensure_optional_at_or_after(required_doc)? else {
+                return Ok(self.exhaust());
+            };
+            if optional_doc == required_doc {
+                return Ok(self.current);
+            }
+            let Some(next_required) = self.required.advance(optional_doc)? else {
+                return Ok(self.exhaust());
+            };
+            required_doc = next_required;
+        }
     }
 
     fn exhaust(&mut self) -> Option<u64> {
@@ -3548,6 +3604,9 @@ impl<'a> ReqOptScorer<'a> {
     fn position(&mut self, mut target: u64) -> Result<Option<u64>> {
         if self.exhausted {
             return Ok(None);
+        }
+        if self.optional_globally_required {
+            return self.position_intersection(target);
         }
 
         'search: loop {
@@ -3776,6 +3835,7 @@ impl ComposableScorer for ReqOptScorer<'_> {
         if min_score > self.min_competitive_score {
             self.min_competitive_score = min_score;
             self.push_translated_required_floor()?;
+            self.promote_optional_if_required()?;
         }
         Ok(())
     }
@@ -3880,7 +3940,11 @@ impl ComposableScorer for ReqOptScorer<'_> {
             });
         }
 
-        if min_score.is_finite() && min_score > 0.0 && Self::usable_bounds(bounds.optional) {
+        if min_score.is_finite()
+            && min_score > 0.0
+            && !self.optional_globally_required
+            && Self::usable_bounds(bounds.optional)
+        {
             self.apply_window_required_floor(bounds.optional)?;
         }
 
@@ -6891,6 +6955,41 @@ mod tests {
             .collect(&mut default_scorer)
             .unwrap();
         assert_eq!(override_top, default_top);
+    }
+
+    #[test]
+    fn reqopt_promotes_optional_once_required_cannot_reach_the_heap() {
+        // The required clause tops out at 4.5 while doc 40 reaches 5.0 only
+        // through the optional clause. Once the heap floor passes 4.5 the
+        // required clause alone is hopeless, so the scan must switch to an
+        // intersection and must still surface doc 40 -- a document in the
+        // sparse tail of the required list, past the window whose floor was
+        // computed from the dense head.
+        let mut required_values = (0..32).map(|doc| (doc, 4.5)).collect::<Vec<_>>();
+        required_values.extend((32..64).map(|doc| (doc, 2.0)));
+        let mut optional_values = (0..32).map(|doc| (doc, 0.15)).collect::<Vec<_>>();
+        optional_values.push((40, 3.0));
+        let required = Box::new(
+            MaterializedScorer::try_new(rows(&required_values))
+                .unwrap()
+                .with_block_size(32),
+        );
+        let optional = Box::new(
+            MaterializedScorer::try_new(rows(&optional_values))
+                .unwrap()
+                .with_block_size(32),
+        );
+        let mut scorer = ReqOptScorer::new(required, optional);
+        assert!(!scorer.optional_globally_required);
+
+        let results = TopKCollector::new(3).collect(&mut scorer).unwrap();
+
+        assert_eq!(results, rows(&[(40, 5.0), (0, 4.65), (1, 4.65)]));
+        assert!(
+            scorer.optional_globally_required,
+            "a heap floor above the required clause's global upper must promote \
+             the optional clause"
+        );
     }
 
     #[test]
