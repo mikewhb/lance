@@ -239,12 +239,12 @@ impl CompetitiveFloorMode {
 // skipping plus a slice-level merge over decompressed blocks, replacing the
 // per-doc `next()` leapfrog. Results are identical to the classic AND loop.
 // LANCE_FTS_BULK_AND accepts auto (default), on/1, or off/0. Auto enables the
-// bulk path for every 2-clause query, for 3-clause queries whose posting
-// lengths are within `BULK_AND_AUTO_SKEW_RATIO`, and for long dense
-// conjunctions whose shortest posting is at least `BULK_AND_AUTO_MIN_COST`.
-// A 3-clause query with a stopword plus a rare term stays off N-way bulk:
+// bulk path for 2- and 3-clause queries whose posting lengths are within
+// `BULK_AND_AUTO_SKEW_RATIO`, and for long dense conjunctions whose shortest
+// posting is at least `BULK_AND_AUTO_MIN_COST`.
+// A conjunction pairing a stopword with a rare term stays off N-way bulk:
 // the merge decompresses the dense list in every window, while a rare
-// lead can skip it. Leftover Auto conjunctions (skewed 3, all 4–5,
+// lead can skip it. Leftover Auto conjunctions (skewed 2 and 3, all 4–5,
 // short 6+) use a Lucene-style lead-stream instead of per-doc leapfrog:
 // the rare list's decompressed block is the buffer, followers only seek.
 const BULK_AND_AUTO_MIN_COST: usize = 500_000;
@@ -280,9 +280,7 @@ impl BulkAndMode {
     const fn enabled_for(self, num_clauses: usize, min_cost: usize, max_cost: usize) -> bool {
         match self {
             Self::Auto => {
-                if num_clauses == 2 {
-                    true
-                } else if num_clauses == 3 {
+                if num_clauses <= 3 {
                     // `min_cost == 0` is an empty rare list; the conjunction
                     // is exhausted before this gate runs.
                     min_cost > 0 && max_cost / min_cost < BULK_AND_AUTO_SKEW_RATIO
@@ -2490,7 +2488,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 return self.and_bulk_search(params, metrics);
             }
-            if mode == BulkAndMode::Auto && self.lead.len() >= 2 {
+            // Buffering the rare clause's block only pays once its cost is
+            // amortized over several followers. A skewed pair has exactly one
+            // follower, so the buffer is pure overhead and the per-doc
+            // leapfrog -- which is what Lucene's ConjunctionDISI does for two
+            // iterators -- wins outright.
+            if mode == BulkAndMode::Auto && self.lead.len() >= 3 {
                 #[cfg(test)]
                 {
                     self.lead_stream_and_searches += 1;
@@ -7256,7 +7259,12 @@ mod tests {
 
     #[rstest]
     #[case::auto_one(BulkAndMode::Auto, 1, 0, 0, false)]
-    #[case::auto_two(BulkAndMode::Auto, 2, 0, 0, true)]
+    #[case::auto_two_empty_rare(BulkAndMode::Auto, 2, 0, 0, false)]
+    #[case::auto_two_similar(BulkAndMode::Auto, 2, 100, 200, true)]
+    #[case::auto_two_just_under_skew(BulkAndMode::Auto, 2, 100, 3_199, true)]
+    // A stopword paired with a rare term: the merge would decompress the
+    // dense list in every window instead of seeking past it.
+    #[case::auto_two_skewed(BulkAndMode::Auto, 2, 100, 3_200, false)]
     #[case::auto_three_similar(BulkAndMode::Auto, 3, 100, 200, true)]
     #[case::auto_three_just_under_skew(BulkAndMode::Auto, 3, 100, 3_199, true)]
     #[case::auto_three_skewed(BulkAndMode::Auto, 3, 100, 3_200, false)]
@@ -9572,6 +9580,52 @@ mod tests {
         assert!(!bulk.is_empty(), "test corpus should produce matches");
         assert_eq!(bulk, classic);
         assert_eq!(auto, classic);
+    }
+
+    #[test]
+    fn skewed_conjunction_pair_leapfrogs_instead_of_buffering() {
+        // 4 postings against 250 is past `BULK_AND_AUTO_SKEW_RATIO`, the shape
+        // of a stopword paired with a rare term. It must take neither the bulk
+        // merge, which decompresses the dense block in every window, nor the
+        // lead-stream buffer, which cannot amortize over a single follower.
+        let rare_docs = vec![10u32, 100, 500, 900];
+        let dense_docs = (0u32..1000).step_by(4).collect::<Vec<_>>();
+        let mut docs = DocSet::default();
+        for doc in 0..1000u32 {
+            docs.append(doc.into(), 1);
+        }
+        let params = FtsSearchParams::default().with_limit(Some(10));
+
+        let run = |mode| {
+            let postings = vec![
+                single_term_posting(rare_docs.clone(), 1.0),
+                single_term_posting(dense_docs.clone(), 1.0),
+            ];
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode);
+            let mut rows = wand
+                .search(&params, &NoOpMetricsCollector)
+                .unwrap()
+                .into_iter()
+                .map(|candidate| candidate.posting_doc_id)
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            (
+                rows,
+                wand.bulk_and_searches > 0,
+                wand.lead_stream_and_searches > 0,
+            )
+        };
+
+        let (auto, auto_bulk, auto_lead) = run(BulkAndMode::Auto);
+        let (forced_bulk, _, _) = run(BulkAndMode::On);
+        assert!(!auto_bulk, "a skewed pair must not use the bulk merge");
+        assert!(
+            !auto_lead,
+            "a skewed pair must not buffer the lead for a single follower"
+        );
+        assert_eq!(auto, vec![100, 500, 900]);
+        assert_eq!(auto, forced_bulk, "routing must not change results");
     }
 
     #[test]
