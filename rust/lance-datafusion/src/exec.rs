@@ -409,6 +409,15 @@ impl SessionContextCacheKey {
 
 struct CachedSessionContext {
     context: SessionContext,
+    /// Task contexts already built from `context`, keyed by the batch size
+    /// override they carry.
+    ///
+    /// Deriving one costs two deep clones of the session state, including its
+    /// scalar and aggregate function registries, which is measurable per
+    /// query. The session's functions and runtime are fixed once it is
+    /// cached, and a `TaskContext` is immutable, so one can be shared by every
+    /// query that resolves to the same session and batch size.
+    task_contexts: HashMap<Option<usize>, Arc<TaskContext>>,
     last_access: std::time::Instant,
 }
 
@@ -456,6 +465,7 @@ pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
         key,
         CachedSessionContext {
             context: context.clone(),
+            task_contexts: HashMap::new(),
             last_access: std::time::Instant::now(),
         },
     );
@@ -466,12 +476,40 @@ fn get_task_context(
     session_ctx: &SessionContext,
     options: &LanceExecutionOptions,
 ) -> Arc<TaskContext> {
+    // Bounds the per-session task context map. Batch size is a coarse knob,
+    // so callers realistically use a handful of values; past that we stop
+    // memoizing rather than grow without limit.
+    const MAX_TASK_CONTEXTS_PER_SESSION: usize = 8;
+
+    let key = SessionContextCacheKey::from_options(options);
+    let mut cache = get_session_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if let Some(entry) = cache.get(&key)
+        && let Some(task_ctx) = entry.task_contexts.get(&options.batch_size)
+    {
+        return task_ctx.clone();
+    }
+
     let mut state = session_ctx.state();
     if let Some(batch_size) = options.batch_size.as_ref() {
         state.config_mut().options_mut().execution.batch_size = *batch_size;
     }
+    let task_ctx = state.task_ctx();
 
-    state.task_ctx()
+    // Only memoize against the session this context was derived from. A
+    // caller that built its own session gets a fresh context every time.
+    if let Some(entry) = cache.get_mut(&key)
+        && entry.context.session_id() == session_ctx.session_id()
+        && entry.task_contexts.len() < MAX_TASK_CONTEXTS_PER_SESSION
+    {
+        entry
+            .task_contexts
+            .insert(options.batch_size, task_ctx.clone());
+    }
+
+    task_ctx
 }
 
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -1247,6 +1285,68 @@ mod tests {
             let cache_guard = cache.lock().unwrap();
             assert_eq!(cache_guard.len(), 2);
         }
+    }
+
+    #[test]
+    fn test_task_context_is_reused_per_batch_size() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let cache = get_session_cache();
+        cache.lock().unwrap().clear();
+
+        let opts = LanceExecutionOptions {
+            batch_size: Some(123),
+            ..Default::default()
+        };
+        let session = get_session_context(&opts);
+
+        let first = get_task_context(&session, &opts);
+        let second = get_task_context(&session, &opts);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the same session and batch size must not rebuild the task context"
+        );
+        assert_eq!(first.session_config().batch_size(), 123);
+
+        // A different batch size must not be served the memoized context.
+        let other_opts = LanceExecutionOptions {
+            batch_size: Some(456),
+            ..Default::default()
+        };
+        let other = get_task_context(&session, &other_opts);
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(other.session_config().batch_size(), 456);
+
+        // Both live under the one session the options resolve to.
+        let cache_guard = cache.lock().unwrap();
+        assert_eq!(cache_guard.len(), 1);
+        assert_eq!(cache_guard.values().next().unwrap().task_contexts.len(), 2);
+    }
+
+    #[test]
+    fn test_task_context_not_memoized_for_foreign_session() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let cache = get_session_cache();
+        cache.lock().unwrap().clear();
+
+        let opts = LanceExecutionOptions::default();
+        // Warm the cache so an entry exists for these options, then ask for a
+        // task context derived from an unrelated session.
+        let _cached_session = get_session_context(&opts);
+        let foreign_session = new_session_context(&opts);
+
+        let first = get_task_context(&foreign_session, &opts);
+        let second = get_task_context(&foreign_session, &opts);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a foreign session must not be served, or populate, the cached context"
+        );
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .values()
+                .all(|entry| entry.task_contexts.is_empty())
+        );
     }
 
     #[test]
