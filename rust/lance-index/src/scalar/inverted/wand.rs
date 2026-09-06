@@ -1066,40 +1066,44 @@ impl PostingIterator {
         self.current_doc = current_doc;
     }
 
-    fn position_cursor(&self) -> Result<PositionCursor<'_>> {
+    fn missing_positions(&self) -> Error {
+        Error::index(format!(
+            "positions are missing for token {:?} (token id {}, query position {})",
+            self.token, self.token_id, self.position
+        ))
+    }
+
+    /// Decode this iterator's current document into `out`.
+    ///
+    /// Packed-delta streams still seek only the candidate doc. Callers that
+    /// already own a buffer (exact-phrase pairwise confirm) skip the per-cursor
+    /// scratch take/return.
+    fn fill_current_positions(&self, out: &mut Vec<u32>) -> Result<()> {
+        out.clear();
         match self.list {
             PostingList::Plain(ref list) => {
-                let positions = list.positions.as_ref().ok_or_else(|| {
-                    Error::index(format!(
-                        "positions are missing for token {:?} (token id {}, query position {})",
-                        self.token, self.token_id, self.position
-                    ))
-                })?;
+                let positions = list
+                    .positions
+                    .as_ref()
+                    .ok_or_else(|| self.missing_positions())?;
                 let start = positions.value_offsets()[self.index] as usize;
                 let end = positions.value_offsets()[self.index + 1] as usize;
-                Ok(PositionCursor::new(
-                    PositionValues::Owned(
-                        positions.values().as_primitive::<Int32Type>().values()[start..end]
-                            .iter()
-                            .map(|value| *value as u32)
-                            .collect(),
-                    ),
-                    self.position as i32,
-                ))
+                out.extend(
+                    positions.values().as_primitive::<Int32Type>().values()[start..end]
+                        .iter()
+                        .map(|value| *value as u32),
+                );
+                Ok(())
             }
-            PostingList::Compressed(ref list) => match list.positions.as_ref().ok_or_else(|| {
-                Error::index(format!(
-                    "positions are missing for token {:?} (token id {}, query position {})",
-                    self.token, self.token_id, self.position
-                ))
-            })? {
+            PostingList::Compressed(ref list) => match list
+                .positions
+                .as_ref()
+                .ok_or_else(|| self.missing_positions())?
+            {
                 CompressedPositionStorage::LegacyPerDoc(positions) => {
-                    let positions = positions.value(self.index);
-                    let positions = decompress_positions(positions.as_binary());
-                    Ok(PositionCursor::new(
-                        PositionValues::Owned(positions),
-                        self.position as i32,
-                    ))
+                    let positions = decompress_positions(positions.value(self.index).as_binary());
+                    out.extend_from_slice(&positions);
+                    Ok(())
                 }
                 CompressedPositionStorage::SharedStream(stream) => {
                     let block_idx = self.index >> list.block_shift();
@@ -1133,12 +1137,7 @@ impl PostingIterator {
                             }
                             let delta_start = compressed.position_offsets[block_offset];
                             let delta_end = compressed.position_offsets[block_offset + 1];
-                            let mut position_values = self
-                                .position_scratch
-                                .borrow_mut()
-                                .take()
-                                .unwrap_or_default();
-                            if let Err(error) = seek_packed_doc_positions(
+                            seek_packed_doc_positions(
                                 stream.block(block_idx),
                                 compressed.position_total_deltas,
                                 delta_start..delta_end,
@@ -1146,21 +1145,14 @@ impl PostingIterator {
                                 &mut compressed.position_unpacked_group,
                                 &mut compressed.position_unpacked_group_idx,
                                 &mut compressed.position_tail,
-                                &mut position_values,
-                            ) {
-                                *self.position_scratch.borrow_mut() = Some(position_values);
-                                return Err(Error::index(format!(
+                                out,
+                            )
+                            .map_err(|error| {
+                                Error::index(format!(
                                     "failed to decode positions for token {:?} (token id {}, query position {}) at posting index {}: {error}",
                                     self.token, self.token_id, self.position, self.index
-                                )));
-                            }
-                            Ok(PositionCursor::new(
-                                PositionValues::Recycled(RecycledPositionValues::new(
-                                    position_values,
-                                    &self.position_scratch,
-                                )),
-                                self.position as i32,
-                            ))
+                                ))
+                            })
                         }
                         PositionStreamCodec::VarintDocDelta => {
                             if compressed.position_block_idx != Some(block_idx) {
@@ -1191,26 +1183,32 @@ impl PostingIterator {
                             }
                             let start = compressed.position_offsets[block_offset];
                             let end = compressed.position_offsets[block_offset + 1];
-                            let mut position_values = self
-                                .position_scratch
-                                .borrow_mut()
-                                .take()
-                                .unwrap_or_default();
-                            position_values.clear();
-                            position_values
-                                .extend_from_slice(&compressed.position_values[start..end]);
-                            Ok(PositionCursor::new(
-                                PositionValues::Recycled(RecycledPositionValues::new(
-                                    position_values,
-                                    &self.position_scratch,
-                                )),
-                                self.position as i32,
-                            ))
+                            out.extend_from_slice(&compressed.position_values[start..end]);
+                            Ok(())
                         }
                     }
                 }
             },
         }
+    }
+
+    fn position_cursor(&self) -> Result<PositionCursor<'_>> {
+        let mut position_values = self
+            .position_scratch
+            .borrow_mut()
+            .take()
+            .unwrap_or_default();
+        if let Err(error) = self.fill_current_positions(&mut position_values) {
+            *self.position_scratch.borrow_mut() = Some(position_values);
+            return Err(error);
+        }
+        Ok(PositionCursor::new(
+            PositionValues::Recycled(RecycledPositionValues::new(
+                position_values,
+                &self.position_scratch,
+            )),
+            self.position as i32,
+        ))
     }
 
     // move to the next doc id that is greater than or equal to least_id
@@ -2266,6 +2264,13 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // k-th score (`atomic_store_max_f32`) and prunes against the running value
     // -- a lower bound on the global k-th, so it never drops a real top-k doc.
     shared_threshold: Option<Arc<AtomicU32>>,
+    // Exact-phrase confirmation reuses these two buffers across candidates.
+    // Lists are decoded rarest-first and pairwise-intersected so a miss can
+    // skip remaining (often stopword) position streams.
+    phrase_left: RefCell<Vec<u32>>,
+    phrase_right: RefCell<Vec<u32>>,
+    #[cfg(test)]
+    phrase_position_fills: std::cell::Cell<usize>,
 }
 
 /// Monotonically raise an f32 stored in an `AtomicU32` to `val`. CAS loop (not a
@@ -2341,6 +2346,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             documents,
             scorer,
             shared_threshold: None,
+            phrase_left: RefCell::new(Vec::with_capacity(32)),
+            phrase_right: RefCell::new(Vec::with_capacity(32)),
+            #[cfg(test)]
+            phrase_position_fills: std::cell::Cell::new(0),
         }
     }
 
@@ -4847,18 +4856,26 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     }
 
     fn current_doc_postings(&self) -> Vec<&PostingIterator> {
+        self.current_doc_posting_refs().into_vec()
+    }
+
+    fn current_doc_posting_refs(&self) -> SmallVec<[&PostingIterator; 8]> {
+        let mut clauses = SmallVec::new();
         if !self.lead.is_empty() {
-            return self.lead.iter().map(|posting| posting.as_ref()).collect();
+            clauses.extend(self.lead.iter().map(|posting| posting.as_ref()));
+            return clauses;
         }
 
         let Some(target) = self.head_doc() else {
-            return Vec::new();
+            return clauses;
         };
-        self.head
-            .iter()
-            .filter(|posting| posting.doc_id() == target)
-            .map(|posting| posting.posting.as_ref())
-            .collect()
+        clauses.extend(
+            self.head
+                .iter()
+                .filter(|posting| posting.doc_id() == target)
+                .map(|posting| posting.posting.as_ref()),
+        );
+        clauses
     }
 
     fn check_positions(&self, slop: i32) -> Result<bool> {
@@ -4905,101 +4922,108 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
     }
 
-    /// Allocation-free exact-phrase check for the bulk conjunction path,
-    /// where every clause is a parked `lead` iterator. Semantically identical
-    /// to [`Self::check_exact_positions`] — some base position must align all
-    /// clauses at their query offsets — without the per-candidate cursor vec
-    /// and sort.
+    /// Exact-phrase check used by both classic and bulk conjunctions.
+    ///
+    /// Semantically identical to aligning every clause at a shared base
+    /// position. Implementation decodes rarest-first into reused buffers and
+    /// pairwise-intersects offset-normalized lists so a miss can skip remaining
+    /// (often stopword) streams.
     fn check_exact_positions_bulk(&self) -> Result<bool> {
-        const MAX_INLINE_CLAUSES: usize = 16;
-        let num_clauses = self.lead.len();
-        if num_clauses > MAX_INLINE_CLAUSES {
-            return self.check_exact_positions();
-        }
-        // Cursors stay alive in the stack array so owned position buffers
-        // (legacy per-doc storage) remain valid while we scan.
-        let mut cursors: [Option<PositionCursor<'_>>; MAX_INLINE_CLAUSES] =
-            std::array::from_fn(|_| None);
-        let mut anchor_idx = 0usize;
-        let mut anchor_len = usize::MAX;
-        for (index, (slot, posting)) in cursors.iter_mut().zip(self.lead.iter()).enumerate() {
-            let cursor = posting.position_cursor()?;
-            if cursor.len() < anchor_len {
-                anchor_len = cursor.len();
-                anchor_idx = index;
-            }
-            *slot = Some(cursor);
-        }
-
-        let anchor = cursors[anchor_idx]
-            .as_ref()
-            .expect("anchor cursor was just populated");
-        let anchor_offset = anchor.position_in_query as u32;
-        'anchor: for &anchor_position in anchor.positions.as_slice() {
-            let Some(base) = anchor_position.checked_sub(anchor_offset) else {
-                continue;
-            };
-            for (index, slot) in cursors[..num_clauses].iter().enumerate() {
-                if index == anchor_idx {
-                    continue;
-                }
-                let cursor = slot.as_ref().expect("clause cursor was just populated");
-                let Some(target) = base.checked_add(cursor.position_in_query as u32) else {
-                    return Ok(false);
-                };
-                if cursor.positions.as_slice().binary_search(&target).is_err() {
-                    continue 'anchor;
-                }
-            }
-            return Ok(true);
-        }
-        Ok(false)
+        self.check_exact_positions()
     }
 
     fn check_exact_positions(&self) -> Result<bool> {
-        let mut position_iters = self
-            .current_doc_postings()
-            .into_iter()
-            .map(PostingIterator::position_cursor)
-            .collect::<Result<Vec<_>>>()?;
-        position_iters.sort_unstable_by_key(|iter| iter.len());
-        let Some(lead) = position_iters.first() else {
+        let mut clauses = self.current_doc_posting_refs();
+        if clauses.is_empty() {
             return Ok(false);
-        };
-        let lead_position = lead.position_in_query;
+        }
+        clauses.sort_unstable_by(|left, right| {
+            let left_freq = left.doc().map(|doc| doc.frequency()).unwrap_or(u32::MAX);
+            let right_freq = right.doc().map(|doc| doc.frequency()).unwrap_or(u32::MAX);
+            left_freq
+                .cmp(&right_freq)
+                .then(left.position.cmp(&right.position))
+        });
 
-        loop {
-            let Some(anchor) = position_iters[0].absolute_position() else {
+        let mut left = self.phrase_left.borrow_mut();
+        let mut right = self.phrase_right.borrow_mut();
+        #[cfg(test)]
+        self.phrase_position_fills
+            .set(self.phrase_position_fills.get() + 1);
+        clauses[0].fill_current_positions(&mut left)?;
+        subtract_query_offset(&mut left, clauses[0].position);
+        if left.is_empty() {
+            return Ok(false);
+        }
+
+        let last = clauses.len() - 1;
+        for (index, clause) in clauses.iter().enumerate().skip(1) {
+            #[cfg(test)]
+            self.phrase_position_fills
+                .set(self.phrase_position_fills.get() + 1);
+            clause.fill_current_positions(&mut right)?;
+            subtract_query_offset(&mut right, clause.position);
+            if index == last {
+                return Ok(sorted_u32_intersects(&left, &right));
+            }
+            intersect_sorted_u32(&mut left, &right);
+            if left.is_empty() {
                 return Ok(false);
-            };
-            let Some(base) = anchor.checked_sub(lead_position as u32) else {
-                position_iters[0].advance_next();
-                continue;
-            };
-
-            let mut next_lead_relative = None;
-            let mut matched = true;
-            for follower in position_iters.iter_mut().skip(1) {
-                let Some(target) = base.checked_add(follower.position_in_query as u32) else {
-                    return Ok(false);
-                };
-                let Some(position) = follower.advance_to_absolute(target) else {
-                    return Ok(false);
-                };
-                if position != target {
-                    next_lead_relative = Some(position as i32 - follower.position_in_query);
-                    matched = false;
-                    break;
-                }
             }
+        }
+        Ok(true)
+    }
+}
 
-            if matched {
-                return Ok(true);
+/// Drop occurrences that cannot be a phrase start (`position < query offset`)
+/// and rewrite the rest as phrase-base positions. The input is sorted, so the
+/// surviving suffix stays sorted.
+fn subtract_query_offset(positions: &mut Vec<u32>, query_offset: u32) {
+    let mut written = 0;
+    for index in 0..positions.len() {
+        let Some(base) = positions[index].checked_sub(query_offset) else {
+            continue;
+        };
+        positions[written] = base;
+        written += 1;
+    }
+    positions.truncate(written);
+}
+
+fn intersect_sorted_u32(left: &mut Vec<u32>, right: &[u32]) {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    let mut written = 0;
+    let left_len = left.len();
+    let right_len = right.len();
+    while left_index < left_len && right_index < right_len {
+        let left_val = left[left_index];
+        let right_val = right[right_index];
+        match left_val.cmp(&right_val) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Equal => {
+                left[written] = left_val;
+                written += 1;
+                left_index += 1;
+                right_index += 1;
             }
-
-            position_iters[0].advance_to_relative(next_lead_relative.unwrap());
+            std::cmp::Ordering::Greater => right_index += 1,
         }
     }
+    left.truncate(written);
+}
+
+fn sorted_u32_intersects(left: &[u32], right: &[u32]) -> bool {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Equal => return true,
+            std::cmp::Ordering::Greater => right_index += 1,
+        }
+    }
+    false
 }
 
 #[derive(Debug)]
@@ -5039,14 +5063,12 @@ impl Drop for RecycledPositionValues<'_> {
 #[derive(Debug)]
 enum PositionValues<'a> {
     Recycled(RecycledPositionValues<'a>),
-    Owned(Vec<u32>),
 }
 
 impl<'a> PositionValues<'a> {
     fn as_slice(&self) -> &[u32] {
         match self {
             Self::Recycled(values) => values.as_slice(),
-            Self::Owned(values) => values.as_slice(),
         }
     }
 
@@ -5075,10 +5097,6 @@ impl<'a> PositionCursor<'a> {
         self.positions.len()
     }
 
-    fn absolute_position(&self) -> Option<u32> {
-        self.positions.as_slice().get(self.index).copied()
-    }
-
     fn relative_position(&self) -> Option<i32> {
         self.positions
             .as_slice()
@@ -5094,19 +5112,6 @@ impl<'a> PositionCursor<'a> {
         let least_pos = least_pos.max(0) as u32;
         let values = self.positions.as_slice();
         self.index += values[self.index..].partition_point(|&pos| pos < least_pos);
-    }
-
-    fn advance_to_absolute(&mut self, least_pos: u32) -> Option<u32> {
-        if self.index >= self.len() {
-            return None;
-        }
-        let values = self.positions.as_slice();
-        self.index += values[self.index..].partition_point(|&pos| pos < least_pos);
-        self.absolute_position()
-    }
-
-    fn advance_next(&mut self) {
-        self.index = self.index.saturating_add(1).min(self.len());
     }
 }
 
@@ -8928,6 +8933,123 @@ mod tests {
         let second = wand.next().unwrap().unwrap();
         assert_eq!(second.0.doc_id(), 1);
         assert!(wand.check_positions(0).unwrap());
+    }
+
+    #[test]
+    fn test_phrase_position_helpers() {
+        let mut positions = vec![0_u32, 2, 5];
+        subtract_query_offset(&mut positions, 2);
+        assert_eq!(positions, vec![0, 3]);
+
+        let mut left = vec![1_u32, 3, 5, 7];
+        intersect_sorted_u32(&mut left, &[3, 4, 7, 9]);
+        assert_eq!(left, vec![3, 7]);
+        assert!(sorted_u32_intersects(&[1, 4], &[4, 8]));
+        assert!(!sorted_u32_intersects(&[1, 3], &[2, 4]));
+    }
+
+    /// A miss after the two rarest current-doc lists must not decode the
+    /// remaining dense (stopword) positions.
+    #[rstest]
+    fn test_exact_phrase_skips_dense_decode_after_rare_miss(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 32);
+
+        let postings = vec![
+            PostingIterator::new(
+                String::from("the"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![(0..20).collect()],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("of"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![5_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("life"),
+                2,
+                2,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![10_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
+        assert!(!wand.check_exact_positions().unwrap());
+        assert_eq!(wand.phrase_position_fills.get(), 2);
+    }
+
+    #[rstest]
+    fn test_exact_phrase_pairwise_match_decodes_all_aligned_terms(
+        #[values(false, true)] is_compressed: bool,
+    ) {
+        let mut docs = DocSet::default();
+        docs.append(0, 32);
+
+        let postings = vec![
+            PostingIterator::new(
+                String::from("the"),
+                0,
+                0,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![0_u32, 8, 14]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("of"),
+                1,
+                1,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![9_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                String::from("life"),
+                2,
+                2,
+                generate_posting_list_with_positions(
+                    vec![0],
+                    vec![vec![10_u32]],
+                    1.0,
+                    is_compressed,
+                ),
+                docs.len(),
+            ),
+        ];
+
+        let wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
+        assert!(wand.check_exact_positions().unwrap());
+        assert_eq!(wand.phrase_position_fills.get(), 3);
     }
 
     /// The bulk conjunction path must return exactly the classic loop's
