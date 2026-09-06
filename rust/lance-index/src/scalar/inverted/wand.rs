@@ -257,6 +257,12 @@ enum BulkAndMode {
     Off,
 }
 
+enum LeadFollowerSeek {
+    Match,
+    Leap(u64),
+    Exhausted,
+}
+
 impl BulkAndMode {
     fn parse(value: &str) -> Option<Self> {
         let value = value.trim();
@@ -2255,6 +2261,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     #[cfg(test)]
     lead_stream_and_searches: usize,
     #[cfg(test)]
+    phrase_pair_prunes: usize,
+    #[cfg(test)]
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
     maxscore_general_windows: usize,
@@ -2339,6 +2347,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             bulk_and_searches: 0,
             #[cfg(test)]
             lead_stream_and_searches: 0,
+            #[cfg(test)]
+            phrase_pair_prunes: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
@@ -4049,6 +4059,27 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
+    /// Seek `lead[from..to]` onto `doc`. Exact-phrase lead-stream confirms
+    /// the rare pair before seeking dense stopword followers.
+    fn seek_lead_followers(&mut self, from: usize, to: usize, doc: u32) -> LeadFollowerSeek {
+        for posting in self.lead.iter_mut().take(to).skip(from) {
+            if posting
+                .doc()
+                .is_none_or(|cur| cur.doc_id() < u64::from(doc))
+            {
+                posting.next(u64::from(doc));
+            }
+            match posting.doc() {
+                None => return LeadFollowerSeek::Exhausted,
+                Some(cur) if cur.doc_id() > u64::from(doc) => {
+                    return LeadFollowerSeek::Leap(cur.doc_id());
+                }
+                Some(_) => {}
+            }
+        }
+        LeadFollowerSeek::Match
+    }
+
     /// Leftover-classic conjunction: the rare lead's decompressed block is
     /// the buffer, followers only `next(target)`. Unlike N-way bulk, this
     /// never decompresses a dense list just to slice-merge a window the rare
@@ -4157,6 +4188,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 [false; FREQ_LUT_BUCKETS]
             };
 
+            let phrase_pair_prune = matches!(phrase_slop, Some(0)) && num_lists >= 2;
             let mut pos = 0;
             while pos < lead_docs.len() {
                 let doc = lead_docs[pos];
@@ -4164,40 +4196,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let freq_bucket = (freq as usize).min(FREQ_LUT_BUCKETS - 1);
                 if freq_cannot_beat[freq_bucket] {
                     pos += 1;
-                    continue;
-                }
-
-                let mut leap_to = None;
-                let mut exhausted = false;
-                for posting in self.lead.iter_mut().skip(1) {
-                    if posting
-                        .doc()
-                        .is_none_or(|cur| cur.doc_id() < u64::from(doc))
-                    {
-                        posting.next(u64::from(doc));
-                    }
-                    match posting.doc() {
-                        None => {
-                            exhausted = true;
-                            break;
-                        }
-                        Some(cur) if cur.doc_id() > u64::from(doc) => {
-                            leap_to = Some(cur.doc_id());
-                            break;
-                        }
-                        Some(_) => {}
-                    }
-                }
-                if exhausted {
-                    break 'window;
-                }
-                if let Some(next) = leap_to {
-                    let next32 = u32::try_from(next).unwrap_or(u32::MAX);
-                    pos += lead_docs[pos + 1..].partition_point(|&id| id < next32) + 1;
-                    if next > win_end {
-                        target = next;
-                        continue 'window;
-                    }
                     continue;
                 }
 
@@ -4209,6 +4207,46 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     doc_id: doc,
                     frequency: freq,
                 }));
+
+                let first_followers = if phrase_pair_prune { 2 } else { num_lists };
+                match self.seek_lead_followers(1, first_followers, doc) {
+                    LeadFollowerSeek::Exhausted => break 'window,
+                    LeadFollowerSeek::Leap(next) => {
+                        let next32 = u32::try_from(next).unwrap_or(u32::MAX);
+                        pos += lead_docs[pos + 1..].partition_point(|&id| id < next32) + 1;
+                        if next > win_end {
+                            target = next;
+                            continue 'window;
+                        }
+                        continue;
+                    }
+                    LeadFollowerSeek::Match => {}
+                }
+
+                if phrase_pair_prune {
+                    if !self.check_exact_phrase_pair()? {
+                        #[cfg(test)]
+                        {
+                            self.phrase_pair_prunes += 1;
+                        }
+                        pos += 1;
+                        continue;
+                    }
+                    match self.seek_lead_followers(2, num_lists, doc) {
+                        LeadFollowerSeek::Exhausted => break 'window,
+                        LeadFollowerSeek::Leap(next) => {
+                            let next32 = u32::try_from(next).unwrap_or(u32::MAX);
+                            pos += lead_docs[pos + 1..].partition_point(|&id| id < next32) + 1;
+                            if next > win_end {
+                                target = next;
+                                continue 'window;
+                            }
+                            continue;
+                        }
+                        LeadFollowerSeek::Match => {}
+                    }
+                }
+
                 let Some(parked) = self.lead[0].doc() else {
                     pos += 1;
                     continue;
@@ -4224,7 +4262,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         pos += 1;
                         continue;
                     }
-                    if !self.check_positions(slop as i32)? {
+                    let pair_is_full_confirm = slop == 0 && num_lists == 2;
+                    if !pair_is_full_confirm && !self.check_positions(slop as i32)? {
                         pos += 1;
                         continue;
                     }
@@ -4972,6 +5011,30 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
         }
         Ok(true)
+    }
+
+    /// Confirm only `lead[0]` vs `lead[1]` on the current doc. Lead-stream
+    /// uses this to reject a phrase candidate before seeking dense followers.
+    fn check_exact_phrase_pair(&self) -> Result<bool> {
+        let [left_posting, right_posting, ..] = self.lead.as_slice() else {
+            return Ok(false);
+        };
+        let mut left = self.phrase_left.borrow_mut();
+        let mut right = self.phrase_right.borrow_mut();
+        #[cfg(test)]
+        self.phrase_position_fills
+            .set(self.phrase_position_fills.get() + 1);
+        left_posting.fill_current_positions(&mut left)?;
+        subtract_query_offset(&mut left, left_posting.position);
+        if left.is_empty() {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        self.phrase_position_fills
+            .set(self.phrase_position_fills.get() + 1);
+        right_posting.fill_current_positions(&mut right)?;
+        subtract_query_offset(&mut right, right_posting.position);
+        Ok(sorted_u32_intersects(&left, &right))
     }
 }
 
@@ -9288,6 +9351,114 @@ mod tests {
         assert!(!off_bulk && !off_lead);
         assert!(!auto_bulk && auto_lead);
         assert!(!on.is_empty());
+        assert_eq!(auto, off);
+        assert_eq!(auto, on);
+    }
+
+    /// Skewed 3-term phrase: Auto uses lead-stream pair-prune. Docs where
+    /// the rare pair is misaligned must not hit; pair-aligned + third-miss
+    /// must not hit; only the full phrase survives. Hit set matches Off/On.
+    #[test]
+    fn lead_stream_phrase_pair_prune_matches_classic() {
+        let num_docs = (BLOCK_SIZE * 8 + 37) as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 32 + doc_id % 57);
+        }
+        let dense: Vec<u32> = (0..num_docs).collect();
+        let mid: Vec<u32> = (0..num_docs).step_by(2).collect();
+        let rare: Vec<u32> = (0..num_docs).step_by(40).collect();
+        let min_cost = rare.len();
+        let max_cost = dense.len();
+        assert!(
+            min_cost > 0 && max_cost / min_cost >= BULK_AND_AUTO_SKEW_RATIO,
+            "expected a skewed 3-clause (max/min={}/{})",
+            max_cost,
+            min_cost
+        );
+
+        let positions_for = |term_pos: usize, doc: u32| -> Vec<u32> {
+            match (term_pos, doc % 120) {
+                // Full phrase: offsets 0,1,2 at 5,6,7.
+                (0, 0) => vec![5],
+                (1, 0) => vec![6],
+                (2, 0) => vec![7],
+                // Pair miss: all terms present, rare+mid bases disagree.
+                (0, 40) => vec![10],
+                (1, 40) => vec![3],
+                (2, 40) => vec![20],
+                // Pair hit, third miss.
+                (0, 80) => vec![5],
+                (1, 80) => vec![6],
+                (2, 80) => vec![99],
+                (_, _) => vec![200 + term_pos as u32],
+            }
+        };
+        let clause_docs = [rare.clone(), mid, dense];
+        let build = || {
+            clause_docs
+                .iter()
+                .enumerate()
+                .map(|(term_pos, doc_ids)| {
+                    let positions = doc_ids
+                        .iter()
+                        .map(|&doc| positions_for(term_pos, doc))
+                        .collect::<Vec<_>>();
+                    PostingIterator::with_query_weight(
+                        format!("t{term_pos}"),
+                        term_pos as u32,
+                        term_pos as u32,
+                        1.0 + term_pos as f32 * 0.5,
+                        generate_posting_list_with_positions(doc_ids.clone(), positions, 8.0, true),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut params = FtsSearchParams::default().with_limit(Some(100));
+        params.phrase_slop = Some(0);
+        let normalize = |result: Vec<DocCandidate<u64>>| {
+            let mut rows = result
+                .into_iter()
+                .map(|c| (c.posting_doc_id, c.doc_length, c.freqs, c.document))
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            rows
+        };
+        let run = |mode| {
+            let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode);
+            let rows = normalize(wand.search(&params, &NoOpMetricsCollector).unwrap());
+            (
+                rows,
+                wand.bulk_and_searches > 0,
+                wand.lead_stream_and_searches > 0,
+                wand.phrase_pair_prunes,
+            )
+        };
+
+        let (on, on_bulk, on_lead, on_prunes) = run(BulkAndMode::On);
+        let (off, off_bulk, off_lead, off_prunes) = run(BulkAndMode::Off);
+        let (auto, auto_bulk, auto_lead, auto_prunes) = run(BulkAndMode::Auto);
+        assert!(on_bulk && !on_lead);
+        assert!(!off_bulk && !off_lead);
+        assert!(!auto_bulk && auto_lead);
+        assert_eq!(on_prunes, 0);
+        assert_eq!(off_prunes, 0);
+        assert!(
+            auto_prunes > 0,
+            "lead-stream should reject pair-misaligned AND hits"
+        );
+        assert!(!auto.is_empty());
+        let expected: Vec<u64> = rare
+            .iter()
+            .copied()
+            .filter(|&doc| doc % 120 == 0)
+            .map(u64::from)
+            .collect();
+        let auto_docs: Vec<u64> = auto.iter().map(|(doc, _, _, _)| *doc).collect();
+        assert_eq!(auto_docs, expected);
         assert_eq!(auto, off);
         assert_eq!(auto, on);
     }
