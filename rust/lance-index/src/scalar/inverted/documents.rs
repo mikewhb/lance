@@ -106,6 +106,9 @@ pub(super) struct DocLengths {
     total_tokens: u64,
     quantized_scoring: bool,
     norms: OnceLock<Box<[u8]>>,
+    /// Per-document BM25 length addends for exact-scoring partitions.
+    /// Quantized partitions use the 256-entry norm cache instead.
+    exact_addends: OnceLock<(u64, Box<[f32]>)>,
 }
 
 impl DeepSizeOf for DocLengths {
@@ -115,6 +118,11 @@ impl DeepSizeOf for DocLengths {
                 .norms
                 .get()
                 .map(|norms| std::mem::size_of_val(norms.as_ref()))
+                .unwrap_or(0)
+            + self
+                .exact_addends
+                .get()
+                .map(|(_, addends)| std::mem::size_of_val(addends.as_ref()))
                 .unwrap_or(0)
     }
 }
@@ -156,6 +164,7 @@ impl DocLengths {
             total_tokens,
             quantized_scoring,
             norms: OnceLock::new(),
+            exact_addends: OnceLock::new(),
         })
     }
 
@@ -186,6 +195,24 @@ impl DocLengths {
                 })
                 .as_ref(),
         )
+    }
+
+    /// Per-document BM25 length addends when this partition scores exact
+    /// lengths. The slab is keyed by the scorer's corpus identity so a
+    /// later search with different statistics does not reuse a stale table.
+    pub(super) fn exact_bm25_addends(
+        &self,
+        cache_key: u64,
+        doc_norm: &mut dyn FnMut(u32) -> f32,
+    ) -> Option<&[f32]> {
+        if self.quantized_scoring {
+            return None;
+        }
+        let (stored_key, addends) = self.exact_addends.get_or_init(|| {
+            let addends: Box<[f32]> = self.values.iter().copied().map(doc_norm).collect();
+            (cache_key, addends)
+        });
+        (*stored_key == cache_key).then_some(addends.as_ref())
     }
 
     fn scoring_ready(&self) -> bool {
