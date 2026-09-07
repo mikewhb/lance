@@ -1701,6 +1701,19 @@ pub(super) fn validate_modern_posting_doc_ids(
 /// `MaxScoreBulkScorer.INNER_WINDOW_SIZE`.
 const MAXSCORE_INNER_WINDOW: usize = 1 << 12;
 
+/// The floor-seeding pass is taken only when the sparsest clause is at most
+/// this fraction of the total posting length, so a query whose clauses are all
+/// about the same length never pays for a pass that cannot save much.
+const SEED_FLOOR_MAX_COST_SHARE: usize = 16;
+
+/// Hard budget on the postings the floor-seeding pass will decode. The share
+/// gate above is relative, and one sixteenth of a stopword's list is still
+/// long enough to cost more than the walk it saves: `the movement` seeded from
+/// 118k postings and lost 2.4ms, while every query the pass helps seeds from
+/// under a thousand. At roughly 20ns per posting this bounds the pass at a
+/// small fraction of the fixed per-query cost.
+const SEED_FLOOR_MAX_POSTINGS: usize = 2048;
+
 /// Lucene's `MathUtil.sumUpperBound` factor, adapted to Lance's `f32` score
 /// accumulation. Prefix bounds are summed in `f64`, then widened enough to
 /// cover any recursive `f32` summation order of the same non-negative values.
@@ -2268,6 +2281,10 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     maxscore_general_windows: usize,
     #[cfg(test)]
     maxscore_window_reopens: usize,
+    #[cfg(test)]
+    maxscore_floor_seeds: usize,
+    #[cfg(test)]
+    maxscore_comparisons: usize,
     documents: &'a D,
     scorer: S,
     // Shared cross-partition top-k floor. Each partition publishes its local
@@ -2359,6 +2376,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             maxscore_general_windows: 0,
             #[cfg(test)]
             maxscore_window_reopens: 0,
+            #[cfg(test)]
+            maxscore_floor_seeds: 0,
+            #[cfg(test)]
+            maxscore_comparisons: 0,
             documents,
             scorer,
             shared_threshold: None,
@@ -2414,7 +2435,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 t = g;
             }
         }
-        self.threshold = t;
+        // Only ever raise. The floor can be seeded before the heap fills, and a
+        // partly filled heap reports a k-th best below that seed.
+        if t > self.threshold {
+            self.threshold = t;
+        }
     }
 
     /// Raise the local threshold to the shared cross-partition floor, picking up
@@ -2856,6 +2881,128 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         Ok(())
     }
 
+    /// Seed the pruning floor from the sparsest clause before walking the
+    /// document space.
+    ///
+    /// MAXSCORE stops iterating a clause only once the floor passes that
+    /// clause's block bound, and the floor climbs in document order. A query
+    /// pairing a very rare term with a very common one therefore scans most of
+    /// the common term's postings before the rare term's documents -- scattered
+    /// across the whole address space -- have had a chance to fill the heap.
+    /// `niceville high school` scored 110,901 documents to return ten, all of
+    /// which contain `niceville`, whose posting list is 81 long.
+    ///
+    /// One clause's contribution is a lower bound on the score of a document
+    /// containing it, so the k-th largest such contribution is a floor no
+    /// document outside the top k can reach.
+    fn seed_floor_from_sparsest_clause(
+        &mut self,
+        clauses: &[MaxScoreClause],
+        limit: usize,
+        wand_factor: f32,
+        norm_k_ref: Option<(&[u8], &[f32; 256])>,
+    ) {
+        let Some(sparsest) = clauses.iter().min_by_key(|clause| clause.posting.cost()) else {
+            return;
+        };
+        let sparse_cost = sparsest.posting.cost();
+        let total_cost = clauses
+            .iter()
+            .map(|clause| clause.posting.cost())
+            .sum::<usize>();
+        // Fewer than k documents cannot define a k-th best score, and the pass
+        // only pays for its own decode when it is both a small slice of the
+        // walk it stands to cut and short in absolute terms.
+        if sparse_cost < limit
+            || sparse_cost > SEED_FLOOR_MAX_POSTINGS
+            || sparse_cost.saturating_mul(SEED_FLOOR_MAX_COST_SHARE) > total_cost
+        {
+            return;
+        }
+        let PostingList::Compressed(list) = &sparsest.posting.list else {
+            return;
+        };
+
+        let query_weight = sparsest.posting.query_weight;
+        let num_blocks = list.blocks.len();
+        let remainder = list.length as usize % list.block_size;
+        // Decode straight off the blocks rather than through a posting
+        // iterator: this pass wants only (doc, freq), and the iterator
+        // allocates a positions cursor per document.
+        let mut buffer = vec![0u32; MAX_POSTING_BLOCK_SIZE];
+        let mut doc_ids = Vec::with_capacity(list.block_size);
+        let mut freqs = Vec::with_capacity(list.block_size);
+        // Min-heap of the k largest contributions. BM25 weights are
+        // non-negative, so their bit patterns order the same way.
+        let mut best = BinaryHeap::with_capacity(limit + 1);
+        for block_idx in 0..num_blocks {
+            let block = list.blocks.value(block_idx);
+            doc_ids.clear();
+            freqs.clear();
+            if block_idx + 1 == num_blocks && remainder != 0 {
+                decompress_posting_remainder(
+                    block,
+                    remainder,
+                    list.posting_tail_codec,
+                    list.block_size,
+                    &mut doc_ids,
+                    &mut freqs,
+                );
+            } else {
+                decompress_posting_block(
+                    block,
+                    &mut buffer[..],
+                    &mut doc_ids,
+                    &mut freqs,
+                    list.block_size,
+                );
+            }
+            for (&doc, &freq) in doc_ids.iter().zip(freqs.iter()) {
+                let score = match norm_k_ref {
+                    Some((norms, norm_cache)) => {
+                        query_weight
+                            * bm25_doc_weight_with_norm(
+                                freq,
+                                norm_cache[norms[doc as usize] as usize],
+                            )
+                    }
+                    None => {
+                        query_weight
+                            * self
+                                .scorer
+                                .doc_weight(freq, self.documents.scoring_num_tokens(doc))
+                    }
+                };
+                if score <= 0.0 || !score.is_finite() {
+                    continue;
+                }
+                let ranked = Reverse(score.to_bits());
+                if best.len() < limit {
+                    best.push(ranked);
+                } else if best.peek().is_some_and(|worst| ranked < *worst) {
+                    best.pop();
+                    best.push(ranked);
+                }
+            }
+        }
+        let Some(&Reverse(kth)) = best.peek() else {
+            return;
+        };
+        if best.len() == limit {
+            // Step one representable value below the k-th best. The heap that
+            // normally publishes a floor already holds the k documents that
+            // reach it, so pruning at exactly that score is safe there; here
+            // the heap is still empty, and an exclusive comparison against an
+            // exact tie would prune every document that ties for k-th.
+            let floor = f32::from_bits(kth.saturating_sub(1));
+            self.update_threshold(floor, wand_factor);
+            #[cfg(test)]
+            {
+                self.maxscore_floor_seeds += 1;
+            }
+        }
+    }
+
     fn maxscore_search(
         &mut self,
         params: &FtsSearchParams,
@@ -2888,6 +3035,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let norm_k_ref = norm_k
             .as_ref()
             .map(|(norms, cache)| (*norms, cache.as_ref()));
+        if limit != usize::MAX && clauses.len() >= 2 && self.threshold <= 0.0 {
+            self.seed_floor_from_sparsest_clause(&clauses, limit, params.wand_factor, norm_k_ref);
+        }
         let mut num_comparisons = 0usize;
         // Adaptive minimum window size (Lucene): grow windows when they yield
         // too few candidates to amortize the per-window bound computations.
@@ -3303,6 +3453,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             };
         }
 
+        #[cfg(test)]
+        {
+            self.maxscore_comparisons = num_comparisons;
+        }
         metrics.record_comparisons(num_comparisons);
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
@@ -6993,6 +7147,180 @@ mod tests {
     }
 
     #[test]
+    fn maxscore_seeds_the_floor_from_a_rare_clause_and_stops_scanning_the_common_one() {
+        // A rare clause whose documents are spread across the whole address
+        // space cannot fill the heap until the walk is nearly over, so without
+        // seeding the common clause stays essential and gets scanned in full.
+        const TOTAL: u32 = 40 * crate::scalar::inverted::LEGACY_BLOCK_SIZE as u32;
+        let common = PostingIterator::new(
+            "common".to_owned(),
+            0,
+            0,
+            generate_contiguous_impact_posting_list_with_block_size(
+                TOTAL as usize,
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            TOTAL as usize,
+        );
+        let stride = TOTAL / 20;
+        let rare_docs = (1..20).map(|i| i * stride).collect::<Vec<_>>();
+        let rare_len = rare_docs.len();
+        let rare = PostingIterator::new(
+            "rare".to_owned(),
+            1,
+            1,
+            generate_impact_posting_list_with_freqs_and_block_size(
+                rare_docs.clone(),
+                vec![400; rare_len],
+                vec![1; rare_len],
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            TOTAL as usize,
+        );
+        let mut docs = DocSet::default();
+        for doc in 0..TOTAL {
+            docs.append(doc.into(), 1);
+        }
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            [common, rare].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(5)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        // Every rare document outscores every common-only one, so the answer
+        // comes entirely from the rare clause.
+        assert_eq!(hits.len(), 5);
+        for hit in &hits {
+            assert!(
+                rare_docs.contains(&(hit.posting_doc_id as u32)),
+                "the rare clause must dominate the top k, got {}",
+                hit.posting_doc_id
+            );
+        }
+        // The seeded floor leaves the common clause unable to compete in any
+        // window, so its blocks are skipped wholesale rather than scored.
+        assert!(
+            wand.maxscore_comparisons <= rare_len,
+            "seeding should keep scoring to the rare clause's own postings, \
+             scored {} of {} candidates",
+            wand.maxscore_comparisons,
+            TOTAL
+        );
+    }
+
+    #[test]
+    fn maxscore_skips_floor_seeding_when_the_sparse_clause_exceeds_the_budget() {
+        // A clause can be a small share of a stopword's list and still be long
+        // enough that decoding it costs more than the walk it saves, so the
+        // share gate alone is not enough to decline.
+        let sparse_len = SEED_FLOOR_MAX_POSTINGS + 1;
+        let total = (sparse_len * SEED_FLOOR_MAX_COST_SHARE * 2) as u32;
+        let common = PostingIterator::new(
+            "common".to_owned(),
+            0,
+            0,
+            generate_contiguous_impact_posting_list_with_block_size(
+                total as usize,
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            total as usize,
+        );
+        let stride = total / sparse_len as u32;
+        let sparse_docs = (0..sparse_len as u32)
+            .map(|i| i * stride)
+            .collect::<Vec<_>>();
+        let sparse = PostingIterator::new(
+            "sparse".to_owned(),
+            1,
+            1,
+            generate_impact_posting_list_with_freqs_and_block_size(
+                sparse_docs,
+                vec![400; sparse_len],
+                vec![1; sparse_len],
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            total as usize,
+        );
+        let mut docs = DocSet::default();
+        for doc in 0..total {
+            docs.append(doc.into(), 1);
+        }
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            [common, sparse].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(5)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 5);
+        assert_eq!(
+            wand.maxscore_floor_seeds, 0,
+            "a sparse clause over the decode budget must not be seeded from"
+        );
+    }
+
+    #[test]
+    fn maxscore_skips_floor_seeding_when_the_clauses_cost_the_same() {
+        // Two clauses of the same length: the pass would decode half the query
+        // to seed a floor the walk reaches on its own, so it must decline.
+        const TOTAL: u32 = 4 * crate::scalar::inverted::LEGACY_BLOCK_SIZE as u32;
+        let build = |token: &str, rank: u32, offset: u32| {
+            let doc_ids = (0..TOTAL / 2).map(|i| i * 2 + offset).collect::<Vec<_>>();
+            let len = doc_ids.len();
+            PostingIterator::new(
+                token.to_owned(),
+                rank,
+                rank,
+                generate_impact_posting_list_with_freqs_and_block_size(
+                    doc_ids,
+                    vec![10; len],
+                    vec![1; len],
+                    crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+                ),
+                TOTAL as usize,
+            )
+        };
+        let mut docs = DocSet::default();
+        for doc in 0..TOTAL {
+            docs.append(doc.into(), 1);
+        }
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            [build("even", 0, 0), build("odd", 1, 1)].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(5)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 5);
+        assert_eq!(
+            wand.maxscore_floor_seeds, 0,
+            "clauses of equal length must not pay for a seeding pass"
+        );
+    }
+
+    #[test]
     fn maxscore_reopens_the_window_once_the_floor_invalidates_the_split() {
         // A block holds a fixed number of postings, not a fixed doc range, so
         // a sparse clause's block end can sit thousands of documents ahead.
@@ -7043,6 +7371,22 @@ mod tests {
             ),
             TOTAL as usize,
         );
+        // Shorter than the limit, so it cannot define a k-th best score and the
+        // floor-seeding pass declines. Without it that pass would hand the
+        // first window a floor high enough to partition correctly straight
+        // away, and the reopen this test covers would never be needed.
+        let too_short_to_seed = PostingIterator::new(
+            "stub".to_owned(),
+            4,
+            4,
+            generate_impact_posting_list_with_freqs_and_block_size(
+                vec![1, 2],
+                vec![1, 1],
+                vec![1; 2],
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            TOTAL as usize,
+        );
         let mut docs = DocSet::default();
         for doc in 0..TOTAL {
             docs.append(doc.into(), 1);
@@ -7055,6 +7399,7 @@ mod tests {
                 sparse("mid_a", 1, 500, 100),
                 sparse("mid_b", 2, 700, 120),
                 riser,
+                too_short_to_seed,
             ]
             .into_iter(),
             &docs,
