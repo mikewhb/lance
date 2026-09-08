@@ -3,11 +3,11 @@
 
 mod should_maxscore;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::{Arc, LazyLock};
 
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -31,7 +31,8 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        TermLeafScorer, WandCursor, WandDocuments, score_sum_upper_bound_factor,
+        TermLeafScorer, Wand, WandCursor, WandDocuments, iu_tight_search,
+        score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -271,6 +272,14 @@ pub(super) trait ComposableScorer: Send {
     /// position. `None` keeps the scorer on exact eager composition paths.
     fn global_score_upper_bound(&self) -> Option<f32> {
         None
+    }
+
+    /// Conservative score upper bound for documents in `[start, up_to]`.
+    /// Default is the list-wide bound. Term and disjunction scorers walk
+    /// overlapping blocks so a MUST-driven IU window can skip.
+    fn range_score_upper_bound(&mut self, start: u64, up_to: u64) -> Result<Option<f32>> {
+        let _ = (start, up_to);
+        Ok(self.global_score_upper_bound())
     }
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()>;
 
@@ -1069,6 +1078,35 @@ impl<D: WandDocuments + Sync> ComposableScorer for TermLeafScorer<'_, D> {
 
     fn global_score_upper_bound(&self) -> Option<f32> {
         TermLeafScorer::global_score_upper_bound(self)
+    }
+
+    fn range_score_upper_bound(&mut self, start: u64, up_to: u64) -> Result<Option<f32>> {
+        if start > up_to {
+            return Ok(Some(0.0));
+        }
+        if self.doc().is_some_and(|doc| doc > up_to) {
+            return Ok(Some(0.0));
+        }
+        let mut t = start;
+        let mut max_upper = 0.0f32;
+        while t <= up_to {
+            let block_end = self.advance_shallow(t)?;
+            let bound_at = block_end.min(up_to);
+            if bound_at < t {
+                break;
+            }
+            let upper = self.score_upper_bound(bound_at)?;
+            if upper.is_finite() {
+                max_upper = max_upper.max(upper.max(0.0));
+            } else {
+                return Ok(None);
+            }
+            if block_end == u64::MAX {
+                break;
+            }
+            t = block_end + 1;
+        }
+        Ok(Some(max_upper))
     }
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
@@ -2298,6 +2336,26 @@ impl<K: Copy + Ord> TopKCollector<K> {
         }
     }
 
+    fn could_enter(&self, score: f32) -> bool {
+        match self.competitive_floor() {
+            None => true,
+            Some(worst) => score.total_cmp(&worst) != Ordering::Less,
+        }
+    }
+
+    fn competitive_floor(&self) -> Option<f32> {
+        if self.heap.len() < self.limit {
+            return None;
+        }
+        Some(
+            self.heap
+                .peek()
+                .expect("a full top-k heap is non-empty")
+                .0
+                .score,
+        )
+    }
+
     fn insert(&mut self, row: ScoredRow<K>) -> CollectionStatus {
         if self.limit == 0 {
             return CollectionStatus::Complete;
@@ -2831,6 +2889,23 @@ impl ComposableScorer for DisjunctionScorer<'_> {
         }
     }
 
+    fn range_score_upper_bound(&mut self, start: u64, up_to: u64) -> Result<Option<f32>> {
+        let mut acc = 0.0f32;
+        for child in &mut self.children {
+            match child.range_score_upper_bound(start, up_to)? {
+                Some(upper) if upper.is_finite() => {
+                    if matches!(self.mode, DisjunctionScore::Sum) {
+                        acc += upper.max(0.0);
+                    } else {
+                        acc = acc.max(upper.max(0.0));
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(acc))
+    }
+
     fn global_score_upper_bound(&self) -> Option<f32> {
         match self.mode {
             DisjunctionScore::Sum => sum_global_score_upper_bounds(&self.children),
@@ -3359,6 +3434,83 @@ struct ReqOptBounds {
     combined: ScoreBounds,
 }
 
+fn iu_no_clip() -> bool {
+    // HACK(throwaway): keep IU windows on the required clause's block
+    // boundary instead of clipping to the next optional doc. Combined with
+    // an inner dead-window skip this is Lucene `advanceImpacts` without the
+    // per-optional-doc window. Revert before merge.
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("LANCE_HACK_IU_NO_CLIP").is_ok_and(|v| v != "0"));
+    *ON
+}
+
+fn iu_diag() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("LANCE_DIAG_IU").is_ok_and(|v| v != "0"));
+    *ON
+}
+
+fn iu_force_intersect() -> bool {
+    // HACK(throwaway): the moment a competitive floor exists, treat the
+    // optional clause as required. Measures the ceiling of early promotion
+    // (walk the intersection, not the MUST posting). May drop MUST-only
+    // documents that would have entered top-k. Revert before merge.
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("LANCE_HACK_IU_FORCE_INTERSECT").is_ok_and(|v| v != "0"));
+    *ON
+}
+
+fn iu_must_drive() -> bool {
+    // HACK(throwaway): IU collect walks MUST blocks only. Optional is
+    // completed on each MUST doc and never clips the shallow window.
+    // MUST-only documents still score (optional contributes 0). Revert
+    // before merge.
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("LANCE_HACK_IU_MUST_DRIVE").is_ok_and(|v| v != "0"));
+    *ON
+}
+
+fn iu_simple() -> bool {
+    // HACK(throwaway): Tantivy-style IU collect. Walk MUST only, complete
+    // SHOULD on score(), no shallow windows. Evidence: Tantivy ReqOpt is
+    // ~9ms on `city +council…` with this algorithm; Lance windows are 24ms.
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("LANCE_HACK_IU_SIMPLE").is_ok_and(|v| v != "0"));
+    *ON
+}
+
+fn iu_tight() -> Option<bool> {
+    // None = default cost gate. Some(true/false) forces the tight IU kernel.
+    // Revert the env override before merge; the gate stays as the product path.
+    static MODE: LazyLock<Option<bool>> =
+        LazyLock::new(|| std::env::var("LANCE_HACK_IU_TIGHT").ok().map(|v| v != "0"));
+    *MODE
+}
+
+/// Wikipedia SBG evidence: `data` (78k vs cooling 8k) stays on default ReqOpt
+/// windows; `financial` (89k) and near-rarest MUST (`security` 77k vs
+/// `airport` 56k) belong on the tight kernel.
+const IU_TIGHT_MIN_MUST_COST: usize = 85_000;
+
+fn iu_tight_cost_gate(leaves: &[LoadedLeaf], must_index: usize, should_indices: &[usize]) -> bool {
+    let must_cost = leaves[must_index].postings[0].cost();
+    let min_should = should_indices
+        .iter()
+        .map(|index| leaves[*index].postings[0].cost())
+        .min()
+        .unwrap_or(0);
+    must_cost <= min_should.saturating_mul(2) || must_cost >= IU_TIGHT_MIN_MUST_COST
+}
+
+fn iu_maxscore() -> bool {
+    // HACK(throwaway): 1-MUST + N-SHOULD term Boolean TOP_K uses the
+    // MatchQuery MAXSCORE single-essential path with MUST pinned. SHOULD
+    // clauses only complete. Revert before merge.
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("LANCE_HACK_IU_MAXSCORE").is_ok_and(|v| v != "0"));
+    *ON
+}
+
 struct ReqOptScorer<'a> {
     required: BoxScorer<'a>,
     optional: BoxScorer<'a>,
@@ -3377,6 +3529,9 @@ struct ReqOptScorer<'a> {
     /// clause alone, so the optional clause is mandatory for the rest of the
     /// scan and the query is an intersection.
     optional_globally_required: bool,
+    diag_windows: u64,
+    diag_skipped: u64,
+    diag_costs_logged: bool,
 }
 
 impl<'a> ReqOptScorer<'a> {
@@ -3397,6 +3552,9 @@ impl<'a> ReqOptScorer<'a> {
             min_competitive_score: f32::NEG_INFINITY,
             shallow_bounds: None,
             optional_globally_required: false,
+            diag_windows: 0,
+            diag_skipped: 0,
+            diag_costs_logged: false,
         }
     }
 
@@ -3437,6 +3595,11 @@ impl<'a> ReqOptScorer<'a> {
     fn promote_optional_if_required(&mut self) -> Result<()> {
         if self.optional_globally_required || !self.min_competitive_score.is_finite() {
             return Ok(());
+        }
+        if iu_force_intersect() && self.min_competitive_score > 0.0 {
+            self.optional_globally_required = true;
+            self.shallow_bounds = None;
+            return self.clear_window_required_floor();
         }
         let Some(required_upper) = self.required.global_score_upper_bound() else {
             return Ok(());
@@ -3741,6 +3904,229 @@ impl<'a> ReqOptScorer<'a> {
         self.confirmed_doc = Some(current);
         Ok(self.confirmed)
     }
+
+    fn collect_intersection_no_windows(
+        &mut self,
+        min_score: f32,
+        out: &mut Vec<ConfirmedHit>,
+        max_hits: usize,
+    ) -> Result<WindowCollect> {
+        self.optional_globally_required = true;
+        self.shallow_bounds = None;
+        self.clear_window_required_floor()?;
+        if self.current.is_none() {
+            self.position_intersection(0)?;
+        }
+        self.diag_windows += 1;
+        loop {
+            if out.len() >= max_hits {
+                return Ok(WindowCollect { exhausted: false });
+            }
+            let Some(doc) = self.current else {
+                return Ok(WindowCollect { exhausted: true });
+            };
+            self.set_optional_required(true);
+            if self.ensure_confirmed()? {
+                let score = checked_score(self.score()?, "required-plus-optional FTS scorer")?;
+                if score >= min_score {
+                    let document_key = self.required.document_key().ok_or_else(|| {
+                        Error::internal(
+                            "required-plus-optional FTS scorer did not expose its current document key",
+                        )
+                    })?;
+                    out.push(ConfirmedHit {
+                        doc,
+                        document_key,
+                        score,
+                    });
+                }
+            }
+            if doc == u64::MAX {
+                self.exhaust();
+                return Ok(WindowCollect { exhausted: true });
+            }
+            self.position_intersection(doc + 1)?;
+        }
+    }
+
+    fn land_required(&mut self, target: u64) -> Result<Option<u64>> {
+        let Some(doc) = self.required.advance(target)? else {
+            self.exhaust();
+            return Ok(None);
+        };
+        self.set_current(Some(doc));
+        self.set_optional_required(false);
+        Ok(self.current)
+    }
+
+    fn optional_cap_in_must_block(&mut self, start: u64, up_to: u64) -> Result<ScoreBounds> {
+        let optional_doc = self.ensure_optional_at_or_after(start)?;
+        if optional_doc.is_none_or(|doc| doc > up_to) {
+            return Ok(ScoreBounds::ZERO);
+        }
+        Ok(match self.optional.range_score_upper_bound(start, up_to)? {
+            Some(upper) if upper.is_finite() => ScoreBounds {
+                lower: 0.0,
+                upper: upper.max(0.0),
+            },
+            _ => ScoreBounds::UNBOUNDED,
+        })
+    }
+
+    /// Tantivy-style: ignore shallow windows. Visit MUST docs in chunks so
+    /// the collector can raise the floor; SHOULD only participates in score().
+    fn collect_simple(
+        &mut self,
+        min_score: f32,
+        out: &mut Vec<ConfirmedHit>,
+        max_hits: usize,
+    ) -> Result<WindowCollect> {
+        self.set_min_competitive_score(min_score)?;
+        if self.exhausted {
+            return Ok(WindowCollect { exhausted: true });
+        }
+        if self.optional_globally_required {
+            return self.collect_intersection_no_windows(min_score, out, max_hits);
+        }
+        if self.current.is_none() && self.land_required(0)?.is_none() {
+            return Ok(WindowCollect { exhausted: true });
+        }
+        let visit_budget = 128usize;
+        let mut visited = 0usize;
+        loop {
+            if out.len() >= max_hits || visited >= visit_budget {
+                return Ok(WindowCollect { exhausted: false });
+            }
+            let Some(doc) = self.current else {
+                return Ok(WindowCollect { exhausted: true });
+            };
+            self.set_optional_required(false);
+            if self.ensure_confirmed()? {
+                let score = checked_score(self.score()?, "required-plus-optional FTS scorer")?;
+                if score >= min_score {
+                    let document_key = self.required.document_key().ok_or_else(|| {
+                        Error::internal(
+                            "required-plus-optional FTS scorer did not expose its current document key",
+                        )
+                    })?;
+                    out.push(ConfirmedHit {
+                        doc,
+                        document_key,
+                        score,
+                    });
+                }
+            }
+            visited += 1;
+            if doc == u64::MAX {
+                self.exhaust();
+                return Ok(WindowCollect { exhausted: true });
+            }
+            if self.land_required(doc + 1)?.is_none() {
+                return Ok(WindowCollect { exhausted: true });
+            }
+        }
+    }
+
+    /// Walk one MUST block per call. Optional never shrinks the window, so
+    /// dense SHOULD clauses cannot explode the window count. Every MUST doc
+    /// in a non-skipped block is scored (optional adds 0 when absent).
+    fn collect_must_driven(
+        &mut self,
+        min_score: f32,
+        out: &mut Vec<ConfirmedHit>,
+        max_hits: usize,
+    ) -> Result<WindowCollect> {
+        self.set_min_competitive_score(min_score)?;
+        if self.exhausted {
+            return Ok(WindowCollect { exhausted: true });
+        }
+        if self.current.is_none() && self.land_required(0)?.is_none() {
+            return Ok(WindowCollect { exhausted: true });
+        }
+
+        loop {
+            if out.len() >= max_hits {
+                return Ok(WindowCollect { exhausted: false });
+            }
+            let Some(start) = self.current else {
+                return Ok(WindowCollect { exhausted: true });
+            };
+
+            let up_to = self.required.advance_shallow(start)?;
+            self.diag_windows += 1;
+            self.shallow_bounds = None;
+            self.clear_window_required_floor()?;
+            let required_bounds = self.required.score_bounds(up_to)?;
+            let optional_cap = self.optional_cap_in_must_block(start, up_to)?;
+            let combined = required_bounds.add(optional_cap);
+
+            if Self::usable_bounds(combined) && combined.upper < min_score {
+                self.diag_skipped += 1;
+                if up_to == u64::MAX {
+                    return Ok(WindowCollect {
+                        exhausted: self.exhaust().is_none(),
+                    });
+                }
+                if self.land_required(up_to + 1)?.is_none() {
+                    return Ok(WindowCollect { exhausted: true });
+                }
+                continue;
+            }
+
+            if min_score.is_finite()
+                && min_score > 0.0
+                && !self.optional_globally_required
+                && Self::usable_bounds(optional_cap)
+            {
+                self.apply_window_required_floor(optional_cap)?;
+            }
+
+            loop {
+                if out.len() >= max_hits {
+                    return Ok(WindowCollect { exhausted: false });
+                }
+                let Some(doc) = self.current else {
+                    return Ok(WindowCollect { exhausted: true });
+                };
+                if doc > up_to {
+                    self.clear_window_required_floor()?;
+                    return Ok(WindowCollect { exhausted: false });
+                }
+                if self.current_cannot_compete(optional_cap)? {
+                    if doc == u64::MAX {
+                        self.exhaust();
+                        return Ok(WindowCollect { exhausted: true });
+                    }
+                    if self.land_required(doc + 1)?.is_none() {
+                        return Ok(WindowCollect { exhausted: true });
+                    }
+                    continue;
+                }
+                if self.ensure_confirmed()? {
+                    let score = checked_score(self.score()?, "required-plus-optional FTS scorer")?;
+                    if score >= min_score {
+                        let document_key = self.required.document_key().ok_or_else(|| {
+                            Error::internal(
+                                "required-plus-optional FTS scorer did not expose its current document key",
+                            )
+                        })?;
+                        out.push(ConfirmedHit {
+                            doc,
+                            document_key,
+                            score,
+                        });
+                    }
+                }
+                if doc == u64::MAX {
+                    self.exhaust();
+                    return Ok(WindowCollect { exhausted: true });
+                }
+                if self.land_required(doc + 1)?.is_none() {
+                    return Ok(WindowCollect { exhausted: true });
+                }
+            }
+        }
+    }
 }
 
 impl ComposableScorer for ReqOptScorer<'_> {
@@ -3794,10 +4180,20 @@ impl ComposableScorer for ReqOptScorer<'_> {
         }
         self.shallow_bounds = None;
         let _ = self.clear_window_required_floor();
+        if iu_must_drive() {
+            return self.required.advance_shallow(target);
+        }
         let mut up_to = self.required.advance_shallow(target)?;
         match self.ensure_optional_at_or_after(target)? {
             Some(optional_doc) if optional_doc <= target => {
                 up_to = up_to.min(self.optional.advance_shallow(target)?);
+            }
+            Some(optional_doc) if iu_no_clip() => {
+                // Keep the required block. If the optional landing sits
+                // inside it, take its shallow bound so score_bounds is valid.
+                if optional_doc <= up_to {
+                    up_to = up_to.min(self.optional.advance_shallow(target)?);
+                }
             }
             Some(optional_doc) => {
                 up_to = up_to.min(optional_doc.saturating_sub(1));
@@ -3917,28 +4313,57 @@ impl ComposableScorer for ReqOptScorer<'_> {
         if self.exhausted {
             return Ok(WindowCollect { exhausted: true });
         }
+        if iu_simple() {
+            return self.collect_simple(min_score, out, max_hits);
+        }
+        if iu_must_drive() {
+            return self.collect_must_driven(min_score, out, max_hits);
+        }
+        if iu_force_intersect() {
+            return self.collect_intersection_no_windows(min_score, out, max_hits);
+        }
         if self.current.is_none() {
             self.next()?;
         }
-        let Some(start) = self.current else {
-            return Ok(WindowCollect { exhausted: true });
-        };
-
-        let up_to = self.advance_shallow(start)?;
-        let bounds = self.bounds(up_to)?;
-        if Self::usable_bounds(bounds.combined) && bounds.combined.upper < min_score {
-            self.shallow_bounds = None;
-            self.clear_window_required_floor()?;
-            if up_to == u64::MAX {
-                return Ok(WindowCollect {
-                    exhausted: self.exhaust().is_none(),
-                });
-            }
-            let next = self.position(up_to + 1)?;
-            return Ok(WindowCollect {
-                exhausted: next.is_none(),
-            });
+        if iu_diag() && !self.diag_costs_logged {
+            eprintln!(
+                "IU costs required={} optional={}",
+                self.required.cost(),
+                self.optional.cost()
+            );
+            self.diag_costs_logged = true;
         }
+
+        let bounds = loop {
+            let Some(start) = self.current else {
+                return Ok(WindowCollect { exhausted: true });
+            };
+            let up_to = self.advance_shallow(start)?;
+            self.diag_windows += 1;
+            let bounds = self.bounds(up_to)?;
+            if Self::usable_bounds(bounds.combined) && bounds.combined.upper < min_score {
+                self.diag_skipped += 1;
+                self.shallow_bounds = None;
+                self.clear_window_required_floor()?;
+                if up_to == u64::MAX {
+                    return Ok(WindowCollect {
+                        exhausted: self.exhaust().is_none(),
+                    });
+                }
+                let next = self.position(up_to + 1)?;
+                if next.is_none() {
+                    return Ok(WindowCollect { exhausted: true });
+                }
+                // Default path: one dead window then return (unit 9 A was
+                // ±1% when this loop stayed here with clipped windows).
+                // The no-clip hack keeps iterating required blocks.
+                if !iu_no_clip() {
+                    return Ok(WindowCollect { exhausted: false });
+                }
+                continue;
+            }
+            break bounds;
+        };
 
         if min_score.is_finite()
             && min_score > 0.0
@@ -3955,7 +4380,7 @@ impl ComposableScorer for ReqOptScorer<'_> {
             let Some(doc) = self.current else {
                 return Ok(WindowCollect { exhausted: true });
             };
-            if doc > up_to {
+            if doc > bounds.up_to {
                 self.shallow_bounds = None;
                 self.clear_window_required_floor()?;
                 return Ok(WindowCollect { exhausted: false });
@@ -3992,6 +4417,19 @@ impl ComposableScorer for ReqOptScorer<'_> {
                 return Ok(WindowCollect { exhausted: true });
             }
             self.position(doc + 1)?;
+        }
+    }
+}
+
+impl Drop for ReqOptScorer<'_> {
+    fn drop(&mut self) {
+        if iu_diag() && self.diag_windows > 0 {
+            eprintln!(
+                "IU windows={} skipped={} live={}",
+                self.diag_windows,
+                self.diag_skipped,
+                self.diag_windows.saturating_sub(self.diag_skipped)
+            );
         }
     }
 }
@@ -4609,6 +5047,139 @@ struct CollectedPartitions {
     boundary: Option<PartitionCollectionBoundary>,
 }
 
+/// 1 MUST leaf + N SHOULD leaves, all identity-boost `Leaf` nodes, no MUST_NOT.
+fn iu_maxscore_leaf_indices(plan: &CompoundScorerPlan) -> Option<(usize, Vec<usize>)> {
+    let CompoundScorerPlan::Boolean {
+        should,
+        must,
+        must_not,
+    } = plan
+    else {
+        return None;
+    };
+    if !must_not.is_empty() || must.len() != 1 || should.is_empty() {
+        return None;
+    }
+    let must_index = match must[0] {
+        CompoundScorerPlan::Leaf { index, boost } if boost == 1.0 => index,
+        _ => return None,
+    };
+    let mut should_indices = Vec::with_capacity(should.len());
+    for child in should {
+        match child {
+            CompoundScorerPlan::Leaf { index, boost } if *boost == 1.0 => {
+                should_indices.push(*index);
+            }
+            _ => return None,
+        }
+    }
+    Some((must_index, should_indices))
+}
+
+fn iu_maxscore_leaves_ready(
+    leaves: &[LoadedLeaf],
+    must_index: usize,
+    should_indices: &[usize],
+) -> bool {
+    if must_index >= leaves.len() || should_indices.iter().any(|&index| index >= leaves.len()) {
+        return false;
+    }
+    std::iter::once(must_index)
+        .chain(should_indices.iter().copied())
+        .all(|index| {
+            let leaf = &leaves[index];
+            leaf.postings.len() == 1
+                && leaf.params.phrase_slop.is_none()
+                && !leaf.postings[0].has_grouped_terms()
+                && leaf.postings[0].is_compressed()
+        })
+}
+
+fn collect_iu_maxscore<D, K>(
+    documents: &D,
+    mut leaves: Vec<LoadedLeaf>,
+    must_index: usize,
+    should_indices: &[usize],
+    metrics: &dyn MetricsCollector,
+    collector: &mut TopKCollector<K>,
+    mut map_document: impl FnMut(u64) -> Result<K>,
+) -> Result<CollectionStatus>
+where
+    D: WandDocuments + Sync,
+    K: Copy + Ord,
+{
+    let mut take_posting = |index: usize, position: u32| -> PostingIterator {
+        let posting = leaves[index]
+            .postings
+            .drain(..)
+            .next()
+            .expect("iu_maxscore_leaves_ready checked a single posting");
+        let mut posting = posting;
+        posting.set_position(position);
+        posting
+    };
+    let mut postings = Vec::with_capacity(1 + should_indices.len());
+    postings.push(take_posting(must_index, 0));
+    for (offset, leaf_index) in should_indices.iter().enumerate() {
+        postings.push(take_posting(
+            *leaf_index,
+            u32::try_from(offset + 1).unwrap_or(u32::MAX),
+        ));
+    }
+    let params = leaves[must_index].params.clone();
+    let scorer = leaves[must_index].scorer.clone();
+    if iu_tight() != Some(false) {
+        let mut postings = postings.into_iter();
+        let must = postings
+            .next()
+            .expect("iu_maxscore_leaves_ready checked MUST");
+        let shoulds = postings.collect::<Vec<_>>();
+        let mut overflow = false;
+        let floor = Cell::new(f32::NEG_INFINITY);
+        iu_tight_search(
+            documents,
+            scorer.as_ref(),
+            must,
+            shoulds,
+            &mut |key, score| {
+                if !collector.could_enter(score) {
+                    return Ok(());
+                }
+                let status = collector.insert(ScoredRow {
+                    row_id: map_document(key)?,
+                    score,
+                });
+                if let Some(worst) = collector.competitive_floor() {
+                    floor.set(worst);
+                }
+                if status == CollectionStatus::ScoreFloorOverflow {
+                    overflow = true;
+                }
+                Ok(())
+            },
+            || floor.get(),
+        )?;
+        return Ok(if overflow {
+            CollectionStatus::ScoreFloorOverflow
+        } else {
+            CollectionStatus::Complete
+        });
+    }
+    let mut wand = Wand::new(Operator::Or, postings.into_iter(), documents, scorer)
+        .with_pin_single_essential();
+    let hits = wand.search(params.as_ref(), metrics)?;
+    for hit in hits {
+        let status = collector.insert(ScoredRow {
+            row_id: map_document(hit.document_key)?,
+            score: hit.score,
+        });
+        if status == CollectionStatus::ScoreFloorOverflow {
+            return Ok(status);
+        }
+    }
+    Ok(CollectionStatus::Complete)
+}
+
 fn collect_partition_with_documents<D, K>(
     documents: &D,
     leaves: Vec<LoadedLeaf>,
@@ -4621,6 +5192,24 @@ where
     D: WandDocuments + Sync,
     K: Copy + Ord,
 {
+    if let Some((must_index, should_indices)) = iu_maxscore_leaf_indices(plan)
+        && iu_maxscore_leaves_ready(&leaves, must_index, &should_indices)
+        && match iu_tight() {
+            Some(false) => iu_maxscore(),
+            Some(true) => true,
+            None => iu_maxscore() || iu_tight_cost_gate(&leaves, must_index, &should_indices),
+        }
+    {
+        return collect_iu_maxscore(
+            documents,
+            leaves,
+            must_index,
+            &should_indices,
+            metrics,
+            collector,
+            map_document,
+        );
+    }
     let mut leaf_scorers = leaves
         .into_iter()
         .map(|leaf| {

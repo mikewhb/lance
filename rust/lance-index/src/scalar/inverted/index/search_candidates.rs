@@ -163,6 +163,7 @@ pub(super) fn rescore_partition_candidates<C>(
                  posting_doc_id,
                  freqs,
                  doc_length,
+                 ..
              }| {
                 position_scores.fill(0.0);
                 for (term_index, freq) in freqs {
