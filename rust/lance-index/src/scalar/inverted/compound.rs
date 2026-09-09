@@ -3051,11 +3051,6 @@ struct ReqOptScorer<'a> {
     confirmed: bool,
     min_competitive_score: f32,
     shallow_bounds: Option<ReqOptBounds>,
-    /// Set once the heap floor passes the required clause's list-wide upper
-    /// bound: from then on no document can reach the heap on the required
-    /// clause alone, so the optional subtree is mandatory for the rest of the
-    /// scan and the query is `required ∩ optional`.
-    optional_globally_required: bool,
 }
 
 impl<'a> ReqOptScorer<'a> {
@@ -3075,7 +3070,6 @@ impl<'a> ReqOptScorer<'a> {
             confirmed: false,
             min_competitive_score: f32::NEG_INFINITY,
             shallow_bounds: None,
-            optional_globally_required: false,
         }
     }
 
@@ -3096,51 +3090,6 @@ impl<'a> ReqOptScorer<'a> {
             self.confirmed = false;
         }
         self.optional_is_required = required;
-    }
-
-    /// Promote the optional subtree to required once the required clause's
-    /// list-wide upper bound can no longer reach the heap. The floor only ever
-    /// rises, so this decision is permanent. Window-local bounds must not
-    /// trigger it: a dense head can sit below the floor while a later required
-    /// block still can.
-    fn promote_optional_if_required(&mut self) {
-        if self.optional_globally_required || !self.min_competitive_score.is_finite() {
-            return;
-        }
-        let Some(required_upper) = self.required.global_score_upper_bound() else {
-            return;
-        };
-        if !required_upper.is_finite() || required_upper >= self.min_competitive_score {
-            return;
-        }
-        self.optional_globally_required = true;
-        // Intersection seeks past the cached shallow range; drop it so a
-        // stale window cannot keep driving required-only iteration.
-        self.shallow_bounds = None;
-    }
-
-    /// Intersect both sides directly once the optional subtree is known to be
-    /// mandatory. Per-window bookkeeping is overhead here: the required clause
-    /// alone cannot produce a competitive document.
-    fn position_intersection(&mut self, target: u64) -> Result<Option<u64>> {
-        self.shallow_bounds = None;
-        let Some(mut required_doc) = self.required.advance(target)? else {
-            return Ok(self.exhaust());
-        };
-        loop {
-            self.set_current(Some(required_doc));
-            self.set_optional_required(true);
-            let Some(optional_doc) = self.ensure_optional_at_or_after(required_doc)? else {
-                return Ok(self.exhaust());
-            };
-            if optional_doc == required_doc {
-                return Ok(self.current);
-            }
-            let Some(next_required) = self.required.advance(optional_doc)? else {
-                return Ok(self.exhaust());
-            };
-            required_doc = next_required;
-        }
     }
 
     fn exhaust(&mut self) -> Option<u64> {
@@ -3205,9 +3154,6 @@ impl<'a> ReqOptScorer<'a> {
     fn position(&mut self, mut target: u64) -> Result<Option<u64>> {
         if self.exhausted {
             return Ok(None);
-        }
-        if self.optional_globally_required {
-            return self.position_intersection(target);
         }
 
         'search: loop {
@@ -3391,7 +3337,6 @@ impl ComposableScorer for ReqOptScorer<'_> {
         }
         if min_score > self.min_competitive_score {
             self.min_competitive_score = min_score;
-            self.promote_optional_if_required();
         }
         Ok(())
     }
@@ -6055,144 +6000,6 @@ mod tests {
         assert_eq!(required_work.confirmations.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(optional_work.advances.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(optional_work.confirmations.load(AtomicOrdering::Relaxed), 1);
-    }
-
-    #[test]
-    fn reqopt_promotes_optional_once_required_cannot_reach_the_heap() {
-        // Required tops out at 4.5. Doc 40 reaches 5.0 only through the
-        // optional clause, past the dense head whose window floor would be
-        // computed from scores of 4.5. After the heap floor passes 4.5 the
-        // scan must switch to an intersection and still surface that tail hit.
-        let mut required_values = (0..32).map(|doc| (doc, 4.5)).collect::<Vec<_>>();
-        required_values.extend((32..64).map(|doc| (doc, 2.0)));
-        let mut optional_values = (0..32).map(|doc| (doc, 0.15)).collect::<Vec<_>>();
-        optional_values.push((40, 3.0));
-        let required = Box::new(
-            MaterializedScorer::try_new(rows(&required_values))
-                .unwrap()
-                .with_block_size(32),
-        );
-        let optional = Box::new(
-            MaterializedScorer::try_new(rows(&optional_values))
-                .unwrap()
-                .with_block_size(32),
-        );
-        let mut scorer = ReqOptScorer::new(required, optional);
-        assert!(!scorer.optional_globally_required);
-
-        let results = TopKCollector::new(3).collect(&mut scorer).unwrap();
-
-        assert_eq!(results, rows(&[(40, 5.0), (0, 4.65), (1, 4.65)]));
-        assert!(
-            scorer.optional_globally_required,
-            "a heap floor above the required clause's global upper must promote \
-             the optional subtree"
-        );
-    }
-
-    #[test]
-    fn reqopt_does_not_permanently_promote_from_a_window_floor() {
-        // The first block cannot reach a heap of 1.15 on required alone, but a
-        // later required-only document scores 10. Promoting from the window
-        // would skip that document because it has no optional match.
-        let mut required_values = (0..32).map(|doc| (doc, 1.0)).collect::<Vec<_>>();
-        required_values.push((100, 10.0));
-        let optional_values = (0..32).map(|doc| (doc, 0.15)).collect::<Vec<_>>();
-        let required = Box::new(
-            MaterializedScorer::try_new(rows(&required_values))
-                .unwrap()
-                .with_block_size(32),
-        );
-        let optional = Box::new(
-            MaterializedScorer::try_new(rows(&optional_values))
-                .unwrap()
-                .with_block_size(32),
-        );
-        let mut scorer = ReqOptScorer::new(required, optional);
-
-        let results = TopKCollector::new(3).collect(&mut scorer).unwrap();
-
-        assert_eq!(results, rows(&[(100, 10.0), (0, 1.15), (1, 1.15)]));
-        assert!(
-            !scorer.optional_globally_required,
-            "a later required-only winner means the list-wide required upper \
-             still reaches the heap, so the optional subtree must stay optional"
-        );
-    }
-
-    #[test]
-    fn reqopt_promotes_optional_disjunction_as_a_union() {
-        // N SHOULD clauses sit under one optional child (their union). After
-        // promote the scan is required ∩ (SHOULD_1 ∨ …), not an intersection
-        // with each SHOULD.
-        let required_values = (0..100).map(|doc| (doc, 1.0)).collect::<Vec<_>>();
-        let required = materialized(&required_values);
-        let optional = Box::new(
-            DisjunctionScorer::try_new(
-                vec![materialized(&[(10, 10.0)]), materialized(&[(90, 10.0)])],
-                DisjunctionScore::Sum,
-            )
-            .unwrap(),
-        );
-        let mut scorer = ReqOptScorer::new(required, optional);
-        let competitive_score = Arc::new(CompetitiveScore::default());
-        competitive_score.raise(5.0);
-
-        let results = TopKCollector::with_competitive_score(2, competitive_score)
-            .collect(&mut scorer)
-            .unwrap();
-
-        assert_eq!(results, rows(&[(10, 11.0), (90, 11.0)]));
-        assert!(
-            scorer.optional_globally_required,
-            "a pre-raised floor above the required global upper must promote \
-             the optional union"
-        );
-    }
-
-    #[test]
-    fn reqopt_does_not_promote_without_a_required_global_bound() {
-        // A missing list-wide bound is not "required cannot reach the heap".
-        // Doc 80 is required-only and is the true winner; promoting on None
-        // would keep only the optional intersection and drop it.
-        let required = Box::new(UnboundedScorer {
-            inner: MaterializedScorer::try_new(rows(&[(0, 1.0), (80, 20.0)])).unwrap(),
-        });
-        let optional = materialized(&[(0, 10.0)]);
-        let mut scorer = ReqOptScorer::new(required, optional);
-        let competitive_score = Arc::new(CompetitiveScore::default());
-        competitive_score.raise(5.0);
-
-        let results = TopKCollector::with_competitive_score(1, competitive_score)
-            .collect(&mut scorer)
-            .unwrap();
-
-        assert_eq!(results, rows(&[(80, 20.0)]));
-        assert!(
-            !scorer.optional_globally_required,
-            "required.global_score_upper_bound() = None must refuse promote"
-        );
-    }
-
-    #[test]
-    fn reqopt_does_not_promote_when_required_upper_equals_the_floor() {
-        // Inclusive heap: score == floor stays competitive. Equality with the
-        // required list-wide upper must not turn the optional subtree on.
-        let required = materialized(&[(0, 1.0), (50, 5.0)]);
-        let optional = materialized(&[(0, 0.1)]);
-        let mut scorer = ReqOptScorer::new(required, optional);
-        let competitive_score = Arc::new(CompetitiveScore::default());
-        competitive_score.raise(5.0);
-
-        let results = TopKCollector::with_competitive_score(1, competitive_score)
-            .collect(&mut scorer)
-            .unwrap();
-
-        assert_eq!(results, rows(&[(50, 5.0)]));
-        assert!(
-            !scorer.optional_globally_required,
-            "required_upper == min_competitive_score must keep required-only hits"
-        );
     }
 
     #[test]
