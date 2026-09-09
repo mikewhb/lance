@@ -178,7 +178,7 @@ Wikipedia SBG 索引是 `block_size=128`、`quantized_scoring=false`（引擎 `d
 |---|---|---:|---|---|---|
 | 1 | **2** BMC 前移 | 几十 | 现成 `level0_doc_weight_bounds_cached`，只是解压前调用 | `+walk +the +line` 社区 10.2ms / 6.13× | **已量、已回滚**（见 §2）。不要同 PR 带 lead-stream |
 | 2 | **1** 稀有词 seed（先留 2048） | ~130 | 一个函数 + `maxscore_search` 开搜调一次 | `niceville` 社区 12.5ms / 19.1× → **0.55ms / 0.84×**；`the incredibles` 38.7ms / 45.5× → **0.97ms / 1.14×** | **已量、已落地**（见 §1）。只报那十几条离群 OR；`the movement` 未变慢 |
-| 3 | **5a** ReqOpt 升格 | ~150 | 只动 `compound.rs` | IU 40 条 8.53× 是最差标签；**这一刀**大约 −12%，8.53×→0.95× 是 5b | 换文件、不挡 AND/OR。场景很大但刀偏瘦：先做是为了看见 5a 够不够，不够再拍 5b |
+| 3 | **5a** ReqOpt 升格 | ~150 | 只动 `compound.rs` | IU 40 条 8.53× 是最差标签；分析树仅升格大约 −12%，8.53×→0.95× 是 5b | **已量、已回滚**（见 §5a）。社区 IU AVERAGE **+5.8%**，0 条快 10% 以上、9 条慢 10% 以上。不要同 PR 带 5b |
 | 4 | **6** dense `f32` addend | ~80 | 只动 `documents.rs`，公式 airtight；后面打分都吃得到 | 薄：分析树 union −9.6%，AVERAGE 读不出来 | 简单且基础，但没有自己的查询标签。放在 2/1 之后，避免污染那两把尖刀；放在 3 之前，大窗直接查表 |
 | 5 | **4** 先打分再对位置（任何 slop） | ~80–120 | 小；叶子三处 + bulk 改序 | phrase 1.94×；分析树 named **几乎噪声** | 同样小，但场景效果六条里最弱，不能排到 2/1 前面。稀对预筛不带 |
 | 6 | **3** MaxScore 一只窗 | ~550–700 | 最大一块 | union 301 条 2.21×，`cheap hotels` / chicago；**量**最大 | 代码最重，放最后。此时 seed 已垫稀有 OR，addend 已在，窗 PR 只看均衡 union |
@@ -325,6 +325,14 @@ Lance 短语分数 = 各词 BM25 按**词频**求和，位置只做 gate（社�
 - 文件：`compound.rs` `ReqOptScorer`
 - 量：大约 **80–120 行**
 - 风险低，Boolean 默认路径就能用。这是 Lucene `ReqOptSumScorer` 在 `minCompetitiveScore > maxScore(required)` 时的行为。
+
+**已量（2026-09-09，社区尺子 A1 TOP_10，对照 Item 1 seed）。** 过程与 JSON 在 `.agent/fts-item5a-reqopt/`。hit count 943/943 一致。
+
+IU 40 条平均 27,377µs → **28,978µs**（**+5.8%**，9.45× → 9.92× Lucene）。`+public transit` −5.9%、`+data privacy` −3.4%，都在噪声里；9 条长 IU 慢 10% 以上（最差 `+health care cost trends` +19.2%），0 条快 10% 以上。intersection / union / phrase 均值不动。
+
+升格本身 recall 正确（只用 MUST 列表级上界，不用窗界；optional 按并集升）。墙钟回归是因为升格之后 `position()` 不再走窗内 `combined.upper` 整窗跳，改成对每个交集候选 leapfrog；社区 `ReqOptScorer` 已经有窗内临时 intersect，再切永久交集在长 IU 上更贵。分析树 −12% 含那棵树上其它 ReqOpt / 窗收集改动，不能当成这一刀叠进社区之后的承诺。
+
+**这刀已 revert**，现场留在 git 历史上。不要据此开 5b；5b 仍单独拍板。
 
 ### 5b. IU tight（单独拍板）
 
