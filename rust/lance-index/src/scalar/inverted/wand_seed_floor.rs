@@ -45,6 +45,7 @@ pub(super) fn seed_floor_from_sparsest_clause<'a, S, D, I>(
     scorer: &S,
     documents: &D,
     norm_k_ref: Option<(&'a [u8], &'a [f32; 256])>,
+    exact_addends: Option<&[f32]>,
 ) -> Option<f32>
 where
     S: Scorer,
@@ -120,14 +121,22 @@ where
             if documents.document_key_for_doc_id(doc).is_none() {
                 continue;
             }
-            let score = match norm_k_ref {
-                Some((norms, cache)) => {
+            let score = match (norm_k_ref, exact_addends) {
+                (Some((norms, cache)), _) => {
                     let Some(&code) = norms.get(doc as usize) else {
                         continue;
                     };
                     query_weight * bm25_doc_weight_with_norm(freq, cache[code as usize])
                 }
-                None => query_weight * scorer.doc_weight(freq, documents.scoring_num_tokens(doc)),
+                (None, Some(addends)) => {
+                    let Some(&addend) = addends.get(doc as usize) else {
+                        continue;
+                    };
+                    query_weight * bm25_doc_weight_with_norm(freq, addend)
+                }
+                (None, None) => {
+                    query_weight * scorer.doc_weight(freq, documents.scoring_num_tokens(doc))
+                }
             };
             if score <= 0.0 || !score.is_finite() {
                 continue;

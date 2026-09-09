@@ -106,6 +106,9 @@ pub(super) struct DocLengths {
     total_tokens: u64,
     quantized_scoring: bool,
     norms: OnceLock<Box<[u8]>>,
+    /// Per-document BM25 length addends for exact-scoring partitions.
+    /// Quantized partitions use the 256-entry norm cache instead.
+    exact_addends: OnceLock<(u64, Box<[f32]>)>,
 }
 
 impl DeepSizeOf for DocLengths {
@@ -115,6 +118,11 @@ impl DeepSizeOf for DocLengths {
                 .norms
                 .get()
                 .map(|norms| std::mem::size_of_val(norms.as_ref()))
+                .unwrap_or(0)
+            + self
+                .exact_addends
+                .get()
+                .map(|(_, slab)| std::mem::size_of_val(slab.as_ref()))
                 .unwrap_or(0)
     }
 }
@@ -156,6 +164,7 @@ impl DocLengths {
             total_tokens,
             quantized_scoring,
             norms: OnceLock::new(),
+            exact_addends: OnceLock::new(),
         })
     }
 
@@ -186,6 +195,27 @@ impl DocLengths {
                 })
                 .as_ref(),
         )
+    }
+
+    /// Per-document BM25 length addends when this partition scores exact
+    /// lengths. The slab is keyed by the scorer's corpus identity so a
+    /// later search with different statistics does not reuse a stale table.
+    pub(super) fn exact_bm25_addends(
+        &self,
+        cache_key: u64,
+        doc_norm: &mut dyn FnMut(u32) -> f32,
+    ) -> Option<&[f32]> {
+        if self.quantized_scoring {
+            return None;
+        }
+        let (stored_key, slab) = self.exact_addends.get_or_init(|| {
+            let mut slab = Vec::with_capacity(self.values.len());
+            for &length in self.values.iter() {
+                slab.push(doc_norm(length));
+            }
+            (cache_key, slab.into_boxed_slice())
+        });
+        (*stored_key == cache_key).then_some(slab.as_ref())
     }
 
     fn scoring_ready(&self) -> bool {
@@ -2744,6 +2774,65 @@ mod tests {
         assert_eq!(lengths.total_tokens(), 10);
         assert_eq!(lengths.scoring_norms().unwrap().len(), 3);
         assert_eq!(lengths.deep_size_of() - before_norms, 3);
+    }
+
+    #[test]
+    fn exact_bm25_addends_match_the_doc_norm_expression() {
+        let lengths = DocLengths::try_new(
+            ScalarBuffer::from(vec![2, 3, 5]),
+            3,
+            Some(10),
+            false,
+            "docs",
+        )
+        .unwrap();
+        let avgdl = 10.0_f32 / 3.0;
+        let mut doc_norm = |tokens: u32| {
+            let tokens = tokens as f32;
+            1.2 * (1.0 - 0.75 + 0.75 * tokens / avgdl)
+        };
+        let expected = [2_u32, 3, 5].map(&mut doc_norm);
+        let cache_key = u64::from(avgdl.to_bits());
+        let before_addends = lengths.deep_size_of();
+        let slab = lengths
+            .exact_bm25_addends(cache_key, &mut doc_norm)
+            .expect("exact partitions expose a dense addend slab");
+        assert_eq!(slab, expected.as_slice());
+        assert_eq!(
+            lengths.deep_size_of() - before_addends,
+            3 * std::mem::size_of::<f32>()
+        );
+        assert!(
+            lengths
+                .exact_bm25_addends(cache_key + 1, &mut doc_norm)
+                .is_none(),
+            "a different corpus-statistics key must not reuse the slab"
+        );
+
+        let empty = DocLengths::try_new(
+            ScalarBuffer::from(Vec::<u32>::new()),
+            0,
+            Some(0),
+            false,
+            "docs",
+        )
+        .unwrap();
+        assert!(
+            empty
+                .exact_bm25_addends(cache_key, &mut doc_norm)
+                .expect("empty exact partitions still expose a slab")
+                .is_empty()
+        );
+
+        let quantized =
+            DocLengths::try_new(ScalarBuffer::from(vec![2, 3, 5]), 3, Some(10), true, "docs")
+                .unwrap();
+        assert!(
+            quantized
+                .exact_bm25_addends(cache_key, &mut doc_norm)
+                .is_none(),
+            "quantized partitions keep the 256-entry norm cache instead"
+        );
     }
 
     #[tokio::test]

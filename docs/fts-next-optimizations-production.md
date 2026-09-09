@@ -179,7 +179,7 @@ Wikipedia SBG 索引是 `block_size=128`、`quantized_scoring=false`（引擎 `d
 | 1 | **2** BMC 前移 | 几十 | 现成 `level0_doc_weight_bounds_cached`，只是解压前调用 | `+walk +the +line` 社区 10.2ms / 6.13× | **已量、已回滚**（见 §2）。不要同 PR 带 lead-stream |
 | 2 | **1** 稀有词 seed（先留 2048） | ~130 | 一个函数 + `maxscore_search` 开搜调一次 | `niceville` 社区 12.5ms / 19.1× → **0.55ms / 0.84×**；`the incredibles` 38.7ms / 45.5× → **0.97ms / 1.14×** | **已量、已落地**（见 §1）。只报那十几条离群 OR；`the movement` 未变慢 |
 | 3 | **5a** ReqOpt 升格 | ~150 | 只动 `compound.rs` | IU 40 条 8.53× 是最差标签；分析树仅升格大约 −12%，8.53×→0.95× 是 5b | **已量、已回滚**（见 §5a）。社区 IU AVERAGE **+5.8%**，0 条快 10% 以上、9 条慢 10% 以上。不要同 PR 带 5b |
-| 4 | **6** dense `f32` addend | ~80 | 只动 `documents.rs`，公式 airtight；后面打分都吃得到 | 薄：分析树 union −9.6%，AVERAGE 读不出来 | 简单且基础，但没有自己的查询标签。放在 2/1 之后，避免污染那两把尖刀；放在 3 之前，大窗直接查表 |
+| 4 | **6** dense `f32` addend | ~80 | 只动 `documents.rs` + 打分热路径查表 | 薄：分析树 union −9.6%，AVERAGE 读不出来 | **已量、已落地**（见 §6）。社区 union 301 条 **−11.3%**（2.27ms → 2.02ms）。不要拿 TOP_10 AVERAGE 当主证据 |
 | 5 | **4** 先打分再对位置（任何 slop） | ~80–120 | 小；叶子三处 + bulk 改序 | phrase 1.94×；分析树 named **几乎噪声** | 同样小，但场景效果六条里最弱，不能排到 2/1 前面。稀对预筛不带 |
 | 6 | **3** MaxScore 一只窗 | ~550–700 | 最大一块 | union 301 条 2.21×，`cheap hotels` / chicago；**量**最大 | 代码最重，放最后。此时 seed 已垫稀有 OR，addend 已在，窗 PR 只看均衡 union |
 
@@ -366,7 +366,11 @@ IU 40 条平均 27,377µs → **28,978µs**（**+5.8%**，9.45× → 9.92× Luce
 - **不要**：`u16` 码 + 小字典、AVX gather 打分路径（关键路径多一次相关载入，换 2 字节/doc；1M doc 才 4MB。本分支测过没墙钟 / 轻微回退，不要 port）
 - **不改**磁盘索引、不改公式
 
-约 **80 行**，`documents.rs`。
+约 **80 行**，`documents.rs`；打分热路径（MAXSCORE / bulk AND / seed floor）改成查表。
+
+**已量（2026-09-09，社区尺子 A1 TOP_10，对照 Item 1 seed）。** 过程与 JSON 在 `.agent/fts-item6-addend/`。hit count 943/943 一致。
+
+union 301 条平均 2,274µs → **2,018µs**（**−11.3%**）。`cheap hotels` −3.7%、`chicago teachers union` −4.0%。不要拿 TOP_10 AVERAGE 当主证据。
 
 ---
 

@@ -1631,6 +1631,7 @@ impl PostingIterator {
         docs: &D,
         scorer: &S,
         norm_k: Option<(&[u8], &[f32; 256])>,
+        exact_addends: Option<&[f32]>,
         acc: &mut WindowAccumulator,
     ) {
         if self.doc().is_some_and(|doc| doc.doc_id() < window_min) {
@@ -1662,12 +1663,17 @@ impl PostingIterator {
                         let freq = compressed.freqs[offset];
                         // One byte-norm load plus a cached addend replaces
                         // recomputing the BM25 denominator per doc.
-                        let doc_weight = match norm_k {
-                            Some((norms, cache)) => bm25_doc_weight_with_norm(
+                        let doc_weight = match (norm_k, exact_addends) {
+                            (Some((norms, cache)), _) => bm25_doc_weight_with_norm(
                                 freq,
                                 cache[norms[doc_id as usize] as usize],
                             ),
-                            None => scorer.doc_weight(freq, docs.scoring_num_tokens(doc_id)),
+                            (None, Some(addends)) => {
+                                bm25_doc_weight_with_norm(freq, addends[doc_id as usize])
+                            }
+                            (None, None) => {
+                                scorer.doc_weight(freq, docs.scoring_num_tokens(doc_id))
+                            }
                         };
                         let score = self.query_weight * doc_weight;
                         let slot = (u64::from(doc_id) - window_min) as usize;
@@ -1880,12 +1886,31 @@ pub(super) trait WandDocuments {
     }
     fn scoring_norms(&self) -> Option<&[u8]>;
     fn scoring_num_tokens(&self, doc_id: u32) -> u32;
+    /// Exact-length BM25 addend slab, when the partition does not quantize
+    /// document lengths. Default is none; modern exact-scoring partitions
+    /// bake it once per corpus-statistics key.
+    fn exact_bm25_addends(
+        &self,
+        _cache_key: u64,
+        _doc_norm: &mut dyn FnMut(u32) -> f32,
+    ) -> Option<&[f32]> {
+        None
+    }
     fn doc_length(&self, doc: &DocInfo) -> u32;
     fn document_key(&self, doc: &DocInfo) -> Option<u64>;
     fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64>;
     fn candidate_from_key(&self, key: u64) -> Self::Candidate;
     fn flat_documents(&self) -> Option<FlatDocuments<'_>>;
     fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32;
+}
+
+fn exact_bm25_addend_slab<'a, S, D>(scorer: &S, documents: &'a D) -> Option<&'a [f32]>
+where
+    S: Scorer + ?Sized,
+    D: WandDocuments + ?Sized,
+{
+    let key = scorer.doc_weight_cache_key()?;
+    documents.exact_bm25_addends(key, &mut |len| scorer.doc_norm(len).unwrap_or(0.0))
 }
 
 pub(super) trait ModernVisibility {
@@ -1967,6 +1992,14 @@ impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
 
     fn scoring_num_tokens(&self, doc_id: u32) -> u32 {
         self.lengths.scoring(DocId::new(doc_id))
+    }
+
+    fn exact_bm25_addends(
+        &self,
+        cache_key: u64,
+        doc_norm: &mut dyn FnMut(u32) -> f32,
+    ) -> Option<&[f32]> {
+        self.lengths.exact_bm25_addends(cache_key, doc_norm)
     }
 
     fn doc_length(&self, doc: &DocInfo) -> u32 {
@@ -2779,6 +2812,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let norm_k_ref = norm_k
             .as_ref()
             .map(|(norms, cache)| (*norms, cache.as_ref()));
+        let exact_addends = if norm_k_ref.is_none() {
+            exact_bm25_addend_slab(&self.scorer, self.documents)
+        } else {
+            None
+        };
         // Before a competitive floor exists the heap climbs in document
         // order, so a rare term paired with a stopword scans most of the
         // stopword before the rare documents have filled top-k. Seeding
@@ -2793,6 +2831,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 &self.scorer,
                 self.documents,
                 norm_k_ref,
+                exact_addends,
             )
         {
             // Lower bound on the live k-th, not a collected heap k-th. Do
@@ -2968,11 +3007,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         // the exact doc length is only needed at insert time.
                         let norm_addend =
                             norm_k_ref.map(|(norms, cache)| cache[norms[doc as usize] as usize]);
-                        let score = match norm_addend {
-                            Some(addend) => {
+                        let exact_addend = exact_addends.map(|addends| addends[doc as usize]);
+                        let score = match (norm_addend, exact_addend) {
+                            (Some(addend), _) | (None, Some(addend)) => {
                                 essential_weight * bm25_doc_weight_with_norm(freq, addend)
                             }
-                            None => {
+                            (None, None) => {
                                 essential_weight
                                     * self.scorer.doc_weight(
                                         freq,
@@ -3020,15 +3060,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                     if let Some(d) = probe.doc()
                                         && d.doc_id() == doc
                                     {
-                                        let contribution = match norm_addend {
-                                            Some(addend) => {
+                                        let contribution = match (norm_addend, exact_addend) {
+                                            (Some(addend), _) | (None, Some(addend)) => {
                                                 probe.query_weight
                                                     * bm25_doc_weight_with_norm(
                                                         d.frequency(),
                                                         addend,
                                                     )
                                             }
-                                            None => probe.score(
+                                            (None, None) => probe.score(
                                                 &self.scorer,
                                                 d.frequency(),
                                                 self.documents.scoring_num_tokens(doc as u32),
@@ -3170,6 +3210,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         self.documents,
                         &self.scorer,
                         norm_k_ref,
+                        exact_addends,
                         &mut acc,
                     );
                 }
@@ -3214,6 +3255,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         // cache when available.
                         let norm_addend =
                             norm_k_ref.map(|(norms, cache)| cache[norms[doc as usize] as usize]);
+                        let exact_addend = exact_addends.map(|addends| addends[doc as usize]);
                         let mut doc_length_cell: Option<u32> = None;
                         let needs_canonical_rescore =
                             first_essential != 0 || !clauses_in_query_order;
@@ -3243,12 +3285,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             if let Some(d) = posting.doc()
                                 && d.doc_id() == doc
                             {
-                                let contribution = match norm_addend {
-                                    Some(addend) => {
+                                let contribution = match (norm_addend, exact_addend) {
+                                    (Some(addend), _) | (None, Some(addend)) => {
                                         posting.query_weight
                                             * bm25_doc_weight_with_norm(d.frequency(), addend)
                                     }
-                                    None => {
+                                    (None, None) => {
                                         let doc_length =
                                             *doc_length_cell.get_or_insert_with(|| {
                                                 self.documents.scoring_num_tokens(doc as u32)
@@ -3279,12 +3321,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                     if freq == 0 {
                                         continue;
                                     }
-                                    let contribution = match norm_addend {
-                                        Some(addend) => {
+                                    let contribution = match (norm_addend, exact_addend) {
+                                        (Some(addend), _) | (None, Some(addend)) => {
                                             clause.posting.query_weight
                                                 * bm25_doc_weight_with_norm(freq, addend)
                                         }
-                                        None => {
+                                        (None, None) => {
                                             clause.posting.score(&self.scorer, freq, doc_length)
                                         }
                                     };
@@ -4177,6 +4219,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // per-clause BM25 denominator recompute in pass B.
         let mut norm_k = None;
         let mut norm_k_initialized = false;
+        let exact_addends = exact_bm25_addend_slab(&self.scorer, self.documents);
 
         // Per-window prune LUT for the merge kernels: an upper bound of the
         // first (rarest) clause's score by clamped frequency. Lead docs whose
@@ -4453,6 +4496,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         }
                         None => (None, batch_lens[index]),
                     };
+                    let exact_addend = exact_addends.map(|addends| addends[doc as usize]);
                     let offs = &batch_offs[index * num_lists..(index + 1) * num_lists];
                     if self.threshold > 0.0 && num_lists >= 2 && others_block_max.is_none() {
                         others_block_max = Some(
@@ -4467,12 +4511,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         && let Some(others_block_max) = others_block_max
                     {
                         let first_freq = unsafe { *wins[0].freqs.add(offs[0] as usize) };
-                        let first_score = match norm_addend {
-                            Some(addend) => {
+                        let first_score = match (norm_addend, exact_addend) {
+                            (Some(addend), _) | (None, Some(addend)) => {
                                 self.lead[0].query_weight
                                     * bm25_doc_weight_with_norm(first_freq, addend)
                             }
-                            None => self.lead[0].score(&self.scorer, first_freq, doc_length),
+                            (None, None) => {
+                                self.lead[0].score(&self.scorer, first_freq, doc_length)
+                            }
                         };
                         if score_sum_cannot_compete(
                             first_score,
@@ -4523,11 +4569,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         let posting = &self.lead[clause_index];
                         let off = offs[clause_index];
                         let freq = unsafe { *win.freqs.add(off as usize) };
-                        score += match norm_addend {
-                            Some(addend) => {
+                        score += match (norm_addend, exact_addend) {
+                            (Some(addend), _) | (None, Some(addend)) => {
                                 posting.query_weight * bm25_doc_weight_with_norm(freq, addend)
                             }
-                            None => posting.score(&self.scorer, freq, doc_length),
+                            (None, None) => posting.score(&self.scorer, freq, doc_length),
                         };
                     }
 
