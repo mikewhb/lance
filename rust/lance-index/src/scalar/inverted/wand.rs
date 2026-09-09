@@ -22,6 +22,8 @@ use crate::metrics::MetricsCollector;
 
 #[path = "wand_intersection.rs"]
 mod intersection;
+#[path = "wand_seed_floor.rs"]
+mod seed_floor;
 
 use super::{
     CompressedPositionStorage,
@@ -2314,6 +2316,10 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
     maxscore_general_windows: usize,
+    #[cfg(test)]
+    maxscore_floor_seeds: usize,
+    #[cfg(test)]
+    maxscore_comparisons: usize,
     documents: &'a D,
     scorer: S,
     // Shared cross-partition top-k floor. Each partition publishes its local
@@ -2420,6 +2426,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
             maxscore_general_windows: 0,
+            #[cfg(test)]
+            maxscore_floor_seeds: 0,
+            #[cfg(test)]
+            maxscore_comparisons: 0,
             documents,
             scorer,
             shared_threshold: None,
@@ -2769,6 +2779,33 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let norm_k_ref = norm_k
             .as_ref()
             .map(|(norms, cache)| (*norms, cache.as_ref()));
+        // Before a competitive floor exists the heap climbs in document
+        // order, so a rare term paired with a stopword scans most of the
+        // stopword before the rare documents have filled top-k. Seeding
+        // from the sparsest clause is valid only for disjunction: a
+        // document on that list may still fail an intersection.
+        if limit != usize::MAX
+            && clauses.len() >= 2
+            && self.threshold <= 0.0
+            && let Some(floor) = seed_floor::seed_floor_from_sparsest_clause(
+                clauses.iter().map(|clause| clause.posting.as_ref()),
+                limit,
+                &self.scorer,
+                self.documents,
+                norm_k_ref,
+            )
+        {
+            // Lower bound on the live k-th, not a collected heap k-th. Do
+            // not multiply by wand_factor or publish to the shared slot:
+            // the heap is still empty, so either would prune the documents
+            // that justify the bound. Factor and shared floor apply once
+            // TopKCollector is full.
+            self.threshold = floor;
+            #[cfg(test)]
+            {
+                self.maxscore_floor_seeds += 1;
+            }
+        }
         let mut num_comparisons = 0usize;
         // Adaptive minimum window size (Lucene): grow windows when they yield
         // too few candidates to amortize the per-window bound computations.
@@ -3298,6 +3335,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
 
         metrics.record_comparisons(num_comparisons);
+        #[cfg(test)]
+        {
+            self.maxscore_comparisons = num_comparisons;
+        }
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
@@ -6239,6 +6280,360 @@ mod tests {
         assert_eq!(scored.load(Ordering::Relaxed), contributions.len());
         assert_eq!(wand.maxscore_single_essential_windows > 0, single_essential);
         assert_eq!(wand.maxscore_general_windows > 0, !single_essential);
+    }
+
+    #[test]
+    fn maxscore_seeds_the_floor_from_a_rare_clause_and_stops_scanning_the_common_one() {
+        // A rare clause whose documents are spread across the whole address
+        // space cannot fill the heap until the walk is nearly over, so without
+        // seeding the common clause stays essential and gets scanned in full.
+        const TOTAL: u32 = 40 * crate::scalar::inverted::LEGACY_BLOCK_SIZE as u32;
+        let common = PostingIterator::new(
+            "common".to_owned(),
+            0,
+            0,
+            generate_contiguous_impact_posting_list_with_block_size(
+                TOTAL as usize,
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            TOTAL as usize,
+        );
+        let stride = TOTAL / 20;
+        let rare_docs = (1..20).map(|i| i * stride).collect::<Vec<_>>();
+        let rare_len = rare_docs.len();
+        let rare = PostingIterator::new(
+            "rare".to_owned(),
+            1,
+            1,
+            generate_impact_posting_list_with_freqs_and_block_size(
+                rare_docs.clone(),
+                vec![400; rare_len],
+                vec![1; rare_len],
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            TOTAL as usize,
+        );
+        let mut docs = DocSet::default();
+        for doc in 0..TOTAL {
+            docs.append(doc.into(), 1);
+        }
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            [common, rare].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(5)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        // Every rare document outscores every common-only one, so the answer
+        // comes entirely from the rare clause.
+        assert_eq!(hits.len(), 5);
+        assert_eq!(wand.maxscore_floor_seeds, 1);
+        for hit in &hits {
+            assert!(
+                rare_docs.contains(&(hit.posting_doc_id as u32)),
+                "the rare clause must dominate the top k, got {}",
+                hit.posting_doc_id
+            );
+        }
+        // The seeded floor leaves the common clause unable to compete in any
+        // window, so its blocks are skipped wholesale rather than scored.
+        assert!(
+            wand.maxscore_comparisons > 0 && wand.maxscore_comparisons <= rare_len,
+            "seeding should keep scoring to the rare clause's own postings, \
+             scored {} of {} candidates",
+            wand.maxscore_comparisons,
+            TOTAL
+        );
+    }
+
+    #[test]
+    fn maxscore_seed_floor_keeps_documents_that_tie_for_kth() {
+        // The search heap is still empty, so the seeded floor must sit one
+        // ULP below the k-th contribution. Exclusive pruning at the exact
+        // k-th would drop every remaining document that ties for k-th.
+        const TOTAL: u32 = 8 * crate::scalar::inverted::LEGACY_BLOCK_SIZE as u32;
+        let common = PostingIterator::new(
+            "common".to_owned(),
+            0,
+            0,
+            generate_contiguous_impact_posting_list_with_block_size(
+                TOTAL as usize,
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            TOTAL as usize,
+        );
+        // Disjoint from the common list so the walk score equals the rare-only
+        // contribution. Overlap would sit above both the exact k-th and the
+        // ULP floor, and this test would stay green for the wrong floor.
+        let rare_docs = vec![TOTAL + 10, TOTAL + 20, TOTAL + 30, TOTAL + 40, TOTAL + 50];
+        let num_docs = (TOTAL + 51) as usize;
+        let rare = PostingIterator::new(
+            "rare".to_owned(),
+            1,
+            1,
+            generate_impact_posting_list_with_freqs_and_block_size(
+                rare_docs.clone(),
+                vec![400; rare_docs.len()],
+                vec![1; rare_docs.len()],
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            num_docs,
+        );
+        let mut docs = DocSet::default();
+        for doc in 0..num_docs as u32 {
+            docs.append(doc.into(), 1);
+        }
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            [common, rare].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(3)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(wand.maxscore_floor_seeds, 1);
+        assert_eq!(hits.len(), 3);
+        for hit in &hits {
+            assert!(
+                rare_docs.contains(&(hit.posting_doc_id as u32)),
+                "tied rare documents must survive the exclusive seeded floor, got {}",
+                hit.posting_doc_id
+            );
+        }
+    }
+
+    struct HidingDocuments<'a> {
+        inner: &'a DocSet,
+        hidden: &'a [u32],
+    }
+
+    impl WandDocuments for HidingDocuments<'_> {
+        type Candidate = u64;
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn scoring_norms(&self) -> Option<&[u8]> {
+            WandDocuments::scoring_norms(self.inner)
+        }
+
+        fn scoring_num_tokens(&self, doc_id: u32) -> u32 {
+            WandDocuments::scoring_num_tokens(self.inner, doc_id)
+        }
+
+        fn doc_length(&self, doc: &DocInfo) -> u32 {
+            WandDocuments::doc_length(self.inner, doc)
+        }
+
+        fn document_key(&self, doc: &DocInfo) -> Option<u64> {
+            self.document_key_for_doc_id(doc.doc_id() as u32)
+        }
+
+        fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+            if self.hidden.contains(&doc_id) {
+                None
+            } else {
+                WandDocuments::document_key_for_doc_id(self.inner, doc_id)
+            }
+        }
+
+        fn candidate_from_key(&self, key: u64) -> Self::Candidate {
+            WandDocuments::candidate_from_key(self.inner, key)
+        }
+
+        fn flat_documents(&self) -> Option<FlatDocuments<'_>> {
+            None
+        }
+
+        fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32 {
+            WandDocuments::flat_doc_length(self.inner, doc_id, document_key, compressed)
+        }
+    }
+
+    #[test]
+    fn maxscore_seed_floor_ignores_invisible_postings() {
+        // Invisible rows stay in the posting list. Counting them toward the
+        // k-th would publish a floor above every live winner.
+        const TOTAL: u32 = 8 * crate::scalar::inverted::LEGACY_BLOCK_SIZE as u32;
+        let common = PostingIterator::new(
+            "common".to_owned(),
+            0,
+            0,
+            generate_contiguous_impact_posting_list_with_block_size(
+                TOTAL as usize,
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            TOTAL as usize,
+        );
+        let rare_docs = vec![10_u32, 20, 30, 40, 50];
+        let hidden = [10_u32, 20, 30];
+        let rare = PostingIterator::new(
+            "rare".to_owned(),
+            1,
+            1,
+            generate_impact_posting_list_with_freqs_and_block_size(
+                rare_docs,
+                vec![400; 5],
+                vec![1; 5],
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            TOTAL as usize,
+        );
+        let mut docs = DocSet::default();
+        for doc in 0..TOTAL {
+            docs.append(doc.into(), 1);
+        }
+        let documents = HidingDocuments {
+            inner: &docs,
+            hidden: &hidden,
+        };
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            [common, rare].into_iter(),
+            &documents,
+            InverseDocLengthScorer,
+        );
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(3)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        // Only two rare docs are live, so the pass cannot fill k and must
+        // decline. The third hit comes from the common clause.
+        assert_eq!(wand.maxscore_floor_seeds, 0);
+        assert_eq!(hits.len(), 3);
+        let rare_hits = hits
+            .iter()
+            .filter(|hit| hit.posting_doc_id == 40 || hit.posting_doc_id == 50)
+            .count();
+        assert_eq!(rare_hits, 2);
+        assert!(
+            hits.iter().any(|hit| hit.posting_doc_id < TOTAL as u64
+                && hit.posting_doc_id != 40
+                && hit.posting_doc_id != 50),
+            "after declining to seed, a common document must fill the remaining slot"
+        );
+    }
+
+    #[test]
+    fn maxscore_skips_floor_seeding_when_the_sparse_clause_exceeds_the_budget() {
+        // A clause can be a small share of a stopword's list and still be long
+        // enough that decoding it costs more than the walk it saves, so the
+        // share gate alone is not enough to decline.
+        let sparse_len = seed_floor::SEED_FLOOR_MAX_POSTINGS + 1;
+        let total = (sparse_len * seed_floor::SEED_FLOOR_MAX_COST_SHARE * 2) as u32;
+        let common = PostingIterator::new(
+            "common".to_owned(),
+            0,
+            0,
+            generate_contiguous_impact_posting_list_with_block_size(
+                total as usize,
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            total as usize,
+        );
+        let stride = total / sparse_len as u32;
+        let sparse_docs = (0..sparse_len as u32)
+            .map(|i| i * stride)
+            .collect::<Vec<_>>();
+        let sparse = PostingIterator::new(
+            "sparse".to_owned(),
+            1,
+            1,
+            generate_impact_posting_list_with_freqs_and_block_size(
+                sparse_docs,
+                vec![400; sparse_len],
+                vec![1; sparse_len],
+                crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+            ),
+            total as usize,
+        );
+        let mut docs = DocSet::default();
+        for doc in 0..total {
+            docs.append(doc.into(), 1);
+        }
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            [common, sparse].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(5)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 5);
+        assert_eq!(
+            wand.maxscore_floor_seeds, 0,
+            "a sparse clause over the decode budget must not be seeded from"
+        );
+    }
+
+    #[test]
+    fn maxscore_skips_floor_seeding_when_the_clauses_cost_the_same() {
+        // Two clauses of the same length: the pass would decode half the query
+        // to seed a floor the walk reaches on its own, so it must decline.
+        const TOTAL: u32 = 4 * crate::scalar::inverted::LEGACY_BLOCK_SIZE as u32;
+        let build = |token: &str, rank: u32, offset: u32| {
+            let doc_ids = (0..TOTAL / 2).map(|i| i * 2 + offset).collect::<Vec<_>>();
+            let len = doc_ids.len();
+            PostingIterator::new(
+                token.to_owned(),
+                rank,
+                rank,
+                generate_impact_posting_list_with_freqs_and_block_size(
+                    doc_ids,
+                    vec![10; len],
+                    vec![1; len],
+                    crate::scalar::inverted::LEGACY_BLOCK_SIZE,
+                ),
+                TOTAL as usize,
+            )
+        };
+        let mut docs = DocSet::default();
+        for doc in 0..TOTAL {
+            docs.append(doc.into(), 1);
+        }
+
+        let mut wand = Wand::new(
+            Operator::Or,
+            [build("even", 0, 0), build("odd", 1, 1)].into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        );
+        let hits = wand
+            .maxscore_search(
+                &FtsSearchParams::default().with_limit(Some(5)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 5);
+        assert_eq!(
+            wand.maxscore_floor_seeds, 0,
+            "clauses of equal length must not pay for a seeding pass"
+        );
     }
 
     #[rstest]
