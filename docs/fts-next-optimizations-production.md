@@ -161,7 +161,7 @@ Wikipedia SBG 索引是 `block_size=128`、`quantized_scoring=false`（引擎 `d
 |---|---|---|---|---|
 | **5a** | Boolean：MUST 整棵全局上界过不了堆 floor → optional **并集**变成必有，之后 `MUST ∩ (SHOULD_1 ∨ …)` | `intersection_union` 40 条，TOP_10 A1 **26.8ms / 8.53×** | `compound.rs` 升格；不是和每个 SHOULD 求交 | **IU AVERAGE** 和 `+public transit` / `+data privacy`。分析树上仅升格大约 −12%；8.53×→0.95× 主要是 **5b**。这条 PR 若 IU 几乎不动，就是 5b 的证据，不是 5a 失败 |
 | **2** | 偏斜 AND：最短 lead + 停词 follower，堆满之后仍整窗解压已经跳不动的 `the` | named `+walk +the +line` 10.2ms / 6.13×；同类 `+time +for +kids`、`+university +of +washington`。**不是**均衡 2/3（那是社区 bulk 回归） | 解压前调现成 `level0_doc_weight_bounds_cached`。`floor==0` 的头 k 篇帮不上 | **这几条 named AND**，不要看 intersection 300 条均值（均衡的占多数）。回归：`+care +a +lot` 和均衡宽 AND 仍进 bulk |
-| **4** | 短语：词已经齐了，但 term-BM25 进不了堆 → 不必对位置。Lance 短语分=词频 BM25，所以这是精确分不是上界 | `phrase` 300 条，TOP_10 A1 1.94× | 叶子 / bulk 先 `exclusive_score_cannot_beat_floor` 再 `check_positions`。`#8749` 只盖了复合路径 | **phrase AVERAGE** + `"the book of life"` 这类高 df。分析树上 2/3 bulk 先打分，named 几乎在噪声里——合进社区也不要先指望 AVERAGE。稀对预筛（仅 slop=0）不在这 PR |
+| **4** | 短语：词已经齐了，但 term-BM25 进不了堆 → 不必对位置。Lance 短语分=词频 BM25，所以这是精确分不是上界 | `phrase` 300 条，TOP_10 A1 1.94× | 叶子 / bulk 先 `exclusive_score_cannot_beat_floor` 再 `check_positions`。`#8749` 只盖了复合路径 | **已量、已落地**（见 §4）。phrase 300 条 **−18.0%**（3.96ms → 3.25ms）；`"the book of life"` **−21.3%**。稀对预筛（仅 slop=0）不在这 PR |
 | **1** | 稀有 OR：一条短 posting 自己就能撑起 top-k，但堆从 0 爬，等它填满时 `high`/`school` 已经扫完 | union 里的离群点：`niceville high school` 12.5ms / 19×；同类 `kasota stone`、`the incredibles`。**不是** `cheap hotels`（两条都长，seed 门拒绝） | 开搜只扫最短列表，第 k 大减 1 ULP 当天花板。AND 不合法，只挂 `maxscore_search` | **触发的那十几条**（分析树 12/943），不要看 union 301 均值。对照：`the movement` 不得变慢（2048 门拒掉） |
 | **3** | 均衡 OR：词差不多长，seed 进不去；贵在窗里打分 / optional 补 freq / 块上界不够仍没整块 skip | union 301 条 2.21×；named `cheap hotels` 3.51×、`chicago teachers union` 3.13× | 一只窗：SoA、两指针 optional、块 skip、top2-gap。不 port 2-ess | **union AVERAGE** 和 `cheap hotels` / `chicago teachers union`。niceville 那类应已在第 1 条吃掉，不要算进这条的功劳 |
 | **6** | 精确长度分区上，每打一篇都现算 `bm25_doc_norm(tokens, avgdl)`。量化 256 格已有 `#7629`，这条补 128-block | **所有要打分的查询**（本机 SBG 正是 128-block） | `DocLengths` 上 `[f32; n]`，同一表达式烤一次 | 分析树在 seed 之后 union **−9.6%**，AVERAGE −42µs 且对照反向漂。**薄、铺在 943 条上**。不要当第一把刀的主证据 |
@@ -180,7 +180,7 @@ Wikipedia SBG 索引是 `block_size=128`、`quantized_scoring=false`（引擎 `d
 | 2 | **1** 稀有词 seed（先留 2048） | ~130 | 一个函数 + `maxscore_search` 开搜调一次 | `niceville` 社区 12.5ms / 19.1× → **0.55ms / 0.84×**；`the incredibles` 38.7ms / 45.5× → **0.97ms / 1.14×** | **已量、已落地**（见 §1）。只报那十几条离群 OR；`the movement` 未变慢 |
 | 3 | **5a** ReqOpt 升格 | ~150 | 只动 `compound.rs` | IU 40 条 8.53× 是最差标签；分析树仅升格大约 −12%，8.53×→0.95× 是 5b | **已量、已回滚**（见 §5a）。社区 IU AVERAGE **+5.8%**，0 条快 10% 以上、9 条慢 10% 以上。不要同 PR 带 5b |
 | 4 | **6** dense `f32` addend | ~80 | 只动 `documents.rs` + 打分热路径查表 | 薄：分析树 union −9.6%，AVERAGE 读不出来 | **已量、已落地**（见 §6）。社区 union 301 条 **−11.3%**（2.27ms → 2.02ms）。不要拿 TOP_10 AVERAGE 当主证据 |
-| 5 | **4** 先打分再对位置（任何 slop） | ~80–120 | 小；叶子三处 + bulk 改序 | phrase 1.94×；分析树 named **几乎噪声** | 同样小，但场景效果六条里最弱，不能排到 2/1 前面。稀对预筛不带 |
+| 5 | **4** 先打分再对位置（任何 slop） | ~80–120 | 小；叶子三处 + bulk 改序 | phrase 1.94×；分析树 named **几乎噪声** | **已量、已落地**（见 §4）。社区 phrase 300 条 **−18.0%**，高 df named 也动了。稀对预筛不带 |
 | 6 | **3** MaxScore 一只窗 | ~550–700 | 最大一块 | union 301 条 2.21×，`cheap hotels` / chicago；**量**最大 | 代码最重，放最后。此时 seed 已垫稀有 OR，addend 已在，窗 PR 只看均衡 union |
 
 暂缓、单独拍板：**2 的 lead-stream**（要窗开销 profile）、**5b IU tight**、seed 的 Impact 停止判据、第 7 条规划税。
@@ -299,16 +299,20 @@ Lance 短语分数 = 各词 BM25 按**词频**求和，位置只做 gate（社�
 | 分不够就不解位置 | **任何 slop**（分数与 slop 无关） | `exclusive_score_cannot_beat_floor` |
 | 先对最稀一对 | **仅 slop=0** | `check_exact_phrase_pair`；对不上不 seek 停词 |
 
-社区已经有 `check_positions` / `check_exact_positions_bulk`，以及 `#8749`（复合 `WandCursor` 先打分，位置放 `matches()`）。叶子经典回路和 bulk 窗仍是词齐了就对位置（bulk 只有 lead freq + 块上界在位置之前）。
+社区已经有 `check_positions` / `check_exact_positions_bulk`，以及 `#8749`（复合 `WandCursor` 先打分，位置放 `matches()`）。本对照树叶子经典回路和 bulk 窗已改成先打完整分，分进不了 exclusive 堆就不解位置。`WandCursor` 不动。稀对预筛不上。
 
 | | 文件 | 大约行数 |
 |---|---|---:|
 | `exclusive_score_cannot_beat_floor` + 叶子三处调用 | `wand.rs` | ~80 |
 | bulk 窗里先算完整分再 `check_positions` | `and_bulk_search`（改顺序） | ~40 |
-| `check_exact_phrase_pair` + 缓冲复用 | `wand.rs` | ~80 |
+| `check_exact_phrase_pair` + 缓冲复用 | `wand.rs` | ~80（**不上**） |
 | leftover 核上的 `phrase_pair_prune` | 挂在第 2 条（若还要那只核） | ~40 |
 
-生产大约 **200 行**，叠在已有 bulk 上，不是第三只核。分数合同与社区一致。
+生产这一刀大约 **120 行**（不含稀对预筛），叠在已有 bulk 上，不是第三只核。分数合同与社区一致：完整分是堆要比的那个 query-order f32，用 `accepts_score`，堆未满（`threshold == 0`）不解。
+
+**已量（2026-09-10，社区尺子 A1 TOP_10，对照 Item 6 addend）。** 过程与 JSON 在 `.agent/fts-item4-phrase/`。hit count 943/943 一致。
+
+phrase 300 条平均 3,960µs → **3,247µs**（**−18.0%**）。`"the book of life"` 88,598µs → **69,747µs**（**−21.3%**）；`"to be or not to be"` −37.6%、`"american south"` −18.7%。union / intersection 均值 +0.6%（噪声）。稀对预筛仍不上。
 
 ---
 
