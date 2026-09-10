@@ -111,7 +111,7 @@ BM25 公式和 dump 保持 bit-identical。
 | # | 条 | 上生产？ | 主要文件 | 叠在新基线上大约 | 社区 stack 有没有 |
 |---|---|---|---|---:|---|
 | 1 | 稀有词预填 floor | 是 | `wand.rs` | ~130 | 无 |
-| 2 | 偏斜 AND（先块级界前移，再决定 lead-stream） | 是（先量） | `wand.rs` | 几十行；核不够再 ~450–500 | `#9030` 无偏斜门；无 lead-stream |
+| 2 | 偏斜 AND（代价比出门 + lead-stream） | **已量** | `wand_lead_stream.rs` | ~400 | `#9030` 无偏斜门；无 lead-stream |
 | 3 | MaxScore 一只窗 | 是（删 2-ess） | `wand.rs` | ~550–700 | 有 `maxscore_search`，无 SoA / 两指针 |
 | 4 | 短语叶子先打分再对位置 | 是 | `wand.rs` | ~200 | `#8749` 只盖复合 `WandCursor`；叶子 / lead-stream 仍先对位置 |
 | 5a | ReqOpt 升格 | 是 | `compound.rs` | ~150 | 有 `ReqOptScorer` |
@@ -119,7 +119,7 @@ BM25 公式和 dump 保持 bit-identical。
 | 6 | 精确长度 dense `f32` addend | 是 | `documents.rs` | ~80 | 有 256 格量化 cache，无精确长度 slab |
 | 7 | 规划税 | **这轮不做** | — | — | — |
 
-1–4 + 5a + 6 收核后大约 **+1,600–1,800 行生产**（另加测试）。第 2 条那 450–500 行**先不要当已定**：先 BMC 前移（现成 `level0_doc_weight_bounds_cached`），量过 `+walk +the +line`。大概率它吃掉绝大部分；floor = 0 的残留是窗开销不是解压量，不足以单独论证第二只核（§2）。
+1–4 + 5a + 6 收核后大约 **+1,600–1,800 行生产**（另加测试）。第 2 条 BMC 前移已回归；lead-stream 已按 32× `max/min` 落地并量过（§2），不是分析树的 4–5–6 词数表。
 
 这是叠在 **main + `#9033` + `#9030`** 上的增量，不是相对旧 `#7624`-only main。现在整棵 `perf/fts-top10-analysis` 倒排相对旧 main 约 +6,500 行（含测试和死路）；差出来的大半是 2-ess、词数表、IU hack、字典、诊断，**不要**当生产 diff。
 
@@ -127,7 +127,7 @@ BM25 公式和 dump 保持 bit-identical。
 
 落地：社区 `wand.rs` 已约 10.3k 行。`rust/AGENTS.md` 要求大块新逻辑抽子模块（`#9030` 自己就新建了 `wand_intersection.rs`）。1/2/3/4/5b 不要继续堆进同一个万行文件。
 
-**5b 已量。** 第 2 条 BMC 前移已回归，lead-stream 仍要窗开销 profile。回归范围：偏斜路径**有没有把社区的宽 AND bulk 抢没**。
+**5b 已量。** 第 2 条 BMC 前移已回归；lead-stream **已量**（见 §2）。回归范围：偏斜路径**有没有把社区的宽 AND bulk 抢没**。
 
 ### 代码依赖
 
@@ -160,7 +160,7 @@ Wikipedia SBG 索引是 `block_size=128`、`quantized_scoring=false`（引擎 `d
 | 条 | 细分场景 | 社区尺子上对哪一格 | 机制 | 量化时看什么 |
 |---|---|---|---|---|
 | **5a** | Boolean：MUST 整棵全局上界过不了堆 floor → optional **并集**变成必有，之后 `MUST ∩ (SHOULD_1 ∨ …)` | `intersection_union` 40 条，TOP_10 A1 **26.8ms / 8.53×** | `compound.rs` 升格；不是和每个 SHOULD 求交 | **IU AVERAGE** 和 `+public transit` / `+data privacy`。分析树上仅升格大约 −12%；8.53×→0.95× 主要是 **5b**。这条 PR 若 IU 几乎不动，就是 5b 的证据，不是 5a 失败 |
-| **2** | 偏斜 AND：最短 lead + 停词 follower，堆满之后仍整窗解压已经跳不动的 `the` | named `+walk +the +line` 10.2ms / 6.13×；同类 `+time +for +kids`、`+university +of +washington`。**不是**均衡 2/3（那是社区 bulk 回归） | 解压前调现成 `level0_doc_weight_bounds_cached`。`floor==0` 的头 k 篇帮不上 | **这几条 named AND**，不要看 intersection 300 条均值（均衡的占多数）。回归：`+care +a +lot` 和均衡宽 AND 仍进 bulk |
+| **2** | 偏斜 AND：最短 lead + 停词 follower。社区 Auto 无条件 bulk 2/3，Wikipedia `block_size=128` 又走不到 `#9030` | named `+walk +the +line`；同类 `+time +for +kids`、`+university +of +washington`。**不是**均衡 2/3（那是社区 bulk 回归） | Auto：`max/min >= 32` 且 n≥3 走 lead-stream；n=2 偏斜仍 leapfrog；`second >= 3×lead` 时先打稀有分再 seek | **已量、已落地**（见 §2）。walk **−66.2%**；intersection 300 **−23.5%**。回归：ratio 31 的 3-AND 仍 bulk；`#9030` 均衡现代 4+ 仍 bulk |
 | **4** | 短语：词已经齐了，但 term-BM25 进不了堆 → 不必对位置。Lance 短语分=词频 BM25，所以这是精确分不是上界。slop=0 再按当前文档词频懒解码位置：稀有词对不上就不解停词 | `phrase` 300 条，TOP_10 A1 1.94× | 叶子 / bulk 先 `exclusive_score_cannot_beat_floor` 再 `check_positions`。`#8749` 只盖了复合路径。精确短语走 `exact_phrase_positions_match` | **已量、已落地**（见 §4）。phrase 300 条相对 Item 6 **−18.0%**，再相对 Item 5b **−8.3%**（3.22ms → 2.95ms）；`"the book of life"` **−31.3%** |
 | **1** | 稀有 OR：一条短 posting 自己就能撑起 top-k，但堆从 0 爬，等它填满时 `high`/`school` 已经扫完 | union 里的离群点：`niceville high school` 12.5ms / 19×；同类 `kasota stone`、`the incredibles`。**不是** `cheap hotels`（两条都长，seed 门拒绝） | 开搜只扫最短列表，第 k 大减 1 ULP 当天花板。AND 不合法，只挂 `maxscore_search` | **触发的那十几条**（分析树 12/943），不要看 union 301 均值。对照：`the movement` 不得变慢（2048 门拒掉） |
 | **3** | 均衡 OR：词差不多长，seed 进不去；贵在窗里打分 / optional 补 freq / 块上界不够仍没整块 skip | union 301 条 2.21×；named `cheap hotels` 3.51×、`chicago teachers union` 3.13× | 一只窗：SoA、两指针 optional、块 skip、top2-gap。不 port 2-ess | **已量、已落地**（见 §3）。union 301 条 **−10.6%**（2.03ms → 1.81ms）；`cheap hotels` **−34.8%**、`chicago teachers union` **−37.4%**。niceville 不算这条功劳 |
@@ -176,14 +176,14 @@ Wikipedia SBG 索引是 `block_size=128`、`quantized_scoring=false`（引擎 `d
 
 | 顺序 | 条 | 大约行数 | 简单 / 基础 | 场景效果 | 为什么是这个位置 |
 |---|---|---:|---|---|---|
-| 1 | **2** BMC 前移 | 几十 | 现成 `level0_doc_weight_bounds_cached`，只是解压前调用 | `+walk +the +line` 社区 10.2ms / 6.13× | **已量、已回滚**（见 §2）。不要同 PR 带 lead-stream |
+| 1 | **2** BMC 前移 | 几十 | 现成 `level0_doc_weight_bounds_cached`，只是解压前调用 | `+walk +the +line` 社区 10.2ms / 6.13× | **已量、已回滚**（见 §2）。不要同 PR 带 BMC 与 lead-stream |
 | 2 | **1** 稀有词 seed（先留 2048） | ~130 | 一个函数 + `maxscore_search` 开搜调一次 | `niceville` 社区 12.5ms / 19.1× → **0.55ms / 0.84×**；`the incredibles` 38.7ms / 45.5× → **0.97ms / 1.14×** | **已量、已落地**（见 §1）。只报那十几条离群 OR；`the movement` 未变慢 |
 | 3 | **5a** ReqOpt 升格 | ~150 | 只动 `compound.rs` | IU 40 条 8.53× 是最差标签；分析树仅升格大约 −12%，8.53×→0.95× 是 5b | **已量、已回滚**（见 §5a）。社区 IU AVERAGE **+5.8%**，0 条快 10% 以上、9 条慢 10% 以上。不要同 PR 带 5b |
 | 4 | **6** dense `f32` addend | ~80 | 只动 `documents.rs` + 打分热路径查表 | 薄：分析树 union −9.6%，AVERAGE 读不出来 | **已量、已落地**（见 §6）。社区 union 301 条 **−11.3%**（2.27ms → 2.02ms）。不要拿 TOP_10 AVERAGE 当主证据 |
 | 5 | **4** 先打分再对位置（任何 slop）；slop=0 按词频懒解码 | ~80–120 + ~80 | 小；叶子三处 + bulk 改序；精确短语共用一只 scan | phrase 1.94×；分析树 named **几乎噪声** | **已量、已落地**（见 §4）。社区 phrase 300 条相对 Item 6 **−18.0%**，再相对 Item 5b **−8.3%**。不是分析树的 lead-stream 稀对预筛 |
 | 6 | **3** MaxScore 一只窗 | ~550–700 | 最大一块 | union 301 条 2.21×，`cheap hotels` / chicago；**量**最大 | **已量、已落地**（见 §3）。社区 union 301 条 **−10.6%**；`cheap hotels` **−34.8%**、chicago **−37.4%**。不 port 2-ess |
 
-暂缓：**2 的 lead-stream**（要窗开销 profile）、seed 的 Impact 停止判据、第 7 条规划税。**5b IU tight 已量**（见 §5b）。
+暂缓：seed 的 Impact 停止判据、第 7 条规划税。**5b IU tight 已量**（见 §5b）。**2 的 lead-stream 已量**（见 §2）。
 
 ---
 
@@ -246,25 +246,41 @@ TOP_10 下 floor = 0 只持续到第 10 个三词齐全的文档。`walk` 约 3.
 
 `+walk +the +line` 10,214µs → **11,304µs**（+10.7%，6.13× → 6.79× Lucene）。intersection 300 条平均 +6.1%；15 条 AND 慢 20% 以上，0 条快 10% 以上。hit count 一致。整窗 BMC 与现成 `and_advance_target` 重复；`the` 的 block-max 在堆满后仍经常过得了 floor，lead-LUT 剪不掉 follower，lead-first 反而给活窗加了解压。
 
-**这刀已从 `wand.rs` 撤掉，不提交。** 也不据此开 lead-stream：第二只核仍要用「每窗开销 × 窗数」的 profile，这次回归不是那份证据。
+**这刀已从 `wand.rs` 撤掉，不提交。** BMC 前移不是 lead-stream 的证据。
 
-若量完仍要一只 leftover 核：
+**已量（2026-09-10，社区尺子 A1 TOP_10，对照 phrase lazy-decode）。** 过程与 JSON 在 `.agent/fts-skew-and-lead-stream/`。hit count 943/943 一致。独立 review：无 P0/P1。
 
-| | 现在本分支（不要 port） | 叠在社区 stack 上应收成 |
+Community Auto 对 2/3 无偏斜门，Wikipedia 又是 block-128（`#9030` 4+ bulk 从不开火），所以偏斜 3 词停在 bulk 窗开销上。这一刀只加代价比：`min_cost > 0 && max_cost / min_cost >= 32`。均衡 2/3 和现代 4+ 仍进社区 bulk；偏斜 n=2 仍 leapfrog；偏斜 n≥3 走 `and_lead_stream_search`（`wand_lead_stream.rs`）。窗内 `second >= 3×lead` 时先打稀有 BM25 再 seek follower。短语确认仍是现成的分后位置 + `exact_phrase_positions_match`，没有 `check_exact_phrase_pair`，没有词数表。
+
+| query / 标签 | 上一刀 µs | 本刀 µs | rel | ×Lucene |
+|---|---:|---:|---:|---|
+| `+walk +the +line` | 10,367 | **3,503** | **−66.2%** | 2.30× |
+| `+time +for +kids` | 8,375 | **2,472** | **−70.5%** | 2.12× |
+| `+university +of +washington` | 12,812 | **5,089** | **−60.3%** | 1.87× |
+| `+to +be +or +not +to +be` | 78,134 | 77,422 | −0.9% | 3.75×（噪声） |
+| intersection 300 | 2,180 | **1,667** | **−23.5%** | 2.02× |
+| `+care +a +lot` | 9,912 | 5,540 | −44.1% | 2.12×（维基上已 ≥32×，进 lead-stream；单测 ratio 31 仍 bulk） |
+| phrase 300（副作用） | 2,953 | 2,541 | −14.0% | `"walk the line"` −56.2% |
+| union 301 / IU 40 | | | −3.7% / −8.3% | 对照，非本刀场景 |
+
+`On` 仍强制 bulk（parity）。均衡 `#9030` 现代 4+ 仍 bulk。Hamlet AND 几乎不动；不要拿它当主证据。
+
+落地收成（相对分析树）：
+
+| | 分析树（不要 port） | 本刀 |
 |---|---|---|
-| 选核第一问 | 2–3 看 32×；4–5 永不 bulk；6+ 且最短 ≥50 万又 bulk | **偏斜 + 地板，从 n=2 起**。差不多长的 2/3 和 4+ 现代块**留给社区 bulk**。偏斜比若还要门，物理量是 `Σcost / min_cost`，不是 `max/min` |
-| `and_lead_stream_search` | ~325 行主循环 | 只吃「BMC + 削窗之后仍亏」的 leftover；用窗开销 profile 证明 |
-| `and_lead_stream_score_first_block` | ~213 行第二套，门 `n≥3 && 3×` | **并进主循环**，门只看 follower/lead cost |
-| 2 词偏斜 | leapfrog | 保持，不走 lead 缓冲 |
-| 4 词差不多长、现代块 | 本分支走 lead-stream（错） | **社区 `#9030` bulk** |
+| 选核 | 2–3 看 32×；4–5 永不 bulk；6+ 且最短 ≥50 万又 bulk | **只看 32× `max/min`**。均衡 2/3 和 4+ 现代块留给社区 bulk |
+| 核 | `and_lead_stream_search` + 单独 `score_first_block` | 一只循环；`second >= 3×lead` 时先打稀有分 |
+| 2 词偏斜 | leapfrog | 保持 |
+| 4 词差不多长、现代块 | 分析树走 lead-stream（错） | **社区 `#9030` bulk** |
 
-**不要改写**社区的 pairwise / `wand_intersection.rs`。2/3 路手写交仍是「差不多长」时的实现细节。政策见 [fts-and-auto-n-buckets.md](./fts-and-auto-n-buckets.md)。
+**不要改写**社区的 pairwise / `wand_intersection.rs`。2/3 路手写交仍是「差不多长」时的实现细节。
 
 回归只守社区 bulk（2/3 均衡 + `#9030` 宽均衡），**没有额外的 `#9033` 回归**：
 
 - 2/3/4/5/6 词、df 差不多、现代块：必须仍进社区 bulk
-- 偏斜停词：BMC 之后不能再整窗白解压已经跳不动的 `the`
-- `+care +a +lot`：偏斜不够，必须仍逐 doc
+- 偏斜停词：lead-stream 由稀有 list 开车，follower 只 seek
+- `+care +a +lot`：ratio < 32 必须仍 bulk；维基这条已经 ≥32×，进 lead-stream 是门的结果，不是词数特判
 
 ---
 
@@ -360,7 +376,7 @@ IU 40 条平均 27,377µs → **28,978µs**（**+5.8%**，9.45× → 9.92× Luce
 
 IU 40 条平均 28,559µs → **11,467µs**（**−59.8%**，9.94× → 5.91× Lucene）。`customer +service phone number` 97ms → **4.9ms**（−95%，0.44× Lucene）；`small +business grants` −96.6%。IU >10% 更快：**20**；>10% 更慢：**0**。intersection / union / phrase 均值 −1.1%。TOP_10 AVERAGE 3,585µs → **2,836µs**（−20.9%）。
 
-没吃到的 IU（`+water quality report` 等）是 MUST 相对最稀 SHOULD 不够 3×、或没有单独必有的 SHOULD，仍走 ReqOpt。不要为这些再加绝对 df 常数。剩余毫秒级 2× 主要是偏斜 AND（Hamlet / `+university +of +washington`）和未升格的 IU；AND 的 BMC 前移已回归，lead-stream 仍要窗开销 profile。
+没吃到的 IU（`+water quality report` 等）是 MUST 相对最稀 SHOULD 不够 3×、或没有单独必有的 SHOULD，仍走 ReqOpt。不要为这些再加绝对 df 常数。剩余毫秒级 2× 里 Hamlet AND 仍贵；`+university +of +washington` 已随 lead-stream 下来。
 
 ---
 
