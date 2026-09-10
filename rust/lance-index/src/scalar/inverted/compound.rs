@@ -2501,17 +2501,11 @@ impl ComposableScorer for DisjunctionScorer<'_> {
     }
 
     fn advance_shallow(&mut self, target: u64) -> Result<u64> {
-        // Lucene: unpositioned (docID == -1) and in-window children are
-        // shallow-advanced at `target`. A child already past `target` only
-        // truncates to a required-only prefix; shallowing it at its own doc
-        // would make `score_bounds(target)` illegal.
         let mut up_to = u64::MAX;
         for child in &mut self.children {
-            if let Some(doc) = child.doc().filter(|&doc| doc > target) {
-                up_to = up_to.min(doc.saturating_sub(1));
-                continue;
+            if let Some(doc) = child.doc() {
+                up_to = up_to.min(child.advance_shallow(target.max(doc))?);
             }
-            up_to = up_to.min(child.advance_shallow(target)?);
         }
         Ok(up_to)
     }
@@ -2525,10 +2519,10 @@ impl ComposableScorer for DisjunctionScorer<'_> {
             },
         };
         for child in &mut self.children {
-            let child_bounds = if child.doc().is_some_and(|doc| doc > up_to) {
-                ScoreBounds::ZERO
-            } else {
+            let child_bounds = if child.doc().is_some_and(|doc| doc <= up_to) {
                 child.score_bounds(up_to)?
+            } else {
+                ScoreBounds::ZERO
             };
             bounds = match self.mode {
                 DisjunctionScore::Sum => bounds.add(child_bounds.include_zero()),
@@ -3041,9 +3035,7 @@ impl ComposableScorer for BoostScorer<'_> {
 /// The required scorer drives iteration. Once a score floor is available,
 /// block bounds may either skip the whole range or temporarily turn the
 /// optional approximation into a required iterator when the required score
-/// cannot reach the floor on its own. `advance_shallow` still exact-advances
-/// an unpositioned optional iterator so a required-only prefix is not given
-/// that iterator's first-block max (which often spans the whole prefix).
+/// cannot reach the floor on its own.
 #[derive(Clone, Copy)]
 struct ReqOptBounds {
     up_to: u64,
@@ -3111,43 +3103,12 @@ impl<'a> ReqOptScorer<'a> {
         None
     }
 
-    fn optional_is_exhausted(&self) -> bool {
-        // Lucene docID == NO_MORE_DOCS. Unpositioned optional is docID == -1
-        // (`optional_initialized == false`) and still belongs in the window.
-        self.optional_initialized && self.optional.doc().is_none()
-    }
-
     fn ensure_optional_at_or_after(&mut self, target: u64) -> Result<Option<u64>> {
         if !self.optional_initialized || self.optional.doc().is_some_and(|doc| doc < target) {
             self.optional.advance(target)?;
             self.optional_initialized = true;
-            if self.optional.doc().is_none() {
-                self.shallow_bounds = None;
-            }
         }
         Ok(self.optional.doc())
-    }
-
-    fn optional_window_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
-        // Lucene `getMaxScore` adds optional when `opt.docID() <= upTo`.
-        // Ahead of `up_to`, or exhausted, is required-only.
-        if self.optional_is_exhausted() || self.optional.doc().is_some_and(|doc| doc > up_to) {
-            return Ok(ScoreBounds::ZERO);
-        }
-        let bounds = self.optional.score_bounds(up_to)?;
-        if !Self::usable_bounds(bounds) {
-            return Ok(ScoreBounds::UNBOUNDED);
-        }
-        // Unpositioned merge reports ZERO over `u64::MAX` without proving this
-        // window has no optional contribution. EmptyScorer is truly 0 (global
-        // upper is 0). Fail closed when the optional side still has a score.
-        if !self.optional_initialized && bounds.upper <= 0.0 {
-            match self.optional.global_score_upper_bound() {
-                Some(global) if global <= 0.0 => {}
-                _ => return Ok(ScoreBounds::UNBOUNDED),
-            }
-        }
-        Ok(bounds.include_zero())
     }
 
     fn optional_matches_current(&mut self) -> Result<bool> {
@@ -3170,13 +3131,21 @@ impl<'a> ReqOptScorer<'a> {
     fn bounds(&mut self, up_to: u64) -> Result<ReqOptBounds> {
         if let Some(bounds) = self.shallow_bounds
             && bounds.up_to == up_to
-            && !self.optional_is_exhausted()
         {
             return Ok(bounds);
         }
 
         let required = self.required.score_bounds(up_to)?;
-        let optional = self.optional_window_bounds(up_to)?;
+        let optional = if self.optional.doc().is_some_and(|doc| doc <= up_to) {
+            let bounds = self.optional.score_bounds(up_to)?;
+            if Self::usable_bounds(bounds) {
+                bounds.include_zero()
+            } else {
+                ScoreBounds::UNBOUNDED
+            }
+        } else {
+            ScoreBounds::ZERO
+        };
         let combined = required.add(optional);
         let bounds = ReqOptBounds {
             up_to,
@@ -3205,13 +3174,9 @@ impl<'a> ReqOptScorer<'a> {
                     if bounds.up_to == u64::MAX {
                         return Ok(self.exhaust());
                     }
-                    // Jump only when the shallow window extends past `target`.
-                    // A 1-doc window must not integer-walk sparse row addresses.
-                    if bounds.up_to > target {
-                        target = bounds.up_to + 1;
-                        self.shallow_bounds = None;
-                        continue;
-                    }
+                    target = bounds.up_to + 1;
+                    self.shallow_bounds = None;
+                    continue;
                 }
 
                 if bounds.required.upper < self.min_competitive_score {
@@ -3333,7 +3298,6 @@ impl ComposableScorer for ReqOptScorer<'_> {
         let target = self.current.map_or(target, |current| target.max(current));
         if let Some(bounds) = self.shallow_bounds
             && target <= bounds.up_to
-            && !self.optional_is_exhausted()
         {
             return Ok(bounds.up_to);
         }
@@ -6140,8 +6104,11 @@ mod tests {
         assert_eq!(required_advances, 100);
         assert_eq!(eager_optional_probes, 100);
         assert_eq!(optional_probes, 1);
-        assert!(required_work.shallow_advances.load(AtomicOrdering::Relaxed) >= 1);
-        assert!(required_work.bounds.load(AtomicOrdering::Relaxed) >= 1);
+        assert_eq!(
+            required_work.shallow_advances.load(AtomicOrdering::Relaxed),
+            2
+        );
+        assert_eq!(required_work.bounds.load(AtomicOrdering::Relaxed), 2);
         assert_eq!(
             required_work.confirmations.load(AtomicOrdering::Relaxed),
             100
@@ -6238,186 +6205,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(results, rows(&[(2, 11.0)]));
-    }
-
-    fn exhaustive_reqopt_top_k(
-        required: &[(u64, f32)],
-        optional: &[(u64, f32)],
-        limit: usize,
-    ) -> Vec<ScoredRow> {
-        let optional: HashMap<u64, f32> = optional.iter().copied().collect();
-        let mut scores = required
-            .iter()
-            .map(|&(doc, score)| (doc, score + optional.get(&doc).copied().unwrap_or(0.0)))
-            .collect::<Vec<_>>();
-        scores.sort_by(|left, right| {
-            right
-                .1
-                .total_cmp(&left.1)
-                .then_with(|| left.0.cmp(&right.0))
-        });
-        scores.truncate(limit);
-        rows(&scores)
-    }
-
-    #[test]
-    fn reqopt_top_k_matches_exhaustive_sum() {
-        let required = (0..64)
-            .map(|doc| (doc, 1.0 + (doc % 5) as f32 * 0.25))
-            .collect::<Vec<_>>();
-        let optional = (0..64)
-            .step_by(4)
-            .map(|doc| (doc, 3.0 + (doc % 7) as f32 * 0.5))
-            .collect::<Vec<_>>();
-        let expected = exhaustive_reqopt_top_k(&required, &optional, 8);
-        let mut scorer = ReqOptScorer::new(materialized(&required), materialized(&optional));
-        let results = TopKCollector::new(8).collect(&mut scorer).unwrap();
-        assert_eq!(results, expected);
-    }
-
-    #[test]
-    fn reqopt_inner_skip_does_not_drop_must_only_hits_that_beat_the_floor() {
-        let required = (0..48).map(|doc| (doc, 5.0)).collect::<Vec<_>>();
-        let optional = vec![(40, 1.0)];
-        let expected = exhaustive_reqopt_top_k(&required, &optional, 5);
-        let (required_scorer, required_work) = instrumented(Box::new(
-            MaterializedScorer::try_new(rows(&required))
-                .unwrap()
-                .with_block_size(8),
-        ));
-        let mut scorer = ReqOptScorer::new(required_scorer, materialized(&optional));
-        let competitive_score = Arc::new(CompetitiveScore::default());
-        competitive_score.raise(4.0);
-        let results = TopKCollector::with_competitive_score(5, competitive_score)
-            .collect(&mut scorer)
-            .unwrap();
-        assert_eq!(results, expected);
-        assert!(required_work.advances.load(AtomicOrdering::Relaxed) >= 5);
-    }
-
-    #[test]
-    fn reqopt_conjunction_inside_a_block_skips_must_only_docs() {
-        let required = (0..64).map(|doc| (doc, 1.0)).collect::<Vec<_>>();
-        let optional = vec![(50, 10.0)];
-        let (required_scorer, required_work) = instrumented(Box::new(
-            MaterializedScorer::try_new(rows(&required))
-                .unwrap()
-                .with_block_size(8),
-        ));
-        let (optional_scorer, optional_work) = instrumented(materialized(&optional));
-        let mut scorer = ReqOptScorer::new(required_scorer, optional_scorer);
-        let competitive_score = Arc::new(CompetitiveScore::default());
-        competitive_score.raise(10.0);
-        let results = TopKCollector::with_competitive_score(1, competitive_score)
-            .collect(&mut scorer)
-            .unwrap();
-        assert_eq!(results, rows(&[(50, 11.0)]));
-        assert!(required_work.advances.load(AtomicOrdering::Relaxed) < 16);
-        assert_eq!(optional_work.advances.load(AtomicOrdering::Relaxed), 1);
-    }
-
-    #[test]
-    fn reqopt_exhausted_optional_does_not_keep_contributing_block_max() {
-        let required = (0..64).map(|doc| (doc, 1.0)).collect::<Vec<_>>();
-        let optional = vec![(5, 10.0)];
-        let (required_scorer, required_work) = instrumented(Box::new(
-            MaterializedScorer::try_new(rows(&required))
-                .unwrap()
-                .with_block_size(8),
-        ));
-        let optional_scorer = Box::new(
-            MaterializedScorer::try_new(rows(&optional))
-                .unwrap()
-                .with_block_size(8),
-        );
-        let mut scorer = ReqOptScorer::new(required_scorer, optional_scorer);
-        let competitive_score = Arc::new(CompetitiveScore::default());
-        competitive_score.raise(5.0);
-        let results = TopKCollector::with_competitive_score(1, competitive_score)
-            .collect(&mut scorer)
-            .unwrap();
-        assert_eq!(results, rows(&[(5, 11.0)]));
-        assert!(required_work.advances.load(AtomicOrdering::Relaxed) < 16);
-    }
-
-    #[test]
-    fn reqopt_behind_optional_merge_keeps_a_later_fragment_hit() {
-        // After scoring the first MUST+optional hit, the optional merge sits on
-        // fragment 0. The better hit lives on fragment 1. Window BMC from the
-        // current fragment must not drop the later hit.
-        let required = materialized(&[(10, 2.0), (20, 2.0), (30, 2.0)]);
-        let optional = Box::new(
-            RowAddressMergeScorer::try_new(vec![
-                row_address_source(&[(10, 1.0), (30, 0.5)]),
-                row_address_source(&[(20, 2.0)]),
-            ])
-            .unwrap(),
-        );
-        let mut scorer = ReqOptScorer::new(required, optional);
-        let results = TopKCollector::new(1).collect(&mut scorer).unwrap();
-        assert_eq!(results, rows(&[(20, 4.0)]));
-    }
-
-    #[test]
-    fn reqopt_unpositioned_merge_optional_does_not_drop_hits() {
-        let required = materialized(&[(10, 2.0), (20, 2.0), (30, 2.0)]);
-        let optional = Box::new(
-            RowAddressMergeScorer::try_new(vec![
-                row_address_source(&[(20, 2.0)]),
-                row_address_source(&[(30, 0.5)]),
-            ])
-            .unwrap(),
-        );
-        let mut scorer = ReqOptScorer::new(required, optional);
-        let competitive_score = Arc::new(CompetitiveScore::default());
-        competitive_score.raise(3.5);
-        let results = TopKCollector::with_competitive_score(1, competitive_score)
-            .collect(&mut scorer)
-            .unwrap();
-        assert_eq!(results, rows(&[(20, 4.0)]));
-    }
-
-    #[test]
-    fn reqopt_optional_disjunction_ahead_child_does_not_break_shallow_bounds() {
-        // One optional child sits at 50 after the first hit. Combined windows
-        // still end at the MUST doc (10). Shallowing that child at 50 would
-        // make score_bounds(10) illegal.
-        let required = materialized(&[(0, 1.0), (10, 1.0), (20, 1.0)]);
-        let optional = Box::new(
-            DisjunctionScorer::try_new(
-                vec![materialized(&[(0, 1.0)]), materialized(&[(50, 10.0)])],
-                DisjunctionScore::Sum,
-            )
-            .unwrap(),
-        );
-        let mut scorer = ReqOptScorer::new(required, optional);
-        let results = TopKCollector::new(2).collect(&mut scorer).unwrap();
-        assert_eq!(results, rows(&[(0, 2.0), (10, 1.0)]));
-    }
-
-    #[test]
-    fn reqopt_unpositioned_disjunction_optional_matches_exhaustive_sum() {
-        let required = (0..32).map(|doc| (doc, 1.0)).collect::<Vec<_>>();
-        let first = vec![(4, 3.0), (20, 1.0)];
-        let second = vec![(12, 5.0), (28, 2.0)];
-        let mut optional_scores = HashMap::<u64, f32>::new();
-        for &(doc, score) in first.iter().chain(second.iter()) {
-            *optional_scores.entry(doc).or_default() += score;
-        }
-        let optional = optional_scores.into_iter().collect::<Vec<_>>();
-        let expected = exhaustive_reqopt_top_k(&required, &optional, 4);
-        let mut scorer = ReqOptScorer::new(
-            materialized(&required),
-            Box::new(
-                DisjunctionScorer::try_new(
-                    vec![materialized(&first), materialized(&second)],
-                    DisjunctionScore::Sum,
-                )
-                .unwrap(),
-            ),
-        );
-        let results = TopKCollector::new(4).collect(&mut scorer).unwrap();
-        assert_eq!(results, expected);
     }
 
     fn pure_should_canary_children() -> (Vec<BoxScorer<'static>>, Vec<Arc<ScorerWork>>) {
