@@ -163,7 +163,7 @@ Wikipedia SBG 索引是 `block_size=128`、`quantized_scoring=false`（引擎 `d
 | **2** | 偏斜 AND：最短 lead + 停词 follower，堆满之后仍整窗解压已经跳不动的 `the` | named `+walk +the +line` 10.2ms / 6.13×；同类 `+time +for +kids`、`+university +of +washington`。**不是**均衡 2/3（那是社区 bulk 回归） | 解压前调现成 `level0_doc_weight_bounds_cached`。`floor==0` 的头 k 篇帮不上 | **这几条 named AND**，不要看 intersection 300 条均值（均衡的占多数）。回归：`+care +a +lot` 和均衡宽 AND 仍进 bulk |
 | **4** | 短语：词已经齐了，但 term-BM25 进不了堆 → 不必对位置。Lance 短语分=词频 BM25，所以这是精确分不是上界 | `phrase` 300 条，TOP_10 A1 1.94× | 叶子 / bulk 先 `exclusive_score_cannot_beat_floor` 再 `check_positions`。`#8749` 只盖了复合路径 | **已量、已落地**（见 §4）。phrase 300 条 **−18.0%**（3.96ms → 3.25ms）；`"the book of life"` **−21.3%**。稀对预筛（仅 slop=0）不在这 PR |
 | **1** | 稀有 OR：一条短 posting 自己就能撑起 top-k，但堆从 0 爬，等它填满时 `high`/`school` 已经扫完 | union 里的离群点：`niceville high school` 12.5ms / 19×；同类 `kasota stone`、`the incredibles`。**不是** `cheap hotels`（两条都长，seed 门拒绝） | 开搜只扫最短列表，第 k 大减 1 ULP 当天花板。AND 不合法，只挂 `maxscore_search` | **触发的那十几条**（分析树 12/943），不要看 union 301 均值。对照：`the movement` 不得变慢（2048 门拒掉） |
-| **3** | 均衡 OR：词差不多长，seed 进不去；贵在窗里打分 / optional 补 freq / 块上界不够仍没整块 skip | union 301 条 2.21×；named `cheap hotels` 3.51×、`chicago teachers union` 3.13× | 一只窗：SoA、两指针 optional、块 skip、top2-gap。不 port 2-ess | **union AVERAGE** 和 `cheap hotels` / `chicago teachers union`。niceville 那类应已在第 1 条吃掉，不要算进这条的功劳 |
+| **3** | 均衡 OR：词差不多长，seed 进不去；贵在窗里打分 / optional 补 freq / 块上界不够仍没整块 skip | union 301 条 2.21×；named `cheap hotels` 3.51×、`chicago teachers union` 3.13× | 一只窗：SoA、两指针 optional、块 skip、top2-gap。不 port 2-ess | **已量、已落地**（见 §3）。union 301 条 **−10.6%**（2.03ms → 1.81ms）；`cheap hotels` **−34.8%**、`chicago teachers union` **−37.4%**。niceville 不算这条功劳 |
 | **6** | 精确长度分区上，每打一篇都现算 `bm25_doc_norm(tokens, avgdl)`。量化 256 格已有 `#7629`，这条补 128-block | **所有要打分的查询**（本机 SBG 正是 128-block） | `DocLengths` 上 `[f32; n]`，同一表达式烤一次 | 分析树在 seed 之后 union **−9.6%**，AVERAGE −42µs 且对照反向漂。**薄、铺在 943 条上**。不要当第一把刀的主证据 |
 
 第 6 条横切、薄、AVERAGE 读不出来，所以不能当第一把刀——否则 walk / union 的 delta 说不清。它仍然比第 4 条更基础（所有打分都吃表），比第 3 条简单，所以放在两把高信号刀之后、大改窗之前。
@@ -181,7 +181,7 @@ Wikipedia SBG 索引是 `block_size=128`、`quantized_scoring=false`（引擎 `d
 | 3 | **5a** ReqOpt 升格 | ~150 | 只动 `compound.rs` | IU 40 条 8.53× 是最差标签；分析树仅升格大约 −12%，8.53×→0.95× 是 5b | **已量、已回滚**（见 §5a）。社区 IU AVERAGE **+5.8%**，0 条快 10% 以上、9 条慢 10% 以上。不要同 PR 带 5b |
 | 4 | **6** dense `f32` addend | ~80 | 只动 `documents.rs` + 打分热路径查表 | 薄：分析树 union −9.6%，AVERAGE 读不出来 | **已量、已落地**（见 §6）。社区 union 301 条 **−11.3%**（2.27ms → 2.02ms）。不要拿 TOP_10 AVERAGE 当主证据 |
 | 5 | **4** 先打分再对位置（任何 slop） | ~80–120 | 小；叶子三处 + bulk 改序 | phrase 1.94×；分析树 named **几乎噪声** | **已量、已落地**（见 §4）。社区 phrase 300 条 **−18.0%**，高 df named 也动了。稀对预筛不带 |
-| 6 | **3** MaxScore 一只窗 | ~550–700 | 最大一块 | union 301 条 2.21×，`cheap hotels` / chicago；**量**最大 | 代码最重，放最后。此时 seed 已垫稀有 OR，addend 已在，窗 PR 只看均衡 union |
+| 6 | **3** MaxScore 一只窗 | ~550–700 | 最大一块 | union 301 条 2.21×，`cheap hotels` / chicago；**量**最大 | **已量、已落地**（见 §3）。社区 union 301 条 **−10.6%**；`cheap hotels` **−34.8%**、chicago **−37.4%**。不 port 2-ess |
 
 暂缓、单独拍板：**2 的 lead-stream**（要窗开销 profile）、**5b IU tight**、seed 的 Impact 停止判据、第 7 条规划税。
 
@@ -272,7 +272,7 @@ TOP_10 下 floor = 0 只持续到第 10 个三词齐全的文档。`walk` 约 3.
 
 社区已经有 MAXSCORE「弱词坐车」（`maxscore_search`）。我们把窗里的活做完：开车的块上界不够就整块 skip；坐车词两指针对 freq；两个开车的离得远时先把前一段当单 essential 做完（top2-gap，必须用 `top2 - top`）；打分用 SoA 缓冲。
 
-仍是 `wand.rs`：
+核在 `wand_maxscore.rs`，`maxscore_search` 仍在 `wand.rs`：
 
 | | 现在本分支 | 上生产 |
 |---|---|---|
@@ -284,7 +284,11 @@ TOP_10 下 floor = 0 只持续到第 10 个三词齐全的文档。`walk` 约 3.
 | `complete_maxscore_two_essential_soa` | ~325 | **删，不要 port** |
 | 非 SoA `complete_maxscore_single_essential` | ~259 | 能并就并，否则只留兜底 |
 
-现在大约 **+1,000 行**（含 2-ess）。上生产大约 **+550–700 行** 叠在社区已有的 MAXSCORE 上。测试大约 15 个（两指针、top2-gap、query-order dump）。`union_buf` 变默认实现，不要留 `LANCE_HACK_UNION_BUF`。不要为 chicago 再开 2-ess 入口。
+抽到 `wand_maxscore.rs`。skip 不得越过本窗 `upto`（下一窗的 optional remainder 可能更大）。>2 个 optional 仍走社区 `consider_candidate`。`union_buf` 就是默认 SoA，没有 `LANCE_HACK_UNION_BUF`。不要为 chicago 再开 2-ess 入口。
+
+**已量（2026-09-10，社区尺子 A1 TOP_10，对照 Item 4 phrase）。** 过程与 JSON 在 `.agent/fts-item3-maxscore/`。hit count 943/943 一致。
+
+union 301 条平均 2,029µs → **1,813µs**（**−10.6%**）。`cheap hotels` 1,591µs → **1,037µs**（**−34.8%**）；`chicago teachers union` 6,033µs → **3,776µs**（**−37.4%**）。intersection / phrase 均值 +0.3%。`niceville high school` +1.8%（seed 已吃掉，不算这条）。
 
 ---
 
