@@ -5872,7 +5872,12 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         let (target, shallow_up_to, upper) = self.shallow.ok_or_else(|| {
             Error::internal("score bound requires advance_shallow on the posting FTS scorer")
         })?;
-        if up_to < target || up_to > shallow_up_to {
+        if up_to < target {
+            // Empty prefix before this block. A parent window can end before
+            // this posting's first live block.
+            return Ok(0.0);
+        }
+        if up_to > shallow_up_to {
             return Err(Error::internal(format!(
                 "posting FTS score bound up_to={up_to} is outside shallow range [{target}, {shallow_up_to}]"
             )));
