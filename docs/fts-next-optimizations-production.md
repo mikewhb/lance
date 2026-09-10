@@ -95,7 +95,7 @@ git cherry-pick 15d48f91e   # #9030
   follower ≫ lead      → score-first（+care +a +lot 偏斜不够，必须仍逐 doc）
   稀有 OR              → 预填 floor
   短语叶子             → 先打分再对位置（任何 slop）；slop=0 另有稀对预筛
-  Boolean              → ReqOpt 升格（5a）；IU tight（5b）单独拍板
+  Boolean              → ReqOpt 升格（5a，已回滚）；IU tight（5b，真界）
   精确长度分区         → 每 partition 一张 dense f32 addend
 ```
 
@@ -115,7 +115,7 @@ BM25 公式和 dump 保持 bit-identical。
 | 3 | MaxScore 一只窗 | 是（删 2-ess） | `wand.rs` | ~550–700 | 有 `maxscore_search`，无 SoA / 两指针 |
 | 4 | 短语叶子先打分再对位置 | 是 | `wand.rs` | ~200 | `#8749` 只盖复合 `WandCursor`；叶子 / lead-stream 仍先对位置 |
 | 5a | ReqOpt 升格 | 是 | `compound.rs` | ~150 | 有 `ReqOptScorer` |
-| 5b | IU tight | **单独拍板** | `wand.rs` + `compound.rs` | ~800 | 无 |
+| 5b | IU tight | **已量** | `wand_iu_tight.rs` + `compound.rs` | ~350 | 无 |
 | 6 | 精确长度 dense `f32` addend | 是 | `documents.rs` | ~80 | 有 256 格量化 cache，无精确长度 slab |
 | 7 | 规划税 | **这轮不做** | — | — | — |
 
@@ -127,7 +127,7 @@ BM25 公式和 dump 保持 bit-identical。
 
 落地：社区 `wand.rs` 已约 10.3k 行。`rust/AGENTS.md` 要求大块新逻辑抽子模块（`#9030` 自己就新建了 `wand_intersection.rs`）。1/2/3/4/5b 不要继续堆进同一个万行文件。
 
-最值得先拍板的仍是 **5b 上不上**，以及 **第 2 条先量块级界前移、再决定 lead-stream**。回归范围：偏斜路径**有没有把社区的宽 AND bulk 抢没**。
+**5b 已量。** 第 2 条 BMC 前移已回归，lead-stream 仍要窗开销 profile。回归范围：偏斜路径**有没有把社区的宽 AND bulk 抢没**。
 
 ### 代码依赖
 
@@ -183,7 +183,7 @@ Wikipedia SBG 索引是 `block_size=128`、`quantized_scoring=false`（引擎 `d
 | 5 | **4** 先打分再对位置（任何 slop） | ~80–120 | 小；叶子三处 + bulk 改序 | phrase 1.94×；分析树 named **几乎噪声** | **已量、已落地**（见 §4）。社区 phrase 300 条 **−18.0%**，高 df named 也动了。稀对预筛不带 |
 | 6 | **3** MaxScore 一只窗 | ~550–700 | 最大一块 | union 301 条 2.21×，`cheap hotels` / chicago；**量**最大 | **已量、已落地**（见 §3）。社区 union 301 条 **−10.6%**；`cheap hotels` **−34.8%**、chicago **−37.4%**。不 port 2-ess |
 
-暂缓、单独拍板：**2 的 lead-stream**（要窗开销 profile）、**5b IU tight**、seed 的 Impact 停止判据、第 7 条规划税。
+暂缓：**2 的 lead-stream**（要窗开销 profile）、seed 的 Impact 停止判据、第 7 条规划税。**5b IU tight 已量**（见 §5b）。
 
 ---
 
@@ -340,27 +340,24 @@ IU 40 条平均 27,377µs → **28,978µs**（**+5.8%**，9.45× → 9.92× Luce
 
 升格本身 recall 正确（只用 MUST 列表级上界，不用窗界；optional 按并集升）。墙钟回归是因为升格之后 `position()` 不再走窗内 `combined.upper` 整窗跳，改成对每个交集候选 leapfrog；社区 `ReqOptScorer` 已经有窗内临时 intersect，再切永久交集在长 IU 上更贵。分析树 −12% 含那棵树上其它 ReqOpt / 窗收集改动，不能当成这一刀叠进社区之后的承诺。
 
-**这刀已 revert**，现场留在 git 历史上。不要据此开 5b；5b 仍单独拍板。
+**这刀已 revert**，现场留在 git 历史上。5b 不是从这次回归开的；剩余毫秒级 2× Lucene 缺口里 IU 仍占六成，才单独上真界。
 
-### 5b. IU tight（单独拍板）
+### 5b. IU tight（真界，已量）
 
-1 个 MUST + N 个 term SHOULD 时，不走 ReqOpt 迭代器，改走 `iu_tight_search`：MUST 开车，floor 超过 MUST 上界后，把「单独也必有」的 SHOULD 提升成求交 lead。另有 `range_score_upper_bound` 按块跳。
+1 个 MUST term + N 个 SHOULD term 时，不走 ReqOpt 迭代器，改走 `iu_tight_search`：MUST 开车，列表级上界证明某个 SHOULD_i 单独也必有（`max(MUST) + Σ_{j≠i} max(SHOULD_j) < floor`）之后，把最便宜的那条升成求交 lead。入口和升格共用相对代价门 `lead * 3 < MUST`，没有 85k df 常数，没有 `LANCE_HACK_*`。不把 optional **并集**升成必有（那是 5a）。
 
 | | 位置 | 大约行数 |
 |---|---|---:|
-| `iu_tight_search` 及 helpers | `wand.rs` | ~300 |
-| 选路 + `iu_tight_cost_gate` | `compound.rs` | ~80 |
-| `range_score_upper_bound` 等 | `compound.rs` | ~150 |
-| `collect_must_driven` / 窗收集 | `compound.rs` | ~400（和 ReqOpt 缠在一起） |
-| `LANCE_HACK_IU_*` | 同文件 | **不上生产** |
+| `iu_tight_search` / 真界 / promote | `wand_iu_tight.rs` | ~300 |
+| 选路 + 相对代价门 | `compound.rs` | ~80 |
+| `range_score_upper_bound` / `collect_must_driven` | — | **不上** |
+| `LANCE_HACK_IU_*` / `IU_TIGHT_MIN_MUST_COST = 85_000` | — | **不上** |
 
-默认门（hack 未设）：`MUST cost ≥ 85_000` **或** `MUST ≤ 2× 最稀 SHOULD`。Wikipedia SBG 拟合，和 4–5–6 同一类味道。IU TOP_10 A1 从 25ms 掉到 3ms，但门是特化的。
+**已量（2026-09-10，社区尺子 A1 TOP_10，对照 Item 3 MaxScore）。** 过程与 JSON 在 `.agent/fts-item5b-iu-tight/`。hit count 943/943 一致。
 
-拍板前先试真界，不要在 85k 上讨价还价：对某个 SHOULD_i，若 `max(MUST) + Σ_{j≠i} max(SHOULD_j) < floor`，则没有 SHOULD_i 就过不了 floor，它可以升成求交 lead。没有常数。值得先试，但不能假设试完 800 行就没了——真界问「这个 SHOULD 数学上必不必有」，85k 问「MUST 走起来贵不贵、值不值得换核」，5a 问「MUST 整棵不够 → optional 并集必有」，三层叠不齐。
+IU 40 条平均 28,559µs → **11,467µs**（**−59.8%**，9.94× → 5.91× Lucene）。`customer +service phone number` 97ms → **4.9ms**（−95%，0.44× Lucene）；`small +business grants` −96.6%。IU >10% 更快：**20**；>10% 更慢：**0**。intersection / union / phrase 均值 −1.1%。TOP_10 AVERAGE 3,585µs → **2,836µs**（−20.9%）。
 
-万一 5b 还要上：绝对 df 常数也不是「哪只核便宜」该有的形状。`data` 7.8 万留 ReqOpt / `financial` 8.9 万上 tight 是 14% 的差别在换核，幅度落在语料噪声里。门应是两条路的估算代价之比（MUST cost vs Σ SHOULD cost，或预期窗数），不是一条 posting 的绝对长度。
-
-只上 5a：大约 **+150 行**。5a+5b 全上、去掉 hack：大约 **+800–1,000 行**，是 1–4 里最重的一块。要么真界够用就不上 5b，要么只靠 5a + 社区 ReqOpt。
+没吃到的 IU（`+water quality report` 等）是 MUST 相对最稀 SHOULD 不够 3×、或没有单独必有的 SHOULD，仍走 ReqOpt。不要为这些再加绝对 df 常数。剩余毫秒级 2× 主要是偏斜 AND（Hamlet / `+university +of +washington`）和未升格的 IU；AND 的 BMC 前移已回归，lead-stream 仍要窗开销 profile。
 
 ---
 

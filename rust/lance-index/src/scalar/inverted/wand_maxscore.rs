@@ -217,7 +217,7 @@ impl PostingIterator {
     /// Copy one decompressed posting block (or a 128-doc Plain slice) with
     /// `doc_id <= window_max` into `out`. Leaves the cursor on the first doc
     /// beyond that chunk.
-    pub(super) fn take_docs_one_block_upto(&mut self, window_max: u64, out: &mut Vec<(u64, u32)>) {
+    pub(crate) fn take_docs_one_block_upto(&mut self, window_max: u64, out: &mut Vec<(u64, u32)>) {
         out.clear();
         match self.list {
             PostingList::Compressed(ref list) => {

@@ -3,7 +3,7 @@
 
 mod should_maxscore;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
@@ -31,7 +31,8 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        WandCursor, WandDocuments, score_sum_upper_bound_factor,
+        WandCursor, WandDocuments, iu_tight_lead_is_cheaper, iu_tight_search,
+        score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -2041,6 +2042,10 @@ impl<K: Copy + Ord> TopKCollector<K> {
         }
     }
 
+    fn min_competitive_score(&self) -> f32 {
+        self.competitive_score.get()
+    }
+
     fn prune_obsolete_score_floors(&mut self) {
         while self.heap.len() > self.limit {
             let floor = self
@@ -4003,6 +4008,19 @@ where
     D: WandDocuments + Sync,
     K: Copy + Ord,
 {
+    if let Some((must_index, should_indices)) = iu_tight_leaf_indices(plan)
+        && iu_tight_leaves_ready(&leaves, must_index, &should_indices)
+        && iu_tight_should_switch(&leaves, must_index, &should_indices)
+    {
+        return collect_iu_tight(
+            documents,
+            leaves,
+            must_index,
+            &should_indices,
+            collector,
+            map_document,
+        );
+    }
     let mut leaf_scorers = leaves
         .into_iter()
         .map(|leaf| {
@@ -4028,6 +4046,127 @@ where
         ));
     }
     collector.collect_mapped(scorer.as_mut(), &mut map_document)
+}
+
+/// 1 MUST leaf + N SHOULD leaves, all identity-boost `Leaf` nodes, no MUST_NOT.
+fn iu_tight_leaf_indices(plan: &CompoundScorerPlan) -> Option<(usize, Vec<usize>)> {
+    let CompoundScorerPlan::Boolean {
+        should,
+        must,
+        must_not,
+    } = plan
+    else {
+        return None;
+    };
+    if !must_not.is_empty() || must.len() != 1 || should.is_empty() {
+        return None;
+    }
+    let CompoundScorerPlan::Leaf {
+        index: must_index,
+        boost: 1.0,
+    } = must[0]
+    else {
+        return None;
+    };
+    let mut should_indices = Vec::with_capacity(should.len());
+    for child in should {
+        match child {
+            CompoundScorerPlan::Leaf { index, boost: 1.0 } => {
+                should_indices.push(*index);
+            }
+            _ => return None,
+        }
+    }
+    Some((must_index, should_indices))
+}
+
+fn iu_tight_leaves_ready(
+    leaves: &[LoadedLeaf],
+    must_index: usize,
+    should_indices: &[usize],
+) -> bool {
+    if must_index >= leaves.len() || should_indices.iter().any(|&index| index >= leaves.len()) {
+        return false;
+    }
+    std::iter::once(must_index)
+        .chain(should_indices.iter().copied())
+        .all(|index| {
+            let leaf = &leaves[index];
+            leaf.postings.len() == 1
+                && leaf.params.phrase_slop.is_none()
+                && !leaf.postings[0].has_grouped_terms()
+                && leaf.postings[0].is_compressed()
+        })
+}
+
+fn iu_tight_should_switch(
+    leaves: &[LoadedLeaf],
+    must_index: usize,
+    should_indices: &[usize],
+) -> bool {
+    let must_cost = leaves[must_index].postings[0].cost();
+    let min_should = should_indices
+        .iter()
+        .map(|index| leaves[*index].postings[0].cost())
+        .min()
+        .unwrap_or(0);
+    iu_tight_lead_is_cheaper(must_cost, min_should)
+}
+
+fn collect_iu_tight<D, K>(
+    documents: &D,
+    mut leaves: Vec<LoadedLeaf>,
+    must_index: usize,
+    should_indices: &[usize],
+    collector: &mut TopKCollector<K>,
+    mut map_document: impl FnMut(u64) -> Result<K>,
+) -> Result<CollectionStatus>
+where
+    D: WandDocuments + Sync,
+    K: Copy + Ord,
+{
+    let mut take_posting = |index: usize| -> Result<PostingIterator> {
+        leaves[index]
+            .postings
+            .drain(..)
+            .next()
+            .ok_or_else(|| Error::internal("iu_tight_leaves_ready checked a single posting"))
+    };
+    let must = take_posting(must_index)?;
+    let shoulds = should_indices
+        .iter()
+        .map(|&leaf_index| take_posting(leaf_index))
+        .collect::<Result<Vec<_>>>()?;
+    let scorer = leaves[must_index].scorer.clone();
+    let mut overflow = false;
+    let floor = Cell::new(collector.min_competitive_score());
+    iu_tight_search(
+        documents,
+        scorer.as_ref(),
+        must,
+        shoulds,
+        &mut |key, score| {
+            if score < collector.min_competitive_score() {
+                return Ok(true);
+            }
+            let status = collector.insert(ScoredRow {
+                row_id: map_document(key)?,
+                score,
+            });
+            floor.set(collector.min_competitive_score());
+            if status == CollectionStatus::ScoreFloorOverflow {
+                overflow = true;
+                return Ok(false);
+            }
+            Ok(true)
+        },
+        || floor.get(),
+    )?;
+    Ok(if overflow {
+        CollectionStatus::ScoreFloorOverflow
+    } else {
+        CollectionStatus::Complete
+    })
 }
 
 fn collect_loaded_partitions(
@@ -6315,6 +6454,37 @@ mod tests {
 
     fn plan_leaf(index: usize) -> CompoundScorerPlan {
         CompoundScorerPlan::Leaf { index, boost: 1.0 }
+    }
+
+    #[test]
+    fn iu_tight_leaf_indices_matches_flat_must_should_terms() {
+        let plan = CompoundScorerPlan::Boolean {
+            should: vec![plan_leaf(0), plan_leaf(1)],
+            must: vec![plan_leaf(2)],
+            must_not: Vec::new(),
+        };
+        assert_eq!(iu_tight_leaf_indices(&plan), Some((2, vec![0, 1])));
+
+        let boosted = CompoundScorerPlan::Boolean {
+            should: vec![CompoundScorerPlan::Leaf {
+                index: 0,
+                boost: 2.0,
+            }],
+            must: vec![plan_leaf(1)],
+            must_not: Vec::new(),
+        };
+        assert_eq!(iu_tight_leaf_indices(&boosted), None);
+
+        let nested = CompoundScorerPlan::Boolean {
+            should: vec![CompoundScorerPlan::Boolean {
+                should: vec![plan_leaf(0)],
+                must: Vec::new(),
+                must_not: Vec::new(),
+            }],
+            must: vec![plan_leaf(1)],
+            must_not: Vec::new(),
+        };
+        assert_eq!(iu_tight_leaf_indices(&nested), None);
     }
 
     #[test]

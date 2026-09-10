@@ -24,10 +24,14 @@ use crate::metrics::MetricsCollector;
 
 #[path = "wand_intersection.rs"]
 mod intersection;
+#[path = "wand_iu_tight.rs"]
+mod iu_tight;
 #[path = "wand_maxscore.rs"]
 mod maxscore;
 #[path = "wand_seed_floor.rs"]
 mod seed_floor;
+
+pub(super) use iu_tight::{iu_tight_lead_is_cheaper, iu_tight_search};
 
 use super::{
     CompressedPositionStorage,
@@ -1111,12 +1115,12 @@ impl PostingIterator {
     }
 
     #[inline]
-    fn has_grouped_terms(&self) -> bool {
+    pub(super) fn has_grouped_terms(&self) -> bool {
         self.grouped_terms.is_some()
     }
 
     #[inline]
-    fn cost(&self) -> usize {
+    pub(super) fn cost(&self) -> usize {
         self.list.len()
     }
 
@@ -1608,7 +1612,7 @@ impl PostingIterator {
     }
 
     #[inline]
-    fn is_compressed(&self) -> bool {
+    pub(super) fn is_compressed(&self) -> bool {
         matches!(self.list, PostingList::Compressed(_))
     }
 
@@ -6731,6 +6735,99 @@ mod tests {
             wand.maxscore_single_essential_windows > 0,
             "a 2048+ gap between essentials must take the Lucene single-clause inner window"
         );
+    }
+
+    struct IuTightUnitScorer;
+
+    impl Scorer for IuTightUnitScorer {
+        fn query_weight(&self, _token: &str) -> f32 {
+            1.0
+        }
+
+        fn doc_weight(&self, _freq: u32, _doc_tokens: u32) -> f32 {
+            1.0
+        }
+    }
+
+    fn iu_tight_plain_posting(
+        token: &str,
+        doc_ids: Vec<u32>,
+        query_weight: f32,
+    ) -> PostingIterator {
+        let num_docs = doc_ids.iter().copied().max().unwrap_or(0) as usize + 1;
+        PostingIterator::with_query_weight(
+            token.to_owned(),
+            0,
+            0,
+            query_weight,
+            generate_posting_list(doc_ids, query_weight, None, false),
+            num_docs,
+        )
+    }
+
+    #[test]
+    fn iu_tight_search_sums_must_and_matching_shoulds() {
+        let mut docs = DocSet::default();
+        for doc_id in 0..8_u64 {
+            docs.append(doc_id, 1);
+        }
+        let must = iu_tight_plain_posting("must", vec![0, 2, 4, 6], 1.0);
+        let should = iu_tight_plain_posting("should", vec![2, 6, 7], 10.0);
+        let mut hits = Vec::new();
+        iu_tight::iu_tight_search(
+            &docs,
+            &IuTightUnitScorer,
+            must,
+            vec![should],
+            &mut |key, score| {
+                hits.push((key, score));
+                Ok(true)
+            },
+            || f32::NEG_INFINITY,
+        )
+        .unwrap();
+        assert_eq!(hits, vec![(0, 1.0), (2, 11.0), (4, 1.0), (6, 11.0)]);
+    }
+
+    #[test]
+    fn iu_tight_search_promotes_to_sparse_required_should() {
+        // MUST-only scores 1.0; the sparse SHOULD adds 10.0. After the first
+        // combined hit the floor is 11.0 and MUST's list-wide bound is 1.0, so
+        // the remaining walk must follow the SHOULD list (doc 250) instead of
+        // the rest of MUST.
+        let mut docs = DocSet::default();
+        for doc_id in 0..300_u64 {
+            docs.append(doc_id, 1);
+        }
+        let must = iu_tight_plain_posting("must", (0..300).collect(), 1.0);
+        let should = iu_tight_plain_posting("should", vec![2, 250], 10.0);
+        let mut hits = Vec::new();
+        let floor = std::cell::Cell::new(f32::NEG_INFINITY);
+        iu_tight::iu_tight_search(
+            &docs,
+            &IuTightUnitScorer,
+            must,
+            vec![should],
+            &mut |key, score| {
+                hits.push((key, score));
+                if score > floor.get() {
+                    floor.set(score);
+                }
+                Ok(true)
+            },
+            || floor.get(),
+        )
+        .unwrap();
+        assert!(
+            hits.iter().any(|&(key, score)| key == 250 && score == 11.0),
+            "promoted walk must still score the late SHOULD hit: {hits:?}"
+        );
+        assert!(
+            hits.len() < 200,
+            "promotion should stop walking MUST-only docs after the first block, got {} hits",
+            hits.len()
+        );
+        assert_eq!(hits.iter().filter(|&&(key, _)| key == 250).count(), 1);
     }
 
     #[test]
