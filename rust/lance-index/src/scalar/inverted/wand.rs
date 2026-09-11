@@ -5904,6 +5904,210 @@ impl<D: WandDocuments> Drop for WandCursor<'_, D> {
     }
 }
 
+/// One-term Boolean Match leaf: posting GEQ for approximation, BM25 on `score()`.
+///
+/// Unlike [`WandCursor`], this is not a WAND machine. Unlike the analysis-branch
+/// `TermLeafScorer`, it never uses a competitive floor to skip blocks or drop
+/// documents — ReqOpt must keep `R < F ≤ R+O` hits.
+pub(super) struct TermLeafScorer<'a, D: WandDocuments> {
+    posting: PostingIterator,
+    documents: &'a D,
+    scorer: Arc<MemBM25Scorer>,
+    cost: usize,
+    global_score_upper_bound: OnceCell<Option<f32>>,
+    current_doc: Option<DocInfo>,
+    current_document_key: Option<u64>,
+    current_score: f32,
+    score_ready: bool,
+    shallow: Option<(u64, u64, f32)>,
+    comparisons: usize,
+    metrics_recorded: bool,
+    metrics: &'a dyn MetricsCollector,
+}
+
+impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
+    pub(super) fn new(
+        posting: PostingIterator,
+        documents: &'a D,
+        scorer: Arc<MemBM25Scorer>,
+        _params: &FtsSearchParams,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Self {
+        let cost = posting.cost().min(documents.visible_cost_upper_bound());
+        Self {
+            posting,
+            documents,
+            scorer,
+            cost,
+            global_score_upper_bound: OnceCell::new(),
+            current_doc: None,
+            current_document_key: None,
+            current_score: 0.0,
+            score_ready: false,
+            shallow: None,
+            comparisons: 0,
+            metrics_recorded: false,
+            metrics,
+        }
+    }
+
+    pub(super) fn doc(&self) -> Option<u64> {
+        self.current_doc.map(|doc| doc.doc_id())
+    }
+
+    pub(super) fn document_key(&self) -> Option<u64> {
+        self.current_document_key
+    }
+
+    fn clear_current(&mut self) {
+        self.current_doc = None;
+        self.current_document_key = None;
+        self.current_score = 0.0;
+        self.score_ready = false;
+        self.shallow = None;
+    }
+
+    fn record_metrics(&mut self) {
+        if !self.metrics_recorded {
+            self.metrics.record_comparisons(self.comparisons);
+            self.metrics_recorded = true;
+        }
+    }
+
+    fn position_geq(&mut self, mut target: u64) -> Result<Option<u64>> {
+        self.clear_current();
+        loop {
+            self.posting.next_doc_id(target, true);
+            let Some(doc) = self.posting.current_doc else {
+                self.record_metrics();
+                return Ok(None);
+            };
+            self.comparisons += 1;
+            let Some(document_key) = self.documents.document_key(&doc) else {
+                target = doc.doc_id().saturating_add(1);
+                continue;
+            };
+            self.current_doc = Some(doc);
+            self.current_document_key = Some(document_key);
+            self.current_score = 0.0;
+            self.score_ready = false;
+            return Ok(Some(doc.doc_id()));
+        }
+    }
+
+    pub(super) fn next(&mut self) -> Result<Option<u64>> {
+        let target = match self.doc() {
+            None => 0,
+            Some(u64::MAX) => {
+                self.clear_current();
+                self.record_metrics();
+                return Ok(None);
+            }
+            Some(current) => current.saturating_add(1),
+        };
+        self.position_geq(target)
+    }
+
+    pub(super) fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.doc().is_some_and(|doc| doc >= target) {
+            return Ok(self.doc());
+        }
+        self.position_geq(target)
+    }
+
+    pub(super) fn cost(&self) -> usize {
+        self.cost
+    }
+
+    pub(super) fn global_score_upper_bound(&self) -> Option<f32> {
+        *self.global_score_upper_bound.get_or_init(|| {
+            if self.posting.has_grouped_terms() {
+                return None;
+            }
+            let upper = conservative_score_sum(std::iter::once(
+                self.posting.global_upper_bound(self.scorer.as_ref()),
+            ));
+            (upper.is_finite() && upper >= 0.0).then_some(upper)
+        })
+    }
+
+    pub(super) fn current_score(&mut self) -> Result<f32> {
+        if self.current_doc.is_none() {
+            return Err(Error::internal(
+                "posting FTS scorer is not positioned on a document",
+            ));
+        }
+        if self.score_ready {
+            return Ok(self.current_score);
+        }
+        let scored = self.posting.doc().ok_or_else(|| {
+            Error::internal("single-term posting is not positioned on a document")
+        })?;
+        let doc_length = self.documents.doc_length(&scored);
+        let score = self
+            .posting
+            .score(self.scorer.as_ref(), scored.frequency(), doc_length);
+        self.current_doc = Some(scored);
+        self.current_score = score;
+        self.score_ready = true;
+        Ok(score)
+    }
+
+    pub(super) fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        self.posting.shallow_next(target);
+        if let Some(first) = self.posting.block_first_doc()
+            && first > target
+        {
+            let up_to = first.saturating_sub(1).max(target);
+            self.shallow = Some((target, up_to, 0.0));
+            return Ok(up_to);
+        }
+        let up_to = self.posting.block_end_doc().max(target);
+        let upper = conservative_score_sum(std::iter::once(
+            self.posting
+                .window_max_score(Some(up_to), self.scorer.as_ref()),
+        ));
+        self.shallow = Some((target, up_to, upper));
+        Ok(up_to)
+    }
+
+    pub(super) fn score_upper_bound(&self, up_to: u64) -> Result<f32> {
+        let (target, shallow_up_to, upper) = self.shallow.ok_or_else(|| {
+            Error::internal("score bound requires advance_shallow on the posting FTS scorer")
+        })?;
+        if up_to < target || up_to > shallow_up_to {
+            return Err(Error::internal(format!(
+                "posting FTS score bound up_to={up_to} is outside shallow range [{target}, {shallow_up_to}]"
+            )));
+        }
+        Ok(upper)
+    }
+
+    pub(super) fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        if min_score.is_nan() {
+            return Err(Error::invalid_input(
+                "minimum competitive FTS score cannot be NaN",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn scored_upper_bound(&self) -> Option<f32> {
+        self.score_ready.then_some(self.current_score)
+    }
+
+    #[cfg(test)]
+    fn frequency_blocks_decoded(&self) -> usize {
+        self.posting.frequency_blocks_decoded()
+    }
+}
+
+impl<D: WandDocuments> Drop for TermLeafScorer<'_, D> {
+    fn drop(&mut self) {
+        self.record_metrics();
+    }
+}
+
 impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
     fn compound_global_score_upper_bound(&self) -> Option<f32> {
         if self.lead.len() + self.head.len() + self.tail.len() != self.num_terms {
@@ -11819,5 +12023,96 @@ mod tests {
             "impact bounds must activate on the first window after the heap fills"
         );
         assert!(scored.load(Ordering::Relaxed) > 0);
+    }
+
+    fn term_leaf_posting(doc_ids: Vec<u32>, compressed: bool) -> (DocSet, PostingIterator) {
+        let mut docs = DocSet::default();
+        let n = (*doc_ids.last().unwrap_or(&0) as usize)
+            .saturating_add(1)
+            .max(1);
+        for doc_id in 0..n {
+            docs.append(doc_id as u64, 1);
+        }
+        let posting = PostingIterator::with_query_weight(
+            "t".to_owned(),
+            0,
+            0,
+            1.0,
+            generate_posting_list(doc_ids, 1.0, None, compressed),
+            docs.len(),
+        );
+        (docs, posting)
+    }
+
+    #[test]
+    fn term_leaf_defers_frequency_decode_until_score() {
+        let (docs, posting) = term_leaf_posting(vec![0, 2, 4], true);
+        let scorer = Arc::new(MemBM25Scorer::new(
+            docs.len() as u64,
+            docs.len(),
+            Default::default(),
+        ));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+        let mut leaf = TermLeafScorer::new(posting, &docs, scorer, &params, &metrics);
+
+        assert_eq!(leaf.next().unwrap(), Some(0));
+        assert_eq!(
+            leaf.frequency_blocks_decoded(),
+            0,
+            "GEQ must not decompress frequencies"
+        );
+        let score = leaf.current_score().unwrap();
+        assert!(score.is_finite());
+        assert!(
+            leaf.frequency_blocks_decoded() > 0,
+            "score() must decompress frequencies"
+        );
+        assert_eq!(leaf.advance(2).unwrap(), Some(2));
+        assert_eq!(leaf.next().unwrap(), Some(4));
+        assert!(leaf.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn term_leaf_matches_wand_cursor_bm25_bits() {
+        let (docs, posting) = term_leaf_posting(vec![0, 3], true);
+        let scored = posting.fork_from_start();
+        let scorer = Arc::new(MemBM25Scorer::new(
+            docs.len() as u64,
+            docs.len(),
+            Default::default(),
+        ));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+        let mut leaf = TermLeafScorer::new(posting, &docs, scorer.clone(), &params, &metrics);
+        let mut wand =
+            WandCursor::new(Operator::Or, vec![scored], &docs, scorer, &params, &metrics);
+
+        assert_eq!(leaf.next().unwrap(), wand.next().unwrap());
+        assert_eq!(
+            leaf.current_score().unwrap().to_bits(),
+            wand.current_score().unwrap().to_bits()
+        );
+        assert_eq!(leaf.next().unwrap(), wand.next().unwrap());
+        assert_eq!(
+            leaf.current_score().unwrap().to_bits(),
+            wand.current_score().unwrap().to_bits()
+        );
+    }
+
+    #[test]
+    fn term_leaf_ignores_competitive_floor_on_advance() {
+        let (docs, posting) = term_leaf_posting(vec![0, 5], true);
+        let scorer = Arc::new(MemBM25Scorer::new(
+            docs.len() as u64,
+            docs.len(),
+            Default::default(),
+        ));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+        let mut leaf = TermLeafScorer::new(posting, &docs, scorer, &params, &metrics);
+        leaf.set_min_competitive_score(f32::MAX).unwrap();
+        assert_eq!(leaf.next().unwrap(), Some(0));
+        assert_eq!(leaf.next().unwrap(), Some(5));
     }
 }

@@ -31,7 +31,7 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        WandCursor, WandDocuments, iu_tight_lead_is_cheaper, iu_tight_search,
+        TermLeafScorer, WandCursor, WandDocuments, iu_tight_lead_is_cheaper, iu_tight_search,
         score_sum_upper_bound_factor,
     },
 };
@@ -297,6 +297,21 @@ pub(super) trait ComposableScorer: Send {
 
     fn scores_non_negative(&self) -> bool {
         false
+    }
+
+    #[cfg(test)]
+    fn debug_type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
+    #[cfg(test)]
+    fn debug_child_type_names(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
+    #[cfg(test)]
+    fn debug_last_min_competitive_score(&self) -> Option<f32> {
+        None
     }
 }
 
@@ -723,7 +738,7 @@ impl CompoundScorerPlan {
                 should,
                 must,
                 must_not,
-            } => Ok(Box::new(BooleanScorer::try_new(
+            } => BooleanScorer::try_root(
                 should
                     .iter()
                     .map(|child| child.build(leaves))
@@ -735,7 +750,7 @@ impl CompoundScorerPlan {
                     .iter()
                     .map(|child| child.build(leaves))
                     .collect::<Result<Vec<_>>>()?,
-            )?)),
+            ),
         }
     }
 }
@@ -798,6 +813,63 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
 
     fn match_cost(&self) -> Option<f32> {
         self.match_cost()
+    }
+
+    fn scores_non_negative(&self) -> bool {
+        true
+    }
+}
+
+impl<D: WandDocuments + Sync> ComposableScorer for TermLeafScorer<'_, D> {
+    fn doc(&self) -> Option<u64> {
+        self.doc()
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        self.document_key()
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        self.next()
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        self.advance(target)
+    }
+
+    fn cost(&self) -> usize {
+        self.cost()
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        self.current_score()
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        self.advance_shallow(target)
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        Ok(ScoreBounds {
+            lower: 0.0,
+            upper: self.score_upper_bound(up_to)?,
+        })
+    }
+
+    fn global_score_upper_bound(&self) -> Option<f32> {
+        TermLeafScorer::global_score_upper_bound(self)
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        self.set_min_competitive_score(min_score)
+    }
+
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        Ok(self.scored_upper_bound())
+    }
+
+    fn matches(&mut self) -> Result<bool> {
+        Ok(self.doc().is_some())
     }
 
     fn scores_non_negative(&self) -> bool {
@@ -1041,6 +1113,11 @@ impl ComposableScorer for MaterializedScorer {
 
     fn scores_non_negative(&self) -> bool {
         self.scores_non_negative
+    }
+
+    #[cfg(test)]
+    fn debug_last_min_competitive_score(&self) -> Option<f32> {
+        Some(self.min_competitive_score)
     }
 }
 
@@ -2372,6 +2449,11 @@ impl ComposableScorer for ScaleScorer<'_> {
     fn scores_non_negative(&self) -> bool {
         self.child.scores_non_negative()
     }
+
+    #[cfg(test)]
+    fn debug_child_type_names(&self) -> Vec<&'static str> {
+        vec![self.child.debug_type_name()]
+    }
 }
 
 /// Union scorer used for Boolean SHOULD sums and MultiMatch DisMax.
@@ -2621,6 +2703,14 @@ impl ComposableScorer for DisjunctionScorer<'_> {
         self.children
             .iter()
             .all(|child| child.scores_non_negative())
+    }
+
+    #[cfg(test)]
+    fn debug_child_type_names(&self) -> Vec<&'static str> {
+        self.children
+            .iter()
+            .map(|child| child.debug_type_name())
+            .collect()
     }
 }
 
@@ -2894,6 +2984,14 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
         self.children
             .iter()
             .all(|child| child.scores_non_negative())
+    }
+
+    #[cfg(test)]
+    fn debug_child_type_names(&self) -> Vec<&'static str> {
+        self.children
+            .iter()
+            .map(|child| child.debug_type_name())
+            .collect()
     }
 }
 
@@ -3405,9 +3503,15 @@ impl ComposableScorer for ReqOptScorer<'_> {
     fn scores_non_negative(&self) -> bool {
         true
     }
-}
 
-/// Boolean scorer preserving the current membership and score semantics.
+    #[cfg(test)]
+    fn debug_child_type_names(&self) -> Vec<&'static str> {
+        vec![
+            self.required.debug_type_name(),
+            self.optional.debug_type_name(),
+        ]
+    }
+}
 pub(super) struct BooleanScorer<'a> {
     driver: BoxScorer<'a>,
     optional: Option<BoxScorer<'a>>,
@@ -3447,7 +3551,11 @@ impl<'a> BooleanScorer<'a> {
                         as BoxScorer<'a>,
                 )
             };
-            let required = Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>;
+            let required = if must.len() == 1 {
+                must.into_iter().next().expect("must has one child")
+            } else {
+                Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>
+            };
             let driver = if required.scores_non_negative()
                 && optional
                     .as_ref()
@@ -3493,6 +3601,19 @@ impl<'a> BooleanScorer<'a> {
             optional_matches: false,
             defer_confirmation: scores_non_negative && has_doc_local_confirmation,
         })
+    }
+
+    pub(super) fn try_root(
+        should: Vec<BoxScorer<'a>>,
+        must: Vec<BoxScorer<'a>>,
+        must_not: Vec<BoxScorer<'a>>,
+    ) -> Result<BoxScorer<'a>> {
+        let boolean = Self::try_new(should, must, must_not)?;
+        if boolean.optional.is_none() && boolean.prohibited.is_none() {
+            Ok(boolean.driver)
+        } else {
+            Ok(Box::new(boolean))
+        }
     }
 
     fn set_current(&mut self, current: Option<u64>) -> Option<u64> {
@@ -3712,6 +3833,18 @@ impl ComposableScorer for BooleanScorer<'_> {
                 .optional
                 .as_ref()
                 .is_none_or(|optional| optional.scores_non_negative())
+    }
+
+    #[cfg(test)]
+    fn debug_child_type_names(&self) -> Vec<&'static str> {
+        let mut names = vec![self.driver.debug_type_name()];
+        if let Some(optional) = &self.optional {
+            names.push(optional.debug_type_name());
+        }
+        if let Some(prohibited) = &self.prohibited {
+            names.push(prohibited.debug_type_name());
+        }
+        names
     }
 }
 
@@ -3996,6 +4129,47 @@ struct CollectedPartitions {
     boundary: Option<PartitionCollectionBoundary>,
 }
 
+fn is_compound_term_leaf(leaf: &LoadedLeaf) -> bool {
+    leaf.postings.len() == 1
+        && leaf.params.phrase_slop.is_none()
+        && !leaf.postings[0].has_grouped_terms()
+}
+
+fn box_leaf_scorer<'a, D>(
+    leaf: LoadedLeaf,
+    documents: &'a D,
+    metrics: &'a dyn MetricsCollector,
+) -> BoxScorer<'a>
+where
+    D: WandDocuments + Sync,
+{
+    if leaf.postings.is_empty() {
+        return Box::new(EmptyScorer);
+    }
+    if is_compound_term_leaf(&leaf) {
+        let posting = leaf
+            .postings
+            .into_iter()
+            .next()
+            .expect("is_compound_term_leaf requires one posting");
+        return Box::new(TermLeafScorer::new(
+            posting,
+            documents,
+            leaf.scorer,
+            leaf.params.as_ref(),
+            metrics,
+        ));
+    }
+    Box::new(WandCursor::new(
+        leaf.operator,
+        leaf.postings,
+        documents,
+        leaf.scorer,
+        leaf.params.as_ref(),
+        metrics,
+    ))
+}
+
 fn collect_partition_with_documents<D, K>(
     documents: &D,
     leaves: Vec<LoadedLeaf>,
@@ -4023,21 +4197,7 @@ where
     }
     let mut leaf_scorers = leaves
         .into_iter()
-        .map(|leaf| {
-            let scorer: BoxScorer<'_> = if leaf.postings.is_empty() {
-                Box::new(EmptyScorer)
-            } else {
-                Box::new(WandCursor::new(
-                    leaf.operator,
-                    leaf.postings,
-                    documents,
-                    leaf.scorer,
-                    leaf.params.as_ref(),
-                    metrics,
-                ))
-            };
-            Some(scorer)
-        })
+        .map(|leaf| Some(box_leaf_scorer(leaf, documents, metrics)))
         .collect::<Vec<_>>();
     let mut scorer = plan.build(&mut leaf_scorers)?;
     if leaf_scorers.iter().any(Option::is_some) {
@@ -4585,6 +4745,7 @@ mod tests {
     };
     use super::super::index::{PlainPostingList, PostingList};
     use super::super::scorer::Scorer;
+    use super::super::wand::GroupedTermScorer;
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::inverted::query::MultiMatchQuery;
@@ -7190,5 +7351,217 @@ mod tests {
                 rows(&[(0, large_score), (1, large_score), (2, large_score)])
             );
         }
+    }
+
+    fn plain_unit_posting(token: &str, doc_ids: Vec<u64>) -> PostingIterator {
+        let freqs = vec![1.0_f32; doc_ids.len()];
+        PostingIterator::with_query_weight(
+            token.to_owned(),
+            0,
+            0,
+            1.0,
+            PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from(doc_ids),
+                ScalarBuffer::from(freqs),
+                Some(1.0),
+                None,
+            )),
+            1,
+        )
+    }
+
+    fn loaded_leaf(postings: Vec<PostingIterator>, phrase_slop: Option<u32>) -> LoadedLeaf {
+        let mut params = FtsSearchParams::default();
+        params.phrase_slop = phrase_slop;
+        LoadedLeaf {
+            postings,
+            params: Arc::new(params),
+            operator: Operator::Or,
+            scorer: Arc::new(MemBM25Scorer::new(1, 1, HashMap::new())),
+        }
+    }
+
+    #[test]
+    fn box_leaf_scorer_uses_term_leaf_for_one_ungrouped_term() {
+        let documents = DocSet::default();
+        let metrics = NoOpMetricsCollector;
+        let leaf = loaded_leaf(vec![plain_unit_posting("a", vec![0])], None);
+        let scorer = box_leaf_scorer(leaf, &documents, &metrics);
+        assert!(
+            scorer.debug_type_name().contains("TermLeafScorer"),
+            "got {}",
+            scorer.debug_type_name()
+        );
+    }
+
+    #[test]
+    fn box_leaf_scorer_keeps_wand_cursor_for_phrase_grouped_and_multi_term() {
+        let documents = DocSet::default();
+        let metrics = NoOpMetricsCollector;
+
+        let phrase = loaded_leaf(vec![plain_unit_posting("a", vec![0])], Some(0));
+        let phrase_scorer = box_leaf_scorer(phrase, &documents, &metrics);
+        assert!(
+            phrase_scorer.debug_type_name().contains("WandCursor"),
+            "got {}",
+            phrase_scorer.debug_type_name()
+        );
+
+        let list = PostingList::Plain(PlainPostingList::new(
+            ScalarBuffer::from(vec![0_u64]),
+            ScalarBuffer::from(vec![1.0_f32]),
+            Some(1.0),
+            None,
+        ));
+        let grouped =
+            PostingIterator::with_query_weight("g".to_owned(), 0, 0, 1.0, list.clone(), 1)
+                .with_grouped_terms(Arc::from([GroupedTermScorer::new(1.0, &list)]));
+        let grouped_scorer =
+            box_leaf_scorer(loaded_leaf(vec![grouped], None), &documents, &metrics);
+        assert!(
+            grouped_scorer.debug_type_name().contains("WandCursor"),
+            "got {}",
+            grouped_scorer.debug_type_name()
+        );
+
+        let multi = loaded_leaf(
+            vec![
+                plain_unit_posting("a", vec![0]),
+                plain_unit_posting("b", vec![0]),
+            ],
+            None,
+        );
+        let multi_scorer = box_leaf_scorer(multi, &documents, &metrics);
+        assert!(
+            multi_scorer.debug_type_name().contains("WandCursor"),
+            "got {}",
+            multi_scorer.debug_type_name()
+        );
+    }
+
+    #[test]
+    fn try_root_unwraps_reqopt_for_one_must_and_keeps_boolean_with_must_not() {
+        let root = BooleanScorer::try_root(
+            vec![
+                materialized(&[(0, 1.0), (1, 1.0)]),
+                materialized(&[(1, 2.0)]),
+            ],
+            vec![materialized(&[(0, 3.0), (1, 3.0)])],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            root.debug_type_name().contains("ReqOptScorer"),
+            "got {}",
+            root.debug_type_name()
+        );
+        let children = root.debug_child_type_names();
+        assert!(
+            !children[0].contains("RequiredConjunctionScorer"),
+            "required child was {}",
+            children[0]
+        );
+
+        let with_must_not = BooleanScorer::try_root(
+            vec![materialized(&[(0, 1.0)])],
+            vec![materialized(&[(0, 3.0)])],
+            vec![materialized(&[(1, 1.0)])],
+        )
+        .unwrap();
+        assert!(
+            with_must_not.debug_type_name().contains("BooleanScorer"),
+            "got {}",
+            with_must_not.debug_type_name()
+        );
+    }
+
+    #[test]
+    fn plan_build_still_wraps_identity_boost_in_scale() {
+        let mut leaves = vec![Some(materialized(&[(0, 1.0)]))];
+        let identity = CompoundScorerPlan::Leaf {
+            index: 0,
+            boost: 1.0,
+        }
+        .build(&mut leaves)
+        .unwrap();
+        assert!(
+            identity.debug_type_name().contains("ScaleScorer"),
+            "got {}",
+            identity.debug_type_name()
+        );
+
+        let mut leaves = vec![Some(materialized(&[(0, 1.0)]))];
+        let boosted = CompoundScorerPlan::Leaf {
+            index: 0,
+            boost: 2.0,
+        }
+        .build(&mut leaves)
+        .unwrap();
+        assert!(
+            boosted.debug_type_name().contains("ScaleScorer"),
+            "got {}",
+            boosted.debug_type_name()
+        );
+        assert!(
+            boosted.debug_child_type_names()[0].contains("MaterializedScorer"),
+            "got {:?}",
+            boosted.debug_child_type_names()
+        );
+    }
+
+    #[test]
+    fn two_must_children_stay_conjunction_and_do_not_forward_full_floor() {
+        let mut conjunction = RequiredConjunctionScorer::try_new(vec![
+            materialized(&[(0, 1.0)]),
+            materialized(&[(0, 2.0)]),
+        ])
+        .unwrap();
+        assert_eq!(conjunction.children.len(), 2);
+        conjunction.set_min_competitive_score(10.0).unwrap();
+        for child in &conjunction.children {
+            assert_eq!(
+                child.debug_last_min_competitive_score(),
+                Some(f32::NEG_INFINITY)
+            );
+        }
+
+        let boolean = BooleanScorer::try_new(
+            Vec::new(),
+            vec![materialized(&[(0, 1.0)]), materialized(&[(0, 2.0)])],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            boolean
+                .driver
+                .debug_type_name()
+                .contains("RequiredConjunctionScorer"),
+            "got {}",
+            boolean.driver.debug_type_name()
+        );
+    }
+
+    #[test]
+    fn signed_should_keeps_boolean_root_and_includes_optional_score() {
+        let signed_should = Box::new(
+            BoostScorer::try_new(materialized(&[(0, 2.0)]), materialized(&[(0, 1.0)]), 1.0)
+                .unwrap(),
+        );
+        assert!(!signed_should.scores_non_negative());
+        let mut root = BooleanScorer::try_root(
+            vec![signed_should],
+            vec![materialized(&[(0, 3.0)])],
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            root.debug_type_name().contains("BooleanScorer"),
+            "got {}",
+            root.debug_type_name()
+        );
+        assert_eq!(
+            TopKCollector::new(1).collect(root.as_mut()).unwrap(),
+            rows(&[(0, 4.0)])
+        );
     }
 }

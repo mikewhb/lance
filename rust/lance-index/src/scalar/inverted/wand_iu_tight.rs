@@ -299,5 +299,9 @@ mod tests {
         assert!(!iu_tight_lead_is_cheaper(20_000, 10_000));
         assert!(!iu_tight_lead_is_cheaper(30_000, 10_000));
         assert!(iu_tight_lead_is_cheaper(31_000, 10_000));
+        // leftover IU: MUST df is close to the cheapest SHOULD (airport ~56k vs
+        // security ~77k). The 3x lead-cost gate must not switch kernels.
+        assert!(!iu_tight_lead_is_cheaper(56_000, 77_000));
+        assert!(!iu_tight_lead_is_cheaper(56_000, 56_000));
     }
 }
