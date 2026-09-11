@@ -271,8 +271,9 @@ impl CompetitiveFloorMode {
 // bulk path for two and three clauses and for wider current-format conjunctions
 // whose posting lengths stay within `lead_stream::AND_SKEW_RATIO`. A stopword
 // paired with a rare term stays off N-way bulk: the merge would decompress
-// the dense list in every window. Skewed Auto conjunctions with three or more
-// clauses use a lead-stream instead; a skewed pair keeps classic leapfrog.
+// the dense list in every window. Auto conjunctions with three or more clauses
+// that do not take bulk use a lead-stream (shortest list drives, including
+// Wikipedia block-128 4+). A skewed pair keeps classic leapfrog.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BulkAndMode {
     #[default]
@@ -2635,10 +2636,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
 
         // Top-k conjunctions (AND and phrase) over compressed lists: N-way
-        // bulk when Auto/On selects a balanced shape; leftover Auto (skewed
-        // 3+, including Wikipedia block-128 4+) uses a lead-stream so the
-        // rare list drives and dense followers only seek. Explicit Off and
-        // skewed pairs keep the classic per-doc leapfrog.
+        // bulk when Auto/On selects a balanced 2/3 or a modern 256-wide
+        // shape. Other Auto conjunctions with three or more clauses use a
+        // lead-stream so the shortest list drives and followers only seek
+        // (including Wikipedia block-128 4+). Explicit Off and skewed pairs
+        // keep the classic per-doc leapfrog.
         if self.operator == Operator::And
             && !self.lead.is_empty()
             && self
@@ -2673,7 +2675,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 return self.and_bulk_search(params, metrics);
             }
-            if mode == BulkAndMode::Auto && is_skewed && num_clauses >= 3 {
+            if mode == BulkAndMode::Auto && num_clauses >= 3 {
                 #[cfg(test)]
                 {
                     self.lead_stream_and_searches += 1;
@@ -11392,6 +11394,56 @@ mod tests {
                 ));
             }
             postings
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let classic = run_and_search(BulkAndMode::Off, build(), &docs, &params);
+        let auto = run_and_search(BulkAndMode::Auto, build(), &docs, &params);
+        let on = run_and_search(BulkAndMode::On, build(), &docs, &params);
+        assert!(!classic.rows.is_empty());
+        assert_eq!(classic.bulk_searches, 0);
+        assert_eq!(classic.lead_stream_searches, 0);
+        assert_eq!(auto.bulk_searches, 0);
+        assert_eq!(auto.lead_stream_searches, 1);
+        assert_eq!(on.bulk_searches, 1);
+        assert_eq!(on.lead_stream_searches, 0);
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(on.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
+        assert_eq!(on.kth_bits, classic.kth_bits);
+    }
+
+    #[rstest]
+    #[case::four(4)]
+    #[case::six(6)]
+    fn auto_uses_lead_stream_for_unskewed_legacy_wide_and(#[case] num_clauses: usize) {
+        // Same-length 128-block lists: Auto n>=4 must not leapfrog and must not
+        // take bulk (reserved for 2/3 and modern 256-wide). On still forces bulk.
+        let num_docs = 512_u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8 + doc_id % 5);
+        }
+        let dense: Vec<u32> = (0..num_docs).collect();
+        let even: Vec<u32> = (0..num_docs).filter(|doc| doc % 2 == 0).collect();
+        // 2× is well below AND_SKEW_RATIO; this is the Wikipedia 128-block 4+ path.
+        assert_eq!(dense.len() / even.len(), 2);
+        let build = || {
+            (0..num_clauses)
+                .map(|term| {
+                    let doc_ids = if term % 2 == 0 {
+                        dense.clone()
+                    } else {
+                        even.clone()
+                    };
+                    compressed_and_clause(
+                        &format!("t{term}"),
+                        term as u32,
+                        1.0,
+                        doc_ids,
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>()
         };
         let params = FtsSearchParams::default().with_limit(Some(10));
         let classic = run_and_search(BulkAndMode::Off, build(), &docs, &params);

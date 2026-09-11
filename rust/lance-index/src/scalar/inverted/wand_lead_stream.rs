@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Skewed conjunction search: the rare list's decompressed block is the
-//! buffer, dense followers only `next(target)`.
+//! Lead-stream conjunction search: the shortest list's decompressed block is
+//! the buffer, followers only `next(target)`.
 //!
 //! Community Auto still uses N-way bulk for balanced 2/3 (and modern 4+).
 //! When `max_cost / min_cost >= AND_SKEW_RATIO`, bulk would decompress the
-//! stopword in every window the rare term barely touches. Three or more
-//! skewed clauses therefore take this lead-stream; a skewed pair stays on
-//! classic leapfrog (Lucene `ConjunctionDISI` — one follower makes the
-//! buffer pure overhead).
+//! stopword in every window the rare term barely touches. Auto conjunctions
+//! with three or more clauses that do not take bulk therefore take this
+//! lead-stream, including unskewed Wikipedia block-128 4+. A skewed pair
+//! stays on classic leapfrog (Lucene `ConjunctionDISI` — one follower makes
+//! the buffer pure overhead).
 //!
 //! Inner score-first is not a dispatch table: with three or more clauses
 //! whose second list is at least `AND_SCORE_FIRST_COST_RATIO` times the
@@ -154,8 +155,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }));
     }
 
-    /// Skewed conjunction: the rare lead's decompressed block is the buffer,
-    /// followers only `next(target)`. Scoring, phrase confirm, and heap
+    /// Lead-stream conjunction: the shortest list's decompressed block is the
+    /// buffer, followers only `next(target)`. Scoring, phrase confirm, and heap
     /// semantics match the classic loop.
     pub(super) fn and_lead_stream_search(
         &mut self,
