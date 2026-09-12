@@ -7371,8 +7371,10 @@ mod tests {
     }
 
     fn loaded_leaf(postings: Vec<PostingIterator>, phrase_slop: Option<u32>) -> LoadedLeaf {
-        let mut params = FtsSearchParams::default();
-        params.phrase_slop = phrase_slop;
+        let params = FtsSearchParams {
+            phrase_slop,
+            ..Default::default()
+        };
         LoadedLeaf {
             postings,
             params: Arc::new(params),
