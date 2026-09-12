@@ -2386,6 +2386,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     #[cfg(test)]
     lead_stream_and_searches: usize,
     #[cfg(test)]
+    lead_stream_score_first_blocks: usize,
+    #[cfg(test)]
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
     maxscore_general_windows: usize,
@@ -2501,6 +2503,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             bulk_and_searches: 0,
             #[cfg(test)]
             lead_stream_and_searches: 0,
+            #[cfg(test)]
+            lead_stream_score_first_blocks: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
@@ -11292,6 +11296,7 @@ mod tests {
         rows: Vec<AndHit>,
         bulk_searches: usize,
         lead_stream_searches: usize,
+        score_first_blocks: usize,
         kth_bits: u32,
     }
 
@@ -11321,6 +11326,7 @@ mod tests {
             rows,
             bulk_searches: wand.bulk_and_searches,
             lead_stream_searches: wand.lead_stream_and_searches,
+            score_first_blocks: wand.lead_stream_score_first_blocks,
             kth_bits: shared_floor.load(Ordering::Relaxed),
         }
     }
@@ -11402,10 +11408,13 @@ mod tests {
         assert!(!classic.rows.is_empty());
         assert_eq!(classic.bulk_searches, 0);
         assert_eq!(classic.lead_stream_searches, 0);
+        assert_eq!(classic.score_first_blocks, 0);
         assert_eq!(auto.bulk_searches, 0);
         assert_eq!(auto.lead_stream_searches, 1);
+        assert!(auto.score_first_blocks >= 1);
         assert_eq!(on.bulk_searches, 1);
         assert_eq!(on.lead_stream_searches, 0);
+        assert_eq!(on.score_first_blocks, 0);
         assert_eq!(auto.rows, classic.rows);
         assert_eq!(on.rows, classic.rows);
         assert_eq!(auto.kth_bits, classic.kth_bits);
@@ -11454,6 +11463,7 @@ mod tests {
         assert_eq!(classic.lead_stream_searches, 0);
         assert_eq!(auto.bulk_searches, 0);
         assert_eq!(auto.lead_stream_searches, 1);
+        assert_eq!(auto.score_first_blocks, 0);
         assert_eq!(on.bulk_searches, 1);
         assert_eq!(on.lead_stream_searches, 0);
         assert_eq!(auto.rows, classic.rows);
@@ -11515,11 +11525,39 @@ mod tests {
         assert!(!classic.rows.is_empty());
         assert_eq!(auto.bulk_searches, 0);
         assert_eq!(auto.lead_stream_searches, 1);
+        assert_eq!(auto.score_first_blocks, 0);
         assert_eq!(on.bulk_searches, 1);
         assert_eq!(auto.rows, classic.rows);
         assert_eq!(on.rows, classic.rows);
         assert_eq!(auto.kth_bits, classic.kth_bits);
         assert_eq!(on.kth_bits, classic.kth_bits);
+    }
+
+    #[test]
+    fn auto_score_first_block_matches_classic_with_unbounded_limit() {
+        let num_docs = 512_u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8 + doc_id % 5);
+        }
+        let rare = every_nth_docs(num_docs, 32);
+        let dense: Vec<u32> = (0..num_docs).collect();
+        let mid: Vec<u32> = (0..num_docs).filter(|doc| doc % 2 == 0).collect();
+        let build = || {
+            vec![
+                compressed_and_clause("rare", 0, 4.0, rare.clone(), docs.len()),
+                compressed_and_clause("mid", 1, 2.0, mid.clone(), docs.len()),
+                compressed_and_clause("dense", 2, 1.0, dense.clone(), docs.len()),
+            ]
+        };
+        let params = FtsSearchParams::default().with_limit(None);
+        let classic = run_and_search(BulkAndMode::Off, build(), &docs, &params);
+        let auto = run_and_search(BulkAndMode::Auto, build(), &docs, &params);
+        assert!(!classic.rows.is_empty());
+        assert_eq!(auto.lead_stream_searches, 1);
+        assert!(auto.score_first_blocks >= 1);
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
     }
 
     #[rstest]

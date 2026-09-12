@@ -35,7 +35,7 @@ pub(super) fn exclusive_cannot_compete(
         )
 }
 
-fn bm25_tf_from_caches(
+pub(super) fn bm25_tf_from_caches(
     query_weight: f32,
     freq: u32,
     doc: u32,
