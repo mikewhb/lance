@@ -2388,6 +2388,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     #[cfg(test)]
     lead_stream_score_first_blocks: usize,
     #[cfg(test)]
+    lead_stream_intersect_first_blocks: usize,
+    #[cfg(test)]
     lead_stream_block_leaps: usize,
     #[cfg(test)]
     maxscore_single_essential_windows: usize,
@@ -2507,6 +2509,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             lead_stream_and_searches: 0,
             #[cfg(test)]
             lead_stream_score_first_blocks: 0,
+            #[cfg(test)]
+            lead_stream_intersect_first_blocks: 0,
             #[cfg(test)]
             lead_stream_block_leaps: 0,
             #[cfg(test)]
@@ -11301,6 +11305,7 @@ mod tests {
         bulk_searches: usize,
         lead_stream_searches: usize,
         score_first_blocks: usize,
+        intersect_first_blocks: usize,
         block_leaps: usize,
         kth_bits: u32,
     }
@@ -11342,6 +11347,7 @@ mod tests {
             bulk_searches: wand.bulk_and_searches,
             lead_stream_searches: wand.lead_stream_and_searches,
             score_first_blocks: wand.lead_stream_score_first_blocks,
+            intersect_first_blocks: wand.lead_stream_intersect_first_blocks,
             block_leaps: wand.lead_stream_block_leaps,
             kth_bits: shared_floor.load(Ordering::Relaxed),
         }
@@ -11428,6 +11434,7 @@ mod tests {
         assert_eq!(auto.bulk_searches, 0);
         assert_eq!(auto.lead_stream_searches, 1);
         assert!(auto.score_first_blocks >= 1);
+        assert_eq!(auto.intersect_first_blocks, 0);
         assert_eq!(on.bulk_searches, 1);
         assert_eq!(on.lead_stream_searches, 0);
         assert_eq!(on.score_first_blocks, 0);
@@ -11527,6 +11534,7 @@ mod tests {
         assert_eq!(auto.bulk_searches, 0);
         assert_eq!(auto.lead_stream_searches, 1);
         assert_eq!(auto.score_first_blocks, 0);
+        assert_eq!(auto.intersect_first_blocks, 0);
         assert_eq!(auto.rows, classic.rows);
         assert_eq!(auto.kth_bits, classic.kth_bits);
     }
@@ -11572,7 +11580,72 @@ mod tests {
         assert!(!classic.rows.is_empty());
         assert_eq!(auto.bulk_searches, 0);
         assert_eq!(auto.lead_stream_searches, 1);
-        assert!(auto.score_first_blocks >= 1);
+        assert!(auto.score_first_blocks + auto.intersect_first_blocks >= 1);
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
+    }
+
+    #[test]
+    fn auto_leftover_shared_floor_uses_intersect_first_when_probe_prunes_little() {
+        let num_docs = 512_u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8 + doc_id % 5);
+        }
+        let dense: Vec<u32> = (0..num_docs).collect();
+        let even: Vec<u32> = (0..num_docs).filter(|doc| doc % 2 == 0).collect();
+        let build = || {
+            vec![
+                compressed_and_clause("t0", 0, 8.0, dense.clone(), docs.len()),
+                compressed_and_clause("t1", 1, 8.0, even.clone(), docs.len()),
+                compressed_and_clause("t2", 2, 8.0, dense.clone(), docs.len()),
+                compressed_and_clause("t3", 3, 8.0, even.clone(), docs.len()),
+            ]
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let seed = run_and_search(BulkAndMode::Off, build(), &docs, &params);
+        let floor = f32::from_bits(seed.kth_bits) * 0.25;
+        assert!(floor > 0.0);
+        let classic = run_and_search_with_floor(BulkAndMode::Off, build(), &docs, &params, floor);
+        let auto = run_and_search_with_floor(BulkAndMode::Auto, build(), &docs, &params, floor);
+        assert!(!classic.rows.is_empty());
+        assert_eq!(auto.bulk_searches, 0);
+        assert_eq!(auto.lead_stream_searches, 1);
+        assert!(auto.intersect_first_blocks >= 1);
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
+    }
+
+    #[test]
+    fn auto_leftover_shared_floor_high_probe_skip_matches_classic() {
+        // Follower bounds are tiny vs the shared floor, so the probe keeps
+        // score-first for the window remainder. Correctness is rows/kth; path
+        // mix is covered by the unit switch test and the low-skip case below.
+        let num_docs = 128_u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8 + doc_id % 5);
+        }
+        let dense: Vec<u32> = (0..num_docs).collect();
+        let even: Vec<u32> = (0..num_docs).filter(|doc| doc % 2 == 0).collect();
+        let build = || {
+            vec![
+                compressed_and_clause("t0", 0, 4.0, dense.clone(), docs.len()),
+                compressed_and_clause("t1", 1, 0.01, even.clone(), docs.len()),
+                compressed_and_clause("t2", 2, 0.01, dense.clone(), docs.len()),
+                compressed_and_clause("t3", 3, 0.01, even.clone(), docs.len()),
+            ]
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let seed = run_and_search(BulkAndMode::Off, build(), &docs, &params);
+        let floor = f32::from_bits(seed.kth_bits) * 2.0;
+        assert!(floor > 0.0);
+        let classic = run_and_search_with_floor(BulkAndMode::Off, build(), &docs, &params, floor);
+        let auto = run_and_search_with_floor(BulkAndMode::Auto, build(), &docs, &params, floor);
+        assert!(!classic.rows.is_empty());
+        assert_eq!(auto.bulk_searches, 0);
+        assert_eq!(auto.lead_stream_searches, 1);
+        assert!(auto.score_first_blocks + auto.intersect_first_blocks >= 1);
         assert_eq!(auto.rows, classic.rows);
         assert_eq!(auto.kth_bits, classic.kth_bits);
     }
@@ -11611,7 +11684,7 @@ mod tests {
         assert!(!classic.rows.is_empty());
         assert_eq!(auto.bulk_searches, 0);
         assert_eq!(auto.lead_stream_searches, 1);
-        assert_eq!(auto.score_first_blocks, 1);
+        assert!(auto.score_first_blocks >= 1);
         assert_eq!(auto.block_leaps, 1);
         assert_eq!(classic.block_leaps, 0);
         assert_eq!(auto.rows, classic.rows);
@@ -11672,6 +11745,7 @@ mod tests {
         assert_eq!(auto.bulk_searches, 0);
         assert_eq!(auto.lead_stream_searches, 1);
         assert_eq!(auto.score_first_blocks, 0);
+        assert_eq!(auto.intersect_first_blocks, 0);
         assert_eq!(on.bulk_searches, 1);
         assert_eq!(auto.rows, classic.rows);
         assert_eq!(on.rows, classic.rows);

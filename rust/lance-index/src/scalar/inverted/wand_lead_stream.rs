@@ -48,8 +48,24 @@ const AND_SCORE_FIRST_COST_RATIO: usize = 3;
 
 /// Heap-empty batches so Exclusive pruning can start (Lucene fills the
 /// heap before scoring the rest of the lead block). Ignored when `limit`
-/// cannot fill the heap.
+/// cannot fill the heap. Leftover windows reuse this as the score-first
+/// probe before deciding whether the rest of the window is intersect-first.
 const HEAP_FILL_BATCH: usize = 16;
+
+/// Switch a leftover window's remainder to intersect-first when the probe's
+/// Exclusive skip rate is below this. Sits in the measured Wikipedia gap
+/// (LA ~11% vs care / Hamlet / book-of-life ≥50%).
+const AND_INTERSECT_FIRST_MAX_PROBE_SKIP: f32 = 0.25;
+
+struct LeadStreamBlockOutcome {
+    follower_exhausted: bool,
+    lead_bm25: u32,
+    floor_skip: u32,
+}
+
+fn leftover_rest_uses_intersect_first(lead_bm25: u32, floor_skip: u32) -> bool {
+    lead_bm25 > 0 && (floor_skip as f32) / (lead_bm25 as f32) < AND_INTERSECT_FIRST_MAX_PROBE_SKIP
+}
 
 const FREQ_LUT_BUCKETS: usize = 64;
 
@@ -190,8 +206,58 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }));
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn insert_lead_stream_hits(
+        &mut self,
+        docs: &[u32],
+        freqs: &[u32],
+        clause_scores: &[f32],
+        num_lists: usize,
+        candidates: &mut TopKCollector,
+        num_comparisons: &mut usize,
+        wand_factor: f32,
+    ) -> Result<()> {
+        for (i, &doc) in docs.iter().enumerate() {
+            let Some(document_key) = self.documents.document_key_for_doc_id(doc) else {
+                continue;
+            };
+            let base = i * num_lists;
+            let contributions = self
+                .lead
+                .iter()
+                .enumerate()
+                .map(|(clause, posting)| {
+                    (
+                        (posting.position, posting.token_id),
+                        clause_scores[base + clause],
+                    )
+                })
+                .collect::<SmallVec<[ScoreContribution; 8]>>();
+            let score = score_contributions_in_query_order(contributions);
+            if candidates.rejects_score(score) {
+                continue;
+            }
+            *num_comparisons += 1;
+            let term_freqs = self
+                .lead
+                .iter()
+                .enumerate()
+                .map(|(clause, posting)| (posting.term_index(), freqs[base + clause]));
+            if candidates.insert(
+                ScoredDoc::new(document_key, score),
+                self.documents.scoring_num_tokens(doc),
+                u64::from(doc),
+                term_freqs,
+            )? && let Some(kth) = candidates.kth_score_if_full()
+            {
+                self.update_threshold(kth, wand_factor);
+            }
+        }
+        Ok(())
+    }
+
     /// Score a slice of the lead block: exact lead BM25, then compact followers
-    /// onto survivors. Returns true when a follower is exhausted.
+    /// onto survivors.
     #[allow(clippy::too_many_arguments)]
     fn and_lead_stream_score_first_block(
         &mut self,
@@ -210,7 +276,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         wand_factor: f32,
         norm_k: Option<(&[u8], &[f32; 256])>,
         exact_addends: Option<&[f32]>,
-    ) -> Result<bool> {
+    ) -> Result<LeadStreamBlockOutcome> {
         #[cfg(test)]
         {
             self.lead_stream_score_first_blocks += 1;
@@ -221,6 +287,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         freqs.clear();
         clause_scores.clear();
 
+        let mut lead_bm25 = 0u32;
+        let mut floor_skip = 0u32;
         for (&doc, &freq) in lead_docs.iter().zip(lead_freqs.iter()) {
             let freq_bucket = (freq as usize).min(FREQ_LUT_BUCKETS - 1);
             if freq_cannot_beat[freq_bucket] {
@@ -235,6 +303,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 norm_k,
                 exact_addends,
             );
+            lead_bm25 += 1;
             if self.threshold > 0.0
                 && score_sum_cannot_compete(
                     lead_score,
@@ -244,6 +313,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     CompetitiveFloorMode::Exclusive,
                 )
             {
+                floor_skip += 1;
                 continue;
             }
             docs.push(doc);
@@ -258,7 +328,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut follower_exhausted = false;
         for clause in 1..num_lists {
             if docs.is_empty() {
-                return Ok(follower_exhausted);
+                return Ok(LeadStreamBlockOutcome {
+                    follower_exhausted,
+                    lead_bm25,
+                    floor_skip,
+                });
             }
             let remaining = others_bounds[(clause - 1)..].iter().copied().sum::<f64>();
             let posting = &mut self.lead[clause];
@@ -317,42 +391,121 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             follower_exhausted |= exhausted;
         }
 
-        for (i, &doc) in docs.iter().enumerate() {
-            let Some(document_key) = self.documents.document_key_for_doc_id(doc) else {
-                continue;
-            };
-            let base = i * num_lists;
-            let contributions = self
-                .lead
-                .iter()
-                .enumerate()
-                .map(|(clause, posting)| {
-                    (
-                        (posting.position, posting.token_id),
-                        clause_scores[base + clause],
-                    )
-                })
-                .collect::<SmallVec<[ScoreContribution; 8]>>();
-            let score = score_contributions_in_query_order(contributions);
-            if candidates.rejects_score(score) {
+        self.insert_lead_stream_hits(
+            docs,
+            freqs,
+            clause_scores,
+            num_lists,
+            candidates,
+            num_comparisons,
+            wand_factor,
+        )?;
+        Ok(LeadStreamBlockOutcome {
+            follower_exhausted,
+            lead_bm25,
+            floor_skip,
+        })
+    }
+
+    /// Compact followers onto lead ids first, then BM25 only the survivors.
+    /// Must not Exclusive-prune with a zero lead score: mixed leftover windows
+    /// have `others < T < others+lead` and would drop real hits.
+    #[allow(clippy::too_many_arguments)]
+    fn and_lead_stream_intersect_first_block(
+        &mut self,
+        lead_docs: &[u32],
+        lead_freqs: &[u32],
+        freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
+        num_lists: usize,
+        docs: &mut Vec<u32>,
+        freqs: &mut Vec<u32>,
+        clause_scores: &mut Vec<f32>,
+        candidates: &mut TopKCollector,
+        num_comparisons: &mut usize,
+        wand_factor: f32,
+        norm_k: Option<(&[u8], &[f32; 256])>,
+        exact_addends: Option<&[f32]>,
+    ) -> Result<bool> {
+        #[cfg(test)]
+        {
+            self.lead_stream_intersect_first_blocks += 1;
+        }
+        docs.clear();
+        freqs.clear();
+        clause_scores.clear();
+
+        for (&doc, &freq) in lead_docs.iter().zip(lead_freqs.iter()) {
+            let freq_bucket = (freq as usize).min(FREQ_LUT_BUCKETS - 1);
+            if freq_cannot_beat[freq_bucket] {
                 continue;
             }
-            *num_comparisons += 1;
-            let term_freqs = self
-                .lead
-                .iter()
-                .enumerate()
-                .map(|(clause, posting)| (posting.term_index(), freqs[base + clause]));
-            if candidates.insert(
-                ScoredDoc::new(document_key, score),
-                self.documents.scoring_num_tokens(doc),
-                u64::from(doc),
-                term_freqs,
-            )? && let Some(kth) = candidates.kth_score_if_full()
-            {
-                self.update_threshold(kth, wand_factor);
+            docs.push(doc);
+            let start = freqs.len();
+            freqs.resize(start + num_lists, 0);
+            freqs[start] = freq;
+        }
+
+        let mut follower_exhausted = false;
+        for clause in 1..num_lists {
+            if docs.is_empty() {
+                return Ok(follower_exhausted);
+            }
+            let posting = &mut self.lead[clause];
+            let mut write = 0usize;
+            let mut exhausted = false;
+            for read in 0..docs.len() {
+                let target = u64::from(docs[read]);
+                if posting.doc().is_none_or(|cur| cur.doc_id() < target) {
+                    posting.next(target);
+                }
+                match posting.doc() {
+                    None => {
+                        exhausted = true;
+                        break;
+                    }
+                    Some(cur) if cur.doc_id() > target => continue,
+                    Some(cur) => {
+                        docs[write] = docs[read];
+                        let src = read * num_lists;
+                        let dst = write * num_lists;
+                        if src != dst {
+                            freqs.copy_within(src..src + num_lists, dst);
+                        }
+                        freqs[dst + clause] = cur.frequency();
+                        write += 1;
+                    }
+                }
+            }
+            docs.truncate(write);
+            freqs.truncate(write * num_lists);
+            follower_exhausted |= exhausted;
+        }
+
+        clause_scores.resize(docs.len() * num_lists, 0.0);
+        for (i, &doc) in docs.iter().enumerate() {
+            let base = i * num_lists;
+            for clause in 0..num_lists {
+                clause_scores[base + clause] = clause_bm25(
+                    &self.lead[clause],
+                    &self.scorer,
+                    self.documents,
+                    freqs[base + clause],
+                    doc,
+                    norm_k,
+                    exact_addends,
+                );
             }
         }
+
+        self.insert_lead_stream_hits(
+            docs,
+            freqs,
+            clause_scores,
+            num_lists,
+            candidates,
+            num_comparisons,
+            wand_factor,
+        )?;
         Ok(follower_exhausted)
     }
 
@@ -500,18 +653,44 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // a live floor admits the block kernel without consulting 3×.
             let use_block = phrase_slop.is_none() && (score_first || self.threshold > 0.0);
             if use_block {
-                let mut offset = 0;
+                let mut offset = 0usize;
                 let mut exhausted = false;
-                while offset < lead_docs.len() {
-                    let take = score_first_batch_len(
-                        lead_docs.len() - offset,
-                        self.threshold,
-                        heap_can_fill,
-                    );
-                    let end = offset + take;
-                    if self.and_lead_stream_score_first_block(
-                        &lead_docs[offset..end],
-                        &lead_freqs[offset..end],
+                if score_first {
+                    while offset < lead_docs.len() {
+                        let take = score_first_batch_len(
+                            lead_docs.len() - offset,
+                            self.threshold,
+                            heap_can_fill,
+                        );
+                        let end = offset + take;
+                        let outcome = self.and_lead_stream_score_first_block(
+                            &lead_docs[offset..end],
+                            &lead_freqs[offset..end],
+                            &others_bounds,
+                            others_block_max,
+                            &freq_cannot_beat,
+                            num_lists,
+                            &mut score_docs,
+                            &mut score_partial,
+                            &mut score_freqs,
+                            &mut score_clause,
+                            &mut candidates,
+                            &mut num_comparisons,
+                            params.wand_factor,
+                            norm_k_ref,
+                            exact_addends,
+                        )?;
+                        if outcome.follower_exhausted {
+                            exhausted = true;
+                            break;
+                        }
+                        offset = end;
+                    }
+                } else {
+                    let probe_end = offset.saturating_add(HEAP_FILL_BATCH).min(lead_docs.len());
+                    let outcome = self.and_lead_stream_score_first_block(
+                        &lead_docs[offset..probe_end],
+                        &lead_freqs[offset..probe_end],
                         &others_bounds,
                         others_block_max,
                         &freq_cannot_beat,
@@ -525,11 +704,59 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         params.wand_factor,
                         norm_k_ref,
                         exact_addends,
-                    )? {
+                    )?;
+                    if outcome.follower_exhausted {
                         exhausted = true;
-                        break;
+                    } else {
+                        offset = probe_end;
+                        let use_intersect = leftover_rest_uses_intersect_first(
+                            outcome.lead_bm25,
+                            outcome.floor_skip,
+                        );
+                        while offset < lead_docs.len() {
+                            let end = lead_docs.len();
+                            if use_intersect {
+                                if self.and_lead_stream_intersect_first_block(
+                                    &lead_docs[offset..end],
+                                    &lead_freqs[offset..end],
+                                    &freq_cannot_beat,
+                                    num_lists,
+                                    &mut score_docs,
+                                    &mut score_freqs,
+                                    &mut score_clause,
+                                    &mut candidates,
+                                    &mut num_comparisons,
+                                    params.wand_factor,
+                                    norm_k_ref,
+                                    exact_addends,
+                                )? {
+                                    exhausted = true;
+                                }
+                            } else {
+                                let rest = self.and_lead_stream_score_first_block(
+                                    &lead_docs[offset..end],
+                                    &lead_freqs[offset..end],
+                                    &others_bounds,
+                                    others_block_max,
+                                    &freq_cannot_beat,
+                                    num_lists,
+                                    &mut score_docs,
+                                    &mut score_partial,
+                                    &mut score_freqs,
+                                    &mut score_clause,
+                                    &mut candidates,
+                                    &mut num_comparisons,
+                                    params.wand_factor,
+                                    norm_k_ref,
+                                    exact_addends,
+                                )?;
+                                if rest.follower_exhausted {
+                                    exhausted = true;
+                                }
+                            }
+                            offset = end;
+                        }
                     }
-                    offset = end;
                 }
                 if exhausted || win_end == TERMINATED_DOC_ID {
                     break;
@@ -674,9 +901,21 @@ fn skip_lead_docs(lead_docs: &[u32], pos: usize, next: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        AND_SKEW_RATIO, HEAP_FILL_BATCH, and_score_first_for, conjunction_lists_are_skewed,
-        score_first_batch_len, skip_lead_docs,
+        AND_INTERSECT_FIRST_MAX_PROBE_SKIP, AND_SKEW_RATIO, HEAP_FILL_BATCH, and_score_first_for,
+        conjunction_lists_are_skewed, leftover_rest_uses_intersect_first, score_first_batch_len,
+        skip_lead_docs,
     };
+
+    #[test]
+    fn leftover_intersect_first_switch_uses_probe_skip_rate() {
+        assert!(!leftover_rest_uses_intersect_first(0, 0));
+        assert!(!leftover_rest_uses_intersect_first(16, 4));
+        assert!(leftover_rest_uses_intersect_first(16, 3));
+        assert!(!leftover_rest_uses_intersect_first(
+            16,
+            (16.0 * AND_INTERSECT_FIRST_MAX_PROBE_SKIP) as u32
+        ));
+    }
 
     #[test]
     fn skew_gate_uses_integer_max_over_min() {
