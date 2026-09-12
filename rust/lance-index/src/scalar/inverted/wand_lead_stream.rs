@@ -534,7 +534,28 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 if exhausted || win_end == TERMINATED_DOC_ID {
                     break;
                 }
+                // Lucene BlockMaxConjunctionBulkScorer: after the current
+                // window, leap lead to max(windowEnd+1, max other current
+                // doc). Dense windows: max other ≤ win_end, this is
+                // win_end+1. The kernel still finishes this window first
+                // (same as Lucene); mid-window leap is the doc-at-a-time
+                // path above.
                 target = win_end + 1;
+                if let Some(other) = self
+                    .lead
+                    .iter()
+                    .skip(1)
+                    .filter_map(|posting| posting.current_doc_id())
+                    .max()
+                {
+                    target = target.max(other);
+                }
+                #[cfg(test)]
+                {
+                    if target > win_end + 1 {
+                        self.lead_stream_block_leaps += 1;
+                    }
+                }
                 continue;
             }
 

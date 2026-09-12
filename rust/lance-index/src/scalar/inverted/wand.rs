@@ -2388,6 +2388,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     #[cfg(test)]
     lead_stream_score_first_blocks: usize,
     #[cfg(test)]
+    lead_stream_block_leaps: usize,
+    #[cfg(test)]
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
     maxscore_general_windows: usize,
@@ -2505,6 +2507,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             lead_stream_and_searches: 0,
             #[cfg(test)]
             lead_stream_score_first_blocks: 0,
+            #[cfg(test)]
+            lead_stream_block_leaps: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
@@ -11297,6 +11301,7 @@ mod tests {
         bulk_searches: usize,
         lead_stream_searches: usize,
         score_first_blocks: usize,
+        block_leaps: usize,
         kth_bits: u32,
     }
 
@@ -11337,6 +11342,7 @@ mod tests {
             bulk_searches: wand.bulk_and_searches,
             lead_stream_searches: wand.lead_stream_and_searches,
             score_first_blocks: wand.lead_stream_score_first_blocks,
+            block_leaps: wand.lead_stream_block_leaps,
             kth_bits: shared_floor.load(Ordering::Relaxed),
         }
     }
@@ -11567,6 +11573,47 @@ mod tests {
         assert_eq!(auto.bulk_searches, 0);
         assert_eq!(auto.lead_stream_searches, 1);
         assert!(auto.score_first_blocks >= 1);
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
+    }
+
+    #[test]
+    fn auto_score_first_block_leaps_over_gapped_follower_lead_blocks() {
+        // Lead two 128-posting blocks. The gapped follower matches 0..15
+        // then jumps to 200, past the second lead block. Floor > 0 so each
+        // entered window is one kernel call; leap must skip the empty
+        // second block. The gapped list is longer than the lead so Auto
+        // does not promote it to lead[0].
+        let lead_ids: Vec<u32> = (0..192).collect();
+        let mut gapped: Vec<u32> = (0..16).collect();
+        gapped.extend(200..=400);
+        let dense: Vec<u32> = (0..=400).collect();
+        assert!(gapped.len() > lead_ids.len());
+        let num_docs = 401_u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8);
+        }
+        let build = || {
+            vec![
+                compressed_and_clause("lead", 0, 4.0, lead_ids.clone(), docs.len()),
+                compressed_and_clause("gap", 1, 2.0, gapped.clone(), docs.len()),
+                compressed_and_clause("d2", 2, 1.0, dense.clone(), docs.len()),
+                compressed_and_clause("d3", 3, 1.0, dense.clone(), docs.len()),
+            ]
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let seed = run_and_search(BulkAndMode::Off, build(), &docs, &params);
+        let floor = f32::from_bits(seed.kth_bits);
+        assert!(floor > 0.0);
+        let classic = run_and_search_with_floor(BulkAndMode::Off, build(), &docs, &params, floor);
+        let auto = run_and_search_with_floor(BulkAndMode::Auto, build(), &docs, &params, floor);
+        assert!(!classic.rows.is_empty());
+        assert_eq!(auto.bulk_searches, 0);
+        assert_eq!(auto.lead_stream_searches, 1);
+        assert_eq!(auto.score_first_blocks, 1);
+        assert_eq!(auto.block_leaps, 1);
+        assert_eq!(classic.block_leaps, 0);
         assert_eq!(auto.rows, classic.rows);
         assert_eq!(auto.kth_bits, classic.kth_bits);
     }
