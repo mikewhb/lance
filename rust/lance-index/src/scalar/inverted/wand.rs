@@ -1361,6 +1361,40 @@ impl PostingIterator {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
                 let shift = list.block_shift();
+                let mask = list.block_mask();
+                // Completing an optional clause walks a sorted hit list. When
+                // the target is still inside the already-decoded block, a
+                // linear scan from the cursor beats locating the block again
+                // and binary-searching its first-doc slab.
+                if let Some(cur) = self.current_doc
+                    && cur.doc_id() >= u64::from(least_id)
+                {
+                    return;
+                }
+                if self.current_doc.is_some() {
+                    let block_idx = self.index >> shift;
+                    let compressed = unsafe { &*self.ensure_compressed_block_ptr(list, block_idx) };
+                    if compressed
+                        .doc_ids
+                        .last()
+                        .is_some_and(|&last| last >= least_id)
+                    {
+                        let start = (self.index & mask) + 1;
+                        if let Some(delta) = compressed.doc_ids[start..]
+                            .iter()
+                            .position(|&doc_id| doc_id >= least_id)
+                        {
+                            let new_offset = start + delta;
+                            self.index = (block_idx << shift) + new_offset;
+                            self.block_idx = block_idx;
+                            self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id: compressed.doc_ids[new_offset],
+                                frequency: compressed.freqs[new_offset],
+                            }));
+                            return;
+                        }
+                    }
+                }
                 let block_idx = self.block_idx_for_doc(list, self.index >> shift, least_id);
                 self.index = self.index.max(block_idx << shift);
                 let length = list.length as usize;
