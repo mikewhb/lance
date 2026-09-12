@@ -12,11 +12,13 @@
 //! stays on classic leapfrog (Lucene `ConjunctionDISI` — one follower makes
 //! the buffer pure overhead).
 //!
-//! Inner score-first is not a dispatch table: with three or more clauses
-//! whose second list is at least `AND_SCORE_FIRST_COST_RATIO` times the
-//! lead, a non-phrase search scores a lead-block buffer of exact BM25 and
-//! applies followers only to survivors. Phrase confirmation stays on the
-//! existing per-doc score-then-positions path.
+//! Inner score-first is not a dispatch table. A non-phrase leftover scores
+//! a lead-block buffer of exact BM25 and applies followers only to
+//! survivors when the second list is at least `AND_SCORE_FIRST_COST_RATIO`
+//! times the lead, or once a competitive floor exists (`threshold > 0`).
+//! The ratio still gates the heap-empty path; balanced leftover would
+//! otherwise pay lead BM25 on every doc and still seek. Phrase
+//! confirmation stays on the existing per-doc score-then-positions path.
 
 use lance_core::Result;
 use smallvec::SmallVec;
@@ -38,8 +40,10 @@ use crate::metrics::MetricsCollector;
 /// the analysis tree used for n≤3; not a term-count bucket.
 pub(super) const AND_SKEW_RATIO: usize = 32;
 
-/// Score the rare lead before seeking followers when the second list is
-/// at least this many times longer. Same 3× shape as IU promotion.
+/// Heap-empty gate: score the rare lead before seeking followers when the
+/// second list is at least this many times longer. Same 3× shape as IU
+/// promotion. After `threshold > 0` the block kernel does not consult this
+/// ratio (Lucene `BlockMaxConjunction` after the heap fills).
 const AND_SCORE_FIRST_COST_RATIO: usize = 3;
 
 /// Heap-empty batches so Exclusive pruning can start (Lucene fills the
@@ -382,14 +386,23 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             self.lead[0].cost(),
             self.lead.get(1).map(|posting| posting.cost()).unwrap_or(0),
         );
-        let use_block = phrase_slop.is_none() && score_first;
         let heap_can_fill = limit != usize::MAX;
+        // Parent Boolean / sibling partitions may already have published a
+        // floor. Raise once so cache prep sees kernel reachability for the
+        // first window; the loop raises again to pick up later updates.
+        self.raise_to_shared_floor(params.wand_factor);
+        let kernel_reachable =
+            phrase_slop.is_none() && (score_first || heap_can_fill || self.threshold > 0.0);
         let documents = self.documents;
-        let norm_k = if use_block { self.norm_k_cache() } else { None };
+        let norm_k = if kernel_reachable {
+            self.norm_k_cache()
+        } else {
+            None
+        };
         let norm_k_ref = norm_k
             .as_ref()
             .map(|(norms, cache)| (*norms, cache.as_ref()));
-        let exact_addends = if use_block && norm_k_ref.is_none() {
+        let exact_addends = if kernel_reachable && norm_k_ref.is_none() {
             exact_bm25_addend_slab(&self.scorer, documents)
         } else {
             None
@@ -403,7 +416,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut score_partial: Vec<f32> = Vec::new();
         let mut score_freqs: Vec<u32> = Vec::new();
         let mut score_clause: Vec<f32> = Vec::new();
-        if use_block {
+        if kernel_reachable {
             score_docs.reserve(MAX_POSTING_BLOCK_SIZE);
             score_partial.reserve(MAX_POSTING_BLOCK_SIZE);
             score_freqs.reserve(MAX_POSTING_BLOCK_SIZE.saturating_mul(num_lists));
@@ -483,6 +496,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 [false; FREQ_LUT_BUCKETS]
             };
 
+            // Window-boundary switch only: the ratio still gates a zero floor,
+            // a live floor admits the block kernel without consulting 3×.
+            let use_block = phrase_slop.is_none() && (score_first || self.threshold > 0.0);
             if use_block {
                 let mut offset = 0;
                 let mut exhausted = false;

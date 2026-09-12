@@ -11306,7 +11306,17 @@ mod tests {
         docs: &DocSet,
         params: &FtsSearchParams,
     ) -> AndSearchDump {
-        let shared_floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        run_and_search_with_floor(mode, postings, docs, params, 0.0)
+    }
+
+    fn run_and_search_with_floor(
+        mode: BulkAndMode,
+        postings: Vec<PostingIterator>,
+        docs: &DocSet,
+        params: &FtsSearchParams,
+        shared_floor: f32,
+    ) -> AndSearchDump {
+        let shared_floor = Arc::new(AtomicU32::new(shared_floor.to_bits()));
         let mut wand = Wand::new(Operator::And, postings.into_iter(), docs, UnitScorer)
             .with_bulk_and_mode(mode)
             .with_shared_threshold(shared_floor.clone());
@@ -11463,13 +11473,102 @@ mod tests {
         assert_eq!(classic.lead_stream_searches, 0);
         assert_eq!(auto.bulk_searches, 0);
         assert_eq!(auto.lead_stream_searches, 1);
-        assert_eq!(auto.score_first_blocks, 0);
+        assert!(auto.score_first_blocks >= 1);
         assert_eq!(on.bulk_searches, 1);
         assert_eq!(on.lead_stream_searches, 0);
         assert_eq!(auto.rows, classic.rows);
         assert_eq!(on.rows, classic.rows);
         assert_eq!(auto.kth_bits, classic.kth_bits);
         assert_eq!(on.kth_bits, classic.kth_bits);
+    }
+
+    #[rstest]
+    #[case::four(4)]
+    #[case::six(6)]
+    fn auto_unskewed_legacy_wide_and_skips_score_first_without_limit(#[case] num_clauses: usize) {
+        // Same 2× lists as the leftover Wikipedia 128-block path, but COUNT
+        // never fills a heap: 3× stays closed and the block kernel must not run.
+        let num_docs = 512_u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8 + doc_id % 5);
+        }
+        let dense: Vec<u32> = (0..num_docs).collect();
+        let even: Vec<u32> = (0..num_docs).filter(|doc| doc % 2 == 0).collect();
+        assert_eq!(dense.len() / even.len(), 2);
+        let build = || {
+            (0..num_clauses)
+                .map(|term| {
+                    let doc_ids = if term % 2 == 0 {
+                        dense.clone()
+                    } else {
+                        even.clone()
+                    };
+                    compressed_and_clause(
+                        &format!("t{term}"),
+                        term as u32,
+                        1.0,
+                        doc_ids,
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let params = FtsSearchParams::default().with_limit(None);
+        let classic = run_and_search(BulkAndMode::Off, build(), &docs, &params);
+        let auto = run_and_search(BulkAndMode::Auto, build(), &docs, &params);
+        assert!(!classic.rows.is_empty());
+        assert_eq!(auto.bulk_searches, 0);
+        assert_eq!(auto.lead_stream_searches, 1);
+        assert_eq!(auto.score_first_blocks, 0);
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
+    }
+
+    #[rstest]
+    #[case::four(4)]
+    #[case::six(6)]
+    fn auto_unskewed_legacy_wide_and_uses_score_first_with_shared_floor(
+        #[case] num_clauses: usize,
+    ) {
+        let num_docs = 512_u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8 + doc_id % 5);
+        }
+        let dense: Vec<u32> = (0..num_docs).collect();
+        let even: Vec<u32> = (0..num_docs).filter(|doc| doc % 2 == 0).collect();
+        assert_eq!(dense.len() / even.len(), 2);
+        let build = || {
+            (0..num_clauses)
+                .map(|term| {
+                    let doc_ids = if term % 2 == 0 {
+                        dense.clone()
+                    } else {
+                        even.clone()
+                    };
+                    compressed_and_clause(
+                        &format!("t{term}"),
+                        term as u32,
+                        1.0,
+                        doc_ids,
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let seed = run_and_search(BulkAndMode::Off, build(), &docs, &params);
+        let floor = f32::from_bits(seed.kth_bits);
+        assert!(floor > 0.0);
+        let classic = run_and_search_with_floor(BulkAndMode::Off, build(), &docs, &params, floor);
+        let auto = run_and_search_with_floor(BulkAndMode::Auto, build(), &docs, &params, floor);
+        assert!(!classic.rows.is_empty());
+        assert_eq!(auto.bulk_searches, 0);
+        assert_eq!(auto.lead_stream_searches, 1);
+        assert!(auto.score_first_blocks >= 1);
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(auto.kth_bits, classic.kth_bits);
     }
 
     #[test]
