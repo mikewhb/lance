@@ -1635,7 +1635,6 @@ impl PostingIterator {
         docs: &D,
         scorer: &S,
         norm_k: Option<(&[u8], &[f32; 256])>,
-        window_norms: Option<&[f32]>,
         acc: &mut WindowAccumulator,
     ) {
         if self.doc().is_some_and(|doc| doc.doc_id() < window_min) {
@@ -1665,22 +1664,14 @@ impl PostingIterator {
                             break 'blocks;
                         }
                         let freq = compressed.freqs[offset];
-                        // Quantized partitions read the byte-norm cache; exact
-                        // partitions read the window's shared `doc_norm`
-                        // scratch, so one doc length is normalized once for
-                        // every essential clause in the window.
+                        // One byte-norm load plus a cached addend replaces
+                        // recomputing the BM25 denominator per doc.
                         let doc_weight = match norm_k {
                             Some((norms, cache)) => bm25_doc_weight_with_norm(
                                 freq,
                                 cache[norms[doc_id as usize] as usize],
                             ),
-                            None => match window_norms {
-                                Some(norms) => bm25_doc_weight_with_norm(
-                                    freq,
-                                    norms[(u64::from(doc_id) - window_min) as usize],
-                                ),
-                                None => scorer.doc_weight(freq, docs.scoring_num_tokens(doc_id)),
-                            },
+                            None => scorer.doc_weight(freq, docs.scoring_num_tokens(doc_id)),
                         };
                         let score = self.query_weight * doc_weight;
                         let slot = (u64::from(doc_id) - window_min) as usize;
@@ -2991,14 +2982,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         num_comparisons += 1;
                         // One byte-norm load + cached addend when available;
                         // the exact doc length is only needed at insert time.
-                        // Exact partitions normalize the doc once and share it
-                        // across the essential and every optional clause.
-                        let norm_addend = norm_k_ref
-                            .map(|(norms, cache)| cache[norms[doc as usize] as usize])
-                            .or_else(|| {
-                                self.scorer
-                                    .doc_norm(self.documents.scoring_num_tokens(doc as u32))
-                            });
+                        let norm_addend =
+                            norm_k_ref.map(|(norms, cache)| cache[norms[doc as usize] as usize]);
                         let score = match norm_addend {
                             Some(addend) => {
                                 essential_weight * bm25_doc_weight_with_norm(freq, addend)
@@ -3179,11 +3164,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 self.maxscore_general_windows += 1;
             }
             let mut inner_min = window_min;
-            // Exact partitions normalize each doc in a window once and share
-            // the addends across every essential clause. Quantized partitions
-            // keep using the byte-norm cache and never touch this buffer.
-            let mut window_norm_buf: Vec<f32> = Vec::new();
-            let mut exact_window_norms = norm_k_ref.is_none();
             loop {
                 let mut next_essential_doc = TERMINATED_DOC_ID;
                 for clause in &clauses[first_essential..] {
@@ -3195,38 +3175,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 if inner_min == TERMINATED_DOC_ID || inner_min > window_max {
                     break;
                 }
-                // Bound the window by the partition. `window_max` is
-                // `TERMINATED_DOC_ID` once every essential clause sits on its
-                // final block, and the exact-partition addend fill walks the
-                // whole window, so it must stop at the last document.
-                let inner_max = window_max
-                    .min(inner_min.saturating_add(MAXSCORE_INNER_WINDOW as u64 - 1))
-                    .min((self.documents.len() as u64).saturating_sub(1));
-
-                let mut window_norms: Option<&[f32]> = None;
-                if exact_window_norms {
-                    window_norm_buf.clear();
-                    let mut complete = true;
-                    for doc in inner_min..=inner_max {
-                        match self
-                            .scorer
-                            .doc_norm(self.documents.scoring_num_tokens(doc as u32))
-                        {
-                            Some(norm) => window_norm_buf.push(norm),
-                            None => {
-                                complete = false;
-                                break;
-                            }
-                        }
-                    }
-                    if complete {
-                        window_norms = Some(window_norm_buf.as_slice());
-                    } else {
-                        // This scorer exposes no exact-length addend.
-                        exact_window_norms = false;
-                        window_norm_buf.clear();
-                    }
-                }
+                let inner_max =
+                    window_max.min(inner_min.saturating_add(MAXSCORE_INNER_WINDOW as u64 - 1));
 
                 for (clause_idx, clause) in clauses.iter_mut().enumerate().skip(first_essential) {
                     clause.posting.collect_window_scores(
@@ -3236,7 +3186,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         self.documents,
                         &self.scorer,
                         norm_k_ref,
-                        window_norms,
                         &mut acc,
                     );
                 }
@@ -3277,12 +3226,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         };
 
                         // Doc length is only needed at heap-insert time; the
-                        // completion scores reuse the window's shared addend.
-                        let norm_addend = norm_k_ref
-                            .map(|(norms, cache)| cache[norms[doc as usize] as usize])
-                            .or_else(|| {
-                                window_norms.map(|norms| norms[(doc - inner_min) as usize])
-                            });
+                        // non-essential completion scores go through the norm
+                        // cache when available.
+                        let norm_addend =
+                            norm_k_ref.map(|(norms, cache)| cache[norms[doc as usize] as usize]);
                         let mut doc_length_cell: Option<u32> = None;
                         let needs_canonical_rescore =
                             first_essential != 0 || !clauses_in_query_order;
@@ -4556,9 +4503,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             let code = batch_norms[index];
                             (Some(cache[code as usize]), dequantize_doc_length(code))
                         }
-                        // Exact partitions normalize the doc once and reuse the
-                        // addend for every clause in the candidate.
-                        None => (self.scorer.doc_norm(batch_lens[index]), batch_lens[index]),
+                        None => (None, batch_lens[index]),
                     };
                     let offs = &batch_offs[index * num_lists..(index + 1) * num_lists];
                     if self.threshold > 0.0 && num_lists >= 2 && others_block_max.is_none() {
@@ -6431,124 +6376,6 @@ mod tests {
         assert_eq!(wand.maxscore_general_windows > 0, !single_essential);
     }
 
-    /// Sharing one exact-length addend per window doc must not move any score:
-    /// a scorer exposing `doc_norm` and one exposing only the equivalent
-    /// `doc_weight` must agree on the hits and on the k-th best score bits.
-    #[rstest]
-    fn maxscore_shared_doc_norm_matches_per_clause_doc_weight(
-        #[values(2_usize, 3_usize, 6_usize)] num_terms: usize,
-    ) {
-        let block = MAX_POSTING_BLOCK_SIZE as u32;
-        let total_docs = 4 * block;
-        let mut docs = DocSet::default();
-        for doc_id in 0..total_docs {
-            // Varied lengths so the addend differs per document.
-            docs.append(u64::from(doc_id), doc_id % 13 + 1);
-        }
-        assert!(
-            docs.scoring_norms().is_none(),
-            "this test covers exact-scoring partitions"
-        );
-
-        let build_postings = || {
-            (0..num_terms)
-                .map(|term| {
-                    let doc_ids = (term as u32..total_docs).collect::<Vec<_>>();
-                    let freqs = doc_ids
-                        .iter()
-                        .map(|doc| (*doc + term as u32) % 7 + 1)
-                        .collect::<Vec<_>>();
-                    let lengths = doc_ids.iter().map(|doc| *doc % 13 + 1).collect::<Vec<_>>();
-                    PostingIterator::with_query_weight(
-                        format!("t{term}"),
-                        term as u32,
-                        term as u32,
-                        0.001_882_293 + term as f32 * 0.000_173_205,
-                        generate_impact_posting_list_with_freqs_and_block_size(
-                            doc_ids,
-                            freqs,
-                            lengths,
-                            MAX_POSTING_BLOCK_SIZE,
-                        ),
-                        docs.len(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-
-        fn run<S: Scorer>(
-            docs: &DocSet,
-            postings: Vec<PostingIterator>,
-            scorer: S,
-        ) -> (Vec<u64>, u32, usize, usize) {
-            let shared_floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-            let mut wand = Wand::new(Operator::Or, postings.into_iter(), docs, scorer)
-                .with_shared_threshold(shared_floor.clone());
-            let hits = wand
-                .maxscore_search(
-                    &FtsSearchParams::default().with_limit(Some(10)),
-                    &NoOpMetricsCollector,
-                )
-                .unwrap();
-            (
-                hits.iter().map(|hit| hit.posting_doc_id).collect(),
-                shared_floor.load(Ordering::Relaxed),
-                wand.maxscore_single_essential_windows,
-                wand.maxscore_general_windows,
-            )
-        }
-
-        let (shared_hits, shared_floor, _, shared_general) =
-            run(&docs, build_postings(), VariedBm25ShapeScorer);
-        let (fallback_hits, fallback_floor, _, _) =
-            run(&docs, build_postings(), VariedBm25NoNormScorer);
-
-        assert_eq!(shared_hits.len(), 10);
-        assert_eq!(shared_hits, fallback_hits);
-        // Bit-identical k-th best score: the shared-addend path is exactly the
-        // per-clause `doc_weight` path.
-        assert_eq!(shared_floor, fallback_floor);
-        assert!(
-            shared_general > 0,
-            "the window-scratch path must have run for this shape"
-        );
-    }
-
-    /// Regression: the window fill runs for `inner_min..=inner_max`. When the
-    /// essential clauses sit on their final block, `window_max` is
-    /// `TERMINATED_DOC_ID`, so `inner_max` overshoots the document set; the
-    /// fill must stop at the last real document instead of indexing past it.
-    #[test]
-    fn maxscore_shared_doc_norm_stops_at_the_last_document() {
-        let docs = unit_length_docs(3);
-        let postings = (0..2u32)
-            .map(|term| {
-                PostingIterator::with_query_weight(
-                    format!("t{term}"),
-                    term,
-                    term,
-                    1.0,
-                    generate_posting_list(vec![0, 1, 2], 1.0, None, true),
-                    docs.len(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut wand = Wand::new(
-            Operator::Or,
-            postings.into_iter(),
-            &docs,
-            VariedBm25ShapeScorer,
-        );
-
-        let hits = wand
-            .maxscore_search(
-                &FtsSearchParams::default().with_limit(Some(10)),
-                &NoOpMetricsCollector,
-            )
-            .unwrap();
-        assert_eq!(hits.len(), 3);
-    }
-
     #[rstest]
     fn bulk_and_and_classic_publish_identical_query_order_score_bits(
         #[values(3, 4, 5, 8, 16)] num_clauses: usize,
@@ -6895,24 +6722,6 @@ mod tests {
 
         fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
             Some(0.3 + doc_tokens as f32 * 0.1)
-        }
-    }
-
-    /// [`VariedBm25ShapeScorer`] weights with no exact-length addend exposed:
-    /// the MAXSCORE paths must fall back to the per-clause `doc_weight`.
-    struct VariedBm25NoNormScorer;
-
-    impl Scorer for VariedBm25NoNormScorer {
-        fn query_weight(&self, _token: &str) -> f32 {
-            1.0
-        }
-
-        fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
-            bm25_doc_weight_with_norm(freq, 0.3 + doc_tokens as f32 * 0.1)
-        }
-
-        fn doc_weight_upper_bound(&self) -> Option<f32> {
-            Some(BM25_DOC_WEIGHT_UPPER_BOUND)
         }
     }
 
