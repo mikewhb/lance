@@ -1,0 +1,6 @@
+quiet (no cargo/rustc) at 13:21:15, core=32, engine=lance-f03a2783c24f
+binary sha256: 5dca292d03f9e19454a86e10fbe1069bbd98aecd3a92397a89c01f8b6463fdd8
+done tier1-cand r1 13:22:02
+done tier1-cand r2 13:22:49
+done tier1-cand r3 13:23:35
+RUN_DONE
