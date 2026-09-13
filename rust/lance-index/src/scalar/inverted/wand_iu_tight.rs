@@ -12,7 +12,21 @@
 use lance_core::Result;
 
 use super::super::scorer::{Scorer, bm25_doc_weight_with_norm};
-use super::{PostingIterator, TERMINATED_DOC_ID, WandDocuments, exact_bm25_addend_slab};
+use super::{
+    PostingIterator, TERMINATED_DOC_ID, WandDocuments, exact_bm25_addend_slab,
+    outward_f32_upper_bound,
+};
+
+/// Conservative sum of upper bounds so f32 rounding cannot shrink below the
+/// true total and trigger premature IU termination.
+fn conservative_ub_sum(values: impl IntoIterator<Item = f32>) -> f32 {
+    let sum: f64 = values.into_iter().map(f64::from).sum();
+    outward_f32_upper_bound(sum)
+}
+
+fn conservative_ub_pair_sum(left: f32, right: f32) -> f32 {
+    outward_f32_upper_bound(f64::from(left) + f64::from(right))
+}
 
 /// Promote only when the new lead is at least this many times cheaper than
 /// MUST. A medium-df SHOULD that just barely becomes required is slower to
@@ -83,7 +97,7 @@ where
         .iter()
         .map(|should| should.global_upper_bound(scorer))
         .collect();
-    let should_ub_sum: f32 = should_ubs.iter().copied().sum();
+    let should_ub_sum = conservative_ub_sum(should_ubs.iter().copied());
     let mut chunk = Vec::with_capacity(128);
     let mut last_doc = 0_u64;
     loop {
@@ -98,7 +112,9 @@ where
             };
             let must_score = scoring.term_score(&must, doc, freq);
             let current_floor = floor();
-            if current_floor.is_finite() && must_score + should_ub_sum < current_floor {
+            if current_floor.is_finite()
+                && conservative_ub_pair_sum(must_score, should_ub_sum) < current_floor
+            {
                 continue;
             }
             let score = must_score + scoring.complete_shoulds(&mut shoulds, doc);
@@ -146,21 +162,22 @@ pub fn iu_tight_required_shoulds(
     if should_ubs.iter().any(|upper| !upper.is_finite()) {
         return None;
     }
-    let sum_shoulds: f32 = should_ubs.iter().sum();
-    if must_ub + sum_shoulds < floor {
+    let sum_shoulds = conservative_ub_sum(should_ubs.iter().copied());
+    if conservative_ub_pair_sum(must_ub, sum_shoulds) < floor {
         return Some(Vec::new());
     }
     let required: Vec<usize> = should_ubs
         .iter()
         .enumerate()
         .filter(|(index, _)| {
-            let others: f32 = should_ubs
-                .iter()
-                .enumerate()
-                .filter(|(other, _)| other != index)
-                .map(|(_, upper)| *upper)
-                .sum();
-            must_ub + others < floor
+            let others = conservative_ub_sum(
+                should_ubs
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| other != index)
+                    .map(|(_, upper)| *upper),
+            );
+            conservative_ub_pair_sum(must_ub, others) < floor
         })
         .map(|(index, _)| index)
         .collect();
@@ -291,6 +308,20 @@ mod tests {
         // MUST + either SHOULD still reaches the floor, so neither list is
         // individually required.
         assert_eq!(iu_tight_required_shoulds(1.0, &[10.0, 10.0], 11.0), None);
+    }
+
+    #[test]
+    fn required_shoulds_does_not_empty_on_f32_rounding_boundary() {
+        // Naive f32 sum rounds 1.0 + 2^-24 down to 1.0, which is below
+        // floor = 1 + 2^-23 and would terminate the MUST walk early.
+        let must_ub = 2.0_f32.powi(-24);
+        let should_ubs = [1.0, 2.0_f32.powi(-24)];
+        let floor = 1.0 + 2.0_f32.powi(-23);
+        assert_ne!(
+            iu_tight_required_shoulds(must_ub, &should_ubs, floor),
+            Some(Vec::new()),
+            "conservative bounds must not declare the combined bound uncompetitive"
+        );
     }
 
     #[test]
