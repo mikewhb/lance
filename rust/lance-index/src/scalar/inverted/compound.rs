@@ -6839,6 +6839,31 @@ mod tests {
     }
 
     #[test]
+    fn reqopt_term_leaf_skips_uncompetitive_must_without_breaking_topk() {
+        // MUST+SHOULD shape like +water quality report: TermLeaf MUST, materialized SHOULD.
+        // Doc 0 MUST score is low; parked optional is 0.1, so it cannot reach floor 2.0.
+        let documents = DocSet::default();
+        let metrics = NoOpMetricsCollector;
+        let required = box_leaf_scorer(
+            loaded_leaf(vec![plain_unit_posting("water", vec![0, 1])], None),
+            &documents,
+            &metrics,
+        );
+        let optional = materialized(&[(0, 0.1), (1, 10.0)]);
+        let mut scorer = ReqOptScorer::new(required, optional);
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(2.0);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut scorer)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].row_id, 1);
+        assert!(results[0].score >= 2.0);
+    }
+
+    #[test]
     fn reqopt_window_collect_matches_default_walk() {
         let (mut override_scorer, default_inner) = reqopt_window_collect_fixture();
         let mut default_scorer = UseDefaultWindowCollect {
