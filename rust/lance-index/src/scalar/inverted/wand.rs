@@ -33,7 +33,7 @@ mod maxscore;
 #[path = "wand_seed_floor.rs"]
 mod seed_floor;
 
-pub(super) use iu_tight::{iu_tight_lead_is_cheaper, iu_tight_search};
+pub(super) use iu_tight::iu_tight_search;
 
 use super::{
     CompressedPositionStorage,

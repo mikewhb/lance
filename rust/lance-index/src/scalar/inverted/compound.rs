@@ -31,8 +31,7 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        TermLeafScorer, WandCursor, WandDocuments, iu_tight_lead_is_cheaper, iu_tight_search,
-        score_sum_upper_bound_factor,
+        TermLeafScorer, WandCursor, WandDocuments, iu_tight_search, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -4653,6 +4652,15 @@ fn iu_tight_leaves_ready(
         })
 }
 
+/// Below this MUST posting-list length, prefer the tight IU kernel even when
+/// the cheapest SHOULD is not dramatically cheaper: walking a small MUST list
+/// and folding the SHOULD contributions is cheaper than the trait-object
+/// ReqOpt scorer's per-doc virtual dispatch. Mirrors the analysis branch's
+/// `iu_tight_cost_gate` policy so that eligible `[(Must, Or), (Should, Or)]`
+/// plans route to `iu_tight_search` (no `ReqOptScorer` tower) instead of the
+/// `ReqOptScorer`/`ScaleScorer`/`DisjunctionScorer` abstraction.
+const IU_TIGHT_MIN_MUST_COST: usize = 85_000;
+
 fn iu_tight_should_switch(
     leaves: &[LoadedLeaf],
     must_index: usize,
@@ -4664,7 +4672,7 @@ fn iu_tight_should_switch(
         .map(|index| leaves[*index].postings[0].cost())
         .min()
         .unwrap_or(0);
-    iu_tight_lead_is_cheaper(must_cost, min_should)
+    must_cost <= min_should.saturating_mul(2) || must_cost >= IU_TIGHT_MIN_MUST_COST
 }
 
 fn collect_iu_tight<D, K>(
