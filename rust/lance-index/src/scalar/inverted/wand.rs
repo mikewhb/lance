@@ -5983,6 +5983,15 @@ pub(super) struct TermLeafScorer<'a, D: WandDocuments> {
     posting: PostingIterator,
     documents: &'a D,
     scorer: Arc<MemBM25Scorer>,
+    wand_factor: f32,
+    // Highest competitive floor published through `set_min_competitive_score`,
+    // scaled by `wand_factor`. Drives `skip_dead_windows` block skipping.
+    sticky_floor: f32,
+    // Highest competitive floor published through `set_window_min_competitive_score`
+    // (the per-window floor installed by `ReqOptScorer::apply_window_required_floor`),
+    // scaled by `wand_factor`. Mirrors the analysis branch so that block skipping
+    // engages on the window path, not only on the sticky path.
+    window_floor: f32,
     cost: usize,
     global_score_upper_bound: OnceCell<Option<f32>>,
     current_doc: Option<DocInfo>,
@@ -6000,7 +6009,7 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
         posting: PostingIterator,
         documents: &'a D,
         scorer: Arc<MemBM25Scorer>,
-        _params: &FtsSearchParams,
+        params: &FtsSearchParams,
         metrics: &'a dyn MetricsCollector,
     ) -> Self {
         let cost = posting.cost().min(documents.visible_cost_upper_bound());
@@ -6008,6 +6017,9 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
             posting,
             documents,
             scorer,
+            wand_factor: params.wand_factor,
+            sticky_floor: f32::NEG_INFINITY,
+            window_floor: f32::NEG_INFINITY,
             cost,
             global_score_upper_bound: OnceCell::new(),
             current_doc: None,
@@ -6044,9 +6056,78 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
         }
     }
 
+    /// Highest competitive floor the leaf must still satisfy, scaled by
+    /// `wand_factor`. Mirrors the analysis branch's `TermLeafScorer` so that
+    /// `skip_dead_windows` can prune whole posting blocks whose block-max
+    /// score cannot reach the heap.
+    fn threshold(&self) -> f32 {
+        self.sticky_floor.max(self.window_floor).max(0.0)
+    }
+
+    /// Skip posting blocks whose impact (block-max, then impact-group) upper
+    /// bound cannot reach `threshold`. Without this, a huge MUST leaf is
+    /// advanced doc-by-doc through every block even after the heap floor has
+    /// risen above the block's best possible score.
+    fn skip_dead_windows(&mut self) {
+        let threshold = self.threshold();
+        if threshold <= 0.0 {
+            return;
+        }
+        loop {
+            let Some(doc) = self.posting.doc() else {
+                return;
+            };
+            let doc_id = doc.doc_id();
+            self.posting.shallow_next(doc_id);
+            let up_to = self.posting.block_end_doc();
+            let upper = conservative_score_sum(std::iter::once(
+                self.posting
+                    .window_max_score(Some(up_to), self.scorer.as_ref()),
+            ));
+            if !CompetitiveFloorMode::Inclusive.rejects_upper_bound(f64::from(upper), threshold) {
+                return;
+            }
+            let mut skip_to = if up_to < u32::MAX as u64 {
+                up_to + 1
+            } else {
+                doc_id + 1
+            };
+            if let Some((group_up_to, group_score)) =
+                self.posting.impact_group_bound(self.scorer.as_ref())
+                && group_up_to > up_to
+            {
+                let group_sum = conservative_score_sum(std::iter::once(group_score));
+                if CompetitiveFloorMode::Inclusive
+                    .rejects_upper_bound(f64::from(group_sum), threshold)
+                {
+                    skip_to = skip_to.max(group_up_to.saturating_add(1));
+                }
+            }
+            self.posting.next(skip_to);
+        }
+    }
+
+    /// Emit rule shared with the parent collector: keep a document whose exact
+    /// score meets the floor, and also one that rounding still cannot prove is
+    /// below the floor.
+    fn should_emit(&self, score: f32) -> bool {
+        let threshold = self.threshold();
+        if CompetitiveFloorMode::Inclusive.accepts_score(score, threshold) {
+            return true;
+        }
+        !score_sum_cannot_compete(
+            score,
+            0.0,
+            threshold,
+            score_sum_upper_bound_factor(1),
+            CompetitiveFloorMode::Inclusive,
+        )
+    }
+
     fn position_geq(&mut self, mut target: u64) -> Result<Option<u64>> {
         self.clear_current();
         loop {
+            self.skip_dead_windows();
             self.posting.next_doc_id(target, true);
             let Some(doc) = self.posting.current_doc else {
                 self.record_metrics();
@@ -6057,10 +6138,28 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
                 target = doc.doc_id().saturating_add(1);
                 continue;
             };
+            // A zero inclusive floor accepts every non-negative BM25. Skip the
+            // score until a parent (ReqOpt prune, collector) asks.
+            let (score, score_ready) = if self.threshold() > 0.0 {
+                let scored = self.posting.doc().ok_or_else(|| {
+                    Error::internal("single-term posting is not positioned on a document")
+                })?;
+                let doc_length = self.documents.doc_length(&scored);
+                let score =
+                    self.posting
+                        .score(self.scorer.as_ref(), scored.frequency(), doc_length);
+                if !self.should_emit(score) {
+                    target = doc.doc_id().saturating_add(1);
+                    continue;
+                }
+                (score, true)
+            } else {
+                (0.0, false)
+            };
             self.current_doc = Some(doc);
             self.current_document_key = Some(document_key);
-            self.current_score = 0.0;
-            self.score_ready = false;
+            self.current_score = score;
+            self.score_ready = score_ready;
             return Ok(Some(doc.doc_id()));
         }
     }
@@ -6158,6 +6257,30 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
             return Err(Error::invalid_input(
                 "minimum competitive FTS score cannot be NaN",
             ));
+        }
+        let floor = min_score * self.wand_factor;
+        if floor > self.sticky_floor {
+            self.sticky_floor = floor;
+        }
+        Ok(())
+    }
+
+    pub(super) fn set_window_min_competitive_score(
+        &mut self,
+        min_score: Option<f32>,
+    ) -> Result<()> {
+        match min_score {
+            Some(min_score) => {
+                if min_score.is_nan() {
+                    return Err(Error::invalid_input(
+                        "minimum competitive FTS score cannot be NaN",
+                    ));
+                }
+                self.window_floor = min_score * self.wand_factor;
+            }
+            None => {
+                self.window_floor = f32::NEG_INFINITY;
+            }
         }
         Ok(())
     }
@@ -12405,7 +12528,7 @@ mod tests {
     }
 
     #[test]
-    fn term_leaf_ignores_competitive_floor_on_advance() {
+    fn term_leaf_respects_competitive_floor_on_advance() {
         let (docs, posting) = term_leaf_posting(vec![0, 5], true);
         let scorer = Arc::new(MemBM25Scorer::new(
             docs.len() as u64,
@@ -12414,10 +12537,19 @@ mod tests {
         ));
         let params = FtsSearchParams::default();
         let metrics = NoOpMetricsCollector;
-        let mut leaf = TermLeafScorer::new(posting, &docs, scorer, &params, &metrics);
-        leaf.set_min_competitive_score(f32::MAX).unwrap();
+
+        // Without a competitive floor the leaf returns every doc.
+        let mut leaf = TermLeafScorer::new(posting, &docs, scorer.clone(), &params, &metrics);
         assert_eq!(leaf.next().unwrap(), Some(0));
         assert_eq!(leaf.next().unwrap(), Some(5));
+        assert!(leaf.next().unwrap().is_none());
+
+        // With an unreachable floor the leaf prunes every doc via block-max
+        // skipping, matching the analysis branch's `TermLeafScorer`.
+        let (docs2, posting2) = term_leaf_posting(vec![0, 5], true);
+        let mut leaf2 = TermLeafScorer::new(posting2, &docs2, scorer, &params, &metrics);
+        leaf2.set_min_competitive_score(f32::MAX).unwrap();
+        assert!(leaf2.next().unwrap().is_none());
     }
 
     #[test]

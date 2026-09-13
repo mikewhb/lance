@@ -1079,6 +1079,10 @@ impl<D: WandDocuments + Sync> ComposableScorer for TermLeafScorer<'_, D> {
         self.set_min_competitive_score(min_score)
     }
 
+    fn set_window_min_competitive_score(&mut self, min_score: Option<f32>) -> Result<()> {
+        self.set_window_min_competitive_score(min_score)
+    }
+
     fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
         Ok(self.scored_upper_bound())
     }
@@ -3418,6 +3422,21 @@ impl<'a> ReqOptScorer<'a> {
         self.optional_is_required = false;
     }
 
+    /// Forward the competitive floor to the required (MUST) leaf, translated by
+    /// the optional side's global upper bound so the leaf only prunes blocks
+    /// that cannot reach the heap even with the optional contribution.
+    fn push_translated_required_floor(&mut self) -> Result<()> {
+        let Some(optional_upper) = self.optional.global_score_upper_bound() else {
+            return Ok(());
+        };
+        if let Some(child_floor) =
+            required_floor_after_optional(self.min_competitive_score, optional_upper)
+        {
+            self.required.set_min_competitive_score(child_floor)?;
+        }
+        Ok(())
+    }
+
     fn set_optional_required(&mut self, required: bool) {
         if self.optional_is_required != required {
             self.confirmed_doc = None;
@@ -3727,6 +3746,13 @@ impl ComposableScorer for ReqOptScorer<'_> {
         }
         if min_score > self.min_competitive_score {
             self.min_competitive_score = min_score;
+            // Mirror the analysis branch: the required (MUST) leaf can only
+            // skip whole posting blocks whose block-max falls below the heap
+            // floor once it is told the floor translated by the optional
+            // side's global upper bound. Without this push, the leaf never
+            // sees a competitive floor and advances doc-by-doc through the
+            // entire huge MUST list.
+            self.push_translated_required_floor()?;
         }
         Ok(())
     }
