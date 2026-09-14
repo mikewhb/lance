@@ -18,7 +18,7 @@ use super::super::encoding::{
     MAX_POSTING_BLOCK_SIZE, decompress_posting_block, decompress_posting_remainder,
 };
 use super::super::scorer::{Scorer, bm25_doc_weight_with_norm};
-use super::{PostingIterator, PostingList, WandDocuments};
+use super::{ExactBm25Addends, PostingIterator, PostingList, WandDocuments};
 
 /// Relative gate: skip seeding when the sparsest clause is more than this
 /// fraction of the query's total posting length. Equal-length OR queries
@@ -45,7 +45,7 @@ pub(super) fn seed_floor_from_sparsest_clause<'a, S, D, I>(
     scorer: &S,
     documents: &D,
     norm_k_ref: Option<(&'a [u8], &'a [f32; 256])>,
-    exact_addends: Option<&[f32]>,
+    exact_addends: Option<ExactBm25Addends<'_>>,
 ) -> Option<f32>
 where
     S: Scorer,
@@ -129,10 +129,10 @@ where
                     query_weight * bm25_doc_weight_with_norm(freq, cache[code as usize])
                 }
                 (None, Some(addends)) => {
-                    let Some(&addend) = addends.get(doc as usize) else {
+                    if doc as usize >= addends.len() {
                         continue;
-                    };
-                    query_weight * bm25_doc_weight_with_norm(freq, addend)
+                    }
+                    query_weight * bm25_doc_weight_with_norm(freq, addends.get(doc))
                 }
                 (None, None) => {
                     query_weight * scorer.doc_weight(freq, documents.scoring_num_tokens(doc))

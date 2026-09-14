@@ -14,8 +14,8 @@ use lance_core::Result;
 use super::super::builder::ScoredDoc;
 use super::super::scorer::{Scorer, bm25_doc_weight_with_norm};
 use super::{
-    CompetitiveFloorMode, DocInfo, MaxScoreClause, PostingIterator, PostingList, RawDocInfo,
-    TopKCollector, Wand, WandDocuments, score_sum_cannot_compete,
+    CompetitiveFloorMode, DocInfo, ExactBm25Addends, MaxScoreClause, PostingIterator, PostingList,
+    RawDocInfo, TopKCollector, Wand, WandDocuments, score_sum_cannot_compete,
 };
 
 #[inline]
@@ -40,13 +40,13 @@ pub(super) fn bm25_tf_from_caches(
     freq: u32,
     doc: u32,
     quantized: Option<(&[u8], &[f32; 256])>,
-    exact_addends: Option<&[f32]>,
+    exact_addends: Option<ExactBm25Addends<'_>>,
 ) -> Option<f32> {
     if let Some((norms, cache)) = quantized {
         Some(query_weight * bm25_doc_weight_with_norm(freq, cache[norms[doc as usize] as usize]))
     } else {
         exact_addends
-            .map(|addends| query_weight * bm25_doc_weight_with_norm(freq, addends[doc as usize]))
+            .map(|addends| query_weight * bm25_doc_weight_with_norm(freq, addends.get(doc)))
     }
 }
 
@@ -54,7 +54,7 @@ fn bulk_bm25_tf(
     query_weight: f32,
     hits: &[(u64, u32)],
     quantized: Option<(&[u8], &[f32; 256])>,
-    exact_addends: Option<&[f32]>,
+    exact_addends: Option<ExactBm25Addends<'_>>,
     fallback: impl Fn(u64, u32) -> f32,
     out: &mut Vec<f32>,
 ) {
@@ -70,7 +70,7 @@ fn bulk_bm25_tf(
     }
     if let Some(addends) = exact_addends {
         for &(doc, freq) in hits {
-            out.push(query_weight * bm25_doc_weight_with_norm(freq, addends[doc as usize]));
+            out.push(query_weight * bm25_doc_weight_with_norm(freq, addends.get(doc as u32)));
         }
         return;
     }
@@ -314,7 +314,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         total_non_essential_bound: f64,
         total_sum_upper_bound_factor: f64,
         norm_k_ref: Option<(&[u8], &[f32; 256])>,
-        exact_addends: Option<&[f32]>,
+        exact_addends: Option<ExactBm25Addends<'_>>,
         essential_chunk: &mut Vec<(u64, u32)>,
         scratch: &mut MaxScoreSoaScratch,
         candidates: &mut TopKCollector,
@@ -398,7 +398,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         total_non_essential_bound: f64,
         total_sum_upper_bound_factor: f64,
         norm_k_ref: Option<(&[u8], &[f32; 256])>,
-        exact_addends: Option<&[f32]>,
+        exact_addends: Option<ExactBm25Addends<'_>>,
         scratch: &mut MaxScoreSoaScratch,
         candidates: &mut TopKCollector,
         num_comparisons: &mut usize,

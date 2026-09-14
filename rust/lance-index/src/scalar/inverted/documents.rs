@@ -8,6 +8,7 @@
 //! never has to infer which value a numeric slot represents.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -99,6 +100,106 @@ impl CacheKey for DocRowIdsKey {
     }
 }
 
+/// Exact BM25 length addends. Wikipedia-scale corpora have far fewer unique
+/// token counts than documents, so the common form is a `u16` code per doc
+/// plus a tiny `f32` dictionary — same bits as a dense slab, half the gather
+/// working set (Lucene's byte-norm + LUT shape, without quantizing lengths).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ExactBm25Addends<'a> {
+    pub(super) codes: Option<&'a [u16]>,
+    pub(super) values: &'a [f32],
+}
+
+impl<'a> ExactBm25Addends<'a> {
+    pub(super) fn dense(values: &'a [f32]) -> Self {
+        Self {
+            codes: None,
+            values,
+        }
+    }
+
+    #[inline]
+    pub(super) fn get(self, doc: u32) -> f32 {
+        match self.codes {
+            None => self.values[doc as usize],
+            Some(codes) => self.values[usize::from(codes[doc as usize])],
+        }
+    }
+
+    /// Number of documents covered, so callers can bound-check a doc id
+    /// before gathering.
+    pub(super) fn len(self) -> usize {
+        match self.codes {
+            None => self.values.len(),
+            Some(codes) => codes.len(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ExactAddendSlab {
+    Dense(Box<[f32]>),
+    Coded { codes: Box<[u16]>, dict: Box<[f32]> },
+}
+
+impl ExactAddendSlab {
+    fn as_addends(&self) -> ExactBm25Addends<'_> {
+        match self {
+            Self::Dense(values) => ExactBm25Addends::dense(values),
+            Self::Coded { codes, dict } => ExactBm25Addends {
+                codes: Some(codes),
+                values: dict,
+            },
+        }
+    }
+
+    fn byte_size(&self) -> usize {
+        match self {
+            Self::Dense(values) => std::mem::size_of_val(values.as_ref()),
+            Self::Coded { codes, dict } => {
+                std::mem::size_of_val(codes.as_ref()) + std::mem::size_of_val(dict.as_ref())
+            }
+        }
+    }
+}
+
+fn build_exact_addend_slab(
+    lengths: &[u32],
+    doc_norm: &mut dyn FnMut(u32) -> f32,
+) -> ExactAddendSlab {
+    const MAX_UNIQUE: usize = u16::MAX as usize + 1;
+    let mut index = HashMap::with_capacity(4096);
+    let mut dict = Vec::with_capacity(4096);
+    let mut codes = Vec::with_capacity(lengths.len());
+    for &length in lengths {
+        match index.get(&length) {
+            Some(&code) => codes.push(code),
+            None => {
+                if dict.len() >= MAX_UNIQUE {
+                    return ExactAddendSlab::Dense(lengths.iter().copied().map(doc_norm).collect());
+                }
+                let code = dict.len() as u16;
+                dict.push(doc_norm(length));
+                index.insert(length, code);
+                codes.push(code);
+            }
+        }
+    }
+    // Coding only pays off when the u16 codes plus the dictionary stay below
+    // one f32 per document. Corpora whose lengths are nearly all unique would
+    // otherwise pay two loads per gather and more bytes than the dense slab.
+    let dense_bytes = lengths.len() * std::mem::size_of::<f32>();
+    if codes.len() * std::mem::size_of::<u16>() + dict.len() * std::mem::size_of::<f32>()
+        >= dense_bytes
+    {
+        return ExactAddendSlab::Dense(lengths.iter().copied().map(doc_norm).collect());
+    }
+    ExactAddendSlab::Coded {
+        codes: codes.into_boxed_slice(),
+        dict: dict.into_boxed_slice(),
+    }
+}
+
 /// Exact document lengths plus the optional quantized scoring representation.
 #[derive(Debug)]
 pub(super) struct DocLengths {
@@ -108,7 +209,7 @@ pub(super) struct DocLengths {
     norms: OnceLock<Box<[u8]>>,
     /// Per-document BM25 length addends for exact-scoring partitions.
     /// Quantized partitions use the 256-entry norm cache instead.
-    exact_addends: OnceLock<(u64, Box<[f32]>)>,
+    exact_addends: OnceLock<(u64, ExactAddendSlab)>,
 }
 
 impl DeepSizeOf for DocLengths {
@@ -122,7 +223,7 @@ impl DeepSizeOf for DocLengths {
             + self
                 .exact_addends
                 .get()
-                .map(|(_, slab)| std::mem::size_of_val(slab.as_ref()))
+                .map(|(_, slab)| slab.byte_size())
                 .unwrap_or(0)
     }
 }
@@ -204,18 +305,14 @@ impl DocLengths {
         &self,
         cache_key: u64,
         doc_norm: &mut dyn FnMut(u32) -> f32,
-    ) -> Option<&[f32]> {
+    ) -> Option<ExactBm25Addends<'_>> {
         if self.quantized_scoring {
             return None;
         }
-        let (stored_key, slab) = self.exact_addends.get_or_init(|| {
-            let mut slab = Vec::with_capacity(self.values.len());
-            for &length in self.values.iter() {
-                slab.push(doc_norm(length));
-            }
-            (cache_key, slab.into_boxed_slice())
-        });
-        (*stored_key == cache_key).then_some(slab.as_ref())
+        let (stored_key, slab) = self
+            .exact_addends
+            .get_or_init(|| (cache_key, build_exact_addend_slab(&self.values, doc_norm)));
+        (*stored_key == cache_key).then_some(slab.as_addends())
     }
 
     fn scoring_ready(&self) -> bool {
@@ -2797,10 +2894,11 @@ mod tests {
         let slab = lengths
             .exact_bm25_addends(cache_key, &mut doc_norm)
             .expect("exact partitions expose a dense addend slab");
-        assert_eq!(slab, expected.as_slice());
-        assert_eq!(
-            lengths.deep_size_of() - before_addends,
-            3 * std::mem::size_of::<f32>()
+        let gathered: Vec<f32> = (0..3).map(|doc| slab.get(doc)).collect();
+        assert_eq!(gathered.as_slice(), expected.as_slice());
+        assert!(
+            lengths.deep_size_of() - before_addends <= 3 * std::mem::size_of::<f32>(),
+            "the coded slab must never be larger than the dense form"
         );
         assert!(
             lengths
@@ -2821,7 +2919,8 @@ mod tests {
             empty
                 .exact_bm25_addends(cache_key, &mut doc_norm)
                 .expect("empty exact partitions still expose a slab")
-                .is_empty()
+                .len()
+                == 0
         );
 
         let quantized =
@@ -2833,6 +2932,31 @@ mod tests {
                 .is_none(),
             "quantized partitions keep the 256-entry norm cache instead"
         );
+    }
+
+    #[test]
+    fn exact_addend_slab_codes_match_dense_values() {
+        let lengths: Vec<u32> = (0..80).map(|i| 10 + (i % 7) * 3).collect();
+        let mut norm = |len: u32| len as f32 * 0.25 + 1.5;
+        let coded = build_exact_addend_slab(&lengths, &mut norm);
+        let norm = |len: u32| len as f32 * 0.25 + 1.5;
+        let dense = ExactAddendSlab::Dense(lengths.iter().copied().map(norm).collect());
+        let coded_view = coded.as_addends();
+        let dense_view = dense.as_addends();
+        assert!(coded_view.codes.is_some());
+        for doc in 0..lengths.len() as u32 {
+            assert_eq!(coded_view.get(doc), dense_view.get(doc), "doc={doc}");
+        }
+    }
+
+    #[test]
+    fn exact_addend_slab_falls_back_to_dense_past_u16_codes() {
+        let lengths: Vec<u32> = (0..70_000).collect();
+        let mut norm = |len: u32| len as f32 * 0.25 + 1.5;
+        let slab = build_exact_addend_slab(&lengths, &mut norm);
+        let view = slab.as_addends();
+        assert!(view.codes.is_none(), "too many unique lengths to code");
+        assert_eq!(view.get(69_999), 69_999_f32 * 0.25 + 1.5);
     }
 
     #[tokio::test]

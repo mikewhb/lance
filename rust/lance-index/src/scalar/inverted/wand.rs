@@ -37,7 +37,7 @@ pub(super) use iu_tight::iu_tight_search;
 
 use super::{
     CompressedPositionStorage,
-    documents::{DocId, DocLengths, DocVisibility},
+    documents::{DocId, DocLengths, DocVisibility, ExactBm25Addends},
     impact::{IMPACT_LEVEL1_BLOCKS, ImpactScoreCache, ImpactSkipData},
     index::{PositionStreamCodec, dequantize_doc_length},
     query::Operator,
@@ -1688,7 +1688,7 @@ impl PostingIterator {
         docs: &D,
         scorer: &S,
         norm_k: Option<(&[u8], &[f32; 256])>,
-        exact_addends: Option<&[f32]>,
+        exact_addends: Option<ExactBm25Addends<'_>>,
         acc: &mut WindowAccumulator,
     ) {
         if self.doc().is_some_and(|doc| doc.doc_id() < window_min) {
@@ -1726,7 +1726,7 @@ impl PostingIterator {
                                 cache[norms[doc_id as usize] as usize],
                             ),
                             (None, Some(addends)) => {
-                                bm25_doc_weight_with_norm(freq, addends[doc_id as usize])
+                                bm25_doc_weight_with_norm(freq, addends.get(doc_id))
                             }
                             (None, None) => {
                                 scorer.doc_weight(freq, docs.scoring_num_tokens(doc_id))
@@ -1959,7 +1959,7 @@ pub(super) trait WandDocuments {
         &self,
         _cache_key: u64,
         _doc_norm: &mut dyn FnMut(u32) -> f32,
-    ) -> Option<&[f32]> {
+    ) -> Option<ExactBm25Addends<'_>> {
         None
     }
     fn doc_length(&self, doc: &DocInfo) -> u32;
@@ -1970,7 +1970,7 @@ pub(super) trait WandDocuments {
     fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32;
 }
 
-fn exact_bm25_addend_slab<'a, S, D>(scorer: &S, documents: &'a D) -> Option<&'a [f32]>
+fn exact_bm25_addend_slab<'a, S, D>(scorer: &S, documents: &'a D) -> Option<ExactBm25Addends<'a>>
 where
     S: Scorer + ?Sized,
     D: WandDocuments + ?Sized,
@@ -2064,7 +2064,7 @@ impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
         &self,
         cache_key: u64,
         doc_norm: &mut dyn FnMut(u32) -> f32,
-    ) -> Option<&[f32]> {
+    ) -> Option<ExactBm25Addends<'_>> {
         self.lengths.exact_bm25_addends(cache_key, doc_norm)
     }
 
@@ -3174,7 +3174,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         // the exact doc length is only needed at insert time.
                         let norm_addend =
                             norm_k_ref.map(|(norms, cache)| cache[norms[doc as usize] as usize]);
-                        let exact_addend = exact_addends.map(|addends| addends[doc as usize]);
+                        let exact_addend = exact_addends.map(|addends| addends.get(doc as u32));
                         let score = match (norm_addend, exact_addend) {
                             (Some(addend), _) | (None, Some(addend)) => {
                                 essential_weight * bm25_doc_weight_with_norm(freq, addend)
@@ -3488,7 +3488,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         // cache when available.
                         let norm_addend =
                             norm_k_ref.map(|(norms, cache)| cache[norms[doc as usize] as usize]);
-                        let exact_addend = exact_addends.map(|addends| addends[doc as usize]);
+                        let exact_addend = exact_addends.map(|addends| addends.get(doc as u32));
                         let mut doc_length_cell: Option<u32> = None;
                         let needs_canonical_rescore =
                             first_essential != 0 || !clauses_in_query_order;
@@ -4742,7 +4742,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         }
                         None => (None, batch_lens[index]),
                     };
-                    let exact_addend = exact_addends.map(|addends| addends[doc as usize]);
+                    let exact_addend = exact_addends.map(|addends| addends.get(doc));
                     let offs = &batch_offs[index * num_lists..(index + 1) * num_lists];
                     if self.threshold > 0.0 && num_lists >= 2 && others_block_max.is_none() {
                         others_block_max = Some(

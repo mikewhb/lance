@@ -13,7 +13,7 @@ use lance_core::Result;
 
 use super::super::scorer::{Scorer, bm25_doc_weight_with_norm};
 use super::{
-    PostingIterator, TERMINATED_DOC_ID, WandDocuments, exact_bm25_addend_slab,
+    ExactBm25Addends, PostingIterator, TERMINATED_DOC_ID, WandDocuments, exact_bm25_addend_slab,
     outward_f32_upper_bound,
 };
 
@@ -40,14 +40,14 @@ pub fn iu_tight_lead_is_cheaper(must_cost: usize, lead_cost: usize) -> bool {
 struct IuTightScoring<'a, D, S> {
     documents: &'a D,
     scorer: &'a S,
-    exact_addends: Option<&'a [f32]>,
+    exact_addends: Option<ExactBm25Addends<'a>>,
 }
 
 impl<'a, D: WandDocuments, S: Scorer> IuTightScoring<'a, D, S> {
     fn term_score(&self, posting: &PostingIterator, doc: u64, freq: u32) -> f32 {
         match self.exact_addends {
             Some(addends) => {
-                posting.query_weight * bm25_doc_weight_with_norm(freq, addends[doc as usize])
+                posting.query_weight * bm25_doc_weight_with_norm(freq, addends.get(doc as u32))
             }
             None => posting.score(
                 self.scorer,

@@ -29,10 +29,10 @@ use super::super::query::FtsSearchParams;
 use super::super::scorer::Scorer;
 use super::maxscore::bm25_tf_from_caches;
 use super::{
-    BLOCK_SIZE, CompetitiveFloorMode, DocCandidate, DocInfo, PostingIterator, PostingList,
-    RawDocInfo, ScoreContribution, TERMINATED_DOC_ID, TopKCollector, Wand, WandDocuments,
-    conservative_score_sum, exact_bm25_addend_slab, score_contributions_in_query_order,
-    score_sum_cannot_compete, score_sum_upper_bound_factor,
+    BLOCK_SIZE, CompetitiveFloorMode, DocCandidate, DocInfo, ExactBm25Addends, PostingIterator,
+    PostingList, RawDocInfo, ScoreContribution, TERMINATED_DOC_ID, TopKCollector, Wand,
+    WandDocuments, conservative_score_sum, exact_bm25_addend_slab,
+    score_contributions_in_query_order, score_sum_cannot_compete, score_sum_upper_bound_factor,
 };
 use crate::metrics::MetricsCollector;
 
@@ -100,7 +100,7 @@ fn clause_bm25<S: Scorer, D: WandDocuments>(
     freq: u32,
     doc: u32,
     norm_k: Option<(&[u8], &[f32; 256])>,
-    exact_addends: Option<&[f32]>,
+    exact_addends: Option<ExactBm25Addends<'_>>,
 ) -> f32 {
     bm25_tf_from_caches(posting.query_weight, freq, doc, norm_k, exact_addends)
         .unwrap_or_else(|| posting.score(scorer, freq, documents.scoring_num_tokens(doc)))
@@ -275,7 +275,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         num_comparisons: &mut usize,
         wand_factor: f32,
         norm_k: Option<(&[u8], &[f32; 256])>,
-        exact_addends: Option<&[f32]>,
+        exact_addends: Option<ExactBm25Addends<'_>>,
     ) -> Result<LeadStreamBlockOutcome> {
         #[cfg(test)]
         {
@@ -424,7 +424,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         num_comparisons: &mut usize,
         wand_factor: f32,
         norm_k: Option<(&[u8], &[f32; 256])>,
-        exact_addends: Option<&[f32]>,
+        exact_addends: Option<ExactBm25Addends<'_>>,
     ) -> Result<bool> {
         #[cfg(test)]
         {
