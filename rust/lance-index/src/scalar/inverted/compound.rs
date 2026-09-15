@@ -314,6 +314,12 @@ pub(super) trait ComposableScorer: Send {
         Ok(None)
     }
 
+    /// Tighter upper bound used only before an expensive two-phase confirmation.
+    /// The default preserves lazy score decoding for ordinary candidate traversal.
+    fn confirmation_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        self.current_score_upper_bound()
+    }
+
     fn supports_doc_local_confirmation_pruning(&self) -> bool {
         false
     }
@@ -419,11 +425,22 @@ fn collect_confirmed_window_default<S: ComposableScorer + ?Sized>(
         if out.len() >= max_hits {
             return Ok(WindowCollect { exhausted: false });
         }
+        let match_cost = scorer.match_cost();
+        if let Some(match_cost) = match_cost
+            && (!match_cost.is_finite() || match_cost < 0.0)
+        {
+            return Err(Error::internal(format!(
+                "FTS scorer reported invalid two-phase match cost: {match_cost}"
+            )));
+        }
         if min_score.is_finite()
             && scorer.supports_doc_local_confirmation_pruning()
-            && scorer
-                .current_score_upper_bound()?
-                .is_some_and(|upper| upper < min_score)
+            && (if match_cost.is_some() {
+                scorer.confirmation_score_upper_bound()?
+            } else {
+                scorer.current_score_upper_bound()?
+            })
+            .is_some_and(|upper| upper < min_score)
         {
             match scorer.next()? {
                 Some(next) if next <= up_to => {
@@ -433,13 +450,6 @@ fn collect_confirmed_window_default<S: ComposableScorer + ?Sized>(
                 Some(_) => return Ok(WindowCollect { exhausted: false }),
                 None => return Ok(WindowCollect { exhausted: true }),
             }
-        }
-        if let Some(match_cost) = scorer.match_cost()
-            && (!match_cost.is_finite() || match_cost < 0.0)
-        {
-            return Err(Error::internal(format!(
-                "FTS scorer reported invalid two-phase match cost: {match_cost}"
-            )));
         }
         if scorer.matches()? {
             let score = checked_score(scorer.score()?, "compound scorer")?;
@@ -1085,6 +1095,13 @@ impl<D: WandDocuments + Sync> ComposableScorer for TermLeafScorer<'_, D> {
 
     fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
         Ok(self.scored_upper_bound())
+    }
+
+    fn confirmation_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        if self.doc().is_none() {
+            return Ok(None);
+        }
+        self.current_score().map(Some)
     }
 
     fn matches(&mut self) -> Result<bool> {
@@ -2645,6 +2662,14 @@ impl ComposableScorer for ScaleScorer<'_> {
         }))
     }
 
+    fn confirmation_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        Ok(self.child.confirmation_score_upper_bound()?.map(|upper| {
+            ScoreBounds { lower: 0.0, upper }
+                .scale_non_negative(self.factor)
+                .upper
+        }))
+    }
+
     fn supports_doc_local_confirmation_pruning(&self) -> bool {
         self.child.supports_doc_local_confirmation_pruning()
     }
@@ -3181,6 +3206,29 @@ impl ComposableScorer for RequiredConjunctionScorer<'_> {
         Ok(bounds.upper.is_finite().then_some(bounds.upper))
     }
 
+    fn confirmation_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        let Some(current) = self.current else {
+            return Ok(None);
+        };
+        let mut bounds = ScoreBounds::ZERO;
+        for child in &mut self.children {
+            if child.doc() != Some(current) {
+                return Ok(None);
+            }
+            let Some(upper) = child.confirmation_score_upper_bound()? else {
+                return Ok(None);
+            };
+            if !upper.is_finite() {
+                return Ok(None);
+            }
+            bounds = bounds.add(ScoreBounds {
+                lower: 0.0,
+                upper: upper.max(0.0),
+            });
+        }
+        Ok(bounds.upper.is_finite().then_some(bounds.upper))
+    }
+
     fn supports_doc_local_confirmation_pruning(&self) -> bool {
         self.children
             .iter()
@@ -3546,7 +3594,14 @@ impl<'a> ReqOptScorer<'a> {
         if !Self::usable_bounds(optional_cap) {
             return Ok(false);
         }
-        let Some(required_upper) = self.required.current_score_upper_bound()? else {
+        let has_two_phase_confirmation =
+            self.required.match_cost().is_some() || self.optional.match_cost().is_some();
+        let required_upper = if has_two_phase_confirmation {
+            self.required.confirmation_score_upper_bound()?
+        } else {
+            self.required.current_score_upper_bound()?
+        };
+        let Some(required_upper) = required_upper else {
             return Ok(false);
         };
         if !required_upper.is_finite() {
@@ -6494,6 +6549,58 @@ mod tests {
                 rows(&[(1, 2.0)])
             );
         }
+    }
+
+    #[rstest::rstest]
+    fn required_phrase_prunes_with_lazy_term_score(#[values(false, true)] phrase_first: bool) {
+        let mut documents = DocSet::default();
+        documents.append(0, 100);
+        documents.append(1, 1);
+        documents.append(2, 1);
+        let scorer = Arc::new(MemBM25Scorer::new(102, 3, HashMap::new()));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+        let posting = PostingIterator::with_query_weight(
+            "term".to_owned(),
+            0,
+            0,
+            1.0,
+            PostingList::Plain(PlainPostingList::new(
+                ScalarBuffer::from(vec![0_u64, 1, 2]),
+                ScalarBuffer::from(vec![1.0_f32; 3]),
+                Some(2.2),
+                None,
+            )),
+            documents.len(),
+        );
+        let term = Box::new(TermLeafScorer::new(
+            posting,
+            &documents,
+            scorer.clone(),
+            &params,
+            &metrics,
+        ));
+        let term = Box::new(ScaleScorer::try_new(term, 1.0).unwrap()) as BoxScorer<'_>;
+        let (phrase, _, confirmations) =
+            two_phase(&[(0, 1.0), (1, 1.0), (2, 1.0)], vec![1, 2], Some(10.0));
+        let children = if phrase_first {
+            vec![phrase, term]
+        } else {
+            vec![term, phrase]
+        };
+        let mut conjunction = RequiredConjunctionScorer::try_new(children).unwrap();
+        let floor = 1.0 + scorer.doc_weight(1, 1);
+        let competitive_score = Arc::new(CompetitiveScore::default());
+        competitive_score.raise(floor);
+
+        let results = TopKCollector::with_competitive_score(1, competitive_score)
+            .collect(&mut conjunction)
+            .unwrap();
+        assert_eq!(results, rows(&[(1, floor)]));
+        assert_eq!(results[0].score.to_bits(), floor.to_bits());
+        // The term's block bound admits doc 0, but its exact score rules it
+        // out before positions. Both floor-equal documents must be confirmed.
+        assert_eq!(confirmations.load(AtomicOrdering::Relaxed), 2);
     }
 
     #[test]

@@ -6290,9 +6290,8 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
         if self.score_ready {
             return Some(self.current_score);
         }
-        // Conservative bound for the parked doc without decoding frequencies.
-        // Same block-max source as advance_shallow window bounds for ReqOpt
-        // parent doc-local pruning on single-term MUST leaves.
+        // The normal candidate path remains lazy: this block bound avoids
+        // decoding frequencies unless a parent is about to run confirmation.
         let upper = conservative_score_sum(std::iter::once(
             self.posting.window_max_score(None, self.scorer.as_ref()),
         ));
@@ -6490,6 +6489,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::super::compound::ComposableScorer;
     use super::super::documents::resident_row_address_projection_for_test;
     use super::super::impact::build_impact_skip_data;
     use super::*;
@@ -12553,7 +12553,7 @@ mod tests {
     }
 
     #[test]
-    fn term_leaf_conservative_upper_is_none_without_doc() {
+    fn term_leaf_current_upper_is_none_without_doc() {
         let (docs, posting) = term_leaf_posting(vec![0], true);
         let scorer = Arc::new(MemBM25Scorer::new(
             docs.len() as u64,
@@ -12562,12 +12562,12 @@ mod tests {
         ));
         let params = FtsSearchParams::default();
         let metrics = NoOpMetricsCollector;
-        let leaf = TermLeafScorer::new(posting, &docs, scorer, &params, &metrics);
-        assert_eq!(leaf.scored_upper_bound(), None);
+        let mut leaf = TermLeafScorer::new(posting, &docs, scorer, &params, &metrics);
+        assert_eq!(leaf.current_score_upper_bound().unwrap(), None);
     }
 
     #[rstest]
-    fn term_leaf_conservative_upper_before_score(#[values(false, true)] compressed: bool) {
+    fn term_leaf_confirmation_upper_scores_on_demand(#[values(false, true)] compressed: bool) {
         let (docs, posting) = term_leaf_posting(vec![0, 2, 4], compressed);
         let scorer = Arc::new(MemBM25Scorer::new(
             docs.len() as u64,
@@ -12580,14 +12580,28 @@ mod tests {
 
         assert_eq!(leaf.next().unwrap(), Some(0));
         assert_eq!(leaf.frequency_blocks_decoded(), 0);
+        let lazy_upper = leaf.current_score_upper_bound().unwrap().unwrap();
+        assert!(!leaf.score_ready);
+        assert_eq!(leaf.frequency_blocks_decoded(), 0);
         let upper = leaf
-            .scored_upper_bound()
-            .expect("parked single-term MUST leaf should expose a conservative upper");
+            .confirmation_score_upper_bound()
+            .unwrap()
+            .expect("a parked term must expose its exact score as an upper bound");
+        assert!(leaf.score_ready);
+        let decoded = leaf.frequency_blocks_decoded();
+        assert_eq!(decoded > 0, compressed);
         let actual = leaf.current_score().unwrap();
-        assert!(
-            upper >= actual,
-            "conservative upper {upper} must be >= scored {actual}"
-        );
+        assert!(lazy_upper >= actual);
+        assert_eq!(upper.to_bits(), actual.to_bits());
+        assert_eq!(leaf.frequency_blocks_decoded(), decoded);
+
+        assert_eq!(leaf.advance(2).unwrap(), Some(2));
+        assert!(!leaf.score_ready);
+        assert_eq!(leaf.frequency_blocks_decoded(), decoded);
+        let upper = leaf.confirmation_score_upper_bound().unwrap().unwrap();
+        assert_eq!(upper.to_bits(), leaf.current_score().unwrap().to_bits());
+        assert!(leaf.advance(5).unwrap().is_none());
+        assert_eq!(leaf.confirmation_score_upper_bound().unwrap(), None);
     }
 
     #[test]
@@ -12603,6 +12617,6 @@ mod tests {
         let mut leaf = TermLeafScorer::new(posting, &docs, scorer, &params, &metrics);
         assert_eq!(leaf.next().unwrap(), Some(0));
         let score = leaf.current_score().unwrap();
-        assert_eq!(leaf.scored_upper_bound(), Some(score));
+        assert_eq!(leaf.confirmation_score_upper_bound().unwrap(), Some(score));
     }
 }
