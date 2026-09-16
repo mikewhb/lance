@@ -6052,6 +6052,10 @@ mod tests {
         },
     };
 
+    mod wand_phrase_bench {
+        include!("wand_phrase_bench.rs");
+    }
+
     struct CostOnlyDocuments {
         total_docs: usize,
         visible_cost_upper_bound: usize,
