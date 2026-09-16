@@ -5604,6 +5604,7 @@ impl<'a> PositionCursor<'a> {
     /// the not-yet-consumed suffix, so the cursor never rewinds and a returned
     /// position is never below `target`. When the cursor already sits past
     /// `target` the search is skipped entirely.
+    #[inline]
     fn advance_to_at_least(&mut self, target: u32) -> Option<u32> {
         if self.index >= self.len() {
             return None;
