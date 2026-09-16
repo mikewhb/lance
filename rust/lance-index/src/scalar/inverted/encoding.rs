@@ -1542,6 +1542,96 @@ mod tests {
         Ok(())
     }
 
+    /// Ranges the doc-by-doc round trip does not already produce: empty
+    /// ranges, a doc that starts exactly on a group boundary while the scratch
+    /// still holds the previous group, a doc that crosses a group boundary,
+    /// a doc that starts mid-group and runs into the varint tail, and the
+    /// range-validation errors.
+    #[test]
+    fn test_seek_packed_doc_positions_boundary_ranges() -> Result<()> {
+        // Shape A: a doc that starts exactly on the group-1 boundary.
+        // Shape B: a doc that crosses a group boundary, and a doc that starts
+        // mid-group and runs into the varint tail.
+        for frequencies in [vec![BLOCK_SIZE as u32, 72, 63], vec![200, 63]] {
+            let total: usize = frequencies.iter().map(|&f| f as usize).sum();
+            let packed_end = (total / BLOCK_SIZE) * BLOCK_SIZE;
+            assert!(total > packed_end, "shape must have a varint tail");
+            let positions: Vec<u32> = (0..total as u32).map(|i| i * 3).collect();
+
+            let mut encoded = Vec::new();
+            encode_position_stream_block_into(
+                &positions,
+                &frequencies,
+                PositionStreamCodec::PackedDelta,
+                &mut encoded,
+            )?;
+            let mut whole = Vec::new();
+            decode_position_stream_block(
+                &encoded,
+                &frequencies,
+                PositionStreamCodec::PackedDelta,
+                &mut whole,
+            )?;
+            assert_eq!(whole, positions);
+
+            let mut group_offsets = vec![0usize];
+            let mut unpacked_group = Box::new([0u32; BLOCK_SIZE]);
+            let mut unpacked_group_idx = None;
+            let mut tail_cache = Vec::new();
+            let mut scratch = Vec::new();
+
+            macro_rules! seek {
+                ($range:expr) => {
+                    seek_packed_doc_positions(
+                        &encoded,
+                        total,
+                        $range,
+                        &mut group_offsets,
+                        &mut unpacked_group,
+                        &mut unpacked_group_idx,
+                        &mut tail_cache,
+                        &mut scratch,
+                    )
+                };
+            }
+
+            // Empty ranges emit nothing and must not error: at the start, on a
+            // group boundary, and inside the varint tail.
+            for empty in [0..0, packed_end..packed_end, packed_end + 1..packed_end + 1] {
+                seek!(empty.clone())?;
+                assert!(
+                    scratch.is_empty(),
+                    "empty range {empty:?} emitted {} positions",
+                    scratch.len()
+                );
+            }
+
+            // Each doc's own delta range, decoded back to back so the scratch
+            // is carried across group boundaries and into the tail.
+            let mut doc_start = 0usize;
+            for &freq in &frequencies {
+                let doc_end = doc_start + freq as usize;
+                seek!(doc_start..doc_end)?;
+                assert_eq!(
+                    scratch,
+                    whole[doc_start..doc_end],
+                    "shape={frequencies:?} range={doc_start}..{doc_end}"
+                );
+                doc_start = doc_end;
+            }
+
+            // Range validation still rejects inverted and over-long ranges.
+            // Built from variables so the reversed range is not a literal.
+            let (bad_start, bad_end) = (5usize, 3usize);
+            assert!(seek!(bad_start..bad_end).is_err(), "start > end must error");
+            assert!(
+                seek!(0..total + 1).is_err(),
+                "end > total_deltas must error"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn test_packed_position_decoders_reject_malformed_groups() {
         let frequencies = [BLOCK_SIZE as u32];
