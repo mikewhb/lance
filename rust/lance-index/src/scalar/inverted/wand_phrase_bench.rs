@@ -104,6 +104,8 @@ fn phrase_position_bench() {
     if std::env::var_os("LANCE_PHRASE_POSITION_BENCH").is_none() {
         return;
     }
+    let scenario_filter = std::env::var("LANCE_PHRASE_POSITION_BENCH_SCENARIO").ok();
+    let path_filter = std::env::var("LANCE_PHRASE_POSITION_BENCH_PATH").ok();
 
     println!(
         "# size_of Option<PositionCursor> = {}",
@@ -213,6 +215,12 @@ fn phrase_position_bench() {
 
     println!("scenario,path,matched,mean_ns,p50_ns,p95_ns,iters,percall_p50_ns,percall_p95_ns");
     for (name, clauses) in scenarios {
+        if scenario_filter
+            .as_ref()
+            .is_some_and(|filter| filter != &name)
+        {
+            continue;
+        }
         let mut docs = DocSet::default();
         docs.append(0, 1_000_001);
         let postings = clauses
@@ -250,14 +258,26 @@ fn phrase_position_bench() {
 
         let batch = bench_phrase_batch(|| wand.check_exact_positions().unwrap());
         println!("# batch {name} = {batch}");
-        bench_phrase_row(&name, "classic", matched, batch, || {
-            wand.check_exact_positions().unwrap()
-        });
-        bench_phrase_row(&name, "compound_dispatch", matched, batch, || {
-            wand.check_positions(0).unwrap()
-        });
-        bench_phrase_row(&name, "bulk", matched, batch, || {
-            wand.check_exact_positions_bulk().unwrap()
-        });
+        if path_filter
+            .as_ref()
+            .is_none_or(|filter| filter == "classic")
+        {
+            bench_phrase_row(&name, "classic", matched, batch, || {
+                wand.check_exact_positions().unwrap()
+            });
+        }
+        if path_filter
+            .as_ref()
+            .is_none_or(|filter| filter == "compound_dispatch")
+        {
+            bench_phrase_row(&name, "compound_dispatch", matched, batch, || {
+                wand.check_positions(0).unwrap()
+            });
+        }
+        if path_filter.as_ref().is_none_or(|filter| filter == "bulk") {
+            bench_phrase_row(&name, "bulk", matched, batch, || {
+                wand.check_exact_positions_bulk().unwrap()
+            });
+        }
     }
 }
