@@ -24,8 +24,15 @@ use crate::metrics::MetricsCollector;
 
 #[path = "wand_intersection.rs"]
 mod intersection;
+#[path = "wand_iu_tight.rs"]
+mod iu_tight;
 #[path = "wand_maxscore.rs"]
 mod maxscore;
+#[path = "wand_term_leaf.rs"]
+mod term_leaf;
+
+pub(super) use iu_tight::{iu_tight_lead_is_cheaper, iu_tight_search};
+pub(super) use term_leaf::TermLeafScorer;
 
 use super::{
     CompressedPositionStorage,
@@ -1109,12 +1116,12 @@ impl PostingIterator {
     }
 
     #[inline]
-    fn has_grouped_terms(&self) -> bool {
+    pub(super) fn has_grouped_terms(&self) -> bool {
         self.grouped_terms.is_some()
     }
 
     #[inline]
-    fn cost(&self) -> usize {
+    pub(super) fn cost(&self) -> usize {
         self.list.len()
     }
 
@@ -1354,6 +1361,45 @@ impl PostingIterator {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
                 let shift = list.block_shift();
+                let mask = list.block_mask();
+                // Completing an optional clause walks a sorted hit list. When
+                // the target is still inside the already-decoded block, a
+                // linear scan from the cursor beats locating the block again
+                // and binary-searching its first-doc slab.
+                // INVARIANT: `self.index` still points at `current_doc` here.
+                // The fast path below scans `doc_ids[(index & mask) + 1..]`, so
+                // a writer of `current_doc` that skips the index update would
+                // silently re-offer or drop docs. Doc ids are delta coded, so
+                // this invariant is documented rather than asserted.
+                if let Some(cur) = self.current_doc
+                    && cur.doc_id() >= u64::from(least_id)
+                {
+                    return;
+                }
+                if self.current_doc.is_some() {
+                    let block_idx = self.index >> shift;
+                    let compressed = unsafe { &*self.ensure_compressed_block_ptr(list, block_idx) };
+                    if compressed
+                        .doc_ids
+                        .last()
+                        .is_some_and(|&last| last >= least_id)
+                    {
+                        let start = (self.index & mask) + 1;
+                        if let Some(delta) = compressed.doc_ids[start..]
+                            .iter()
+                            .position(|&doc_id| doc_id >= least_id)
+                        {
+                            let new_offset = start + delta;
+                            self.index = (block_idx << shift) + new_offset;
+                            self.block_idx = block_idx;
+                            self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id: compressed.doc_ids[new_offset],
+                                frequency: compressed.freqs[new_offset],
+                            }));
+                            return;
+                        }
+                    }
+                }
                 let block_idx = self.block_idx_for_doc(list, self.index >> shift, least_id);
                 self.index = self.index.max(block_idx << shift);
                 let length = list.length as usize;
@@ -1618,7 +1664,7 @@ impl PostingIterator {
     }
 
     #[inline]
-    fn is_compressed(&self) -> bool {
+    pub(super) fn is_compressed(&self) -> bool {
         matches!(self.list, PostingList::Compressed(_))
     }
 
@@ -6003,6 +6049,7 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     wand: Wand<'a, Arc<MemBM25Scorer>, D>,
     phrase_slop: Option<u32>,
     wand_factor: f32,
+    sticky_floor: f32,
     cost: usize,
     global_score_upper_bound: OnceCell<Option<f32>>,
     current_doc: Option<DocInfo>,
@@ -6044,6 +6091,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             wand,
             phrase_slop: params.phrase_slop,
             wand_factor: params.wand_factor,
+            sticky_floor: 0.0,
             cost,
             global_score_upper_bound: OnceCell::new(),
             current_doc: None,
@@ -6190,14 +6238,19 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             ));
         }
         let floor = min_score * self.wand_factor;
-        if floor > self.wand.threshold {
+        if floor > self.sticky_floor {
             if self.wand.score_first_and_enabled && self.wand.threshold <= 0.0 && floor > 0.0 {
                 self.wand.up_to = None;
                 self.wand.invalidate_score_first_and_window();
             }
-            self.wand.threshold = floor;
+            self.sticky_floor = floor;
         }
+        self.apply_effective_threshold();
         Ok(())
+    }
+
+    fn apply_effective_threshold(&mut self) {
+        self.wand.threshold = self.sticky_floor.max(0.0);
     }
 }
 
@@ -6329,7 +6382,7 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
     }
 }
 
-fn conservative_score_sum(scores: impl Iterator<Item = f32>) -> f32 {
+pub(super) fn conservative_score_sum(scores: impl Iterator<Item = f32>) -> f32 {
     let (num_scores, exact) = scores.fold((0, 0.0_f64), |(count, sum), score| {
         (count + 1, sum + f64::from(score))
     });
@@ -7651,6 +7704,202 @@ mod tests {
             wand.maxscore_single_essential_windows > 0,
             "a 2048+ gap between essentials must take the Lucene single-clause inner window"
         );
+    }
+
+    struct IuTightUnitScorer;
+
+    impl Scorer for IuTightUnitScorer {
+        fn query_weight(&self, _token: &str) -> f32 {
+            1.0
+        }
+
+        fn doc_weight(&self, _freq: u32, _doc_tokens: u32) -> f32 {
+            1.0
+        }
+    }
+
+    fn iu_tight_posting(
+        token: &str,
+        doc_ids: Vec<u32>,
+        query_weight: f32,
+        compressed: bool,
+    ) -> PostingIterator {
+        let num_docs = doc_ids.iter().copied().max().unwrap_or(0) as usize + 1;
+        PostingIterator::with_query_weight(
+            token.to_owned(),
+            0,
+            0,
+            query_weight,
+            generate_posting_list(doc_ids, query_weight, None, compressed),
+            num_docs,
+        )
+    }
+
+    #[test]
+    fn iu_tight_search_sums_must_and_matching_shoulds() {
+        let mut docs = DocSet::default();
+        for doc_id in 0..8_u64 {
+            docs.append(doc_id, 1);
+        }
+        let must = iu_tight_posting("must", vec![0, 2, 4, 6], 1.0, false);
+        let should = iu_tight_posting("should", vec![2, 6, 7], 10.0, false);
+        let mut hits = Vec::new();
+        iu_tight::iu_tight_search(
+            &docs,
+            &IuTightUnitScorer,
+            must,
+            vec![should],
+            &mut |key, score| {
+                hits.push((key, score));
+                Ok(true)
+            },
+            || f32::NEG_INFINITY,
+        )
+        .unwrap();
+        assert_eq!(hits, vec![(0, 1.0), (2, 11.0), (4, 1.0), (6, 11.0)]);
+    }
+
+    #[test]
+    fn iu_tight_search_promotes_to_sparse_required_should() {
+        // MUST-only scores 1.0; the sparse SHOULD adds 10.0. After the first
+        // combined hit the floor is 11.0 and MUST's list-wide bound is 1.0, so
+        // the remaining walk must follow the SHOULD list (doc 250) instead of
+        // the rest of MUST.
+        let mut docs = DocSet::default();
+        for doc_id in 0..300_u64 {
+            docs.append(doc_id, 1);
+        }
+        let must = iu_tight_posting("must", (0..300).collect(), 1.0, true);
+        let should = iu_tight_posting("should", vec![2, 250], 10.0, true);
+        let mut hits = Vec::new();
+        let floor = std::cell::Cell::new(f32::NEG_INFINITY);
+        iu_tight::iu_tight_search(
+            &docs,
+            &IuTightUnitScorer,
+            must,
+            vec![should],
+            &mut |key, score| {
+                hits.push((key, score));
+                if score > floor.get() {
+                    floor.set(score);
+                }
+                Ok(true)
+            },
+            || floor.get(),
+        )
+        .unwrap();
+        assert!(
+            hits.iter().any(|&(key, score)| key == 250 && score == 11.0),
+            "promoted walk must still score the late SHOULD hit: {hits:?}"
+        );
+        assert!(
+            hits.len() < 200,
+            "promotion should stop walking MUST-only docs after the first block, got {} hits",
+            hits.len()
+        );
+        assert_eq!(hits.iter().filter(|&&(key, _)| key == 250).count(), 1);
+    }
+
+    #[test]
+    fn iu_tight_search_skips_documents_hidden_by_visibility() {
+        struct HiddenDocs<'a> {
+            inner: &'a DocSet,
+            hidden: Vec<bool>,
+        }
+
+        impl WandDocuments for HiddenDocs<'_> {
+            type Candidate = u64;
+
+            fn len(&self) -> usize {
+                self.inner.len()
+            }
+
+            fn scoring_norms(&self) -> Option<&[u8]> {
+                self.inner.scoring_norms()
+            }
+
+            fn scoring_num_tokens(&self, doc_id: u32) -> u32 {
+                self.inner.scoring_num_tokens(doc_id)
+            }
+
+            fn doc_length(&self, doc: &DocInfo) -> u32 {
+                self.inner.scoring_num_tokens(doc.doc_id() as u32)
+            }
+
+            fn document_key(&self, doc: &DocInfo) -> Option<u64> {
+                self.document_key_for_doc_id(doc.doc_id() as u32)
+            }
+
+            fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+                (!self.hidden[doc_id as usize]).then_some(u64::from(doc_id))
+            }
+
+            fn candidate_from_key(&self, key: u64) -> Self::Candidate {
+                key
+            }
+
+            fn flat_documents(&self) -> Option<FlatDocuments<'_>> {
+                None
+            }
+
+            fn flat_doc_length(&self, doc_id: u64, _key: u64, _compressed: bool) -> u32 {
+                self.inner.scoring_num_tokens(doc_id as u32)
+            }
+        }
+
+        let mut docs = DocSet::default();
+        for doc_id in 0..8_u64 {
+            docs.append(doc_id, 1);
+        }
+        // Document 2 is deleted: the kernel must drop it on the
+        // document_key_for_doc_id probe, before any scoring work.
+        let hidden = HiddenDocs {
+            inner: &docs,
+            hidden: vec![false, false, true, false, false, false, false, false],
+        };
+        let must = iu_tight_posting("must", vec![0, 2, 4, 6], 1.0, true);
+        let should = iu_tight_posting("should", vec![2, 6, 7], 10.0, true);
+        let mut hits = Vec::new();
+        iu_tight::iu_tight_search(
+            &hidden,
+            &IuTightUnitScorer,
+            must,
+            vec![should],
+            &mut |key, score| {
+                hits.push((key, score));
+                Ok(true)
+            },
+            || f32::NEG_INFINITY,
+        )
+        .unwrap();
+        assert_eq!(hits, vec![(0, 1.0), (4, 1.0), (6, 11.0)]);
+    }
+
+    #[test]
+    fn iu_tight_search_emits_documents_exactly_at_the_floor() {
+        let mut docs = DocSet::default();
+        for doc_id in 0..8_u64 {
+            docs.append(doc_id, 1);
+        }
+        let must = iu_tight_posting("must", vec![0, 2, 4, 6], 1.0, false);
+        let should = iu_tight_posting("should", vec![2, 6, 7], 10.0, false);
+        let mut hits = Vec::new();
+        iu_tight::iu_tight_search(
+            &docs,
+            &IuTightUnitScorer,
+            must,
+            vec![should],
+            &mut |key, score| {
+                hits.push((key, score));
+                Ok(true)
+            },
+            // The should upper-bound pre-check and the emitted score meet the
+            // floor exactly (1.0 + 10.0 == 11.0): an inclusive comparison in
+            // the pre-check would drop all four documents.
+            || 11.0,
+        )
+        .unwrap();
+        assert_eq!(hits, vec![(0, 1.0), (2, 11.0), (4, 1.0), (6, 11.0)]);
     }
 
     #[test]
@@ -12743,5 +12992,95 @@ mod tests {
             windows_frequency_pruned, 1,
             "the second window must apply the frequency prune table"
         );
+    }
+    fn term_leaf_posting(doc_ids: Vec<u32>, compressed: bool) -> (DocSet, PostingIterator) {
+        let mut docs = DocSet::default();
+        let n = (*doc_ids.last().unwrap_or(&0) as usize)
+            .saturating_add(1)
+            .max(1);
+        for doc_id in 0..n {
+            docs.append(doc_id as u64, 1);
+        }
+        let posting = PostingIterator::with_query_weight(
+            "t".to_owned(),
+            0,
+            0,
+            1.0,
+            generate_posting_list(doc_ids, 1.0, None, compressed),
+            docs.len(),
+        );
+        (docs, posting)
+    }
+
+    #[test]
+    fn term_leaf_defers_frequency_decode_until_score() {
+        let (docs, posting) = term_leaf_posting(vec![0, 2, 4], true);
+        let scorer = Arc::new(MemBM25Scorer::new(
+            docs.len() as u64,
+            docs.len(),
+            Default::default(),
+        ));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+        let mut leaf = TermLeafScorer::new(posting, &docs, scorer, &params, &metrics);
+
+        assert_eq!(leaf.next().unwrap(), Some(0));
+        assert_eq!(
+            leaf.frequency_blocks_decoded(),
+            0,
+            "GEQ must not decompress frequencies"
+        );
+        let score = leaf.current_score().unwrap();
+        assert!(score.is_finite());
+        assert!(
+            leaf.frequency_blocks_decoded() > 0,
+            "score() must decompress frequencies"
+        );
+        assert_eq!(leaf.advance(2).unwrap(), Some(2));
+        assert_eq!(leaf.next().unwrap(), Some(4));
+        assert!(leaf.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn term_leaf_matches_wand_cursor_bm25_bits() {
+        let (docs, posting) = term_leaf_posting(vec![0, 3], true);
+        let scored = posting.fork_from_start();
+        let scorer = Arc::new(MemBM25Scorer::new(
+            docs.len() as u64,
+            docs.len(),
+            Default::default(),
+        ));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+        let mut leaf = TermLeafScorer::new(posting, &docs, scorer.clone(), &params, &metrics);
+        let mut wand =
+            WandCursor::new(Operator::Or, vec![scored], &docs, scorer, &params, &metrics);
+
+        assert_eq!(leaf.next().unwrap(), wand.next().unwrap());
+        assert_eq!(
+            leaf.current_score().unwrap().to_bits(),
+            wand.current_score().unwrap().to_bits()
+        );
+        assert_eq!(leaf.next().unwrap(), wand.next().unwrap());
+        assert_eq!(
+            leaf.current_score().unwrap().to_bits(),
+            wand.current_score().unwrap().to_bits()
+        );
+    }
+
+    #[test]
+    fn term_leaf_ignores_competitive_floor_on_advance() {
+        let (docs, posting) = term_leaf_posting(vec![0, 5], true);
+        let scorer = Arc::new(MemBM25Scorer::new(
+            docs.len() as u64,
+            docs.len(),
+            Default::default(),
+        ));
+        let params = FtsSearchParams::default();
+        let metrics = NoOpMetricsCollector;
+        let mut leaf = TermLeafScorer::new(posting, &docs, scorer, &params, &metrics);
+        leaf.set_min_competitive_score(f32::MAX).unwrap();
+        assert_eq!(leaf.next().unwrap(), Some(0));
+        assert_eq!(leaf.next().unwrap(), Some(5));
     }
 }
