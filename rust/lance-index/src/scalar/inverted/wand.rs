@@ -1358,6 +1358,45 @@ impl PostingIterator {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
                 let shift = list.block_shift();
+                let mask = list.block_mask();
+                // Completing an optional clause walks a sorted hit list. When
+                // the target is still inside the already-decoded block, a
+                // linear scan from the cursor beats locating the block again
+                // and binary-searching its first-doc slab.
+                // INVARIANT: `self.index` still points at `current_doc` here.
+                // The fast path below scans `doc_ids[(index & mask) + 1..]`, so
+                // a writer of `current_doc` that skips the index update would
+                // silently re-offer or drop docs. Doc ids are delta coded, so
+                // this invariant is documented rather than asserted.
+                if let Some(cur) = self.current_doc
+                    && cur.doc_id() >= u64::from(least_id)
+                {
+                    return;
+                }
+                if self.current_doc.is_some() {
+                    let block_idx = self.index >> shift;
+                    let compressed = unsafe { &*self.ensure_compressed_block_ptr(list, block_idx) };
+                    if compressed
+                        .doc_ids
+                        .last()
+                        .is_some_and(|&last| last >= least_id)
+                    {
+                        let start = (self.index & mask) + 1;
+                        if let Some(delta) = compressed.doc_ids[start..]
+                            .iter()
+                            .position(|&doc_id| doc_id >= least_id)
+                        {
+                            let new_offset = start + delta;
+                            self.index = (block_idx << shift) + new_offset;
+                            self.block_idx = block_idx;
+                            self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id: compressed.doc_ids[new_offset],
+                                frequency: compressed.freqs[new_offset],
+                            }));
+                            return;
+                        }
+                    }
+                }
                 let block_idx = self.block_idx_for_doc(list, self.index >> shift, least_id);
                 self.index = self.index.max(block_idx << shift);
                 let length = list.length as usize;
@@ -6007,6 +6046,8 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     wand: Wand<'a, Arc<MemBM25Scorer>, D>,
     phrase_slop: Option<u32>,
     wand_factor: f32,
+    sticky_floor: f32,
+    window_floor: f32,
     cost: usize,
     global_score_upper_bound: OnceCell<Option<f32>>,
     current_doc: Option<DocInfo>,
@@ -6048,6 +6089,8 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             wand,
             phrase_slop: params.phrase_slop,
             wand_factor: params.wand_factor,
+            sticky_floor: 0.0,
+            window_floor: f32::NEG_INFINITY,
             cost,
             global_score_upper_bound: OnceCell::new(),
             current_doc: None,
@@ -6194,14 +6237,43 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             ));
         }
         let floor = min_score * self.wand_factor;
-        if floor > self.wand.threshold {
+        if floor > self.sticky_floor {
             if self.wand.score_first_and_enabled && self.wand.threshold <= 0.0 && floor > 0.0 {
                 self.wand.up_to = None;
                 self.wand.invalidate_score_first_and_window();
             }
-            self.wand.threshold = floor;
+            self.sticky_floor = floor;
         }
+        self.apply_effective_threshold();
         Ok(())
+    }
+
+    /// Window-scoped half of the competitive floor. Unlike `sticky_floor`
+    /// this resets to `None` on every call, so a caller that drives windows
+    /// explicitly (the ReqOpt window-collect path) can raise the floor for
+    /// one window without pinning it for the rest of the query. No production
+    /// caller yet in this series; kept as the hook for that path.
+    #[allow(dead_code)]
+    pub(super) fn set_window_min_competitive_score(
+        &mut self,
+        min_score: Option<f32>,
+    ) -> Result<()> {
+        if let Some(min_score) = min_score {
+            if min_score.is_nan() {
+                return Err(Error::invalid_input(
+                    "minimum competitive FTS score cannot be NaN",
+                ));
+            }
+            self.window_floor = min_score * self.wand_factor;
+        } else {
+            self.window_floor = f32::NEG_INFINITY;
+        }
+        self.apply_effective_threshold();
+        Ok(())
+    }
+
+    fn apply_effective_threshold(&mut self) {
+        self.wand.threshold = self.sticky_floor.max(self.window_floor).max(0.0);
     }
 }
 
