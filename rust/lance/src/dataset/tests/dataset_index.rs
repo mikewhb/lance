@@ -1145,6 +1145,97 @@ async fn test_fts_fuzzy_query() {
 }
 
 #[tokio::test]
+async fn test_fts_count_only_matches_ranked() {
+    async fn ranked_len(dataset: &Dataset, query: FtsQuery) -> usize {
+        let mut scanner = dataset.scan();
+        scanner.empty_project().unwrap();
+        scanner.with_row_id();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(query))
+            .unwrap();
+        scanner.try_into_batch().await.unwrap().num_rows()
+    }
+
+    async fn counted(dataset: &Dataset, query: FtsQuery) -> usize {
+        let mut scanner = dataset.scan();
+        scanner.empty_project().unwrap();
+        scanner.with_row_id();
+        scanner
+            .full_text_search(FullTextSearchQuery::new_query(query).count_only(true))
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        if batch.num_rows() == 0 {
+            return 0;
+        }
+        batch
+            .column_by_name("_rowid")
+            .expect("count scan must return _rowid")
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0) as usize
+    }
+
+    let params = InvertedIndexParams::default().with_position(true);
+    let text_col = GenericStringArray::<i32>::from(vec![
+        "the quick brown fox",
+        "the lazy dog",
+        "quick brown fox jumps",
+        "brown fox",
+    ]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            text_col.data_type().to_owned(),
+            false,
+        )])
+        .into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+
+    let column = Some("text".to_string());
+    for (label, query) in [
+        (
+            "or",
+            FtsQuery::Match(
+                MatchQuery::new("quick brown".to_string())
+                    .with_column(column.clone())
+                    .with_operator(Operator::Or),
+            ),
+        ),
+        (
+            "and",
+            FtsQuery::Match(
+                MatchQuery::new("quick brown".to_string())
+                    .with_column(column.clone())
+                    .with_operator(Operator::And),
+            ),
+        ),
+        (
+            "phrase",
+            FtsQuery::Phrase(PhraseQuery::new("quick brown".to_string()).with_column(column)),
+        ),
+    ] {
+        let ranked = ranked_len(&dataset, query.clone()).await;
+        let count = counted(&dataset, query).await;
+        assert!(ranked > 0, "{label}: expected a non-empty ranked result");
+        assert_eq!(
+            ranked, count,
+            "{label}: count must equal the ranked row count"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_fts_on_multiple_columns() {
     let params = InvertedIndexParams::default();
     let title_col =
@@ -6781,6 +6872,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -6797,6 +6889,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -6815,6 +6908,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -6833,6 +6927,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -6851,6 +6946,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -6869,6 +6965,7 @@ async fn test_json_inverted_fuzziness_query() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -6910,6 +7007,7 @@ async fn test_json_inverted_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -6927,6 +7025,7 @@ async fn test_json_inverted_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -6944,6 +7043,7 @@ async fn test_json_inverted_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -6961,6 +7061,7 @@ async fn test_json_inverted_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -7026,6 +7127,7 @@ async fn test_json_inverted_flat_match_query() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -7065,6 +7167,7 @@ async fn test_json_inverted_phrase_query() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -7082,6 +7185,7 @@ async fn test_json_inverted_phrase_query() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -7124,6 +7228,7 @@ async fn test_json_inverted_multimatch_query() {
         }),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -7172,6 +7277,7 @@ async fn test_json_inverted_boolean_query() {
         }),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()
@@ -7444,6 +7550,7 @@ async fn test_auto_infer_lance_tokenizer() {
         ),
         limit: None,
         wand_factor: None,
+        count_only: false,
     };
     let batch = dataset
         .scan()

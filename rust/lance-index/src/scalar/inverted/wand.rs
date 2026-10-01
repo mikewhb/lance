@@ -2708,9 +2708,40 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         params: &FtsSearchParams,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<DocCandidate<D::Candidate>>> {
-        let limit = params.limit.unwrap_or(usize::MAX);
+        Ok(self.run(params, metrics, false)?.0)
+    }
+
+    /// Count the documents that match the query without scoring, ranking, or
+    /// materializing candidates.
+    ///
+    /// The match set is identical to [`Self::search`]: the same iterator walk,
+    /// the same visibility filter and the same phrase position confirmation.
+    /// Only the ranking machinery is elided — the BM25 total, the per-candidate
+    /// frequency slots, the top-k heap and the candidate vector.
+    pub(crate) fn count(
+        &mut self,
+        params: &FtsSearchParams,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<usize> {
+        Ok(self.run(params, metrics, true)?.1)
+    }
+
+    pub(crate) fn run(
+        &mut self,
+        params: &FtsSearchParams,
+        metrics: &dyn MetricsCollector,
+        count_only: bool,
+    ) -> Result<(Vec<DocCandidate<D::Candidate>>, usize)> {
+        // A count is the size of the whole match set: any top-k limit is
+        // irrelevant, so pin it to unbounded in count mode. This keeps the
+        // answer independent of `limit` and identical across index layouts.
+        let limit = if count_only {
+            usize::MAX
+        } else {
+            params.limit.unwrap_or(usize::MAX)
+        };
         if limit == 0 {
-            return Ok(vec![]);
+            return Ok((vec![], 0));
         }
 
         if params.phrase_slop.is_some() {
@@ -2723,14 +2754,17 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             && num_docs_selected.saturating_mul(100)
                 <= (*FLAT_SEARCH_PERCENT_THRESHOLD as usize).saturating_mul(self.documents.len())
         {
-            return self.flat_search(params, documents, metrics);
+            return self.flat_search(params, documents, metrics, count_only);
         }
 
         // Top-k disjunctions over compressed lists can opt into the bulk
         // MAXSCORE path (Lucene MaxScoreBulkScorer style): it streams whole
         // blocks of the essential clauses into a window accumulator instead of
-        // advancing doc-at-a-time through a heap.
-        if *USE_MAXSCORE_SEARCH
+        // advancing doc-at-a-time through a heap. A bare count keeps the simple
+        // loop: it has no competitive floor, so the window pruning the bulk
+        // path exists for is inert and the extra bookkeeping is pure overhead.
+        if !count_only
+            && *USE_MAXSCORE_SEARCH
             && self.operator == Operator::Or
             && params.phrase_slop.is_none()
             && !self.head.is_empty()
@@ -2738,14 +2772,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 posting.posting.is_compressed() && !posting.posting.has_grouped_terms()
             })
         {
-            return self.maxscore_search(params, metrics);
+            return Ok((self.maxscore_search(params, metrics)?, 0));
         }
 
         // Top-k conjunctions (AND and phrase) over compressed lists use the
         // bulk path: the same block-max window pruning, but candidates come
         // from a slice-level merge over decompressed blocks instead of per-doc
         // `next()` leapfrogging through boxed iterators.
-        if self.operator == Operator::And
+        if !count_only
+            && self.operator == Operator::And
             && !self.lead.is_empty()
             && self
                 .lead
@@ -2768,10 +2803,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             {
                 self.bulk_and_searches += 1;
             }
-            return self.and_bulk_search(params, metrics);
+            return Ok((self.and_bulk_search(params, metrics)?, 0));
         }
 
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut count_only_hits = 0usize;
         let mut num_comparisons = 0;
         loop {
             self.raise_to_shared_floor(params.wand_factor);
@@ -2787,6 +2823,26 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 continue;
             };
+
+            if count_only {
+                // Match-only candidate: align the tail postings and confirm
+                // phrase positions exactly as the ranked loop does, then count.
+                // The BM25 total, the frequency slots and the heap are skipped;
+                // with no limit the competitive floor is inert anyway, so the
+                // match set is unchanged.
+                self.advance_all_tail(doc.doc_id(), None, None);
+                let matched = match params.phrase_slop {
+                    Some(slop) => self.check_positions(slop as i32)?,
+                    None => true,
+                };
+                if self.operator == Operator::Or {
+                    self.push_back_leads(doc.doc_id() + 1);
+                }
+                if matched {
+                    count_only_hits += 1;
+                }
+                continue;
+            }
 
             let doc_length = self.documents.doc_length(&doc);
 
@@ -2864,7 +2920,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
         metrics.record_comparisons(num_comparisons);
 
-        candidates.into_candidates(|key| self.documents.candidate_from_key(key))
+        if count_only {
+            return Ok((Vec::new(), count_only_hits));
+        }
+        Ok((
+            candidates.into_candidates(|key| self.documents.candidate_from_key(key))?,
+            0,
+        ))
     }
 
     fn flat_search(
@@ -2872,10 +2934,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         params: &FtsSearchParams,
         documents: Box<dyn Iterator<Item = (u64, u64)> + '_>,
         metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<DocCandidate<D::Candidate>>> {
+        count_only: bool,
+    ) -> Result<(Vec<DocCandidate<D::Candidate>>, usize)> {
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
-            return Ok(vec![]);
+            return Ok((vec![], 0));
         }
 
         // Posting iterators are forward-only, so selected DocIds are sorted
@@ -2893,6 +2956,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .unwrap_or(false);
 
         let mut num_comparisons = 0;
+        let mut count_only_hits = 0usize;
         let mut candidates = TopKCollector::new(limit, 0);
         for (doc_id, document_key) in documents {
             num_comparisons += 1;
@@ -2929,6 +2993,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
 
             self.collect_tail_matches(doc_id);
+            if count_only {
+                // Match-only: confirm phrase positions, then count. Scoring and
+                // the heap are skipped; the flat allow-list still drives which
+                // doc ids are eligible.
+                if let Some(slop) = params.phrase_slop
+                    && !self.check_positions(slop as i32)?
+                {
+                    self.advance_lead_to_head(doc_id + 1);
+                    continue;
+                }
+                count_only_hits += 1;
+                self.advance_lead_to_head(doc_id + 1);
+                continue;
+            }
             // Only front-load the BM25 total when a floor exists: with no floor
             // the skip cannot fire, and scoring before position confirmation
             // would make every position-failing candidate pay for a score it
@@ -2960,7 +3038,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
         metrics.record_comparisons(num_comparisons);
 
-        candidates.into_candidates(|key| self.documents.candidate_from_key(key))
+        if count_only {
+            return Ok((Vec::new(), count_only_hits));
+        }
+        Ok((
+            candidates.into_candidates(|key| self.documents.candidate_from_key(key))?,
+            0,
+        ))
     }
 
     /// Bulk MAXSCORE top-k disjunction, mirroring Lucene's MaxScoreBulkScorer.
@@ -8792,6 +8876,107 @@ mod tests {
     }
 
     #[test]
+    fn count_matches_search_for_or_and_disjunctions() {
+        // Count mode walks the classic loop while the ranked pass uses MAXSCORE
+        // for compressed disjunctions: the two must agree on the match set.
+        let total = 3 * BLOCK_SIZE as u32 + 5;
+        let mut docs = DocSet::default();
+        for row_id in 0..total {
+            docs.append(row_id as u64, 1 + (row_id % 11));
+        }
+        let even: Vec<u32> = (0..total).filter(|d| d % 2 == 0).collect();
+        let third: Vec<u32> = (0..total).filter(|d| d % 3 == 0).collect();
+        let fifth: Vec<u32> = (0..total).filter(|d| d % 5 == 0).collect();
+        let build = || {
+            vec![
+                PostingIterator::new(
+                    String::from("a"),
+                    0,
+                    0,
+                    generate_posting_list(even.clone(), 1.0, None, true),
+                    docs.len(),
+                ),
+                PostingIterator::new(
+                    String::from("b"),
+                    1,
+                    1,
+                    generate_posting_list(third.clone(), 1.0, None, true),
+                    docs.len(),
+                ),
+                PostingIterator::new(
+                    String::from("c"),
+                    2,
+                    2,
+                    generate_posting_list(fifth.clone(), 1.0, None, true),
+                    docs.len(),
+                ),
+            ]
+        };
+        for operator in [Operator::Or, Operator::And] {
+            let bm25 = IndexBM25Scorer::new(std::iter::empty());
+            let mut wand = Wand::new(operator, build().into_iter(), &docs, bm25);
+            let ranked = wand
+                .search(&FtsSearchParams::default(), &NoOpMetricsCollector)
+                .unwrap();
+            let bm25 = IndexBM25Scorer::new(std::iter::empty());
+            let mut wand = Wand::new(operator, build().into_iter(), &docs, bm25);
+            let counted = wand
+                .count(&FtsSearchParams::default(), &NoOpMetricsCollector)
+                .unwrap();
+            assert_eq!(ranked.len(), counted, "operator {operator:?}");
+        }
+    }
+
+    #[test]
+    fn count_matches_search_for_phrase_positions() {
+        // Phrase confirmation must gate the count exactly as it gates the
+        // ranked path: only docs where the terms are adjacent are counted.
+        let mut docs = DocSet::default();
+        for row_id in 0..4 {
+            docs.append(row_id, 16);
+        }
+        let build = |is_compressed| {
+            vec![
+                PostingIterator::new(
+                    String::from("a"),
+                    0,
+                    0,
+                    generate_posting_list_with_positions(
+                        vec![0, 1, 2, 3],
+                        vec![vec![1], vec![1], vec![1], vec![1]],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+                PostingIterator::new(
+                    String::from("b"),
+                    1,
+                    1,
+                    generate_posting_list_with_positions(
+                        vec![0, 1, 2, 3],
+                        vec![vec![2], vec![5], vec![2], vec![5]],
+                        1.0,
+                        is_compressed,
+                    ),
+                    docs.len(),
+                ),
+            ]
+        };
+        let params = FtsSearchParams::new().with_phrase_slop(Some(0));
+        for is_compressed in [false, true] {
+            let bm25 = IndexBM25Scorer::new(std::iter::empty());
+            let mut wand = Wand::new(Operator::And, build(is_compressed).into_iter(), &docs, bm25);
+            let ranked = wand.search(&params, &NoOpMetricsCollector).unwrap();
+            let bm25 = IndexBM25Scorer::new(std::iter::empty());
+            let mut wand = Wand::new(Operator::And, build(is_compressed).into_iter(), &docs, bm25);
+            let counted = wand.count(&params, &NoOpMetricsCollector).unwrap();
+            assert_eq!(ranked.len(), 2, "two docs have adjacent positions");
+            assert_eq!(ranked.len(), counted, "compressed={is_compressed}");
+        }
+    }
+
+    #[test]
     fn test_or_single_term_block_skip_matches_and() {
         // Hot docs occupy the middle block; the flanking blocks score far below
         // the threshold. A single-term disjunction must skip them yet return what
@@ -11072,8 +11257,10 @@ mod tests {
                 &FtsSearchParams::default(),
                 Box::new(selected.into_iter()),
                 &NoOpMetricsCollector,
+                false,
             )
-            .unwrap();
+            .unwrap()
+            .0;
 
         let matched = result
             .into_iter()
@@ -11139,8 +11326,10 @@ mod tests {
                 &FtsSearchParams::default(),
                 Box::new(selected.into_iter()),
                 &NoOpMetricsCollector,
+                false,
             )
-            .unwrap();
+            .unwrap()
+            .0;
 
         // The legacy adapter resolves the prefilter to every owned document,
         // while the candidate identity remains row 100.

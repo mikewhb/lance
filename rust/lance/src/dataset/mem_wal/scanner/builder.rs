@@ -809,6 +809,15 @@ impl LsmScanner {
     /// scanner limit/offset still apply to the final merged result. The LSM
     /// path supports a single FTS-indexed column.
     pub fn full_text_search(mut self, query: FullTextSearchQuery) -> Result<Self> {
+        if query.count_only {
+            // The LSM planner always emits ranked rows and has no count path
+            // equivalent to the dataset scanner's, so honoring this here would
+            // silently return rows where the caller expects a single count.
+            return Err(Error::invalid_input(
+                "count_only full-text search is not supported by the mem_wal (LSM) scanner"
+                    .to_string(),
+            ));
+        }
         self.full_text_query = Some(query);
         Ok(self)
     }

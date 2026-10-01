@@ -624,6 +624,55 @@ impl InvertedIndex {
         .await
     }
 
+    /// Count matching logical FTS documents without materializing ranked rows.
+    ///
+    /// Shares the token/scorer preparation and match walk of
+    /// [`Self::bm25_search_documents`]; only the collector differs.
+    #[instrument(level = "debug", skip_all)]
+    pub async fn bm25_count_documents(
+        &self,
+        tokens: Arc<Tokens>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+        base_scorer: Option<&MemBM25Scorer>,
+    ) -> Result<usize> {
+        if base_scorer.is_some() && uses_fuzzy_expansion(params.fuzziness) {
+            return Err(Error::invalid_input(
+                "fuzzy BM25 search cannot use an injected scorer without its prepared vocabulary; use bm25_search_prepared or bm25_search_prepared_documents",
+            ));
+        }
+        let tokens = if uses_fuzzy_expansion(params.fuzziness) {
+            let expanded = Arc::new(self.expand_fuzzy_tokens(tokens.as_ref(), params.as_ref())?);
+            if operator == Operator::And || params.phrase_slop.is_some() {
+                let surviving = (0..expanded.len())
+                    .map(|idx| expanded.position(idx))
+                    .collect::<HashSet<_>>();
+                if (0..tokens.len()).any(|idx| !surviving.contains(&tokens.position(idx))) {
+                    return Ok(0);
+                }
+            }
+            expanded
+        } else {
+            tokens
+        };
+
+        let local_scorer;
+        let scorer: &MemBM25Scorer = if let Some(base_scorer) = base_scorer {
+            base_scorer
+        } else {
+            local_scorer = self
+                .bm25_scorer_for_final_tokens(tokens.as_ref(), Some(metrics.as_ref()))
+                .await?;
+            &local_scorer
+        };
+        self.bm25_count_final_documents(
+            tokens, params, operator, prefilter, metrics, scorer, None, None,
+        )
+        .await
+    }
+
     /// Search with a vocabulary/scorer pair prepared once across every
     /// physical segment. No fuzzy expansion or local scorer construction is
     /// permitted below this boundary.
@@ -730,6 +779,52 @@ impl InvertedIndex {
         .await
     }
 
+    /// Count documents matching a vocabulary/scorer pair prepared once across
+    /// every physical segment, without materializing ranked candidates.
+    #[doc(hidden)]
+    pub async fn bm25_count_prepared_documents(
+        &self,
+        prepared: Arc<crate::scalar::inverted::PreparedBm25Query>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<usize> {
+        self.bm25_count_prepared_documents_impl(prepared, params, operator, prefilter, metrics)
+            .await
+    }
+
+    async fn bm25_count_prepared_documents_impl(
+        &self,
+        prepared: Arc<crate::scalar::inverted::PreparedBm25Query>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<usize> {
+        if (operator == Operator::And || params.phrase_slop.is_some())
+            && !prepared.has_all_query_positions()
+        {
+            return Ok(0);
+        }
+        let scorer = prepared.scorer();
+        let reusable_scorer = prepared.reusable_scorer();
+        let term_ids = prepared
+            .term_ids()
+            .and_then(|term_ids| term_ids.for_segment(self, prepared.tokens().len()));
+        self.bm25_count_final_documents(
+            prepared.tokens().clone(),
+            params,
+            operator,
+            prefilter,
+            metrics,
+            scorer.as_ref(),
+            reusable_scorer,
+            term_ids,
+        )
+        .await
+    }
+
     // This is the boundary between query preparation and final document search;
     // each argument is an independent prepared input consumed by both legacy and
     // modern implementations.
@@ -795,6 +890,58 @@ impl InvertedIndex {
             })
             .await
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn bm25_count_final_documents(
+        &self,
+        tokens: Arc<Tokens>,
+        params: Arc<FtsSearchParams>,
+        operator: Operator,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+        scorer: &MemBM25Scorer,
+        prepared_scorer: Option<&Arc<MemBM25Scorer>>,
+        term_ids: Option<SegmentTermIds<'_>>,
+    ) -> Result<usize> {
+        let impact_scorer = select_impact_scorer(
+            scorer,
+            prepared_scorer,
+            || self.is_legacy(),
+            || *LANCE_FTS_REUSE_PREPARED_SCORER_ENABLED,
+        );
+        // A count is independent of any top-k limit: count the whole match set.
+        let mask = prefilter.mask();
+        if self.is_legacy() {
+            // The legacy layout has no score-free walk; rank without a limit
+            // and count the ids. The answer is identical to the modern path,
+            // only the cost differs.
+            let (row_ids, _) = self
+                .bm25_search_legacy(
+                    tokens,
+                    params,
+                    operator,
+                    mask,
+                    metrics,
+                    scorer,
+                    impact_scorer,
+                    usize::MAX,
+                )
+                .await?;
+            return Ok(row_ids.len());
+        }
+        self.bm25_count_modern(ModernSearchRequest {
+            tokens,
+            params,
+            operator,
+            mask,
+            metrics,
+            impact_scorer,
+            limit: usize::MAX,
+            initial_score_floor: None,
+            term_ids,
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -926,7 +1073,10 @@ impl InvertedIndex {
                 }
             }
             all.sort_unstable_by(|left, right| {
-                right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
             });
             return Ok(all.into_iter().unzip());
         }
@@ -1235,7 +1385,7 @@ impl InvertedIndex {
                     }));
                 }
             }
-            all.sort_unstable_by(|left, right| right.0.score.cmp(&left.0.score));
+            all.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0.score));
             return Ok(all);
         }
         let mut ranked = BinaryHeap::new();
@@ -1251,6 +1401,174 @@ impl InvertedIndex {
         }
 
         Ok(ranked.into_sorted_vec())
+    }
+
+    /// Count the documents matching a modern-format query without building,
+    /// scoring, or ranking candidates.
+    ///
+    /// This shares the partition loading and the per-partition `Wand` walk of
+    /// [`Self::bm25_search_modern_candidates`]; only the collector differs.
+    /// Partition row sets are disjoint, so the per-partition counts sum to the
+    /// number of distinct matching rows.
+    async fn bm25_count_modern(&self, request: ModernSearchRequest<'_>) -> Result<usize> {
+        let ModernSearchRequest {
+            tokens,
+            params,
+            operator,
+            mask,
+            metrics,
+            impact_scorer,
+            limit: _,
+            initial_score_floor: _,
+            term_ids,
+        } = request;
+        let impact_shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
+        let shared_norm_addends = SharedNormAddends::default();
+        let io_parallelism = self.store.io_parallelism();
+        let is_phrase_query = params.phrase_slop.is_some();
+        let searched_partitions = self
+            .partitions
+            .iter()
+            .enumerate()
+            .filter(|(partition_ordinal, _)| {
+                term_ids.is_none_or(|term_ids| {
+                    token_ids_may_match(
+                        tokens.as_ref(),
+                        term_ids.partition(*partition_ordinal),
+                        operator,
+                        is_phrase_query,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let parts = searched_partitions
+            .chunks(fts_search_chunk())
+            .map(|chunk| {
+                let chunk = chunk
+                    .iter()
+                    .map(|&(partition_ordinal, part)| (partition_ordinal, Arc::clone(part)))
+                    .collect::<Vec<_>>();
+                let tokens = tokens.clone();
+                let params = params.clone();
+                let mask = mask.clone();
+                let metrics = metrics.clone();
+                let impact_scorer = impact_scorer.clone();
+                let impact_shared_threshold = impact_shared_threshold.clone();
+                let shared_norm_addends = shared_norm_addends.clone();
+                async move {
+                    let loads = chunk.into_iter().map(|(partition_ordinal, part)| {
+                        let tokens = tokens.clone();
+                        let params = params.clone();
+                        let mask = mask.clone();
+                        let metrics = metrics.clone();
+                        let partition_term_ids =
+                            term_ids.map(|term_ids| term_ids.partition(partition_ordinal));
+                        async move {
+                            let Some(postings) = part
+                                .fetch_posting_lists(
+                                    tokens.as_ref(),
+                                    params.as_ref(),
+                                    operator,
+                                    metrics.as_ref(),
+                                    PostingLoadOptions::read_ahead(false),
+                                    partition_term_ids,
+                                )
+                                .await?
+                            else {
+                                return Result::Ok(None);
+                            };
+                            let documents = part.docs.modern().ok_or_else(|| {
+                                Error::internal("modern index contains legacy partition documents")
+                            })?;
+                            let materialize_selected = operator == Operator::Or
+                                && mask.max_len().is_some_and(|selected| {
+                                    u128::from(selected).saturating_mul(100)
+                                        <= u128::from(*FLAT_SEARCH_PERCENT_THRESHOLD)
+                                            .saturating_mul(documents.len() as u128)
+                                });
+                            let visibility = match documents
+                                .immediate_visibility(mask.clone(), materialize_selected)
+                            {
+                                Some(visibility) => visibility,
+                                None => {
+                                    documents
+                                        .visibility(mask.clone(), materialize_selected)
+                                        .await?
+                                }
+                            };
+                            if visibility.is_empty() {
+                                return Result::Ok(None);
+                            }
+                            let lengths = match documents.cached_lengths() {
+                                Some(lengths) => lengths,
+                                None => documents.lengths().await?,
+                            };
+                            Result::Ok(Some((
+                                partition_ordinal,
+                                part,
+                                lengths,
+                                visibility,
+                                postings,
+                            )))
+                        }
+                    });
+                    let loaded = stream::iter(loads)
+                        .buffer_unordered(io_parallelism)
+                        .try_collect::<Vec<_>>()
+                        .await?
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    if loaded.is_empty() {
+                        return Result::Ok(0usize);
+                    }
+
+                    let count = spawn_cpu(move || {
+                        let mut total = 0usize;
+                        for (_partition_ordinal, part, lengths, visibility, postings) in loaded {
+                            let LoadedPostings {
+                                postings,
+                                impact_safe,
+                                exact_scoring_required,
+                                ..
+                            } = postings.into_loaded(tokens.as_ref(), impact_scorer.as_ref())?;
+                            if postings.is_empty() {
+                                continue;
+                            }
+                            let use_global_scorer = impact_safe || exact_scoring_required;
+                            let threshold = if use_global_scorer {
+                                impact_shared_threshold.clone()
+                            } else {
+                                Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
+                            };
+                            let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
+                            total += part.bm25_count_modern(
+                                lengths.as_ref(),
+                                &visibility,
+                                params.as_ref(),
+                                operator,
+                                postings,
+                                wand_scorer,
+                                shared_norm_addends.clone(),
+                                metrics.as_ref(),
+                                threshold,
+                            )?;
+                        }
+                        Result::Ok(total)
+                    })
+                    .await?;
+                    Result::Ok(count)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut parts =
+            stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus().min(32));
+        let mut total = 0usize;
+        while let Some(count) = parts.try_next().await? {
+            total += count;
+        }
+        Ok(total)
     }
 
     fn resolve_resident_modern_candidates(

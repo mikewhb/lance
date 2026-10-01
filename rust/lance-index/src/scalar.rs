@@ -110,6 +110,15 @@ pub struct FullTextSearchQuery {
     /// Increasing this value will reduce the recall and improve the performance
     /// 1.0 is the value that would give the best performance without recall loss
     pub wand_factor: Option<f32>,
+
+    /// The caller only needs the number of matching rows.
+    ///
+    /// Ranking is meaningless for a bare count, so the search may skip BM25
+    /// scoring and return rows without ordering. Rows are still matched with
+    /// the normal semantics: phrase positions, grouped expansions and fuzzy
+    /// expansions are resolved before a row is counted, and deleted or
+    /// pre-filtered rows are excluded.
+    pub count_only: bool,
 }
 
 impl FullTextSearchQuery {
@@ -120,6 +129,7 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             wand_factor: None,
+            count_only: false,
         }
     }
 
@@ -130,6 +140,7 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             wand_factor: None,
+            count_only: false,
         }
     }
 
@@ -139,6 +150,7 @@ impl FullTextSearchQuery {
             query,
             limit: None,
             wand_factor: None,
+            count_only: false,
         }
     }
 
@@ -168,6 +180,12 @@ impl FullTextSearchQuery {
         self
     }
 
+    /// Request only the number of matching rows rather than ranked rows.
+    pub fn count_only(mut self, count_only: bool) -> Self {
+        self.count_only = count_only;
+        self
+    }
+
     pub fn columns(&self) -> HashSet<String> {
         self.query.columns()
     }
@@ -176,6 +194,7 @@ impl FullTextSearchQuery {
         FtsSearchParams::new()
             .with_limit(self.limit.map(|limit| limit as usize))
             .with_wand_factor(self.wand_factor.unwrap_or(1.0))
+            .with_count_only(self.count_only)
     }
 }
 

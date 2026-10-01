@@ -1550,6 +1550,48 @@ impl InvertedPartition {
         }
     }
 
+    /// Count matching documents on the modern layout without materializing the
+    /// ranked candidates. Shares the `flat_documents` visibility semantics.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn bm25_count_modern(
+        &self,
+        lengths: &DocLengths,
+        visibility: &DocVisibility,
+        params: &FtsSearchParams,
+        operator: Operator,
+        postings: Vec<PostingIterator>,
+        impact_scorer: Option<Arc<MemBM25Scorer>>,
+        shared_norm_addends: SharedNormAddends,
+        metrics: &dyn MetricsCollector,
+        shared_threshold: Arc<AtomicU32>,
+    ) -> Result<usize> {
+        if visibility.is_all() {
+            let documents = ModernWandDocuments::all(lengths);
+            self.bm25_count_with_documents(
+                &documents,
+                params,
+                operator,
+                postings,
+                impact_scorer,
+                Some(shared_norm_addends),
+                metrics,
+                shared_threshold,
+            )
+        } else {
+            let documents = ModernWandDocuments::filtered(lengths, visibility);
+            self.bm25_count_with_documents(
+                &documents,
+                params,
+                operator,
+                postings,
+                impact_scorer,
+                Some(shared_norm_addends),
+                metrics,
+                shared_threshold,
+            )
+        }
+    }
+
     #[instrument(level = "debug", skip_all)]
     #[allow(clippy::too_many_arguments)]
     fn bm25_search_with_documents<D: WandDocuments>(
@@ -1563,24 +1605,88 @@ impl InvertedPartition {
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
     ) -> Result<Vec<DocCandidate<D::Candidate>>> {
+        Ok(self
+            .run_wand(
+                documents,
+                params,
+                operator,
+                postings,
+                impact_scorer,
+                shared_norm_addends,
+                metrics,
+                shared_threshold,
+                false,
+            )?
+            .0)
+    }
+
+    /// Count matching documents without scoring or ranking them. Shares the
+    /// candidate walk with [`Self::bm25_search_with_documents`].
+    #[allow(clippy::too_many_arguments)]
+    fn bm25_count_with_documents<D: WandDocuments>(
+        &self,
+        documents: &D,
+        params: &FtsSearchParams,
+        operator: Operator,
+        postings: Vec<PostingIterator>,
+        impact_scorer: Option<Arc<MemBM25Scorer>>,
+        shared_norm_addends: Option<SharedNormAddends>,
+        metrics: &dyn MetricsCollector,
+        shared_threshold: Arc<AtomicU32>,
+    ) -> Result<usize> {
+        Ok(self
+            .run_wand(
+                documents,
+                params,
+                operator,
+                postings,
+                impact_scorer,
+                shared_norm_addends,
+                metrics,
+                shared_threshold,
+                true,
+            )?
+            .1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_wand<D: WandDocuments>(
+        &self,
+        documents: &D,
+        params: &FtsSearchParams,
+        operator: Operator,
+        postings: Vec<PostingIterator>,
+        impact_scorer: Option<Arc<MemBM25Scorer>>,
+        shared_norm_addends: Option<SharedNormAddends>,
+        metrics: &dyn MetricsCollector,
+        shared_threshold: Arc<AtomicU32>,
+        count_only: bool,
+    ) -> Result<(Vec<DocCandidate<D::Candidate>>, usize)> {
         if postings.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
-        let hits = if let Some(scorer) = impact_scorer {
+        if let Some(scorer) = impact_scorer {
             let mut wand = Wand::new(operator, postings.into_iter(), documents, scorer)
                 .with_shared_threshold(shared_threshold);
             if let Some(shared_norm_addends) = shared_norm_addends {
                 wand = wand.with_shared_norm_addends(shared_norm_addends);
             }
-            wand.search(params, metrics)?
+            if count_only {
+                Ok((Vec::new(), wand.count(params, metrics)?))
+            } else {
+                Ok((wand.search(params, metrics)?, 0))
+            }
         } else {
             let scorer = IndexBM25Scorer::new(std::iter::once(self));
             let mut wand = Wand::new(operator, postings.into_iter(), documents, scorer)
                 .with_shared_threshold(shared_threshold);
-            wand.search(params, metrics)?
-        };
-        Ok(hits)
+            if count_only {
+                Ok((Vec::new(), wand.count(params, metrics)?))
+            } else {
+                Ok((wand.search(params, metrics)?, 0))
+            }
+        }
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {

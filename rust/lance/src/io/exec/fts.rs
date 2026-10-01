@@ -365,6 +365,71 @@ async fn search_prepared_segments(
         .collect())
 }
 
+/// Count matches over prepared segments without materializing ranked rows.
+///
+/// Mirrors [`search_prepared_segments`]'s segment fan-out; each segment
+/// returns its match count instead of its candidates.
+async fn search_prepared_segments_count(
+    indices: &[Arc<InvertedIndex>],
+    prepared: Arc<PreparedMatch>,
+    pre_filter: Arc<dyn PreFilter>,
+    metrics: Arc<FtsIndexMetrics>,
+) -> Result<usize> {
+    let searches = indices
+        .iter()
+        .map(|index| {
+            let index = Arc::clone(index);
+            let prepared = prepared.clone();
+            let pre_filter = pre_filter.clone();
+            let metrics = metrics.clone();
+            async move {
+                index
+                    .bm25_count_prepared_documents(
+                        prepared.query.clone(),
+                        prepared.params.clone(),
+                        prepared.operator,
+                        pre_filter,
+                        metrics,
+                    )
+                    .await
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut searches = stream::iter(searches).buffer_unordered(get_num_compute_intensive_cpus());
+    let mut total = 0usize;
+    while let Some(count) = searches.try_next().await? {
+        total += count;
+    }
+    Ok(total)
+}
+
+/// A one-row batch carrying a match count.
+///
+/// A count request has no ranked rows, but the scan protocol still needs a
+/// record to report through. The count is carried in the `_rowid` column (a u64,
+/// so exact) with a zero `_score`; callers that asked for
+/// [`FtsSearchParams::count_only`] read that value instead of the row count.
+///
+/// A plan that resolves to an `EmptyExec` (no target fragments, or `fast_search`
+/// with no covering index) emits **zero** rows rather than one zero row; a count
+/// consumer must treat both as 0.
+fn fts_count_batch(schema: SchemaRef, count: usize) -> Result<RecordBatch> {
+    let row_ids = UInt64Array::from_iter_values([count as u64]);
+    let scores = Float32Array::from_iter_values([0.0f32]);
+    let mut columns = vec![Arc::new(row_ids) as Arc<dyn Array>];
+    if schema.field_with_name(DOC_INDEX_COL).is_ok() {
+        let mut builder = ListBuilder::new(UInt32Builder::new()).with_field(Field::new(
+            "item",
+            DataType::UInt32,
+            false,
+        ));
+        builder.append(true);
+        columns.push(Arc::new(builder.finish()));
+    }
+    columns.push(Arc::new(scores));
+    Ok(RecordBatch::try_new(schema, columns)?)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn search_segments(
     indices: &[Arc<InvertedIndex>],
@@ -434,6 +499,47 @@ async fn search_segments(
         .into_iter()
         .map(|std::cmp::Reverse(document)| document)
         .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn search_segments_count(
+    indices: &[Arc<InvertedIndex>],
+    tokens: Arc<Tokens>,
+    params: Arc<FtsSearchParams>,
+    operator: Operator,
+    pre_filter: Arc<dyn PreFilter>,
+    metrics: Arc<FtsIndexMetrics>,
+    base_scorer: Arc<MemBM25Scorer>,
+) -> Result<usize> {
+    let searches = indices
+        .iter()
+        .map(|index| {
+            let index = Arc::clone(index);
+            let tokens = tokens.clone();
+            let params = params.clone();
+            let pre_filter = pre_filter.clone();
+            let metrics = metrics.clone();
+            let base_scorer = base_scorer.clone();
+            async move {
+                index
+                    .bm25_count_documents(
+                        tokens,
+                        params,
+                        operator,
+                        pre_filter,
+                        metrics,
+                        Some(base_scorer.as_ref()),
+                    )
+                    .await
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut searches = stream::iter(searches).buffer_unordered(get_num_compute_intensive_cpus());
+    let mut total = 0usize;
+    while let Some(count) = searches.try_next().await? {
+        total += count;
+    }
+    Ok(total)
 }
 
 #[derive(Clone)]
@@ -2985,6 +3091,7 @@ impl ExecutionPlan for MatchQueryExec {
         let query = self.query.clone();
         let tokenized_query = self.tokenized_query.clone();
         let params = self.params.clone();
+        let count_only = params.count_only;
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
         let external_mask = self.external_mask.clone();
@@ -3096,6 +3203,16 @@ impl ExecutionPlan for MatchQueryExec {
             };
 
             pre_filter.wait_for_ready().await?;
+            if count_only {
+                // A bare count needs neither scores nor ranks: resolve the
+                // match count per segment and report it in a single row.
+                let count =
+                    search_prepared_segments_count(&indices, prepared, pre_filter, metrics.clone())
+                        .await?;
+                // The node emits exactly one count row; the count itself is in `_rowid`.
+                metrics.baseline_metrics.record_output(1);
+                return Ok::<_, DataFusionError>(fts_count_batch(schema, count)?);
+            }
             let mut documents =
                 search_prepared_segments(&indices, prepared, pre_filter, metrics.clone(), None)
                     .await?;
@@ -5161,6 +5278,7 @@ impl ExecutionPlan for PhraseQueryExec {
         let query = self.query.clone();
         let tokenized_query = self.tokenized_query.clone();
         let params = self.params.clone();
+        let count_only = params.count_only;
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
         let external_mask = self.external_mask.clone();
@@ -5244,6 +5362,21 @@ impl ExecutionPlan for PhraseQueryExec {
             };
 
             pre_filter.wait_for_ready().await?;
+            if count_only {
+                let count = search_segments_count(
+                    &indices,
+                    Arc::new(tokens),
+                    Arc::new(params),
+                    lance_index::scalar::inverted::query::Operator::And,
+                    pre_filter,
+                    metrics.clone(),
+                    base_scorer,
+                )
+                .await?;
+                // The node emits exactly one count row; the count itself is in `_rowid`.
+                metrics.baseline_metrics.record_output(1);
+                return Ok::<_, DataFusionError>(fts_count_batch(schema, count)?);
+            }
             let tokens = Arc::new(tokens);
             let params = Arc::new(params);
             let documents = search_segments(

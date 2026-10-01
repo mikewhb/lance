@@ -5080,6 +5080,12 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if params.count_only && !matches!(query, FtsQuery::Match(_) | FtsQuery::Phrase(_)) {
+            return Err(Error::invalid_input(
+                "count_only full-text search is only supported for Match and Phrase queries"
+                    .to_string(),
+            ));
+        }
         let document_granularity = self.fts_document_granularity(query)?;
         if !document_granularity.is_list_element()
             && supports_compound_scorer(query)
@@ -5639,8 +5645,26 @@ impl Scanner {
         flat_plan: Option<Arc<dyn ExecutionPlan>>,
         params: &FtsSearchParams,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        if params.count_only && indexed_plan.is_none() {
+            // A count request is only resolvable through the indexed leaf; the
+            // flat (unindexed-residual) leaf emits ranked rows.
+            return Err(Error::invalid_input(
+                "count_only full-text search requires an indexed column".to_string(),
+            ));
+        }
         let plan = match (indexed_plan, flat_plan) {
             (Some(indexed_plan), Some(flat_plan)) => {
+                if params.count_only {
+                    // A count request must resolve to a single count row; a
+                    // union with the flat (unindexed-residual) leaf would mix
+                    // ranked rows into it. Rejecting is safer than silently
+                    // mis-counting.
+                    return Err(Error::invalid_input(
+                        "count_only full-text search requires the index-only path; \
+                         this query also has unindexed or stale rows"
+                            .to_string(),
+                    ));
+                }
                 UnionExec::try_new(vec![indexed_plan, flat_plan])?
             }
             (Some(indexed_plan), None) => return Ok(indexed_plan),
