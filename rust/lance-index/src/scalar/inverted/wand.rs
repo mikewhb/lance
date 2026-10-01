@@ -1757,6 +1757,44 @@ impl PostingIterator {
         }
     }
 
+    /// Mark every document of this posting list in `bits`, keyed by `doc_id`.
+    ///
+    /// A docs-only bulk walk over the decompressed blocks, used by the
+    /// score-free disjunction count. It performs no scoring, no heap work and no
+    /// visibility check: callers must have established that every document of
+    /// the partition is visible (see `Wand::count_disjunction`).
+    fn mark_all_docs(&mut self, bits: &mut [u64]) {
+        #[inline]
+        fn set(bits: &mut [u64], doc_id: u64) {
+            let doc_id = doc_id as usize;
+            // Modern posting doc ids are dense in `[0, documents.len())`. Fail
+            // loudly if that invariant ever breaks rather than undercounting.
+            debug_assert!(
+                doc_id >> 6 < bits.len(),
+                "posting doc id {doc_id} is outside the partition's document range"
+            );
+            if let Some(word) = bits.get_mut(doc_id >> 6) {
+                *word |= 1u64 << (doc_id & 63);
+            }
+        }
+        match self.list {
+            PostingList::Compressed(ref list) => {
+                for block_idx in 0..list.blocks.len() {
+                    let compressed =
+                        unsafe { &*self.ensure_compressed_doc_ids_ptr(list, block_idx) };
+                    for &doc_id in compressed.doc_ids.iter() {
+                        set(bits, u64::from(doc_id));
+                    }
+                }
+            }
+            PostingList::Plain(ref plain) => {
+                for &doc_id in plain.row_ids.iter() {
+                    set(bits, doc_id);
+                }
+            }
+        }
+    }
+
     #[inline]
     fn next_block_first_doc(&self) -> Option<u64> {
         match self.list {
@@ -2726,6 +2764,28 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         Ok(self.run(params, metrics, true)?.1)
     }
 
+    /// Count a pure disjunction as the cardinality of the union of its clause
+    /// postings, without scoring or maintaining a heap.
+    ///
+    /// Each clause is written into a partition-local doc-id bitmap via a bulk
+    /// walk over the decompressed blocks (`PostingIterator::mark_all_docs`), so
+    /// there is no per-document heap traffic. Only call this when the
+    /// disjunction is exhaustive (a count has no competitive floor) and no
+    /// document of the partition can be invisible; both are checked by
+    /// [`Self::run`].
+    fn count_disjunction(&mut self) -> usize {
+        let num_docs = self.documents.len();
+        if num_docs == 0 {
+            return 0;
+        }
+        let mut bits = vec![0u64; num_docs.div_ceil(64)];
+        for head in std::mem::take(&mut self.head).into_vec() {
+            let mut posting = head.posting;
+            posting.mark_all_docs(&mut bits);
+        }
+        bits.iter().map(|word| word.count_ones() as usize).sum()
+    }
+
     pub(crate) fn run(
         &mut self,
         params: &FtsSearchParams,
@@ -2755,6 +2815,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 <= (*FLAT_SEARCH_PERCENT_THRESHOLD as usize).saturating_mul(self.documents.len())
         {
             return self.flat_search(params, documents, metrics, count_only);
+        }
+
+        // A bare count needs neither scores nor ranks. For a pure disjunction
+        // over a partition whose documents are all visible, the count is the
+        // cardinality of the union of the clause postings, which a bulk bitmap
+        // walk computes far more cheaply than the per-document WAND loop.
+        if count_only
+            && self.operator == Operator::Or
+            && params.phrase_slop.is_none()
+            && !self.documents.any_invisible()
+        {
+            return Ok((Vec::new(), self.count_disjunction()));
         }
 
         // Top-k disjunctions over compressed lists can opt into the bulk
@@ -6619,6 +6691,56 @@ mod tests {
         },
     };
 
+    /// A documents adapter whose partitions have no invisible document, so the
+    /// score-free disjunction count may skip the per-document visibility check.
+    struct AllVisibleDocuments {
+        total_docs: usize,
+    }
+
+    impl WandDocuments for AllVisibleDocuments {
+        type Candidate = u64;
+
+        fn len(&self) -> usize {
+            self.total_docs
+        }
+
+        fn any_invisible(&self) -> bool {
+            false
+        }
+
+        fn scoring_norms(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn scoring_num_tokens(&self, _doc_id: u32) -> u32 {
+            1
+        }
+
+        fn doc_length(&self, _doc: &DocInfo) -> u32 {
+            1
+        }
+
+        fn document_key(&self, doc: &DocInfo) -> Option<u64> {
+            Some(doc.doc_id())
+        }
+
+        fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+            Some(u64::from(doc_id))
+        }
+
+        fn candidate_from_key(&self, key: u64) -> Self::Candidate {
+            key
+        }
+
+        fn flat_documents(&self) -> Option<FlatDocuments<'_>> {
+            None
+        }
+
+        fn flat_doc_length(&self, _doc_id: u64, _document_key: u64, _compressed: bool) -> u32 {
+            1
+        }
+    }
+
     struct CostOnlyDocuments {
         total_docs: usize,
         visible_cost_upper_bound: usize,
@@ -8974,6 +9096,47 @@ mod tests {
             assert_eq!(ranked.len(), 2, "two docs have adjacent positions");
             assert_eq!(ranked.len(), counted, "compressed={is_compressed}");
         }
+    }
+
+    #[test]
+    fn count_disjunction_matches_search_across_blocks() {
+        // The bulk bitmap path must match the ranked walk's cardinality even
+        // when the postings span several compressed blocks.
+        let total = 3 * BLOCK_SIZE as u32 + 7;
+        let even: Vec<u32> = (0..total).filter(|d| d % 2 == 0).collect();
+        let third: Vec<u32> = (0..total).filter(|d| d % 3 == 0).collect();
+        let build = || {
+            vec![
+                PostingIterator::new(
+                    String::from("a"),
+                    0,
+                    0,
+                    generate_posting_list(even.clone(), 1.0, None, true),
+                    total as usize,
+                ),
+                PostingIterator::new(
+                    String::from("b"),
+                    1,
+                    1,
+                    generate_posting_list(third.clone(), 1.0, None, true),
+                    total as usize,
+                ),
+            ]
+        };
+        let adapter = AllVisibleDocuments {
+            total_docs: total as usize,
+        };
+        let params = FtsSearchParams::default();
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let mut wand = Wand::new(Operator::Or, build().into_iter(), &adapter, bm25);
+        let ranked = wand.search(&params, &NoOpMetricsCollector).unwrap();
+        let bm25 = IndexBM25Scorer::new(std::iter::empty());
+        let mut wand = Wand::new(Operator::Or, build().into_iter(), &adapter, bm25);
+        let counted = wand.count(&params, &NoOpMetricsCollector).unwrap();
+        let expected: std::collections::HashSet<u32> =
+            even.iter().chain(third.iter()).copied().collect();
+        assert_eq!(ranked.len(), counted, "count must equal the ranked walk");
+        assert_eq!(counted, expected.len(), "count must equal the union");
     }
 
     #[test]

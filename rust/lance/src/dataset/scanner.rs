@@ -5080,6 +5080,25 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         prefilter_source: &PreFilterSource,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // A count request for a Boolean whose only required clause is `x`
+        // (no MUST_NOT) has exactly `x`'s match set: SHOULD clauses affect only
+        // scoring. Reduce to the required clause so the count reuses the
+        // single-leaf path — this mirrors Lucene's `BooleanWeight.reqCount`
+        // shortcut, and keeps the answer exact.
+        if params.count_only
+            && let FtsQuery::Boolean(boolean) = query
+            && boolean.must_not.is_empty()
+        {
+            return match boolean.must.as_slice() {
+                [required] => {
+                    Box::pin(self.plan_fts(required, params, filter_plan, prefilter_source)).await
+                }
+                _ => Err(Error::invalid_input(
+                    "count_only full-text search over a Boolean query requires exactly one MUST clause"
+                        .to_string(),
+                )),
+            };
+        }
         if params.count_only && !matches!(query, FtsQuery::Match(_) | FtsQuery::Phrase(_)) {
             return Err(Error::invalid_input(
                 "count_only full-text search is only supported for Match and Phrase queries"

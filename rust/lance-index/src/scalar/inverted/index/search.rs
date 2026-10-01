@@ -910,6 +910,19 @@ impl InvertedIndex {
             || self.is_legacy(),
             || *LANCE_FTS_REUSE_PREPARED_SCORER_ENABLED,
         );
+        // A single exact token over unfiltered, row-granularity data is exactly
+        // the term's document frequency. Posting metadata answers it without
+        // touching a posting, mirroring Lucene's `TermWeight.count` -> `docFreq`.
+        if params.phrase_slop.is_none()
+            && !uses_fuzzy_expansion(params.fuzziness)
+            && tokens.len() == 1
+            && prefilter.is_empty()
+            && !self.is_legacy()
+            && !self.params.get_document_granularity().is_list_element()
+        {
+            let term = tokens.get_token(0);
+            return self.df_for_term(term, Some(metrics.as_ref())).await;
+        }
         // A count is independent of any top-k limit: count the whole match set.
         let mask = prefilter.mask();
         if self.is_legacy() {

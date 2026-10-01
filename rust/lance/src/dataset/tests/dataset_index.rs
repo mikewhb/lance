@@ -1203,27 +1203,31 @@ async fn test_fts_count_only_matches_ranked() {
         .unwrap();
 
     let column = Some("text".to_string());
+    let match_q = |terms: &str, operator: Operator| {
+        FtsQuery::Match(
+            MatchQuery::new(terms.to_string())
+                .with_column(column.clone())
+                .with_operator(operator),
+        )
+    };
+    // A Boolean whose only MUST clause is a countable leaf: Lance reduces the
+    // count to that clause (Lucene's `BooleanWeight.reqCount`).
+    let boolean_single_must = FtsQuery::Boolean(BooleanQuery::new([
+        (Occur::Must, match_q("quick", Operator::Or)),
+        (Occur::Should, match_q("brown", Operator::Or)),
+    ]));
     for (label, query) in [
-        (
-            "or",
-            FtsQuery::Match(
-                MatchQuery::new("quick brown".to_string())
-                    .with_column(column.clone())
-                    .with_operator(Operator::Or),
-            ),
-        ),
-        (
-            "and",
-            FtsQuery::Match(
-                MatchQuery::new("quick brown".to_string())
-                    .with_column(column.clone())
-                    .with_operator(Operator::And),
-            ),
-        ),
+        ("or", match_q("quick brown", Operator::Or)),
+        ("and", match_q("quick brown", Operator::And)),
+        // Single token: takes the document-frequency statistics path.
+        ("single-token", match_q("fox", Operator::Or)),
         (
             "phrase",
-            FtsQuery::Phrase(PhraseQuery::new("quick brown".to_string()).with_column(column)),
+            FtsQuery::Phrase(
+                PhraseQuery::new("quick brown".to_string()).with_column(column.clone()),
+            ),
         ),
+        ("boolean-single-must", boolean_single_must),
     ] {
         let ranked = ranked_len(&dataset, query.clone()).await;
         let count = counted(&dataset, query).await;
@@ -1233,6 +1237,74 @@ async fn test_fts_count_only_matches_ranked() {
             "{label}: count must equal the ranked row count"
         );
     }
+}
+
+#[tokio::test]
+async fn test_fts_count_only_single_term_with_deletions() {
+    // The single-term statistics shortcut must not fire when rows are deleted:
+    // the term's raw posting length would still include them.
+    let params = InvertedIndexParams::default();
+    let text_col = GenericStringArray::<i32>::from(vec![
+        "the quick brown fox",
+        "the lazy dog",
+        "quick brown fox jumps",
+        "brown fox",
+    ]);
+    let batch = RecordBatch::try_new(
+        arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "text",
+            text_col.data_type().to_owned(),
+            false,
+        )])
+        .into(),
+        vec![Arc::new(text_col) as ArrayRef],
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+    let test_uri = TempStrDir::default();
+    let mut dataset = Dataset::write(batches, &test_uri, None).await.unwrap();
+    dataset
+        .create_index(&["text"], IndexType::Inverted, None, &params, true)
+        .await
+        .unwrap();
+    dataset.delete("text = 'brown fox'").await.unwrap();
+
+    let query = FtsQuery::Match(
+        MatchQuery::new("fox".to_string())
+            .with_column(Some("text".to_string()))
+            .with_operator(Operator::Or),
+    );
+
+    let mut scanner = dataset.scan();
+    scanner.empty_project().unwrap();
+    scanner.with_row_id();
+    scanner
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    let ranked = scanner.try_into_batch().await.unwrap().num_rows();
+
+    let mut scanner = dataset.scan();
+    scanner.empty_project().unwrap();
+    scanner.with_row_id();
+    scanner
+        .full_text_search(FullTextSearchQuery::new_query(query).count_only(true))
+        .unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    let count = if batch.num_rows() == 0 {
+        0
+    } else {
+        batch
+            .column_by_name("_rowid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0) as usize
+    };
+
+    assert_eq!(ranked, 2, "rows 0 and 2 match 'fox' after the delete");
+    assert_eq!(count, ranked, "count must exclude the deleted row");
 }
 
 #[tokio::test]
