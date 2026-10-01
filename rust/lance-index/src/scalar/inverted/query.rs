@@ -62,6 +62,16 @@ pub struct FtsSearchParams {
     /// DataFusion fallback passes `None` recursively so intermediate children
     /// remain complete.
     pub limit: Option<usize>,
+    /// The caller only needs the number of matching rows.
+    ///
+    /// Ranking is meaningless for a bare count, so the search may skip BM25
+    /// scoring, the top-k heap, the final sort and row-id materialization and
+    /// return a single number instead. Rows are still matched with the normal
+    /// semantics: phrase positions, grouped expansions and fuzzy expansions
+    /// are resolved before a row is counted, and deleted / pre-filtered rows
+    /// are excluded.
+    #[serde(default)]
+    pub count_only: bool,
     pub wand_factor: f32,
     pub fuzziness: Option<u32>,
     /// Final fuzzy vocabulary budget for one Match leaf across all selected
@@ -78,6 +88,7 @@ impl FtsSearchParams {
     pub fn new() -> Self {
         Self {
             limit: None,
+            count_only: false,
             wand_factor: 1.0,
             fuzziness: Some(0),
             max_expansions: 50,
@@ -88,6 +99,11 @@ impl FtsSearchParams {
 
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.limit = limit;
+        self
+    }
+
+    pub fn with_count_only(mut self, count_only: bool) -> Self {
+        self.count_only = count_only;
         self
     }
 

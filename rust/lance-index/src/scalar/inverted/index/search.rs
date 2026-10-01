@@ -911,11 +911,26 @@ impl InvertedIndex {
             })
             .collect::<Vec<_>>();
 
-        let mut ranked = BinaryHeap::new();
         let mut parts = stream::iter(parts)
             .buffer_unordered(get_num_compute_intensive_cpus().min(32))
             .map_ok(|results| stream::iter(results.into_iter().map(Result::Ok)))
             .try_flatten();
+        if limit == usize::MAX {
+            // No limit: nothing can be dropped, so the heap only adds a
+            // per-candidate sift through an ever-growing and therefore cold
+            // buffer. Collect linearly and sort once instead.
+            let mut all: Vec<(u64, f32)> = Vec::new();
+            while let Some(partition) = parts.try_next().await? {
+                for (row_id, score) in rescore_partition_candidates(partition, scorer) {
+                    all.push((row_id, score));
+                }
+            }
+            all.sort_unstable_by(|left, right| {
+                right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+            });
+            return Ok(all.into_iter().unzip());
+        }
+        let mut ranked = BinaryHeap::new();
         while let Some(partition) = parts.try_next().await? {
             for (row_id, score) in rescore_partition_candidates(partition, scorer) {
                 push_scored_key(&mut ranked, limit, row_id, score);
@@ -1205,11 +1220,25 @@ impl InvertedIndex {
             })
             .collect::<Vec<_>>();
 
-        let mut ranked = BinaryHeap::new();
         let mut parts = stream::iter(parts)
             .buffer_unordered(get_num_compute_intensive_cpus().min(32))
             .map_ok(|results| stream::iter(results.into_iter().map(Result::Ok)))
             .try_flatten();
+        if limit == usize::MAX {
+            // See the same branch above: with no limit the heap is pure overhead.
+            let mut all: Vec<Reverse<ScoredPartitionDoc>> = Vec::new();
+            while let Some((partition_ordinal, scored)) = parts.try_next().await? {
+                for (doc_id, score) in scored {
+                    all.push(Reverse(ScoredPartitionDoc {
+                        document: PartitionDocId::try_new(partition_ordinal, doc_id)?,
+                        score: OrderedFloat(score),
+                    }));
+                }
+            }
+            all.sort_unstable_by(|left, right| right.0.score.cmp(&left.0.score));
+            return Ok(all);
+        }
+        let mut ranked = BinaryHeap::new();
         while let Some((partition_ordinal, scored)) = parts.try_next().await? {
             for (doc_id, score) in scored {
                 push_scored_partition_doc(
