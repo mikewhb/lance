@@ -267,7 +267,12 @@ impl CompetitiveFloorMode {
 // skipping plus a slice-level merge over decompressed blocks, replacing the
 // per-doc `next()` leapfrog. Results are identical to the classic AND loop.
 // LANCE_FTS_BULK_AND accepts auto (default), on/1, or off/0. Auto enables the
-// bulk path for two and three clauses and for wider current-format conjunctions.
+// bulk path for every two-clause query, for three-clause queries whose posting
+// lengths are within `BULK_AND_AUTO_SKEW_RATIO`, and for wider current-format
+// conjunctions. A three-clause query with a stopword plus a rare term stays on
+// classic leapfrog: the N-way merge decompresses the dense list in every
+// window, while the rare lead can skip it.
+const BULK_AND_AUTO_SKEW_RATIO: usize = 32;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BulkAndMode {
     #[default]
@@ -290,9 +295,22 @@ impl BulkAndMode {
         }
     }
 
-    const fn enabled_for(self, num_clauses: usize) -> bool {
+    /// Whether the bulk N-way merge should drive a conjunction. `min_cost` and
+    /// `max_cost` are the cheapest and dearest clause posting lengths (the lead
+    /// is sorted by cost), used to spot a cost-skewed three-clause query.
+    const fn enabled_for(self, num_clauses: usize, min_cost: usize, max_cost: usize) -> bool {
         match self {
-            Self::Auto => matches!(num_clauses, 2 | 3),
+            Self::Auto => {
+                if num_clauses == 2 {
+                    true
+                } else if num_clauses == 3 {
+                    // `min_cost == 0` is an empty rare list; the conjunction is
+                    // exhausted before this gate runs.
+                    min_cost > 0 && max_cost / min_cost < BULK_AND_AUTO_SKEW_RATIO
+                } else {
+                    false
+                }
+            }
             Self::On => true,
             Self::Off => false,
         }
@@ -1496,6 +1514,44 @@ impl PostingIterator {
         }
     }
 
+    /// Copy remaining docs in the current decompressed block at or before
+    /// `window_max` without moving the cursor. Leftover-classic AND uses this
+    /// as a forward-only rare-lead buffer; followers keep seeking with `next`.
+    /// Returns the absolute posting index of the first copied doc.
+    fn peek_remaining_block_docs_upto(
+        &mut self,
+        window_max: u64,
+        docs: &mut Vec<u32>,
+        freqs: &mut Vec<u32>,
+    ) -> Option<usize> {
+        docs.clear();
+        freqs.clear();
+        let PostingList::Compressed(ref list) = self.list else {
+            return None;
+        };
+        let cur = self.current_doc?;
+        if cur.doc_id() > window_max {
+            return None;
+        }
+        let shift = list.block_shift();
+        let block_idx = self.index >> shift;
+        let block_offset = self.index & list.block_mask();
+        let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+        for offset in block_offset..compressed.doc_ids.len() {
+            let doc_id = compressed.doc_ids[offset];
+            if u64::from(doc_id) > window_max {
+                break;
+            }
+            docs.push(doc_id);
+            freqs.push(compressed.freqs[offset]);
+        }
+        if docs.is_empty() {
+            None
+        } else {
+            Some((block_idx << shift) + block_offset)
+        }
+    }
+
     fn shallow_next(&mut self, least_id: u64) {
         match self.list {
             PostingList::Compressed(ref list) => {
@@ -2496,6 +2552,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     #[cfg(test)]
     bulk_and_searches: usize,
     #[cfg(test)]
+    lead_stream_and_searches: usize,
+    #[cfg(test)]
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
     maxscore_general_windows: usize,
@@ -2614,6 +2672,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             bulk_and_mode_override: None,
             #[cfg(test)]
             bulk_and_searches: 0,
+            #[cfg(test)]
+            lead_stream_and_searches: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
@@ -2748,34 +2808,46 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             return self.maxscore_search(params, metrics);
         }
 
-        // Top-k conjunctions (AND and phrase) over compressed lists use the
-        // bulk path: the same block-max window pruning, but candidates come
-        // from a slice-level merge over decompressed blocks instead of per-doc
-        // `next()` leapfrogging through boxed iterators.
+        // Top-k conjunctions (AND and phrase) over compressed lists: N-way bulk
+        // when Auto/On selects it; a cost-skewed three-clause conjunction that
+        // the bulk gate rejects uses a lead-stream so the rare list drives and
+        // dense followers only seek. Explicit Off keeps the classic per-doc
+        // leapfrog, and wider conjunctions stay on the bulk or classic path:
+        // streaming a rare lead pays for three clauses but loses once several
+        // dense stopword lists have to be sought per candidate.
         if self.operator == Operator::And
             && !self.lead.is_empty()
             && self
                 .lead
                 .iter()
                 .all(|posting| posting.is_compressed() && !posting.has_grouped_terms())
-            && {
-                let mode = self
-                    .bulk_and_mode_override
-                    .unwrap_or_else(|| *BULK_AND_MODE);
-                mode.enabled_for(self.lead.len())
-                    || (mode == BulkAndMode::Auto
-                        && self.lead.len() >= 4
-                        && self.lead.iter().all(|posting| {
-                            matches!(&posting.list, PostingList::Compressed(list)
-                                if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
-                        }))
-            }
         {
-            #[cfg(test)]
-            {
-                self.bulk_and_searches += 1;
+            let mode = self
+                .bulk_and_mode_override
+                .unwrap_or_else(|| *BULK_AND_MODE);
+            let min_cost = self.lead[0].cost();
+            let max_cost = self.lead.last().map(|posting| posting.cost()).unwrap_or(0);
+            let bulk = mode.enabled_for(self.lead.len(), min_cost, max_cost)
+                || (mode == BulkAndMode::Auto
+                    && self.lead.len() >= 4
+                    && self.lead.iter().all(|posting| {
+                        matches!(&posting.list, PostingList::Compressed(list)
+                            if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
+                    }));
+            if bulk {
+                #[cfg(test)]
+                {
+                    self.bulk_and_searches += 1;
+                }
+                return self.and_bulk_search(params, metrics);
             }
-            return self.and_bulk_search(params, metrics);
+            if mode == BulkAndMode::Auto && self.lead.len() == 3 {
+                #[cfg(test)]
+                {
+                    self.lead_stream_and_searches += 1;
+                }
+                return self.and_lead_stream_search(params, metrics);
+            }
         }
 
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
@@ -4117,6 +4189,214 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .map(|doc| doc.saturating_sub(1))
             .unwrap_or(TERMINATED_DOC_ID)
             .max(target)
+    }
+
+    /// Leftover-classic conjunction: the rare lead's decompressed block is the
+    /// buffer, followers only `next(target)`. Unlike N-way bulk, this never
+    /// decompresses a dense list just to slice-merge a window the rare term
+    /// barely touches — Lucene `BlockMaxConjunctionBulkScorer` shape. Scoring,
+    /// phrase confirm, and heap semantics match the classic loop.
+    fn and_lead_stream_search(
+        &mut self,
+        params: &FtsSearchParams,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<DocCandidate<D::Candidate>>> {
+        let limit = params.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let phrase_slop = params.phrase_slop;
+        let num_lists = self.lead.len();
+        const FREQ_LUT_BUCKETS: usize = 64;
+        let mut freq_bound_lut = [f32::INFINITY; FREQ_LUT_BUCKETS];
+        for (freq, slot) in freq_bound_lut
+            .iter_mut()
+            .enumerate()
+            .take(FREQ_LUT_BUCKETS - 1)
+        {
+            *slot = self.lead[0].score(&self.scorer, freq as u32, 0);
+        }
+        freq_bound_lut[FREQ_LUT_BUCKETS - 1] =
+            self.lead[0].frequency_clamp_upper_bound(&self.scorer);
+
+        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut num_comparisons: usize = 0;
+        let mut lead_docs: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
+        let mut lead_freqs: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
+
+        let mut target: u64 = 0;
+        for posting in &self.lead {
+            match posting.doc() {
+                Some(doc) => target = target.max(doc.doc_id()),
+                None => return Ok(vec![]),
+            }
+        }
+
+        'window: loop {
+            self.raise_to_shared_floor(params.wand_factor);
+            self.lead[0].next(target);
+            let Some(lead_doc) = self.lead[0].doc() else {
+                break;
+            };
+            target = target.max(lead_doc.doc_id());
+            let win_end = Self::posting_block_up_to(&self.lead[0], target);
+
+            if self.threshold > 0.0 {
+                for posting in &mut self.lead {
+                    posting.shallow_next(target);
+                }
+                let wide_max = conservative_score_sum(self.lead.iter().map(|posting| {
+                    posting
+                        .block_max_score_up_to_with_stats(win_end, &self.scorer)
+                        .score
+                }));
+                if wide_max < self.threshold {
+                    #[cfg(test)]
+                    {
+                        self.and_window_stats.windows_skipped += 1;
+                    }
+                    if win_end == TERMINATED_DOC_ID {
+                        break;
+                    }
+                    target = win_end + 1;
+                    continue;
+                }
+            }
+
+            let Some(first_index) = self.lead[0].peek_remaining_block_docs_upto(
+                win_end,
+                &mut lead_docs,
+                &mut lead_freqs,
+            ) else {
+                if win_end == TERMINATED_DOC_ID {
+                    break;
+                }
+                target = win_end + 1;
+                continue;
+            };
+
+            let others_block_max = self.lead[1..]
+                .iter()
+                .map(|posting| {
+                    f64::from(
+                        posting
+                            .block_max_score_up_to_with_stats(win_end, &self.scorer)
+                            .score,
+                    )
+                })
+                .sum::<f64>();
+            let freq_cannot_beat = if self.threshold > 0.0 && num_lists >= 2 {
+                std::array::from_fn(|frequency| {
+                    score_sum_cannot_compete(
+                        freq_bound_lut[frequency],
+                        others_block_max,
+                        self.threshold,
+                        score_sum_upper_bound_factor(num_lists),
+                        CompetitiveFloorMode::Exclusive,
+                    )
+                })
+            } else {
+                [false; FREQ_LUT_BUCKETS]
+            };
+
+            let mut pos = 0;
+            while pos < lead_docs.len() {
+                let doc = lead_docs[pos];
+                let freq = lead_freqs[pos];
+                let freq_bucket = (freq as usize).min(FREQ_LUT_BUCKETS - 1);
+                if freq_cannot_beat[freq_bucket] {
+                    pos += 1;
+                    continue;
+                }
+
+                let mut leap_to = None;
+                let mut exhausted = false;
+                for posting in self.lead.iter_mut().skip(1) {
+                    if posting
+                        .doc()
+                        .is_none_or(|cur| cur.doc_id() < u64::from(doc))
+                    {
+                        posting.next(u64::from(doc));
+                    }
+                    match posting.doc() {
+                        None => {
+                            exhausted = true;
+                            break;
+                        }
+                        Some(cur) if cur.doc_id() > u64::from(doc) => {
+                            leap_to = Some(cur.doc_id());
+                            break;
+                        }
+                        Some(_) => {}
+                    }
+                }
+                if exhausted {
+                    break 'window;
+                }
+                if let Some(next) = leap_to {
+                    let next32 = u32::try_from(next).unwrap_or(u32::MAX);
+                    pos += lead_docs[pos + 1..].partition_point(|&id| id < next32) + 1;
+                    if next > win_end {
+                        target = next;
+                        continue 'window;
+                    }
+                    continue;
+                }
+
+                self.lead[0].index = first_index + pos;
+                if let PostingList::Compressed(ref list) = self.lead[0].list {
+                    self.lead[0].block_idx = (first_index + pos) >> list.block_shift();
+                }
+                self.lead[0].current_doc = Some(DocInfo::Raw(RawDocInfo {
+                    doc_id: doc,
+                    frequency: freq,
+                }));
+                let Some(parked) = self.lead[0].doc() else {
+                    pos += 1;
+                    continue;
+                };
+                let Some(document_key) = self.documents.document_key(&parked) else {
+                    pos += 1;
+                    continue;
+                };
+                let doc_length = self.documents.doc_length(&parked);
+                let score = self.score_in_query_order(doc_length);
+                if let Some(slop) = phrase_slop {
+                    if self.exclusive_score_cannot_beat_floor(score) {
+                        pos += 1;
+                        continue;
+                    }
+                    if !self.check_positions(slop as i32)? {
+                        pos += 1;
+                        continue;
+                    }
+                }
+
+                #[cfg(test)]
+                {
+                    self.and_window_stats.candidates_returned += 1;
+                }
+                num_comparisons += 1;
+                if candidates.insert(
+                    ScoredDoc::new(document_key, score),
+                    doc_length,
+                    u64::from(doc),
+                    self.iter_term_freqs(),
+                )? && let Some(kth) = candidates.kth_score_if_full()
+                {
+                    self.update_threshold(kth, params.wand_factor);
+                }
+                pos += 1;
+            }
+
+            if win_end == TERMINATED_DOC_ID {
+                break;
+            }
+            target = win_end + 1;
+        }
+
+        metrics.record_comparisons(num_comparisons);
+        candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
     /// Bulk conjunction search. The window ends at the nearest next-block
@@ -8297,20 +8577,25 @@ mod tests {
     }
 
     #[rstest]
-    #[case::auto_one(BulkAndMode::Auto, 1, false)]
-    #[case::auto_two(BulkAndMode::Auto, 2, true)]
-    #[case::auto_three(BulkAndMode::Auto, 3, true)]
-    #[case::auto_four(BulkAndMode::Auto, 4, false)]
-    #[case::on_one(BulkAndMode::On, 1, true)]
-    #[case::on_five(BulkAndMode::On, 5, true)]
-    #[case::off_two(BulkAndMode::Off, 2, false)]
-    #[case::off_five(BulkAndMode::Off, 5, false)]
+    #[case::auto_one(BulkAndMode::Auto, 1, 0, 0, false)]
+    #[case::auto_two(BulkAndMode::Auto, 2, 0, 0, true)]
+    #[case::auto_three_similar(BulkAndMode::Auto, 3, 100, 200, true)]
+    #[case::auto_three_just_under_skew(BulkAndMode::Auto, 3, 100, 3_199, true)]
+    #[case::auto_three_skewed(BulkAndMode::Auto, 3, 100, 3_200, false)]
+    #[case::auto_three_empty_rare(BulkAndMode::Auto, 3, 0, 1_000, false)]
+    #[case::auto_four(BulkAndMode::Auto, 4, 0, 0, false)]
+    #[case::on_one(BulkAndMode::On, 1, 0, 0, true)]
+    #[case::on_five(BulkAndMode::On, 5, 0, 0, true)]
+    #[case::off_two(BulkAndMode::Off, 2, 0, 0, false)]
+    #[case::off_five(BulkAndMode::Off, 5, usize::MAX, usize::MAX, false)]
     fn test_bulk_and_mode_enabled_for(
         #[case] mode: BulkAndMode,
         #[case] num_clauses: usize,
+        #[case] min_cost: usize,
+        #[case] max_cost: usize,
         #[case] expected: bool,
     ) {
-        assert_eq!(mode.enabled_for(num_clauses), expected);
+        assert_eq!(mode.enabled_for(num_clauses, min_cost, max_cost), expected);
     }
 
     #[test]
@@ -12281,6 +12566,73 @@ mod tests {
         assert!(!bulk.0.is_empty(), "test corpus should produce matches");
         assert_eq!(bulk, classic);
         assert_eq!(auto, classic);
+    }
+
+    #[test]
+    fn lead_stream_and_matches_bulk_and_classic_on_skewed_three_clause() {
+        let num_docs = (BLOCK_SIZE * 8 + 37) as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 32 + doc_id % 57);
+        }
+        // Rare subset of mid subset of dense so the conjunction is non-empty,
+        // with max/min cost >= the skew ratio so Auto stays off N-way bulk.
+        let dense: Vec<u32> = (0..num_docs).collect();
+        let mid: Vec<u32> = (0..num_docs).step_by(2).collect();
+        let rare: Vec<u32> = (0..num_docs).step_by(40).collect();
+        let clauses = [rare, mid, dense];
+        let min_cost = clauses.iter().map(|c| c.len()).min().unwrap();
+        let max_cost = clauses.iter().map(|c| c.len()).max().unwrap();
+        assert!(
+            min_cost > 0 && max_cost / min_cost >= BULK_AND_AUTO_SKEW_RATIO,
+            "expected a skewed 3-clause (max/min={max_cost}/{min_cost})"
+        );
+
+        let build = || {
+            clauses
+                .iter()
+                .enumerate()
+                .map(|(term_pos, doc_ids)| {
+                    PostingIterator::with_query_weight(
+                        format!("t{term_pos}"),
+                        term_pos as u32,
+                        term_pos as u32,
+                        1.0 + term_pos as f32 * 0.5,
+                        generate_posting_list(doc_ids.clone(), 8.0, None, true),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let normalize = |result: Vec<DocCandidate<u64>>| {
+            let mut rows = result
+                .into_iter()
+                .map(|c| (c.posting_doc_id, c.doc_length, c.freqs, c.document))
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            rows
+        };
+        let run = |mode| {
+            let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode);
+            let rows = normalize(wand.search(&params, &NoOpMetricsCollector).unwrap());
+            (
+                rows,
+                wand.bulk_and_searches > 0,
+                wand.lead_stream_and_searches > 0,
+            )
+        };
+
+        let (on, on_bulk, on_lead) = run(BulkAndMode::On);
+        let (off, off_bulk, off_lead) = run(BulkAndMode::Off);
+        let (auto, auto_bulk, auto_lead) = run(BulkAndMode::Auto);
+        assert!(on_bulk && !on_lead);
+        assert!(!off_bulk && !off_lead);
+        assert!(!auto_bulk && auto_lead, "Auto must pick the lead-stream");
+        assert!(!on.is_empty(), "test corpus should produce matches");
+        assert_eq!(auto, off);
+        assert_eq!(auto, on);
     }
 
     #[rstest]
