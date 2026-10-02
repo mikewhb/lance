@@ -406,6 +406,12 @@ fn find_next_geq_in_block(docs: &[u32], pos: usize, target: u32) -> usize {
 }
 
 #[inline]
+/// Advance an array-walk position to the first entry at or after `next`.
+fn skip_lead_docs(lead_docs: &[u32], pos: usize, next: u64) -> usize {
+    let next32 = u32::try_from(next).unwrap_or(u32::MAX);
+    pos + lead_docs[pos + 1..].partition_point(|&id| id < next32) + 1
+}
+
 fn conservative_bm25_upper_bound(query_weight: f32) -> f32 {
     if query_weight <= 0.0 {
         0.0
@@ -906,6 +912,48 @@ impl PostingIterator {
         // this method is called very frequently, so we prefer to use `UnsafeCell` instead of
         // `RefCell` to avoid the overhead of runtime borrow checking
         self.compressed.as_ref().unwrap().get()
+    }
+
+    /// Copy the remaining docs of the current decompressed block at or before
+    /// `window_max` into `docs`/`freqs` without moving the cursor, decoding the
+    /// block's frequencies too so every copied entry carries its real frequency.
+    /// Returns the absolute posting index of the first copied doc.
+    fn peek_remaining_block_docs_upto(
+        &mut self,
+        window_max: u64,
+        docs: &mut Vec<u32>,
+        freqs: &mut Vec<u32>,
+    ) -> Option<usize> {
+        docs.clear();
+        freqs.clear();
+        let PostingList::Compressed(ref list) = self.list else {
+            return None;
+        };
+        let cur = self.current_doc?;
+        if cur.doc_id() > window_max {
+            return None;
+        }
+        let shift = list.block_shift();
+        let block_idx = self.index >> shift;
+        let block_offset = self.index & list.block_mask();
+        // SAFETY: `ensure_compressed_block_ptr` hands back a pointer into this
+        // iterator's own `UnsafeCell` state for `block_idx`, populated for both
+        // doc ids and frequencies. We hold `&mut self` and finish reading before
+        // the state is touched again.
+        let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+        for offset in block_offset..compressed.doc_ids.len() {
+            let doc_id = compressed.doc_ids[offset];
+            if u64::from(doc_id) > window_max {
+                break;
+            }
+            docs.push(doc_id);
+            freqs.push(compressed.freqs[offset]);
+        }
+        if docs.is_empty() {
+            None
+        } else {
+            Some((block_idx << shift) + block_offset)
+        }
     }
 
     #[inline]
@@ -1421,6 +1469,32 @@ impl PostingIterator {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
                 let shift = list.block_shift();
+                // Sequential fast path: the target is very often the posting
+                // right after the cursor, inside the block that is already
+                // decoded. Answer it with two loads instead of running block
+                // navigation plus an in-block search. Sound because the entries
+                // are sorted: `doc_ids[offset] < least_id <= doc_ids[offset+1]`
+                // pins the answer to `offset + 1`.
+                let cur_block = self.index >> shift;
+                let cur_offset = self.index & list.block_mask();
+                let fast = unsafe { &mut *self.ensure_compressed_doc_ids_ptr(list, cur_block) };
+                if cur_offset + 1 < fast.doc_ids.len()
+                    && fast.doc_ids[cur_offset] < least_id
+                    && fast.doc_ids[cur_offset + 1] >= least_id
+                {
+                    self.index = (cur_block << shift) + cur_offset + 1;
+                    self.block_idx = cur_block;
+                    let frequency = if fast.frequency_block_idx == Some(cur_block) {
+                        fast.freqs[cur_offset + 1]
+                    } else {
+                        0
+                    };
+                    self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                        doc_id: fast.doc_ids[cur_offset + 1],
+                        frequency,
+                    }));
+                    return;
+                }
                 let block_idx = self.block_idx_for_doc(list, self.index >> shift, least_id);
                 self.index = self.index.max(block_idx << shift);
                 let length = list.length as usize;
@@ -2448,6 +2522,18 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Exact query-order score computed while progressively confirming a
     // conjunction candidate. This is valid only for `and_last_doc`.
     and_candidate_score: Option<f32>,
+    // Prototype (array-backed lead): for skewed conjunctions the lead clause's
+    // current block is copied into `lead_docs`/`lead_freqs` once per window and
+    // walked by index, so moving the lead to its next candidate costs an index
+    // bump instead of a cursor seek. `and_lead_arrayed` is set by the routing in
+    // `search`; every other field is owned by this route.
+    and_lead_arrayed: bool,
+    lead_docs: Vec<u32>,
+    lead_freqs: Vec<u32>,
+    lead_pos: usize,
+    lead_first_index: usize,
+    lead_window_end: u64,
+    lead_next_target: u64,
     // Score-first conjunction pruning is restricted to the current impact
     // format and scorers that expose the BM25 denominator contract.
     score_first_and_enabled: bool,
@@ -2577,6 +2663,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             and_max_score: f32::INFINITY,
             and_last_doc: None,
             and_candidate_score: None,
+            and_lead_arrayed: false,
+            lead_docs: Vec::new(),
+            lead_freqs: Vec::new(),
+            lead_pos: 0,
+            lead_first_index: 0,
+            lead_window_end: 0,
+            lead_next_target: 0,
             score_first_and_enabled,
             #[cfg(test)]
             disable_score_first_and: false,
@@ -2694,6 +2787,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         if limit == 0 {
             return Ok(vec![]);
         }
+        // A `Wand` is searched once in practice, but the array-backed lead is
+        // state like any other: clearing it means a second `search` cannot
+        // inherit the previous one's array or its pending target.
+        self.and_lead_arrayed = false;
+        self.lead_pos = 0;
+        self.lead_next_target = 0;
+        self.lead_docs.clear();
+        self.lead_freqs.clear();
 
         if params.phrase_slop.is_some() {
             self.invalidate_score_first_and_window();
@@ -2743,6 +2844,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let skewed_auto = mode == BulkAndMode::Auto
                     && self.lead.len() >= 3
                     && conjunction_lists_are_skewed(&self.lead);
+                self.and_lead_arrayed = skewed_auto;
                 !skewed_auto
                     && (mode.enabled_for(self.lead.len())
                         || (mode == BulkAndMode::Auto
@@ -3948,6 +4050,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
     }
     fn next_and_candidate(&mut self) -> Option<DocInfo> {
+        if self.and_lead_arrayed {
+            return self.next_and_candidate_arrayed();
+        }
         self.and_candidate_score = None;
         if self.lead.len() < self.num_terms {
             return None;
@@ -4091,6 +4196,139 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             self.and_last_doc = Some(doc);
             return Some(lead_doc);
         }
+    }
+
+    /// Array-backed lead, for skewed conjunctions only.
+    ///
+    /// The lead clause's current block is copied into `lead_docs`/`lead_freqs`
+    /// once per window, then walked by index. Advancing the lead is an index
+    /// bump, and a follower leap skips the array by binary search, so the lead
+    /// never pays a cursor seek per candidate. No pre-seek pruning here: this
+    /// prototype exists to measure what the array alone buys.
+    fn next_and_candidate_arrayed(&mut self) -> Option<DocInfo> {
+        self.and_candidate_score = None;
+        if self.lead.len() < self.num_terms {
+            return None;
+        }
+        let is_vectorized_search_enabled = matches!(self.lead.len(), 3 | 4 | 5);
+
+        'advance_head: loop {
+            while self.lead_pos >= self.lead_docs.len() {
+                if !self.open_lead_array() {
+                    return None;
+                }
+            }
+            let doc = self.lead_docs[self.lead_pos];
+            let freq = self.lead_freqs[self.lead_pos];
+            // Park the lead clause on this entry so every downstream reader --
+            // `doc()`, `score_in_query_order`, `iter_term_freqs`, the phrase
+            // position check -- sees the candidate without another seek.
+            self.park_lead_at(self.lead_first_index + self.lead_pos, doc, freq);
+
+            for index in 1..self.lead.len() {
+                let posting = &mut self.lead[index];
+                if posting
+                    .current_doc_id()
+                    .is_none_or(|cur| cur < u64::from(doc))
+                {
+                    posting.next_doc_id(u64::from(doc), is_vectorized_search_enabled);
+                }
+                match posting.current_doc_id() {
+                    None => return None,
+                    Some(next) if next > u64::from(doc) => {
+                        self.lead_pos = skip_lead_docs(&self.lead_docs, self.lead_pos, next);
+                        if next > self.lead_window_end {
+                            self.lead_next_target = next;
+                            self.lead_pos = self.lead_docs.len();
+                        }
+                        continue 'advance_head;
+                    }
+                    Some(_) => {}
+                }
+            }
+
+            let lead_doc = self.lead.first().and_then(|posting| posting.doc())?;
+            let doc_length = self.documents.doc_length(&lead_doc);
+            if self.and_candidate_cannot_beat_threshold(doc_length) {
+                self.lead_pos += 1;
+                continue;
+            }
+            self.lead_pos += 1;
+            self.and_last_doc = None;
+            return Some(lead_doc);
+        }
+    }
+
+    /// Copy the lead clause's current block into the arrays and move the cursor
+    /// to the window's first entry. Returns false when the lead is exhausted.
+    fn open_lead_array(&mut self) -> bool {
+        loop {
+            if self.lead_next_target == TERMINATED_DOC_ID {
+                return false;
+            }
+            // The floor is raised by `search` before every `next()`, so it is
+            // already current here.
+            self.lead[0].next(self.lead_next_target);
+            let Some(lead_doc) = self.lead[0].doc() else {
+                return false;
+            };
+            let target = self.lead_next_target.max(lead_doc.doc_id());
+            // The window is the lead clause's own block end: the rarest clause
+            // sets the window, so one window serves many candidates.
+            let win_end = Self::posting_block_up_to(&self.lead[0], target);
+
+            if self.threshold > 0.0 {
+                for posting in &mut self.lead {
+                    posting.shallow_next(target);
+                }
+                let wide_max = conservative_score_sum(self.lead.iter().map(|posting| {
+                    posting
+                        .block_max_score_up_to_with_stats(win_end, &self.scorer)
+                        .score
+                }));
+                if wide_max < self.threshold {
+                    if win_end == TERMINATED_DOC_ID {
+                        return false;
+                    }
+                    self.lead_next_target = win_end + 1;
+                    continue;
+                }
+            }
+
+            let Some(first_index) = self.lead[0].peek_remaining_block_docs_upto(
+                win_end,
+                &mut self.lead_docs,
+                &mut self.lead_freqs,
+            ) else {
+                if win_end == TERMINATED_DOC_ID {
+                    return false;
+                }
+                self.lead_next_target = win_end + 1;
+                continue;
+            };
+
+            self.lead_first_index = first_index;
+            self.lead_pos = 0;
+            self.lead_window_end = win_end;
+            self.lead_next_target = if win_end == TERMINATED_DOC_ID {
+                TERMINATED_DOC_ID
+            } else {
+                win_end + 1
+            };
+            return true;
+        }
+    }
+
+    /// Park the lead clause's cursor on an array entry without searching for it.
+    fn park_lead_at(&mut self, index: usize, doc: u32, freq: u32) {
+        self.lead[0].index = index;
+        if let PostingList::Compressed(ref list) = self.lead[0].list {
+            self.lead[0].block_idx = index >> list.block_shift();
+        }
+        self.lead[0].current_doc = Some(DocInfo::Raw(RawDocInfo {
+            doc_id: doc,
+            frequency: freq,
+        }));
     }
 
     fn posting_block_up_to(posting: &PostingIterator, target: u64) -> u64 {
