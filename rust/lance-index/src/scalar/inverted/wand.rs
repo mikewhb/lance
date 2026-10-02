@@ -304,8 +304,9 @@ impl BulkAndMode {
                 if num_clauses == 2 {
                     true
                 } else if num_clauses == 3 {
-                    // `min_cost == 0` is an empty rare list; the conjunction is
-                    // exhausted before this gate runs.
+                    // `min_cost == 0` is an empty rare list: Auto then falls
+                    // through to the lead-stream, whose own exhaustion guard
+                    // returns the empty set.
                     min_cost > 0 && max_cost / min_cost < BULK_AND_AUTO_SKEW_RATIO
                 } else {
                     false

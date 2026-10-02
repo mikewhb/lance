@@ -270,7 +270,10 @@ pub(super) trait ComposableScorer: Send {
     fn advance_shallow(&mut self, target: u64) -> Result<u64>;
     fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds>;
     /// Conservative list-wide score upper bound, independent of iterator
-    /// position. `None` keeps the scorer on exact eager composition paths.
+    /// position: it must cover every document of the list, not a range.
+    /// Understating it lets a parent prune documents that can still compete,
+    /// so implementations return `None` rather than guess. `None` keeps the
+    /// scorer on exact eager composition paths.
     fn global_score_upper_bound(&self) -> Option<f32> {
         None
     }
