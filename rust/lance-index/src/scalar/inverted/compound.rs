@@ -4390,33 +4390,68 @@ fn is_compound_term_leaf(leaf: &LoadedLeaf) -> bool {
 /// `set_min_competitive_score` is a no-op and it never skips — so the swap
 /// also gives up the wrapper's block-max skipping. Where that skipping earns
 /// nothing the wrapper is pure overhead; where it earns, the leaf keeps its
-/// cursor. Measured on the Wikipedia A1 SBG set:
+/// cursor.
 ///
-/// - the single MUST child of a required/optional Boolean wins: its
-///   candidates are admitted one by one and the wrapper spent its time on
-///   window bookkeeping;
+/// The ReqOpt scorer holds its floor itself and never forwards it to either
+/// side (`ReqOptScorer::set_min_competitive_score`); it prunes by consulting
+/// each side's `advance_shallow`/`score_bounds`, and it probes the optional side
+/// by exact `advance(required_doc)`. So on that path neither leaf is steered by
+/// a floor and the wrapper's skipping earns nothing. Measured on the Wikipedia
+/// A1 SBG set:
+///
+/// - the single MUST child of a 1-MUST Boolean wins: its candidates are
+///   admitted one by one and the wrapper spent its time on window bookkeeping;
+/// - the SHOULD children of the same 1-MUST Boolean win too: the wrapper has no
+///   union machine to steer and only adds seek and scoring bookkeeping
+///   (SBG `intersection_union` 335 ms -> 189 ms, overall -6.4%);
 /// - the leaves of a multi-MUST conjunction are driven by their parent's own
-///   skipping, and the optional children of a SHOULD-only union sit far from
-///   any floor — both measured slower with the swap.
+///   skipping, and the optional children of a SHOULD-only union sit inside a
+///   union machine — both measured slower with the swap.
 ///
-/// The remaining arms (Boost-positive, MultiMatch, nested shapes) are left
-/// on the WAND wrapper: TermLeafScorer never skips, and those arms are
-/// correctness-safe either way but have no measurement behind the swap.
+/// The remaining arms (MUST_NOT, Boost-positive, MultiMatch, nested shapes) are
+/// left on the WAND wrapper: TermLeafScorer never skips, and those arms are
+/// correctness-safe either way but have no measurement behind the swap. Note
+/// that a MUST_NOT Boolean still drives through `ReqOptScorer`; excluding it is
+/// deliberate conservatism, not a structural difference.
 fn leaf_admits_term_leaf(plan: &CompoundScorerPlan, index: usize) -> bool {
     match plan {
         CompoundScorerPlan::Boolean {
             must,
-            should: _,
-            must_not: _,
+            should,
+            must_not,
         } => {
-            must.len() == 1
-                && matches!(
-                    &must[0],
-                    CompoundScorerPlan::Leaf {
-                        index: must_index,
-                        boost: _,
-                    } if *must_index == index
-                )
+            if must.len() != 1 {
+                return false;
+            }
+            let CompoundScorerPlan::Leaf {
+                index: must_index,
+                boost: _,
+            } = &must[0]
+            else {
+                return false;
+            };
+            // The single MUST leaf keeps its existing admission.
+            if *must_index == index {
+                return true;
+            }
+            // In a 1-MUST ReqOpt, the SHOULD leaves are probed by
+            // `advance(doc)` once per required document, and the ReqOpt scorer
+            // holds the floor itself (it forwards it to neither side). A direct
+            // posting seek beats the WAND machine there, so admit them too.
+            // MUST_NOT is deliberately excluded — the ReqOpt scorer still drives
+            // in that case, but admitting it is unmeasured — and a multi-MUST
+            // conjunction or a SHOULD-only union stays on the WAND cursor, which
+            // the parent's or the union's block skipping steers.
+            must_not.is_empty()
+                && should.iter().any(|clause| {
+                    matches!(
+                        clause,
+                        CompoundScorerPlan::Leaf {
+                            index: should_index,
+                            boost: _,
+                        } if *should_index == index
+                    )
+                })
         }
         // A standalone single-leaf plan (one term query): TermLeafScorer is
         // the whole scorer, so there is no wrapper bookkeeping to save.
@@ -7730,6 +7765,57 @@ mod tests {
     }
 
     #[test]
+    fn term_leaf_optional_probe_matches_wand_cursor() {
+        // After the ReqOpt change a SHOULD leaf of a 1-MUST Boolean is driven by
+        // TermLeafScorer instead of WandCursor. For the probe pattern the parent
+        // uses (`advance(required_doc)`), the two must visit exactly the same
+        // documents and report the same scores.
+        let mut docs = DocSet::default();
+        for row in 0..8u64 {
+            docs.append(row, 3);
+        }
+        let ids = vec![1u64, 3, 5, 6];
+        let metrics = NoOpMetricsCollector;
+        let leaf = || loaded_leaf(vec![plain_unit_posting("s", ids.clone())], None);
+        let mut term = box_leaf_scorer(leaf(), &docs, &metrics, true);
+        let mut wand = box_leaf_scorer(leaf(), &docs, &metrics, false);
+
+        assert!(
+            term.debug_type_name().contains("TermLeafScorer"),
+            "got {}",
+            term.debug_type_name()
+        );
+        assert!(
+            !wand.debug_type_name().contains("TermLeafScorer"),
+            "got {}",
+            wand.debug_type_name()
+        );
+
+        let mut visited = std::collections::BTreeSet::new();
+        for target in [0u64, 1, 2, 3, 4, 5, 6, 7, 8] {
+            let t = term.advance(target).unwrap();
+            let w = wand.advance(target).unwrap();
+            assert_eq!(t, w, "advance({target})");
+            assert_eq!(term.doc(), wand.doc(), "doc after advance({target})");
+            if let Some(doc) = t {
+                visited.insert(doc);
+                assert_eq!(
+                    term.score().unwrap(),
+                    wand.score().unwrap(),
+                    "score at {target}"
+                );
+            }
+        }
+        assert_eq!(
+            visited,
+            ids.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "every posting document was probed"
+        );
+    }
+
+    #[test]
     fn box_leaf_scorer_uses_term_leaf_for_one_ungrouped_term() {
         let documents = DocSet::default();
         let metrics = NoOpMetricsCollector;
@@ -7743,22 +7829,39 @@ mod tests {
     }
 
     #[test]
-    fn optional_child_of_must_boolean_keeps_wand_cursor() {
-        // ReqOptScorer forwards floors only to the required side, so a
-        // single-posting SHOULD child there never sees a floor and must keep
-        // its WandCursor instead of taking the (floor-driven) TermLeaf path.
-        let documents = DocSet::default();
-        let metrics = NoOpMetricsCollector;
+    fn reqopt_admits_one_must_and_its_shoulds() {
+        // The ReqOpt shape (one MUST + N SHOULD): the parent holds the floor
+        // itself and probes the optional side by `advance(required_doc)` once
+        // per required document. Neither side is steered by a union machine or
+        // by a forwarded floor, so both may step a direct posting: WandCursor's
+        // window bookkeeping is pure overhead there, and TermLeafScorer's
+        // no-floor contract costs nothing.
+        //
+        // Measured on the Wikipedia A1 SBG set (943-query TOP_10, same core):
+        // intersection_union 335 ms -> 189 ms (-43.5%), overall -6.4%,
+        // 943/943 result dumps bit-identical, 0 per-query regressions >5%.
         let leaf_node = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
-        // Single MUST + SHOULD: only the MUST leaf is admitted — it is the
-        // side that receives the required floor.
         let plan = CompoundScorerPlan::Boolean {
             must: vec![leaf_node(0)],
             should: vec![leaf_node(1)],
             must_not: Vec::new(),
         };
+        assert!(leaf_admits_term_leaf(&plan, 0), "required side");
+        assert!(
+            leaf_admits_term_leaf(&plan, 1),
+            "optional side of a 1-MUST Boolean"
+        );
+
+        // A MUST_NOT still drives through ReqOptScorer, but admitting its
+        // optional side is unmeasured, so it keeps the WAND cursor.
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0)],
+            should: vec![leaf_node(1)],
+            must_not: vec![leaf_node(2)],
+        };
         assert!(leaf_admits_term_leaf(&plan, 0));
         assert!(!leaf_admits_term_leaf(&plan, 1));
+
         // A multi-MUST conjunction is driven by the parent's skipping; its
         // leaves are not admitted.
         let plan = CompoundScorerPlan::Boolean {
@@ -7768,21 +7871,15 @@ mod tests {
         };
         assert!(!leaf_admits_term_leaf(&plan, 0));
         assert!(!leaf_admits_term_leaf(&plan, 1));
-        // A SHOULD-only union never forwards a floor; not admitted either.
+
+        // A SHOULD-only union: every leaf keeps its WAND cursor.
         let plan = CompoundScorerPlan::Boolean {
             must: Vec::new(),
-            should: vec![leaf_node(0)],
+            should: vec![leaf_node(0), leaf_node(1)],
             must_not: Vec::new(),
         };
         assert!(!leaf_admits_term_leaf(&plan, 0));
-
-        let leaf = loaded_leaf(vec![plain_unit_posting("b", vec![0])], None);
-        let scorer = box_leaf_scorer(leaf, &documents, &metrics, false);
-        assert!(
-            scorer.debug_type_name().contains("WandCursor"),
-            "got {}",
-            scorer.debug_type_name()
-        );
+        assert!(!leaf_admits_term_leaf(&plan, 1));
     }
 
     #[test]
