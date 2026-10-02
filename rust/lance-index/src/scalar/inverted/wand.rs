@@ -261,6 +261,27 @@ impl CompetitiveFloorMode {
 // per-doc `next()` leapfrog. Results are identical to the classic AND loop.
 // LANCE_FTS_BULK_AND accepts auto (default), on/1, or off/0. Auto enables the
 // bulk path for two and three clauses and for wider current-format conjunctions.
+//
+// A skewed Auto conjunction of three or more clauses is the exception: it stays
+// on the per-document leapfrog. There the rarest clause sets the pace and each
+// candidate costs one advance of that clause plus a seek of the dense ones,
+// whereas the bulk merge materializes a block of *every* clause before it can
+// test a window. Measured on the SBG corpus this decision is worth ~13% of
+// aggregate top-10 latency over the 30 three-clause queries it moves.
+const AND_SKEW_RATIO: usize = 32;
+
+/// True when the conjunction's rarest and densest clauses differ by at least
+/// `AND_SKEW_RATIO`. `lead` is sorted by cost, so the ends are the extremes.
+fn conjunction_lists_are_skewed(lead: &[Box<PostingIterator>]) -> bool {
+    let (Some(min_cost), Some(max_cost)) = (
+        lead.first().map(|posting| posting.cost()),
+        lead.last().map(|posting| posting.cost()),
+    ) else {
+        return false;
+    };
+    min_cost.saturating_mul(AND_SKEW_RATIO) <= max_cost
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BulkAndMode {
     #[default]
@@ -2705,7 +2726,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // Top-k conjunctions (AND and phrase) over compressed lists use the
         // bulk path: the same block-max window pruning, but candidates come
         // from a slice-level merge over decompressed blocks instead of per-doc
-        // `next()` leapfrogging through boxed iterators.
+        // `next()` leapfrogging through boxed iterators. A skewed three-or-more
+        // clause conjunction under `Auto` skips the merge and leapfrogs instead;
+        // `On` and `Off` still match the bulk decision exactly, so the override
+        // stays a faithful control.
         if self.operator == Operator::And
             && !self.lead.is_empty()
             && self
@@ -2716,13 +2740,17 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let mode = self
                     .bulk_and_mode_override
                     .unwrap_or_else(|| *BULK_AND_MODE);
-                mode.enabled_for(self.lead.len())
-                    || (mode == BulkAndMode::Auto
-                        && self.lead.len() >= 4
-                        && self.lead.iter().all(|posting| {
-                            matches!(&posting.list, PostingList::Compressed(list)
-                                if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
-                        }))
+                let skewed_auto = mode == BulkAndMode::Auto
+                    && self.lead.len() >= 3
+                    && conjunction_lists_are_skewed(&self.lead);
+                !skewed_auto
+                    && (mode.enabled_for(self.lead.len())
+                        || (mode == BulkAndMode::Auto
+                            && self.lead.len() >= 4
+                            && self.lead.iter().all(|posting| {
+                                matches!(&posting.list, PostingList::Compressed(list)
+                                    if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
+                            })))
             }
         {
             #[cfg(test)]
