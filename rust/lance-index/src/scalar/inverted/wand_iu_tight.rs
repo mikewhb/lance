@@ -100,12 +100,69 @@ where
     let should_ub_sum = conservative_ub_sum(should_ubs.iter().copied());
     let mut chunk = Vec::with_capacity(128);
     let mut last_doc = 0_u64;
+    // One decoded (doc, freq) buffer per SHOULD, refilled once per MUST block.
+    let mut should_hits: Vec<Vec<(u32, u32)>> = vec![Vec::new(); shoulds.len()];
+    let mut scratch: Vec<(u64, u32)> = Vec::with_capacity(128);
+    let mut should_sums: Vec<f32> = Vec::with_capacity(128);
     loop {
         must.take_docs_one_block_upto(TERMINATED_DOC_ID, &mut chunk);
         if chunk.is_empty() {
             break;
         }
-        for &(doc, freq) in &chunk {
+        // Window = exactly the MUST documents just consumed, so the SHOULD
+        // buffers cover every candidate regardless of posting format.
+        let window_start = chunk[0].0;
+        let window_end = chunk[chunk.len() - 1].0;
+        // Decode every SHOULD document inside this MUST block up front. A block
+        // of a sparse MUST spans thousands of document ids, so seeking each
+        // SHOULD posting once per candidate pays a full block locate for every
+        // one of them; decoding the window once and merging it against the
+        // candidates turns that into one seek plus a contiguous decode.
+        for (index, should) in shoulds.iter_mut().enumerate() {
+            let hits = &mut should_hits[index];
+            hits.clear();
+            if should.doc().is_some_and(|cur| cur.doc_id() < window_start) {
+                should.next(window_start);
+            }
+            while let Some(cur) = should.doc() {
+                if cur.doc_id() > window_end {
+                    break;
+                }
+                should.take_docs_one_block_upto(window_end, &mut scratch);
+                if scratch.is_empty() {
+                    break;
+                }
+                hits.extend(scratch.iter().map(|(doc, freq)| {
+                    debug_assert!(*doc <= u32::MAX as u64);
+                    (*doc as u32, *freq)
+                }));
+            }
+        }
+        // Merge each SHOULD buffer against the MUST candidates once: both sides
+        // are ascending, so a linear walk replaces a per-candidate binary
+        // search that misses cache on every probe. Accumulating per clause in
+        // clause order keeps the f32 sum bit-identical to `complete_shoulds`.
+        should_sums.clear();
+        should_sums.resize(chunk.len(), 0.0);
+        for (index, hits) in should_hits.iter().enumerate() {
+            if hits.is_empty() {
+                continue;
+            }
+            let mut cursor = 0usize;
+            for (candidate, &(doc, _)) in chunk.iter().enumerate() {
+                while cursor < hits.len() && (hits[cursor].0 as u64) < doc {
+                    cursor += 1;
+                }
+                if cursor >= hits.len() {
+                    break;
+                }
+                if hits[cursor].0 as u64 == doc {
+                    should_sums[candidate] +=
+                        scoring.term_score(&shoulds[index], doc, hits[cursor].1);
+                }
+            }
+        }
+        for (candidate, &(doc, freq)) in chunk.iter().enumerate() {
             last_doc = doc;
             let Some(key) = scoring.documents.document_key_for_doc_id(doc as u32) else {
                 continue;
@@ -117,7 +174,7 @@ where
             {
                 continue;
             }
-            let score = must_score + scoring.complete_shoulds(&mut shoulds, doc);
+            let score = must_score + should_sums[candidate];
             if !on_hit(key, score)? {
                 return Ok(());
             }
