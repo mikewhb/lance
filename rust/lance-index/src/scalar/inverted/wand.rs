@@ -3952,10 +3952,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         if self.lead.len() < self.num_terms {
             return None;
         }
-        // Two- and three-clause conjunctions use the bulk SIMD kernels by
-        // default. Restrict this classic-path optimization to four and five
-        // clauses, keeping one clause as the benchmark's drift control.
-        let is_vectorized_search_enabled = matches!(self.lead.len(), 4 | 5);
+        // Three-clause conjunctions now reach this loop too (see the routing in
+        // `search`), so they get the in-block SIMD search as well. The flag only
+        // selects how a block is searched, never which documents match.
+        let is_vectorized_search_enabled = matches!(self.lead.len(), 3 | 4 | 5);
         if let Some(last_doc) = self.and_last_doc
             && self
                 .lead
