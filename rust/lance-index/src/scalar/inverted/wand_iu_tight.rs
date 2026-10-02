@@ -12,32 +12,14 @@
 use lance_core::Result;
 
 use super::super::scorer::Scorer;
-use super::{
-    PostingIterator, TERMINATED_DOC_ID, WandDocuments, outward_f32_upper_bound,
-    score_sum_upper_bound_factor,
-};
+use super::{PostingIterator, TERMINATED_DOC_ID, WandDocuments, conservative_score_sum};
 
-/// Conservative sum of upper bounds so f32 rounding cannot shrink below the
-/// true total and trigger premature IU termination. The consumer scores the
-/// same values by sequential `f32` accumulation, so the sum is widened by
-/// Lucene's `MathUtil.sumUpperBound` factor: with `n >= 3` clauses the f32
-/// accumulation order alone can exceed the f64 sum by `(n-1) * f32::EPSILON`
-/// relative error, and a bound that tight would drop a document tying the
-/// floor.
-fn conservative_ub_sum(values: impl IntoIterator<Item = f32>) -> f32 {
-    let mut sum: f64 = 0.0;
-    let mut count: usize = 0;
-    for value in values {
-        sum += f64::from(value);
-        count += 1;
-    }
-    outward_f32_upper_bound(sum * score_sum_upper_bound_factor(count))
-}
-
-fn conservative_ub_pair_sum(left: f32, right: f32) -> f32 {
-    outward_f32_upper_bound(f64::from(left) + f64::from(right))
-}
-
+/// The SHOULD/MUST bounds below are widened by `conservative_score_sum` so f32
+/// rounding cannot shrink them below the true total and trigger premature IU
+/// termination: the consumer scores the same values by sequential `f32`
+/// accumulation, so with `n >= 3` clauses the accumulation order alone can
+/// exceed the f64 sum by `(n-1) * f32::EPSILON` relative error, and a bound
+/// that tight would drop a document tying the floor.
 /// Promote only when the new lead is at least this many times cheaper than
 /// MUST. A medium-df SHOULD that just barely becomes required is slower to
 /// walk than finishing MUST.
@@ -59,21 +41,6 @@ impl<'a, D: WandDocuments, S: Scorer> IuTightScoring<'a, D, S> {
             freq,
             self.documents.scoring_num_tokens(doc as u32),
         )
-    }
-
-    fn complete_shoulds(&self, shoulds: &mut [PostingIterator], doc: u64) -> f32 {
-        let mut should_sum = 0.0_f32;
-        for should in shoulds.iter_mut() {
-            if should.doc().is_some_and(|info| info.doc_id() < doc) {
-                should.next(doc);
-            }
-            if let Some(info) = should.doc()
-                && info.doc_id() == doc
-            {
-                should_sum += self.term_score(should, doc, info.frequency());
-            }
-        }
-        should_sum
     }
 }
 
@@ -97,7 +64,7 @@ where
         .iter()
         .map(|should| should.global_upper_bound(scorer))
         .collect();
-    let should_ub_sum = conservative_ub_sum(should_ubs.iter().copied());
+    let should_ub_sum = conservative_score_sum(should_ubs.iter().copied());
     let mut chunk = Vec::with_capacity(128);
     let mut last_doc = 0_u64;
     // One decoded (doc, freq) buffer per SHOULD, refilled once per MUST block.
@@ -170,7 +137,7 @@ where
             let must_score = scoring.term_score(&must, doc, freq);
             let current_floor = floor();
             if current_floor.is_finite()
-                && conservative_ub_pair_sum(must_score, should_ub_sum) < current_floor
+                && conservative_score_sum([must_score, should_ub_sum].into_iter()) < current_floor
             {
                 continue;
             }
@@ -219,22 +186,22 @@ pub fn iu_tight_required_shoulds(
     if should_ubs.iter().any(|upper| !upper.is_finite()) {
         return None;
     }
-    let sum_shoulds = conservative_ub_sum(should_ubs.iter().copied());
-    if conservative_ub_pair_sum(must_ub, sum_shoulds) < floor {
+    let sum_shoulds = conservative_score_sum(should_ubs.iter().copied());
+    if conservative_score_sum([must_ub, sum_shoulds].into_iter()) < floor {
         return Some(Vec::new());
     }
     let required: Vec<usize> = should_ubs
         .iter()
         .enumerate()
         .filter(|(index, _)| {
-            let others = conservative_ub_sum(
+            let others = conservative_score_sum(
                 should_ubs
                     .iter()
                     .enumerate()
                     .filter(|(other, _)| other != index)
                     .map(|(_, upper)| *upper),
             );
-            conservative_ub_pair_sum(must_ub, others) < floor
+            conservative_score_sum([must_ub, others].into_iter()) < floor
         })
         .map(|(index, _)| index)
         .collect();
