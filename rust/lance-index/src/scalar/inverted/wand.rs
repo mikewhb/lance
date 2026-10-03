@@ -274,6 +274,12 @@ const AND_SKEW_RATIO: usize = 32;
 /// after a check that did not skip. See the `wb_windows_since_check` field.
 const WB_REPROBE_INTERVAL: u32 = 32;
 
+/// A query whose check has skipped this many windows in total latches into
+/// always-check mode: measured skip counts are bimodal (skip-heavy queries
+/// skip hundreds of windows, most skip none), so a small latch count protects
+/// the skip-heavy ones at negligible cost for the rest.
+const WB_LATCH_SKIP_COUNT: u32 = 8;
+
 /// True when the conjunction's rarest and densest clauses differ by at least
 /// `AND_SKEW_RATIO`. `lead` is sorted by cost, so the ends are the extremes.
 fn conjunction_lists_are_skewed(lead: &[Box<PostingIterator>]) -> bool {
@@ -2549,6 +2555,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // `WB_REPROBE_INTERVAL` windows keeps zero-skip queries from paying the
     // check on every window while still catching isolated skippable ones.
     wb_windows_since_check: u32,
+    wb_total_skips: u32,
+    wb_always_check: bool,
     // Score-first conjunction pruning is restricted to the current impact
     // format and scorers that expose the BM25 denominator contract.
     score_first_and_enabled: bool,
@@ -2687,6 +2695,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             lead_window_end: 0,
             lead_next_target: 0,
             wb_windows_since_check: WB_REPROBE_INTERVAL,
+            wb_total_skips: 0,
+            wb_always_check: false,
             score_first_and_enabled,
             #[cfg(test)]
             disable_score_first_and: false,
@@ -4303,7 +4313,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // sets the window, so one window serves many candidates.
             let win_end = Self::posting_block_up_to(&self.lead[0], target);
 
-            if self.threshold > 0.0 && self.wb_windows_since_check >= WB_REPROBE_INTERVAL {
+            if self.threshold > 0.0
+                && (self.wb_always_check || self.wb_windows_since_check >= WB_REPROBE_INTERVAL)
+            {
                 self.wb_windows_since_check = 0;
                 for posting in &mut self.lead {
                     posting.shallow_next(target);
@@ -4314,6 +4326,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         .score
                 }));
                 if wide_max < self.threshold {
+                    self.wb_total_skips = self.wb_total_skips.saturating_add(1);
+                    if self.wb_total_skips >= WB_LATCH_SKIP_COUNT {
+                        self.wb_always_check = true;
+                    }
                     if win_end == TERMINATED_DOC_ID {
                         return false;
                     }
