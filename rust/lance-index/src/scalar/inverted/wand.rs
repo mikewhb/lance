@@ -4277,7 +4277,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // sets the window, so one window serves many candidates.
             let win_end = Self::posting_block_up_to(&self.lead[0], target);
 
-            if self.threshold > 0.0 {
+            // Measurement-only ablation gate: setting LANCE_ABLATE_WIDE_BIND=1
+            // skips the window-level wide-bound prune to attribute how much of
+            // the array route's win comes from it. Default behavior unchanged.
+            let ablate_wide_bind = std::env::var("LANCE_ABLATE_WIDE_BIND")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if self.threshold > 0.0 && !ablate_wide_bind {
                 for posting in &mut self.lead {
                     posting.shallow_next(target);
                 }
