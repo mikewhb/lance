@@ -278,7 +278,7 @@ const WB_REPROBE_INTERVAL: u32 = 32;
 /// always-check mode: measured skip counts are bimodal (skip-heavy queries
 /// skip hundreds of windows, most skip none), so a small latch count protects
 /// the skip-heavy ones at negligible cost for the rest.
-const WB_LATCH_SKIP_COUNT: u32 = 8;
+const WB_LATCH_SKIP_COUNT: u32 = 1;
 
 /// True when the conjunction's rarest and densest clauses differ by at least
 /// `AND_SKEW_RATIO`. `lead` is sorted by cost, so the ends are the extremes.
