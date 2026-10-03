@@ -1486,24 +1486,31 @@ impl PostingIterator {
                 // are sorted: `doc_ids[offset] < least_id <= doc_ids[offset+1]`
                 // pins the answer to `offset + 1`.
                 let cur_block = self.index >> shift;
-                let cur_offset = self.index & list.block_mask();
-                let fast = unsafe { &mut *self.ensure_compressed_doc_ids_ptr(list, cur_block) };
-                if cur_offset + 1 < fast.doc_ids.len()
-                    && fast.doc_ids[cur_offset] < least_id
-                    && fast.doc_ids[cur_offset + 1] >= least_id
-                {
-                    self.index = (cur_block << shift) + cur_offset + 1;
-                    self.block_idx = cur_block;
-                    let frequency = if fast.frequency_block_idx == Some(cur_block) {
-                        fast.freqs[cur_offset + 1]
-                    } else {
-                        0
-                    };
-                    self.current_doc = Some(DocInfo::Raw(RawDocInfo {
-                        doc_id: fast.doc_ids[cur_offset + 1],
-                        frequency,
-                    }));
-                    return;
+                // An exhausted cursor has index == length; when the length is
+                // block-aligned that points one past the last block, and the
+                // cache lookup below would decode a non-existent block. Defer
+                // to the general path, which answers exhaustion without
+                // decoding.
+                if cur_block < list.blocks.len() {
+                    let cur_offset = self.index & list.block_mask();
+                    let fast = unsafe { &mut *self.ensure_compressed_doc_ids_ptr(list, cur_block) };
+                    if cur_offset + 1 < fast.doc_ids.len()
+                        && fast.doc_ids[cur_offset] < least_id
+                        && fast.doc_ids[cur_offset + 1] >= least_id
+                    {
+                        self.index = (cur_block << shift) + cur_offset + 1;
+                        self.block_idx = cur_block;
+                        let frequency = if fast.frequency_block_idx == Some(cur_block) {
+                            fast.freqs[cur_offset + 1]
+                        } else {
+                            0
+                        };
+                        self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                            doc_id: fast.doc_ids[cur_offset + 1],
+                            frequency,
+                        }));
+                        return;
+                    }
                 }
                 let block_idx = self.block_idx_for_doc(list, self.index >> shift, least_id);
                 self.index = self.index.max(block_idx << shift);
@@ -2869,8 +2876,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let mode = self
                     .bulk_and_mode_override
                     .unwrap_or_else(|| *BULK_AND_MODE);
+                // Restrict the array route to the current posting format:
+                // legacy compressed lists keep their existing (classic)
+                // routing instead of being pulled into a new mechanism.
                 let skewed_auto = mode == BulkAndMode::Auto
                     && self.lead.len() >= 3
+                    && self.lead.iter().all(|posting| {
+                        matches!(&posting.list, PostingList::Compressed(list)
+                            if list.block_size == MAX_POSTING_BLOCK_SIZE
+                                && list.impacts.is_some())
+                    })
                     && conjunction_lists_are_skewed(&self.lead);
                 self.and_lead_arrayed = skewed_auto;
                 // Defensive reset of the array route's adaptive gate so a
@@ -8756,6 +8771,83 @@ mod tests {
                 Some(position_builder.finish()),
             ))
         }
+    }
+
+    #[test]
+    fn test_next_doc_id_after_exhaustion_block_aligned_length_is_safe() {
+        // Exactly one full block: an exhausted cursor ends with
+        // index == length == MAX_POSTING_BLOCK_SIZE, which is block-aligned
+        // and used to make the cached-next fast path decode one block past
+        // the end (LargeBinaryArray::value panics out of range).
+        let doc_ids: Vec<u32> = (0..MAX_POSTING_BLOCK_SIZE as u32).collect();
+        let frequencies: Vec<u32> = vec![10_u32; doc_ids.len()];
+        let blocks = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            frequencies.iter(),
+            std::iter::once(1.0),
+            crate::scalar::inverted::PostingTailCodec::VarintDelta,
+            MAX_POSTING_BLOCK_SIZE,
+        )
+        .unwrap();
+        let posting_list = PostingList::Compressed(CompressedPostingList::new(
+            blocks,
+            1.0,
+            doc_ids.len() as u32,
+            crate::scalar::inverted::PostingTailCodec::VarintDelta,
+            MAX_POSTING_BLOCK_SIZE,
+            None,
+            None,
+        ));
+        let mut posting =
+            PostingIterator::new(String::from("term"), 0, 0, posting_list, doc_ids.len());
+
+        // Exhaust: seek past the last doc; the cursor lands on
+        // index == length (block-aligned).
+        posting.next_doc_id(MAX_POSTING_BLOCK_SIZE as u64, false);
+        assert!(posting.current_doc_id().is_none());
+
+        // Repeated seeks after exhaustion must stay safe and stay exhausted.
+        posting.next_doc_id(MAX_POSTING_BLOCK_SIZE as u64, false);
+        assert!(posting.current_doc_id().is_none());
+        posting.next_doc_id(0, false);
+        assert!(posting.current_doc_id().is_none());
+    }
+
+    #[test]
+    fn test_next_doc_id_after_exhaustion_partial_tail_block_is_safe() {
+        // Non-aligned length: the exhausted index lands inside the last
+        // block, which the fast path must also answer without decoding
+        // anything new.
+        let doc_ids: Vec<u32> = (0..(MAX_POSTING_BLOCK_SIZE as u32 + 7)).collect();
+        let frequencies: Vec<u32> = vec![10_u32; doc_ids.len()];
+        let blocks = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            frequencies.iter(),
+            std::iter::once(1.0),
+            crate::scalar::inverted::PostingTailCodec::VarintDelta,
+            MAX_POSTING_BLOCK_SIZE,
+        )
+        .unwrap();
+        let posting_list = PostingList::Compressed(CompressedPostingList::new(
+            blocks,
+            1.0,
+            doc_ids.len() as u32,
+            crate::scalar::inverted::PostingTailCodec::VarintDelta,
+            MAX_POSTING_BLOCK_SIZE,
+            None,
+            None,
+        ));
+        let mut posting =
+            PostingIterator::new(String::from("term"), 0, 0, posting_list, doc_ids.len());
+
+        posting.next_doc_id(u64::from(u32::MAX), false);
+        assert!(posting.current_doc_id().is_none());
+        posting.next_doc_id(MAX_POSTING_BLOCK_SIZE as u64, false);
+        assert!(posting.current_doc_id().is_none());
+        posting.next_doc_id(0, false);
+        assert!(posting.current_doc_id().is_none());
     }
 
     #[rstest]
