@@ -2535,7 +2535,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Document length of the last conjunction candidate, read while the
     // candidate was already materialized inside the conjunction loop. The
     // scoring loop would otherwise pay a second lookup for the same doc.
-    // Valid only for `and_last_doc`.
+    // Consumed once by the scoring loop (`take`) and reset at every
+    // candidate-loop entry and window invalidation.
     and_candidate_doc_length: Option<u32>,
     // Prototype (array-backed lead): for skewed conjunctions the lead clause's
     // current block is copied into `lead_docs`/`lead_freqs` once per window and
@@ -2872,6 +2873,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     && self.lead.len() >= 3
                     && conjunction_lists_are_skewed(&self.lead);
                 self.and_lead_arrayed = skewed_auto;
+                // Defensive reset of the array route's adaptive gate so a
+                // hypothetical second `search` on the same Wand starts clean.
+                self.wb_windows_since_check = WB_REPROBE_INTERVAL;
+                self.wb_total_skips = 0;
+                self.wb_always_check = false;
                 !skewed_auto
                     && (mode.enabled_for(self.lead.len())
                         || (mode == BulkAndMode::Auto
@@ -3873,6 +3879,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             self.score_first_and_dense_range = None;
         }
         self.and_candidate_score = None;
+        self.and_candidate_doc_length = None;
     }
 
     fn prepare_score_first_and_window(&mut self) {
@@ -4330,6 +4337,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     if self.wb_total_skips >= WB_LATCH_SKIP_COUNT {
                         self.wb_always_check = true;
                     }
+                    // Stay hot: the next window must be checked too, so a
+                    // run of skippable windows is followed continuously
+                    // instead of re-probed only every WB_REPROBE_INTERVAL.
+                    self.wb_windows_since_check = WB_REPROBE_INTERVAL;
                     if win_end == TERMINATED_DOC_ID {
                         return false;
                     }
