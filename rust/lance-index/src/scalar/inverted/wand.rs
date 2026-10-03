@@ -270,6 +270,10 @@ impl CompetitiveFloorMode {
 // aggregate top-10 latency over the 30 three-clause queries it moves.
 const AND_SKEW_RATIO: usize = 32;
 
+/// Quiet period, in windows, between wide-bound re-probes of the array lead
+/// after a check that did not skip. See the `wb_windows_since_check` field.
+const WB_REPROBE_INTERVAL: u32 = 32;
+
 /// True when the conjunction's rarest and densest clauses differ by at least
 /// `AND_SKEW_RATIO`. `lead` is sorted by cost, so the ends are the extremes.
 fn conjunction_lists_are_skewed(lead: &[Box<PostingIterator>]) -> bool {
@@ -2539,6 +2543,12 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     lead_first_index: usize,
     lead_window_end: u64,
     lead_next_target: u64,
+    // Adaptive gate for the window-level wide-bound check in `open_lead_array`.
+    // Measured skip rates are bimodal: a few queries skip 67-78% of their
+    // windows, almost all others skip none. Re-probing every
+    // `WB_REPROBE_INTERVAL` windows keeps zero-skip queries from paying the
+    // check on every window while still catching isolated skippable ones.
+    wb_windows_since_check: u32,
     // Score-first conjunction pruning is restricted to the current impact
     // format and scorers that expose the BM25 denominator contract.
     score_first_and_enabled: bool,
@@ -2676,6 +2686,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             lead_first_index: 0,
             lead_window_end: 0,
             lead_next_target: 0,
+            wb_windows_since_check: WB_REPROBE_INTERVAL,
             score_first_and_enabled,
             #[cfg(test)]
             disable_score_first_and: false,
@@ -4292,7 +4303,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // sets the window, so one window serves many candidates.
             let win_end = Self::posting_block_up_to(&self.lead[0], target);
 
-            if self.threshold > 0.0 {
+            if self.threshold > 0.0 && self.wb_windows_since_check >= WB_REPROBE_INTERVAL {
+                self.wb_windows_since_check = 0;
                 for posting in &mut self.lead {
                     posting.shallow_next(target);
                 }
@@ -4309,6 +4321,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     continue;
                 }
             }
+            self.wb_windows_since_check = self.wb_windows_since_check.saturating_add(1);
 
             let Some(first_index) = self.lead[0].peek_remaining_block_docs_upto(
                 win_end,
