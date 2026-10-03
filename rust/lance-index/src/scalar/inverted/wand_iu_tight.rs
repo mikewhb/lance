@@ -205,7 +205,7 @@ where
     // Align every required cursor on one document: seek-to-max until they
     // agree. A required list running out empties the intersection.
     let mut candidate = 0_u64;
-    'search: loop {
+    loop {
         let mut max_doc = candidate;
         for posting in required.iter_mut() {
             if posting.doc().is_none_or(|cur| cur.doc_id() < candidate) {
@@ -221,15 +221,30 @@ where
             continue;
         }
 
-        // All required cursors sit on `candidate`. Score in plan order —
-        // required clauses first, then the matching optional clauses — the
-        // same accumulation order as RequiredConjunctionScorer plus
-        // DisjunctionScorer inside ReqOptScorer, so the f32 result is
-        // bit-identical to the generic path.
+        // A required posting may name an invisible document (deleted rows
+        // stay in postings until compaction); the K=1 kernel skips those too.
+        let Some(key) = documents.document_key_for_doc_id(candidate as u32) else {
+            candidate += 1;
+            continue;
+        };
+
+        // Score the required clauses first so the floor can prune before any
+        // optional is probed. Accumulating required clauses first, then the
+        // matching optional clauses in plan order, is the same order as
+        // RequiredConjunctionScorer plus DisjunctionScorer inside ReqOptScorer,
+        // so the f32 result is bit-identical to the generic path.
         let mut required_sum = 0.0_f32;
         for posting in required.iter() {
             let cur = posting.doc().expect("aligned above");
             required_sum += scoring.term_score(posting, candidate, cur.frequency());
+        }
+        let current_floor = floor();
+        if current_floor.is_finite()
+            && conservative_score_sum([required_sum, optional_ub_sum].into_iter())
+                < current_floor
+        {
+            candidate += 1;
+            continue;
         }
         let mut optional_sum = 0.0_f32;
         for posting in optional.iter_mut() {
@@ -242,9 +257,6 @@ where
                 optional_sum += scoring.term_score(posting, candidate, cur.frequency());
             }
         }
-        let key = documents
-            .document_key_for_doc_id(candidate as u32)
-            .expect("aligned required cursors name a real document");
         if !on_hit(key, required_sum + optional_sum)? {
             return Ok(());
         }

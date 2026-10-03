@@ -4615,6 +4615,7 @@ where
                 leaves,
                 must_indices[0],
                 &should_indices,
+                metrics,
                 collector,
                 map_document,
             );
@@ -4629,6 +4630,7 @@ where
                 leaves,
                 &must_indices,
                 &should_indices,
+                metrics,
                 collector,
                 map_document,
             );
@@ -4719,6 +4721,7 @@ fn collect_iu_tight_multi<D, K>(
     mut leaves: Vec<LoadedLeaf>,
     must_indices: &[usize],
     should_indices: &[usize],
+    metrics: &dyn MetricsCollector,
     collector: &mut TopKCollector<K>,
     mut map_document: impl FnMut(u64) -> Result<K>,
 ) -> Result<CollectionStatus>
@@ -4743,13 +4746,15 @@ where
         .collect::<Result<Vec<_>>>()?;
     let scorer = leaves[must_indices[0]].scorer.clone();
     let mut overflow = false;
+    let mut comparisons = 0usize;
     let floor = Cell::new(collector.min_competitive_score());
-    iu_tight_search_multi(
+    let result = iu_tight_search_multi(
         documents,
         scorer.as_ref(),
         required,
         optional,
         &mut |key, score| {
+            comparisons += 1;
             let score = checked_score(score, "iu_tight kernel")?;
             if score < collector.min_competitive_score() {
                 return Ok(true);
@@ -4766,31 +4771,14 @@ where
             Ok(true)
         },
         || floor.get(),
-    )?;
+    );
+    metrics.record_comparisons(comparisons);
+    result?;
     Ok(if overflow {
         CollectionStatus::ScoreFloorOverflow
     } else {
         CollectionStatus::Complete
     })
-}
-
-fn iu_tight_leaves_ready(
-    leaves: &[LoadedLeaf],
-    must_index: usize,
-    should_indices: &[usize],
-) -> bool {
-    if must_index >= leaves.len() || should_indices.iter().any(|&index| index >= leaves.len()) {
-        return false;
-    }
-    std::iter::once(must_index)
-        .chain(should_indices.iter().copied())
-        .all(|index| {
-            let leaf = &leaves[index];
-            leaf.postings.len() == 1
-                && leaf.params.phrase_slop.is_none()
-                && !leaf.postings[0].has_grouped_terms()
-                && leaf.postings[0].is_compressed()
-        })
 }
 
 fn iu_tight_should_switch(
@@ -4812,6 +4800,7 @@ fn collect_iu_tight<D, K>(
     mut leaves: Vec<LoadedLeaf>,
     must_index: usize,
     should_indices: &[usize],
+    metrics: &dyn MetricsCollector,
     collector: &mut TopKCollector<K>,
     mut map_document: impl FnMut(u64) -> Result<K>,
 ) -> Result<CollectionStatus>
@@ -4824,7 +4813,7 @@ where
             .postings
             .drain(..)
             .next()
-            .ok_or_else(|| Error::internal("iu_tight_leaves_ready checked a single posting"))
+            .ok_or_else(|| Error::internal("iu_tight_clauses_ready checked a single posting"))
     };
     let must = take_posting(must_index)?;
     let shoulds = should_indices
@@ -4833,13 +4822,15 @@ where
         .collect::<Result<Vec<_>>>()?;
     let scorer = leaves[must_index].scorer.clone();
     let mut overflow = false;
+    let mut comparisons = 0usize;
     let floor = Cell::new(collector.min_competitive_score());
-    iu_tight_search(
+    let result = iu_tight_search(
         documents,
         scorer.as_ref(),
         must,
         shoulds,
         &mut |key, score| {
+            comparisons += 1;
             let score = checked_score(score, "iu_tight kernel")?;
             if score < collector.min_competitive_score() {
                 return Ok(true);
@@ -4856,7 +4847,9 @@ where
             Ok(true)
         },
         || floor.get(),
-    )?;
+    );
+    metrics.record_comparisons(comparisons);
+    result?;
     Ok(if overflow {
         CollectionStatus::ScoreFloorOverflow
     } else {
@@ -5281,8 +5274,10 @@ mod tests {
     use super::super::index::{PlainPostingList, PostingList};
     use super::super::scorer::Scorer;
     use super::super::wand::GroupedTermScorer;
+    use super::super::encoding::compress_posting_list;
+    use super::super::{CompressedPostingList, LEGACY_BLOCK_SIZE, PostingTailCodec};
     use super::*;
-    use crate::metrics::NoOpMetricsCollector;
+    use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::scalar::inverted::query::MultiMatchQuery;
 
     fn rows(values: &[(u64, f32)]) -> Vec<ScoredRow> {
@@ -8121,7 +8116,7 @@ mod tests {
     fn reqopt_fallback_enumerates_every_must_doc_for_counting() {
         // The COUNT path has no competitive floor: it relies on the IU fast
         // path and the ReqOptScorer fallback both enumerating every MUST
-        // document. Plain postings fail `iu_tight_leaves_ready` (not
+        // document. Plain postings fail `iu_tight_clauses_ready` (not
         // compressed), so this exercises the ReqOptScorer fallback; the
         // kernel side is pinned by
         // `iu_tight_search_sums_must_and_matching_shoulds` (floor = -inf).
@@ -8179,6 +8174,124 @@ mod tests {
         assert_eq!(
             seen, want,
             "a floor-less collection must enumerate every MUST document"
+        );
+    }
+
+    fn compressed_unit_posting(token: &str, doc_ids: Vec<u32>) -> PostingIterator {
+        let max_score = 1.0_f32;
+        let freqs = vec![1_u32; doc_ids.len()];
+        let block_max_scores = vec![max_score; doc_ids.len()];
+        let blocks = compress_posting_list(
+            doc_ids.len(),
+            doc_ids.iter(),
+            freqs.iter(),
+            block_max_scores.into_iter(),
+        )
+        .unwrap();
+        let num_docs = doc_ids.iter().copied().max().unwrap_or(0) as usize + 1;
+        PostingIterator::with_query_weight(
+            token.to_owned(),
+            0,
+            0,
+            1.0,
+            PostingList::Compressed(CompressedPostingList::new(
+                blocks,
+                max_score,
+                doc_ids.len() as u32,
+                PostingTailCodec::VarintDelta,
+                LEGACY_BLOCK_SIZE,
+                None,
+                None,
+            )),
+            num_docs,
+        )
+    }
+
+    #[test]
+    fn iu_tight_fast_paths_record_comparisons() {
+        // The IU fast paths bypass the scorer tree, so they must report their
+        // own comparison counts; a zero here means the metric was dropped.
+        let mut docs = DocSet::default();
+        for doc_id in 0..50_u64 {
+            docs.append(doc_id, 1);
+        }
+        let leaf_node = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+
+        // K=1: the dense MUST against two sparse SHOULDs clears the 3x gate.
+        let k1_plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0)],
+            should: vec![leaf_node(1)],
+            must_not: Vec::new(),
+        };
+        let k1_leaves = vec![
+            loaded_leaf(
+                vec![compressed_unit_posting("must", (0..50).collect())],
+                None,
+            ),
+            loaded_leaf(
+                vec![compressed_unit_posting("should", vec![3, 9])],
+                None,
+            ),
+        ];
+        let (k1_must, k1_should) = iu_tight_clause_indices(&k1_plan).expect("1+1 shape");
+        assert!(iu_tight_clauses_ready(&k1_leaves, &k1_must, &k1_should));
+
+        let metrics = LocalMetricsCollector::default();
+        let mut collector = TopKCollector::new(10);
+        let status = collect_partition_with_documents(
+            &docs,
+            k1_leaves,
+            &k1_plan,
+            &metrics,
+            &mut collector,
+            Ok,
+        )
+        .unwrap();
+        assert_eq!(status, CollectionStatus::Complete);
+        assert!(
+            metrics.comparisons.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "K=1 IU fast path must record comparisons"
+        );
+
+        // K>=2: two dense MUSTs plus a sparse SHOULD take the multi kernel.
+        let k2_plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0), leaf_node(1)],
+            should: vec![leaf_node(2)],
+            must_not: Vec::new(),
+        };
+        let k2_leaves = vec![
+            loaded_leaf(
+                vec![compressed_unit_posting("must_a", (0..50).collect())],
+                None,
+            ),
+            loaded_leaf(
+                vec![compressed_unit_posting("must_b", (0..50).step_by(2).collect())],
+                None,
+            ),
+            loaded_leaf(
+                vec![compressed_unit_posting("should", vec![3, 9])],
+                None,
+            ),
+        ];
+        let (k2_must, k2_should) = iu_tight_clause_indices(&k2_plan).expect("2+1 shape");
+        assert_eq!(k2_must.len(), 2);
+        assert!(iu_tight_clauses_ready(&k2_leaves, &k2_must, &k2_should));
+
+        let metrics = LocalMetricsCollector::default();
+        let mut collector = TopKCollector::new(10);
+        let status = collect_partition_with_documents(
+            &docs,
+            k2_leaves,
+            &k2_plan,
+            &metrics,
+            &mut collector,
+            Ok,
+        )
+        .unwrap();
+        assert_eq!(status, CollectionStatus::Complete);
+        assert!(
+            metrics.comparisons.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "K>=2 IU fast path must record comparisons"
         );
     }
 

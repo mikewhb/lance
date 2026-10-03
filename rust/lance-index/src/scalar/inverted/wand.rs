@@ -7757,6 +7757,53 @@ mod tests {
         }
     }
 
+    /// WandDocuments wrapper whose `document_key_for_doc_id` hides flagged
+    /// documents, mirroring visibility filtering on real partitions.
+    struct HiddenDocs<'a> {
+        inner: &'a DocSet,
+        hidden: Vec<bool>,
+    }
+
+    impl WandDocuments for HiddenDocs<'_> {
+        type Candidate = u64;
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn scoring_norms(&self) -> Option<&[u8]> {
+            self.inner.scoring_norms()
+        }
+
+        fn scoring_num_tokens(&self, doc_id: u32) -> u32 {
+            self.inner.scoring_num_tokens(doc_id)
+        }
+
+        fn doc_length(&self, doc: &DocInfo) -> u32 {
+            self.inner.scoring_num_tokens(doc.doc_id() as u32)
+        }
+
+        fn document_key(&self, doc: &DocInfo) -> Option<u64> {
+            self.document_key_for_doc_id(doc.doc_id() as u32)
+        }
+
+        fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+            (!self.hidden[doc_id as usize]).then_some(u64::from(doc_id))
+        }
+
+        fn candidate_from_key(&self, key: u64) -> Self::Candidate {
+            key
+        }
+
+        fn flat_documents(&self) -> Option<FlatDocuments<'_>> {
+            None
+        }
+
+        fn flat_doc_length(&self, doc_id: u64, _key: u64, _compressed: bool) -> u32 {
+            self.inner.scoring_num_tokens(doc_id as u32)
+        }
+    }
+
     fn iu_tight_posting(
         token: &str,
         doc_ids: Vec<u32>,
@@ -7841,51 +7888,6 @@ mod tests {
 
     #[test]
     fn iu_tight_search_skips_documents_hidden_by_visibility() {
-        struct HiddenDocs<'a> {
-            inner: &'a DocSet,
-            hidden: Vec<bool>,
-        }
-
-        impl WandDocuments for HiddenDocs<'_> {
-            type Candidate = u64;
-
-            fn len(&self) -> usize {
-                self.inner.len()
-            }
-
-            fn scoring_norms(&self) -> Option<&[u8]> {
-                self.inner.scoring_norms()
-            }
-
-            fn scoring_num_tokens(&self, doc_id: u32) -> u32 {
-                self.inner.scoring_num_tokens(doc_id)
-            }
-
-            fn doc_length(&self, doc: &DocInfo) -> u32 {
-                self.inner.scoring_num_tokens(doc.doc_id() as u32)
-            }
-
-            fn document_key(&self, doc: &DocInfo) -> Option<u64> {
-                self.document_key_for_doc_id(doc.doc_id() as u32)
-            }
-
-            fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
-                (!self.hidden[doc_id as usize]).then_some(u64::from(doc_id))
-            }
-
-            fn candidate_from_key(&self, key: u64) -> Self::Candidate {
-                key
-            }
-
-            fn flat_documents(&self) -> Option<FlatDocuments<'_>> {
-                None
-            }
-
-            fn flat_doc_length(&self, doc_id: u64, _key: u64, _compressed: bool) -> u32 {
-                self.inner.scoring_num_tokens(doc_id as u32)
-            }
-        }
-
         let mut docs = DocSet::default();
         for doc_id in 0..8_u64 {
             docs.append(doc_id, 1);
@@ -7912,6 +7914,131 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hits, vec![(0, 1.0), (4, 1.0), (6, 11.0)]);
+    }
+
+    #[test]
+    fn iu_tight_search_multi_sums_required_and_matching_shoulds() {
+        let mut docs = DocSet::default();
+        for doc_id in 0..8_u64 {
+            docs.append(doc_id, 1);
+        }
+        let must_a = iu_tight_posting("must_a", vec![2, 4, 6], 1.0, true);
+        let must_b = iu_tight_posting("must_b", vec![2, 4, 6], 2.0, true);
+        let should = iu_tight_posting("should", vec![4, 6, 7], 10.0, true);
+        let mut hits = Vec::new();
+        iu_tight::iu_tight_search_multi(
+            &docs,
+            &IuTightUnitScorer,
+            vec![must_a, must_b],
+            vec![should],
+            &mut |key, score| {
+                hits.push((key, score));
+                Ok(true)
+            },
+            || f32::NEG_INFINITY,
+        )
+        .unwrap();
+        assert_eq!(hits, vec![(2, 3.0), (4, 13.0), (6, 13.0)]);
+    }
+
+    #[test]
+    fn iu_tight_search_multi_skips_documents_hidden_by_visibility() {
+        // Document 4 is deleted. The K>=2 kernel must skip it on the
+        // document_key_for_doc_id probe instead of panicking: postings keep
+        // deleted rows until compaction, so an aligned required cursor does
+        // not imply a visible document.
+        let mut docs = DocSet::default();
+        for doc_id in 0..8_u64 {
+            docs.append(doc_id, 1);
+        }
+        let hidden = HiddenDocs {
+            inner: &docs,
+            hidden: vec![false, false, false, false, true, false, false, false],
+        };
+        let must_a = iu_tight_posting("must_a", vec![2, 4, 6], 1.0, true);
+        let must_b = iu_tight_posting("must_b", vec![2, 4, 6], 2.0, true);
+        let should = iu_tight_posting("should", vec![4, 6, 7], 10.0, true);
+        let mut hits = Vec::new();
+        iu_tight::iu_tight_search_multi(
+            &hidden,
+            &IuTightUnitScorer,
+            vec![must_a, must_b],
+            vec![should],
+            &mut |key, score| {
+                hits.push((key, score));
+                Ok(true)
+            },
+            || f32::NEG_INFINITY,
+        )
+        .unwrap();
+        assert_eq!(hits, vec![(2, 3.0), (6, 13.0)]);
+    }
+
+    #[test]
+    fn iu_tight_search_multi_prunes_with_floor_and_keeps_exact_floor_hits() {
+        // Required sum is 3.0 for every candidate and the optional ub is 10.
+        // A floor of 13 prunes nothing (13 < 13 is false), so every candidate
+        // — including the one scoring exactly at the floor — reaches on_hit.
+        // A floor of 14 prunes every candidate before any optional probe.
+        // The kernel itself never filters hits: dropping sub-floor scores is
+        // the collector's job, pruning only skips probes that cannot compete.
+        let build = || {
+            (
+                iu_tight_posting("must_a", vec![2, 4, 6], 1.0, true),
+                iu_tight_posting("must_b", vec![2, 4, 6], 2.0, true),
+                iu_tight_posting("should", vec![4, 6, 7], 10.0, true),
+            )
+        };
+        let run = |floor: f32| {
+            let mut docs = DocSet::default();
+            for doc_id in 0..8_u64 {
+                docs.append(doc_id, 1);
+            }
+            let (must_a, must_b, should) = build();
+            let mut hits = Vec::new();
+            iu_tight::iu_tight_search_multi(
+                &docs,
+                &IuTightUnitScorer,
+                vec![must_a, must_b],
+                vec![should],
+                &mut |key, score| {
+                    hits.push((key, score));
+                    Ok(true)
+                },
+                || floor,
+            )
+            .unwrap();
+            hits
+        };
+        assert_eq!(run(13.0), vec![(2, 3.0), (4, 13.0), (6, 13.0)]);
+        assert_eq!(run(14.0), Vec::<(u64, f32)>::new());
+    }
+
+    #[test]
+    fn iu_tight_search_multi_enumerates_every_required_doc_for_counting() {
+        // COUNT mode pins the floor at zero: pruning must stay silent so the
+        // kernel enumerates every aligned required document.
+        let mut docs = DocSet::default();
+        for doc_id in 0..8_u64 {
+            docs.append(doc_id, 1);
+        }
+        let must_a = iu_tight_posting("must_a", vec![0, 2, 4, 6], 1.0, true);
+        let must_b = iu_tight_posting("must_b", vec![0, 3, 6], 1.0, true);
+        let should = iu_tight_posting("should", vec![1], 1.0, true);
+        let mut hits = Vec::new();
+        iu_tight::iu_tight_search_multi(
+            &docs,
+            &IuTightUnitScorer,
+            vec![must_a, must_b],
+            vec![should],
+            &mut |key, score| {
+                hits.push((key, score));
+                Ok(true)
+            },
+            || 0.0,
+        )
+        .unwrap();
+        assert_eq!(hits, vec![(0, 2.0), (6, 2.0)]);
     }
 
     #[test]
