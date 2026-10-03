@@ -8010,6 +8010,68 @@ mod tests {
     }
 
     #[test]
+    fn reqopt_fallback_enumerates_every_must_doc_for_counting() {
+        // The COUNT path has no competitive floor: it relies on the IU fast
+        // path and the ReqOptScorer fallback both enumerating every MUST
+        // document. Plain postings fail `iu_tight_leaves_ready` (not
+        // compressed), so this exercises the ReqOptScorer fallback; the
+        // kernel side is pinned by
+        // `iu_tight_search_sums_must_and_matching_shoulds` (floor = -inf).
+        let mut docs = DocSet::default();
+        for doc_id in 0..50_u64 {
+            docs.append(doc_id, 1);
+        }
+        let must_docs: Vec<u64> = (0..50).step_by(2).collect();
+        let should_docs: Vec<u64> = (0..50).step_by(3).collect();
+
+        let leaf_node = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0)],
+            should: vec![leaf_node(1)],
+            must_not: Vec::new(),
+        };
+
+        let build_leaves = || {
+            vec![
+                loaded_leaf(vec![plain_unit_posting("must", must_docs.clone())], None),
+                loaded_leaf(
+                    vec![plain_unit_posting("should", should_docs.clone())],
+                    None,
+                ),
+            ]
+        };
+
+        let leaves = build_leaves();
+        assert!(iu_tight_leaf_indices(&plan) == Some((0, vec![1])));
+        assert!(
+            !iu_tight_leaves_ready(&leaves, 0, &[1]),
+            "plain postings must route to the ReqOptScorer fallback"
+        );
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut collector = TopKCollector::new(10_000);
+        let status = collect_partition_with_documents(
+            &docs,
+            build_leaves(),
+            &plan,
+            &NoOpMetricsCollector,
+            &mut collector,
+            |key| {
+                seen.insert(key);
+                Ok(key)
+            },
+        )
+        .unwrap();
+        assert_eq!(status, CollectionStatus::Complete);
+
+        let want: std::collections::BTreeSet<u64> = must_docs.iter().copied().collect();
+        assert_eq!(
+            seen, want,
+            "a floor-less collection must enumerate every MUST document"
+        );
+    }
+
+    #[test]
     fn box_leaf_scorer_keeps_wand_cursor_for_phrase_grouped_and_multi_term() {
         let documents = DocSet::default();
         let metrics = NoOpMetricsCollector;

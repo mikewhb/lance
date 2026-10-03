@@ -203,15 +203,25 @@ iter_term_freqs()                     ×3      约 150–180 行 → 可提 1 �
 
 ---
 
-## 7. 建议执行顺序
+## 7. 决议（2026-10-03，经两轮独立 agent 质证后定稿）
 
-1. **push 现有 7 个提交**（`88933c0dc`/`c68f74947` iu-tight 内核与换叶、`9ecec3ebe` ReqOpt 提升交集、
-   `d59b55d86` 3 子句 cost-skew lead-stream、`af87363a4` 契约文档、`7001f0c26` C2 窗口批量解码、
-   `a20371e4b` 去重），走社区 PR 流程。
-2. **(a) 提升后交 AND 内核**：独立 PR，直接打剩余 4 条 >2x 查询；943 门禁 + IU 40q + 全量 A/B。
-3. **框架化收敛 PR**：提公共 emit-tail helper（机械、安全）→ `promoted` 并入 lead-stream →
-   门控合一成策略函数。预计 −300~350 行，不碰 4 个特化内层循环。
-4. (b)(c)(d) 作为收尾清理。
+| 项 | 决议 | 依据 |
+|---|---|---|
+| push IU PR(`fts/iu-reuse-main`,7 提交) | 按指示**暂不 push**,仅本地保留 | 用户指令 |
+| K≥2+N 泛化 | **搁置**,等真实负载证明需要再做;方案已定型(option c:
+  `iu_tight_leaf_indices` 放宽到 `must.len()>=1` + 内核扩展 K 个 MUST 求交,~100 行,不碰 trait) | 943 基准里 K≥2+N 查询为零;
+  Lance 真实过滤模式是 RowAddrMask 预过滤,不走 MUST 子句 |
+| ReqOptScorer 提速改造 | **不做** | BoxScorer 无块解码接口,三条替代路线均侵入
+  (下转逃生口/17 个实现方全改/构造点路由);
+  且即使做了内核仍领先(预解码窗口+归并 vs 逐候选虚调用) |
+| 统一内层循环 | **不做** | 实测收益(−85.3%)全部来自特化 |
+| emit-tail 提 helper | **降级、暂不做**:重新量后真正逐位相同的只有
+  `insert+kth+update_threshold`(~6 行 ×6 处 ≈30 行),score 计算各不相同;churn 不值得 | — |
+| count-mode 合并期义务 | **已钉死**:floor=−inf 时内核与 ReqOpt 路径都必须枚举全部 MUST doc
+  (count 正确性不变量),测试已加在 `fts/iu-reuse-main` | 唯一发现的合并期义务 |
+
+已推送:`fts/reqopt-window-leftovers` @ `a20371e4b`(含 skew,供 9175 参考)。
+本地保留:`fts/iu-reuse-main`(社区 main + IU,7 提交),未推送。
 
 ---
 
