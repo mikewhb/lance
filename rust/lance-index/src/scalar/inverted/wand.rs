@@ -2522,6 +2522,11 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Exact query-order score computed while progressively confirming a
     // conjunction candidate. This is valid only for `and_last_doc`.
     and_candidate_score: Option<f32>,
+    // Document length of the last conjunction candidate, read while the
+    // candidate was already materialized inside the conjunction loop. The
+    // scoring loop would otherwise pay a second lookup for the same doc.
+    // Valid only for `and_last_doc`.
+    and_candidate_doc_length: Option<u32>,
     // Prototype (array-backed lead): for skewed conjunctions the lead clause's
     // current block is copied into `lead_docs`/`lead_freqs` once per window and
     // walked by index, so moving the lead to its next candidate costs an index
@@ -2663,6 +2668,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             and_max_score: f32::INFINITY,
             and_last_doc: None,
             and_candidate_score: None,
+            and_candidate_doc_length: None,
             and_lead_arrayed: false,
             lead_docs: Vec::new(),
             lead_freqs: Vec::new(),
@@ -2879,8 +2885,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 continue;
             };
 
-            let doc_length = self.documents.doc_length(&doc);
-
+            // Conjunction candidates already materialized their document
+            // length inside the candidate loop; reuse it instead of paying a
+            // second lookup for the same doc.
+            let doc_length = self
+                .and_candidate_doc_length
+                .take()
+                .unwrap_or_else(|| self.documents.doc_length(&doc));
             let score = if self.operator == Operator::Or {
                 self.advance_all_tail(doc.doc_id(), None, None);
                 if let Some(slop) = params.phrase_slop {
@@ -4054,13 +4065,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             return self.next_and_candidate_arrayed();
         }
         self.and_candidate_score = None;
+        self.and_candidate_doc_length = None;
         if self.lead.len() < self.num_terms {
             return None;
         }
         // Three-clause conjunctions now reach this loop too (see the routing in
         // `search`), so they get the in-block SIMD search as well. The flag only
         // selects how a block is searched, never which documents match.
-        let is_vectorized_search_enabled = matches!(self.lead.len(), 3 | 4 | 5);
+        let is_vectorized_search_enabled = matches!(self.lead.len(), 3..=5);
         if let Some(last_doc) = self.and_last_doc
             && self
                 .lead
@@ -4193,6 +4205,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 self.and_candidate_score =
                     Some(score_contributions_in_query_order(score_contributions));
             }
+            self.and_candidate_doc_length = Some(doc_length);
             self.and_last_doc = Some(doc);
             return Some(lead_doc);
         }
@@ -4207,10 +4220,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     /// prototype exists to measure what the array alone buys.
     fn next_and_candidate_arrayed(&mut self) -> Option<DocInfo> {
         self.and_candidate_score = None;
+        self.and_candidate_doc_length = None;
         if self.lead.len() < self.num_terms {
             return None;
         }
-        let is_vectorized_search_enabled = matches!(self.lead.len(), 3 | 4 | 5);
+        let is_vectorized_search_enabled = matches!(self.lead.len(), 3..=5);
 
         'advance_head: loop {
             while self.lead_pos >= self.lead_docs.len() {
@@ -4255,6 +4269,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
             self.lead_pos += 1;
             self.and_last_doc = None;
+            self.and_candidate_doc_length = Some(doc_length);
             return Some(lead_doc);
         }
     }
