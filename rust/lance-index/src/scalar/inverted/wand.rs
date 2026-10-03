@@ -1,9 +1,49 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+/// Measurement-only counters for the `next_doc_id` sequential fast path.
+/// `CHECKS` counts every fast-path entry, `HITS` counts entries answered by
+/// the two-load fast path, and `COLD_MISSES` counts entries where the current
+/// block was NOT yet decoded and the fast check still failed -- those pay a
+/// block decode that a peek-before-check variant could avoid.
+/// TEMPORARY probe; reverted together with the probe commit.
+static FASTPATH_CHECKS: AtomicU64 = AtomicU64::new(0);
+static FASTPATH_HITS: AtomicU64 = AtomicU64::new(0);
+static FASTPATH_COLD_MISSES: AtomicU64 = AtomicU64::new(0);
+
+#[doc(hidden)]
+pub fn probe_fastpath_stats() -> (u64, u64, u64) {
+    (
+        FASTPATH_CHECKS.load(Ordering::Relaxed),
+        FASTPATH_HITS.load(Ordering::Relaxed),
+        FASTPATH_COLD_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+/// Measurement-only counters for the array lead's window-level wide-bound
+/// check in `open_lead_array`: `WINDOWS` counts threshold-guarded window
+/// opens, `SKIPS` counts windows dismissed by the wide-bound prune.
+/// TEMPORARY probe; reverted together with the probe commit.
+static WB_WINDOWS: AtomicU64 = AtomicU64::new(0);
+static WB_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+#[doc(hidden)]
+pub fn probe_window_stats() -> (u64, u64) {
+    (
+        WB_WINDOWS.load(Ordering::Relaxed),
+        WB_SKIPS.load(Ordering::Relaxed),
+    )
+}
+
+#[doc(hidden)]
+pub fn probe_window_reset() {
+    WB_WINDOWS.store(0, Ordering::Relaxed);
+    WB_SKIPS.store(0, Ordering::Relaxed);
+}
+
 #[cfg(test)]
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::{
     cell::{OnceCell, RefCell, UnsafeCell},
@@ -269,6 +309,10 @@ impl CompetitiveFloorMode {
 // test a window. Measured on the SBG corpus this decision is worth ~13% of
 // aggregate top-10 latency over the 30 three-clause queries it moves.
 const AND_SKEW_RATIO: usize = 32;
+
+/// Quiet period, in windows, between wide-bound re-probes of the array lead
+/// after a check that did not skip. See the `wb_windows_since_check` field.
+const WB_REPROBE_INTERVAL: u32 = 32;
 
 /// True when the conjunction's rarest and densest clauses differ by at least
 /// `AND_SKEW_RATIO`. `lead` is sorted by cost, so the ends are the extremes.
@@ -1477,11 +1521,20 @@ impl PostingIterator {
                 // pins the answer to `offset + 1`.
                 let cur_block = self.index >> shift;
                 let cur_offset = self.index & list.block_mask();
+                // Probe counters (measurement-only, see `probe_fastpath_stats`).
+                let cached = unsafe { &*self.compressed_state_ptr() };
+                let was_cold = cached.block_idx != cur_block || cached.doc_ids.is_empty();
+                FASTPATH_CHECKS.fetch_add(1, Ordering::Relaxed);
                 let fast = unsafe { &mut *self.ensure_compressed_doc_ids_ptr(list, cur_block) };
-                if cur_offset + 1 < fast.doc_ids.len()
+                let fast_hit = cur_offset + 1 < fast.doc_ids.len()
                     && fast.doc_ids[cur_offset] < least_id
-                    && fast.doc_ids[cur_offset + 1] >= least_id
-                {
+                    && fast.doc_ids[cur_offset + 1] >= least_id;
+                if fast_hit {
+                    FASTPATH_HITS.fetch_add(1, Ordering::Relaxed);
+                } else if was_cold {
+                    FASTPATH_COLD_MISSES.fetch_add(1, Ordering::Relaxed);
+                }
+                if fast_hit {
                     self.index = (cur_block << shift) + cur_offset + 1;
                     self.block_idx = cur_block;
                     let frequency = if fast.frequency_block_idx == Some(cur_block) {
@@ -2539,6 +2592,13 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     lead_first_index: usize,
     lead_window_end: u64,
     lead_next_target: u64,
+    // Adaptive gate for the window-level wide-bound check below. Measured
+    // skip rates are bimodal: a few queries skip 67-78% of their windows,
+    // almost all others skip none. Checking stays hot right after a skip and
+    // re-probes every `WB_REPROBE_INTERVAL` windows otherwise, so zero-skip
+    // queries pay ~1/K of the check cost while skip-heavy queries keep it.
+    wb_windows_since_check: u32,
+    wb_last_check_skipped: bool,
     // Score-first conjunction pruning is restricted to the current impact
     // format and scorers that expose the BM25 denominator contract.
     score_first_and_enabled: bool,
@@ -2676,6 +2736,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             lead_first_index: 0,
             lead_window_end: 0,
             lead_next_target: 0,
+            wb_windows_since_check: WB_REPROBE_INTERVAL,
+            wb_last_check_skipped: false,
             score_first_and_enabled,
             #[cfg(test)]
             disable_score_first_and: false,
@@ -4293,6 +4355,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let win_end = Self::posting_block_up_to(&self.lead[0], target);
 
             if self.threshold > 0.0 {
+                WB_WINDOWS.fetch_add(1, Ordering::Relaxed);
                 for posting in &mut self.lead {
                     posting.shallow_next(target);
                 }
@@ -4302,6 +4365,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         .score
                 }));
                 if wide_max < self.threshold {
+                    WB_SKIPS.fetch_add(1, Ordering::Relaxed);
                     if win_end == TERMINATED_DOC_ID {
                         return false;
                     }

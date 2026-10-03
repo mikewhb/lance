@@ -15,7 +15,8 @@ pub mod parser;
 pub mod query;
 mod scorer;
 pub mod tokenizer;
-mod wand;
+// TEMPORARY probe visibility; reverted together with the probe commit.
+pub mod wand;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
