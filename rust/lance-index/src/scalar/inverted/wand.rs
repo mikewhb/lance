@@ -1555,6 +1555,57 @@ impl PostingIterator {
         }
     }
 
+    /// Resolve a seek to `least_id` when the already-decoded block brackets
+    /// the target: search that block directly and skip block navigation
+    /// entirely. Never decodes on its own; returns false when the cached
+    /// block cannot answer (target beyond the block, cache miss, or Plain
+    /// list), leaving the caller to run the full seek. Cursor state updates
+    /// mirror `next_doc_id`'s general path.
+    fn seek_within_cached_block(
+        &mut self,
+        least_id: u64,
+        is_vectorized_search_enabled: bool,
+    ) -> bool {
+        match self.list {
+            PostingList::Compressed(ref list) => {
+                debug_assert!(least_id <= u32::MAX as u64);
+                let least_id = least_id as u32;
+                let shift = list.block_shift();
+                let target_block = (least_id as usize) >> shift;
+                let cur_block = self.index >> shift;
+                if target_block != cur_block {
+                    return false;
+                }
+                let cached = unsafe { &*self.compressed_state_ptr() };
+                if cached.block_idx != cur_block || cached.doc_ids.is_empty() {
+                    return false;
+                }
+                let offset = self.index & list.block_mask();
+                let new_offset = if is_vectorized_search_enabled {
+                    find_next_geq_in_block(&cached.doc_ids, offset, least_id)
+                } else {
+                    offset + cached.doc_ids[offset..].partition_point(|&doc_id| doc_id < least_id)
+                };
+                if new_offset >= cached.doc_ids.len() {
+                    return false;
+                }
+                self.index = (cur_block << shift) + new_offset;
+                self.block_idx = cur_block;
+                let frequency = if cached.frequency_block_idx == Some(cur_block) {
+                    cached.freqs[new_offset]
+                } else {
+                    0
+                };
+                self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                    doc_id: cached.doc_ids[new_offset],
+                    frequency,
+                }));
+                true
+            }
+            PostingList::Plain(_) => false,
+        }
+    }
+
     fn shallow_next(&mut self, least_id: u64) {
         match self.list {
             PostingList::Compressed(ref list) => {
@@ -4273,7 +4324,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     .current_doc_id()
                     .is_none_or(|cur| cur < u64::from(doc))
                 {
-                    posting.next_doc_id(u64::from(doc), is_vectorized_search_enabled);
+                    // Fast in-block seek: when the follower's already-decoded
+                    // block contains the candidate, resolve it directly and
+                    // skip block navigation. Full seek on a miss (target
+                    // beyond the block or cache miss).
+                    if !posting
+                        .seek_within_cached_block(u64::from(doc), is_vectorized_search_enabled)
+                    {
+                        posting.next_doc_id(u64::from(doc), is_vectorized_search_enabled);
+                    }
                 }
                 match posting.current_doc_id() {
                     None => return None,
