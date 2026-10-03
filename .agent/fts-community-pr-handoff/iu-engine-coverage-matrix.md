@@ -165,8 +165,20 @@ MUST 侧合成一个 scorer:
 (`take_docs_one_block_upto` 解码必需侧、`merge` 归并 optional)。
 原语全部现成;与方案 (a)(提升后交 AND 内核)二选一或互补。
 
-**路线 2(特化式,量大)**:给 `K≥2+N` 写专门的内核。仅在路线 1 实测
-仍不够快时考虑。
+**路线 2(特化式)——已实现并实测(2026-10-03)**:
+`iu_tight_search_multi`(wand_iu_tight.rs):K 个必需子句按 cost 升序、最稀有者驱动,
+seek-to-max 对齐全部必需游标,逐候选探测 N 个 optional 并按 plan 序加总
+(与 RequiredConjunctionScorer + DisjunctionScorer 的加总顺序一致,f32 位一致)。
+路由:`iu_tight_clause_indices` 接受 K≥1(替换 `iu_tight_leaf_indices`),
+K=1 走原内核(带 promotion),K≥2 走 multi 内核。
+
+实测(合成 2-MUST+1-SHOULD 查询 12 条,min-of-45,3 轮交错,对社区 main):
+- **−82.4%**(74934 → 13190µs),**12/12 全部改善 >5%**(−54.7% ~ −84.7%),0 回归;
+- 943/943 dump 位一致;936 测试通过;clippy 干净;
+- 合成查询的 dump 与 main 逐字节一致(12/12)。
+
+**结论:矩阵已无洞。** K=1+N 由原内核覆盖,K≥2+N 由 multi 内核覆盖,
+纯 AND/OR 由 main 已有引擎覆盖。
 
 **同时**:窗口批量解码(C2)可用基线 `merge_optional_freqs` 的 Compressed 路径
 替换(见 `iu-framework-simplification.md` §4(d)),进一步减自研代码。
