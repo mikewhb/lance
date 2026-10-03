@@ -172,6 +172,86 @@ where
     Ok(())
 }
 
+/// IU kernel for K >= 2 required clauses plus N optional clauses.
+///
+/// Every required clause must hit the document; the optional clauses are
+/// probed per candidate and summed. The classic seek-to-max convergence
+/// aligns all required cursors on one document, then the optional clauses are
+/// probed. No optional-to-required promotion: the required set is fixed.
+pub fn iu_tight_search_multi<D, S>(
+    documents: &D,
+    scorer: &S,
+    mut required: Vec<PostingIterator>,
+    mut optional: Vec<PostingIterator>,
+    on_hit: &mut dyn FnMut(u64, f32) -> Result<bool>,
+    floor: impl Fn() -> f32,
+) -> Result<()>
+where
+    D: WandDocuments,
+    S: Scorer,
+{
+    debug_assert!(required.len() >= 2);
+    let scoring = IuTightScoring { documents, scorer };
+    let optional_ub_sum = if optional.is_empty() {
+        0.0
+    } else {
+        conservative_score_sum(
+            optional
+                .iter()
+                .map(|posting| posting.global_upper_bound(scorer)),
+        )
+    };
+
+    // Align every required cursor on one document: seek-to-max until they
+    // agree. A required list running out empties the intersection.
+    let mut candidate = 0_u64;
+    'search: loop {
+        let mut max_doc = candidate;
+        for posting in required.iter_mut() {
+            if posting.doc().is_none_or(|cur| cur.doc_id() < candidate) {
+                posting.next(candidate);
+            }
+            let Some(cur) = posting.doc() else {
+                return Ok(());
+            };
+            max_doc = max_doc.max(cur.doc_id());
+        }
+        if max_doc > candidate {
+            candidate = max_doc;
+            continue;
+        }
+
+        // All required cursors sit on `candidate`. Score in plan order —
+        // required clauses first, then the matching optional clauses — the
+        // same accumulation order as RequiredConjunctionScorer plus
+        // DisjunctionScorer inside ReqOptScorer, so the f32 result is
+        // bit-identical to the generic path.
+        let mut required_sum = 0.0_f32;
+        for posting in required.iter() {
+            let cur = posting.doc().expect("aligned above");
+            required_sum += scoring.term_score(posting, candidate, cur.frequency());
+        }
+        let mut optional_sum = 0.0_f32;
+        for posting in optional.iter_mut() {
+            if posting.doc().is_none_or(|cur| cur.doc_id() < candidate) {
+                posting.next(candidate);
+            }
+            if let Some(cur) = posting.doc()
+                && cur.doc_id() == candidate
+            {
+                optional_sum += scoring.term_score(posting, candidate, cur.frequency());
+            }
+        }
+        let key = documents
+            .document_key_for_doc_id(candidate as u32)
+            .expect("aligned required cursors name a real document");
+        if !on_hit(key, required_sum + optional_sum)? {
+            return Ok(());
+        }
+        candidate += 1;
+    }
+}
+
 /// SHOULD indices that are each individually required once MUST-only scores
 /// can no longer reach `floor`. `Some(empty)` means even MUST plus every
 /// SHOULD clause cannot compete. `None` means keep walking MUST.
