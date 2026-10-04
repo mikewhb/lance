@@ -32,8 +32,8 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        TermLeafScorer, WandCursor, WandDocuments, iu_tight_lead_is_cheaper, iu_tight_search,
-        iu_tight_search_multi, score_sum_upper_bound_factor,
+        TermLeafScorer, WandCursor, WandDocuments, iu_tight_enabled, iu_tight_lead_is_cheaper,
+        iu_tight_search, iu_tight_search_multi, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -4604,7 +4604,15 @@ where
     D: WandDocuments + Sync,
     K: Copy + Ord,
 {
-    if let Some((must_indices, should_indices)) = iu_tight_clause_indices(plan)
+    // The IU fast paths replace the generic scorer tree for the "K required
+    // + N optional" shapes over plain single-posting leaves. `LANCE_FTS_IU_TIGHT`
+    // gates them for A/B and rollout. Known imbalance: when every required
+    // list is dense while an optional list is rare, the optional clause's
+    // large upper bound keeps the multi kernel's floor prune inert and the
+    // generic path's block-max window skipping can win; an optional-driven
+    // intersection is the planned fix, the env switch is the escape hatch.
+    if iu_tight_enabled()
+        && let Some((must_indices, should_indices)) = iu_tight_clause_indices(plan)
         && iu_tight_clauses_ready(&leaves, &must_indices, &should_indices)
     {
         if must_indices.len() == 1
@@ -4621,10 +4629,10 @@ where
             );
         }
         if must_indices.len() >= 2 {
-            // Exploration: the mixed "K required + N optional" shape has no
-            // dedicated engine on main (it falls back to the generic
-            // ReqOptScorer path); the generalized kernel intersects the
-            // required clauses and sums the optional matches.
+            // The mixed "K required + N optional" shape has no dedicated
+            // engine on main (it falls back to the generic ReqOptScorer
+            // path); the generalized kernel intersects the required clauses
+            // and sums the optional matches.
             return collect_iu_tight_multi(
                 documents,
                 leaves,
@@ -4746,6 +4754,9 @@ where
         .collect::<Result<Vec<_>>>()?;
     let scorer = leaves[must_indices[0]].scorer.clone();
     let mut overflow = false;
+    // Counted here: candidates scored (on_hit calls). WandCursor's
+    // num_comparisons counts heap advances instead, so the two metrics use
+    // different units and must not be compared directly.
     let mut comparisons = 0usize;
     let floor = Cell::new(collector.min_competitive_score());
     let result = iu_tight_search_multi(
@@ -4822,6 +4833,9 @@ where
         .collect::<Result<Vec<_>>>()?;
     let scorer = leaves[must_index].scorer.clone();
     let mut overflow = false;
+    // Counted here: candidates scored (on_hit calls). WandCursor's
+    // num_comparisons counts heap advances instead, so the two metrics use
+    // different units and must not be compared directly.
     let mut comparisons = 0usize;
     let floor = Cell::new(collector.min_competitive_score());
     let result = iu_tight_search(

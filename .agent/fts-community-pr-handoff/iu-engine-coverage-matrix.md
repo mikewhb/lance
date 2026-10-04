@@ -28,7 +28,7 @@
 
 ---
 
-## 2. wand_iu_tight.rs(362 行)在做什么
+## 2. wand_iu_tight.rs(490 行,含测试与门控)在做什么
 
 它服务 `K=1, N≥1` 这个格子,主循环四步:
 
@@ -174,11 +174,21 @@ K=1 走原内核(带 promotion),K≥2 走 multi 内核。
 
 实测(合成 2-MUST+1-SHOULD 查询 12 条,min-of-45,3 轮交错,对社区 main):
 - **−82.4%**(74934 → 13190µs),**12/12 全部改善 >5%**(−54.7% ~ −84.7%),0 回归;
-- 943/943 dump 位一致;936 测试通过;clippy 干净;
-- 合成查询的 dump 与 main 逐字节一致(12/12)。
+- 943/943 dump 位一致;合成查询的 dump 与 main 逐字节一致(12/12)。
+- 上列数字测于 multi 内核加 floor 剪枝之前(8c4dd53a7);56facbd68 起 multi
+  带 per-candidate floor 剪枝与 metrics,**合入前需重跑 943 与合成套件**
+  (剪枝只减工作,预期持平或略好)。
 
 **结论:矩阵已无洞。** K=1+N 由原内核覆盖,K≥2+N 由 multi 内核覆盖,
 纯 AND/OR 由 main 已有引擎覆盖。
+
+**门控与已知不平衡(56facbd68 后)**:
+- 两条 IU 快路挂 `LANCE_FTS_IU_TIGHT`(auto/on/off,默认 auto,惯例同
+  `LANCE_FTS_BULK_AND`),作为 A/B 与灰度开关。
+- 已知慢速场景:required 全稠密 × optional 稀有时,巨大 optional ub 令
+  multi 的 floor 剪枝失效,通用路径的块级窗跳可能反超。后续修法是
+  optional 驱动的交集(multi 版 promotion)或 required 侧块级 ub;
+  off 开关是当前的逃生门。
 
 **同时**:窗口批量解码(C2)可用基线 `merge_optional_freqs` 的 Compressed 路径
 替换(见 `iu-framework-simplification.md` §4(d)),进一步减自研代码。

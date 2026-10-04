@@ -31,7 +31,9 @@ mod maxscore;
 #[path = "wand_term_leaf.rs"]
 mod term_leaf;
 
-pub(super) use iu_tight::{iu_tight_lead_is_cheaper, iu_tight_search, iu_tight_search_multi};
+pub(super) use iu_tight::{
+    iu_tight_enabled, iu_tight_lead_is_cheaper, iu_tight_search, iu_tight_search_multi,
+};
 pub(super) use term_leaf::TermLeafScorer;
 
 use super::{

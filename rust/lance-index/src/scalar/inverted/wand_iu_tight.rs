@@ -12,7 +12,37 @@
 use lance_core::Result;
 
 use super::super::scorer::Scorer;
-use super::{PostingIterator, TERMINATED_DOC_ID, WandDocuments, conservative_score_sum};
+use super::{BulkAndMode, PostingIterator, TERMINATED_DOC_ID, WandDocuments, conservative_score_sum};
+
+/// Env gate for the IU fast paths, following the `LANCE_FTS_BULK_AND`
+/// convention: `auto` (default) enables both kernels, `on`/`1` forces them
+/// on, `off`/`0` routes every IU-shaped Boolean back to the generic scorer
+/// tree. This is the A/B and rollout switch; it does not change results,
+/// only which engine computes them.
+static IU_TIGHT_MODE: std::sync::LazyLock<BulkAndMode> = std::sync::LazyLock::new(|| {
+    match std::env::var("LANCE_FTS_IU_TIGHT") {
+        Ok(value) => BulkAndMode::parse(&value).unwrap_or_else(|| {
+            log::warn!(
+                "Invalid LANCE_FTS_IU_TIGHT value {value:?}; expected auto, on/1, or off/0; \
+                 falling back to auto"
+            );
+            BulkAndMode::Auto
+        }),
+        Err(std::env::VarError::NotPresent) => BulkAndMode::Auto,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            log::warn!(
+                "Invalid non-Unicode LANCE_FTS_IU_TIGHT value {value:?}; expected auto, on/1, \
+                 or off/0; falling back to auto"
+            );
+            BulkAndMode::Auto
+        }
+    }
+});
+
+/// Whether the IU fast paths may run in this process.
+pub fn iu_tight_enabled() -> bool {
+    *IU_TIGHT_MODE != BulkAndMode::Off
+}
 
 /// The SHOULD/MUST bounds below are widened by `conservative_score_sum` so f32
 /// rounding cannot shrink them below the true total and trigger premature IU
@@ -108,7 +138,8 @@ where
         // Merge each SHOULD buffer against the MUST candidates once: both sides
         // are ascending, so a linear walk replaces a per-candidate binary
         // search that misses cache on every probe. Accumulating per clause in
-        // clause order keeps the f32 sum bit-identical to `complete_shoulds`.
+        // clause order keeps the f32 sum bit-identical to the generic path's
+        // `DisjunctionScorer` (Sum) plus `ReqOptScorer::score` accumulation.
         should_sums.clear();
         should_sums.resize(chunk.len(), 0.0);
         for (index, hits) in should_hits.iter().enumerate() {
@@ -235,7 +266,12 @@ where
         // so the f32 result is bit-identical to the generic path.
         let mut required_sum = 0.0_f32;
         for posting in required.iter() {
-            let cur = posting.doc().expect("aligned above");
+            let Some(cur) = posting.doc() else {
+                // The alignment loop above guarantees every required cursor
+                // sits on `candidate`; a cursor that moved out from under us
+                // can only mean the intersection is exhausted.
+                return Ok(());
+            };
             required_sum += scoring.term_score(posting, candidate, cur.frequency());
         }
         let current_floor = floor();
