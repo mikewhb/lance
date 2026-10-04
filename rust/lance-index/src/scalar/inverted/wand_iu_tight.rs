@@ -206,18 +206,20 @@ where
     };
 
     // Align every required cursor on one document: seek-to-max until they
-    // agree. A required list running out empties the intersection.
+    // agree. A required list running out empties the intersection. Alignment
+    // uses the doc-id-only seek (`next_doc_id`), which leaves the frequency
+    // stream lazy; `doc()` materializes it only for candidates that survive.
     let mut candidate = 0_u64;
     loop {
         let mut max_doc = candidate;
         for posting in required.iter_mut() {
-            if posting.doc().is_none_or(|cur| cur.doc_id() < candidate) {
-                posting.next(candidate);
+            if posting.current_doc_id().is_none_or(|cur| cur < candidate) {
+                posting.next_doc_id(candidate, true);
             }
-            let Some(cur) = posting.doc() else {
+            let Some(cur) = posting.current_doc_id() else {
                 return Ok(());
             };
-            max_doc = max_doc.max(cur.doc_id());
+            max_doc = max_doc.max(cur);
         }
         if max_doc > candidate {
             candidate = max_doc;
@@ -255,12 +257,13 @@ where
         }
         let mut optional_sum = 0.0_f32;
         for posting in optional.iter_mut() {
-            if posting.doc().is_none_or(|cur| cur.doc_id() < candidate) {
-                posting.next(candidate);
+            if posting.current_doc_id().is_none_or(|cur| cur < candidate) {
+                posting.next_doc_id(candidate, true);
             }
-            if let Some(cur) = posting.doc()
-                && cur.doc_id() == candidate
-            {
+            if posting.current_doc_id() == Some(candidate) {
+                let Some(cur) = posting.doc() else {
+                    continue;
+                };
                 optional_sum += scoring.term_score(posting, candidate, cur.frequency());
             }
         }

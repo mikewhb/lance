@@ -8138,6 +8138,34 @@ mod tests {
     }
 
     #[test]
+    fn next_doc_id_stays_lazy_until_doc_materializes_the_frequency() {
+        // The multi kernel aligns required cursors with next_doc_id, which
+        // must not decode frequency streams; doc() materializes the current
+        // block exactly once, and later seeks inside the same block reuse it.
+        let mut posting = iu_tight_posting("term", vec![2, 6, 10], 5.0, true);
+        posting.next_doc_id(2, true);
+        assert_eq!(posting.current_doc_id(), Some(2));
+        assert_eq!(
+            posting.frequency_blocks_decoded(),
+            0,
+            "doc-id alignment must not decode any frequency stream"
+        );
+        let doc = posting.doc().expect("positioned on doc 2");
+        assert_eq!(doc.doc_id(), 2);
+        assert_eq!(doc.frequency(), 1);
+        assert_eq!(posting.frequency_blocks_decoded(), 1);
+        posting.next_doc_id(10, true);
+        assert_eq!(posting.current_doc_id(), Some(10));
+        let doc = posting.doc().expect("positioned on doc 10");
+        assert_eq!(doc.frequency(), 1);
+        assert_eq!(
+            posting.frequency_blocks_decoded(),
+            1,
+            "the materialized frequency stream must be reused within the block"
+        );
+    }
+
+    #[test]
     fn iu_tight_search_emits_documents_exactly_at_the_floor() {
         let mut docs = DocSet::default();
         for doc_id in 0..8_u64 {
