@@ -1,6 +1,9 @@
 # IU PR 收敛计划：复用 merge_optional_freqs、合并收集入口、去冗余状态
 
-> 状态：步骤 0-5 已完成（2026-10-04），步骤 6（943 dump + bench）待跑。
+> 状态：**全部完成**（2026-10-04）。步骤 0-5（5 个代码提交）+ 步骤 6 验证：
+> inverted 943 测试全过、clippy/fmt 干净、**943 dump vs 社区 main 逐字节一致**、
+> 943 bench −32.5%、IU40 −84.8%、合成 12 条 −85.4%（0 回归）；
+> 窗口 drain 消融 = −8.8%/−3.0% → **§1.3 裁决：保留专用 drain 协议，不收敛**（§4.2）。
 > 分支：`fts/iu-reuse-convergence`（自 `fts/iu-reuse-main`/`49d7e90e0` 切出），5 个新提交：
 > `38dce4132` fmt+注释、`c7a004204` merge 复用、`be7563b77` IuCollector、
 > `558ece25b` sticky_floor/fork 删除+边界测试、`e8171cde2` 懒频率对齐。
@@ -72,6 +75,27 @@
 （把 TopKCollector 的收集强制走无窗口路径做一版消融二进制），与 943 bench / 合成 12 条
 同轮跑出数据，直接决定 §1.3 收不收敛——收敛则生产落回 1,200～1,400 预算带，
 不收敛则按预期落 2,500～2,800 总量带（检视双方对该前提的判断一致）。
+
+## 4.2 窗口 drain 孤立消融结果（2026-10-04，§1.3 的裁决数据）
+
+消融二进制：同一份收敛代码，仅把 `TopKCollector` 的收集分流强制走逐 doc 路径
+（`if min_score <= 0.0` → `if true`，即保留 advance_shallow/score_bounds/two-phase，
+仅去掉窗口批量确认）。`/tmp/do_query_conv`（带 drain）vs `/tmp/do_query_conv_nodrain`：
+
+| 套件 | 带 drain | 无 drain | drain 贡献 |
+|---|---|---|---|
+| IU 40q（min-of-9） | 152,848µs | 167,618µs | **−8.8%** |
+| 全量 943（min-of-7） | 1,766,686µs | 1,820,511µs | **−3.0%** |
+
+逐查询分布：IU40 最大受益 `urban +planning`（去掉则 +44.9%）、`electric +vehicles`（+27.2%）、
+`+climate change impact report`（+19.8%）——正是 3x 门槛失败、走通用 ReqOptScorer 回落路径
+的那批；943 上单一查询 `+"the who" +uk`（2-MUST 短语 Boolean）占节省额的 73%（39.6ms/53.8ms）。
+
+**裁决：此前 AI 的前提「把窗口优化收回原 collector 后性能仍然成立」在朴素形式下被证伪**——
+逐 doc 路径即使带着 two-phase 确认也损失 8.8%/3.0%。collector 内窗口缓存*或许*能追平，
+但那是未经验证的新实现。**决定：§1.3 不收敛，保留专用 drain 协议**；
+生产规模落在 ~1,620 行、PR 总量 ~2,828 行（2,500～2,800 预测带的边界上）。
+若未来要进 2,200～2,600 带，前置是「collector 内窗口缓存追平 8.8%/3.0%」的独立实验。
 
 ## 4. 规模预算（来自此前高阶 AI 的预期，2026-10-04 记录）
 
