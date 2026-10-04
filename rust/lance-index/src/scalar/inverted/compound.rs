@@ -4720,6 +4720,69 @@ fn iu_tight_clauses_ready(
         })
 }
 
+/// Shared collection tail for the two IU kernels: floor-checked top-k
+/// insertion with overflow tracking, comparison counting, and the floor
+/// callback the kernels poll. Interior mutability lets a kernel hold its
+/// `on_hit` callback and its floor callback over the same instance.
+struct IuCollector<'a, K: Copy + Ord> {
+    collector: RefCell<&'a mut TopKCollector<K>>,
+    map_document: RefCell<Box<dyn FnMut(u64) -> Result<K> + 'a>>,
+    floor: Cell<f32>,
+    overflow: Cell<bool>,
+    comparisons: Cell<usize>,
+}
+
+impl<'a, K: Copy + Ord> IuCollector<'a, K> {
+    fn new(
+        collector: &'a mut TopKCollector<K>,
+        map_document: impl FnMut(u64) -> Result<K> + 'a,
+    ) -> Self {
+        let floor = collector.min_competitive_score();
+        Self {
+            collector: RefCell::new(collector),
+            map_document: RefCell::new(Box::new(map_document)),
+            floor: Cell::new(floor),
+            overflow: Cell::new(false),
+            comparisons: Cell::new(0),
+        }
+    }
+
+    /// The kernels' `on_hit`.
+    fn hit(&self, key: u64, score: f32) -> Result<bool> {
+        self.comparisons.set(self.comparisons.get() + 1);
+        let score = checked_score(score, "iu_tight kernel")?;
+        let mut collector = self.collector.borrow_mut();
+        if score < collector.min_competitive_score() {
+            return Ok(true);
+        }
+        let row_id = (self.map_document.borrow_mut())(key)?;
+        let status = collector.insert(ScoredRow { row_id, score });
+        self.floor.set(collector.min_competitive_score());
+        if status == CollectionStatus::ScoreFloorOverflow {
+            self.overflow.set(true);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// The kernels' `floor` callback.
+    fn floor_value(&self) -> f32 {
+        self.floor.get()
+    }
+
+    fn finish(&self, metrics: &dyn MetricsCollector) -> CollectionStatus {
+        // Counted here: candidates scored (on_hit calls). WandCursor's
+        // num_comparisons counts heap advances instead, so the two metrics
+        // use different units and must not be compared directly.
+        metrics.record_comparisons(self.comparisons.get());
+        if self.overflow.get() {
+            CollectionStatus::ScoreFloorOverflow
+        } else {
+            CollectionStatus::Complete
+        }
+    }
+}
+
 /// Collect the mixed Boolean `K required + N optional` shape with the
 /// generalized IU kernel: the required cursors align on each candidate by
 /// seek-to-max in plan order (no lead selection), and the optional clauses
@@ -4731,7 +4794,7 @@ fn collect_iu_tight_multi<D, K>(
     should_indices: &[usize],
     metrics: &dyn MetricsCollector,
     collector: &mut TopKCollector<K>,
-    mut map_document: impl FnMut(u64) -> Result<K>,
+    map_document: impl FnMut(u64) -> Result<K>,
 ) -> Result<CollectionStatus>
 where
     D: WandDocuments + Sync,
@@ -4753,43 +4816,18 @@ where
         .map(|&leaf_index| take_posting(leaf_index))
         .collect::<Result<Vec<_>>>()?;
     let scorer = leaves[must_indices[0]].scorer.clone();
-    let mut overflow = false;
-    // Counted here: candidates scored (on_hit calls). WandCursor's
-    // num_comparisons counts heap advances instead, so the two metrics use
-    // different units and must not be compared directly.
-    let mut comparisons = 0usize;
-    let floor = Cell::new(collector.min_competitive_score());
+    let iu = IuCollector::new(collector, map_document);
     let result = iu_tight_search_multi(
         documents,
         scorer.as_ref(),
         required,
         optional,
-        &mut |key, score| {
-            comparisons += 1;
-            let score = checked_score(score, "iu_tight kernel")?;
-            if score < collector.min_competitive_score() {
-                return Ok(true);
-            }
-            let status = collector.insert(ScoredRow {
-                row_id: map_document(key)?,
-                score,
-            });
-            floor.set(collector.min_competitive_score());
-            if status == CollectionStatus::ScoreFloorOverflow {
-                overflow = true;
-                return Ok(false);
-            }
-            Ok(true)
-        },
-        || floor.get(),
+        &mut |key, score| iu.hit(key, score),
+        || iu.floor_value(),
     );
-    metrics.record_comparisons(comparisons);
+    let status = iu.finish(metrics);
     result?;
-    Ok(if overflow {
-        CollectionStatus::ScoreFloorOverflow
-    } else {
-        CollectionStatus::Complete
-    })
+    Ok(status)
 }
 
 fn iu_tight_should_switch(
@@ -4813,7 +4851,7 @@ fn collect_iu_tight<D, K>(
     should_indices: &[usize],
     metrics: &dyn MetricsCollector,
     collector: &mut TopKCollector<K>,
-    mut map_document: impl FnMut(u64) -> Result<K>,
+    map_document: impl FnMut(u64) -> Result<K>,
 ) -> Result<CollectionStatus>
 where
     D: WandDocuments + Sync,
@@ -4832,43 +4870,18 @@ where
         .map(|&leaf_index| take_posting(leaf_index))
         .collect::<Result<Vec<_>>>()?;
     let scorer = leaves[must_index].scorer.clone();
-    let mut overflow = false;
-    // Counted here: candidates scored (on_hit calls). WandCursor's
-    // num_comparisons counts heap advances instead, so the two metrics use
-    // different units and must not be compared directly.
-    let mut comparisons = 0usize;
-    let floor = Cell::new(collector.min_competitive_score());
+    let iu = IuCollector::new(collector, map_document);
     let result = iu_tight_search(
         documents,
         scorer.as_ref(),
         must,
         shoulds,
-        &mut |key, score| {
-            comparisons += 1;
-            let score = checked_score(score, "iu_tight kernel")?;
-            if score < collector.min_competitive_score() {
-                return Ok(true);
-            }
-            let status = collector.insert(ScoredRow {
-                row_id: map_document(key)?,
-                score,
-            });
-            floor.set(collector.min_competitive_score());
-            if status == CollectionStatus::ScoreFloorOverflow {
-                overflow = true;
-                return Ok(false);
-            }
-            Ok(true)
-        },
-        || floor.get(),
+        &mut |key, score| iu.hit(key, score),
+        || iu.floor_value(),
     );
-    metrics.record_comparisons(comparisons);
+    let status = iu.finish(metrics);
     result?;
-    Ok(if overflow {
-        CollectionStatus::ScoreFloorOverflow
-    } else {
-        CollectionStatus::Complete
-    })
+    Ok(status)
 }
 
 fn collect_loaded_partitions(
