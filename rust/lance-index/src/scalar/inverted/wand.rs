@@ -6090,7 +6090,6 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     wand: Wand<'a, Arc<MemBM25Scorer>, D>,
     phrase_slop: Option<u32>,
     wand_factor: f32,
-    sticky_floor: f32,
     cost: usize,
     global_score_upper_bound: OnceCell<Option<f32>>,
     current_doc: Option<DocInfo>,
@@ -6132,7 +6131,6 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             wand,
             phrase_slop: params.phrase_slop,
             wand_factor: params.wand_factor,
-            sticky_floor: 0.0,
             cost,
             global_score_upper_bound: OnceCell::new(),
             current_doc: None,
@@ -6279,19 +6277,14 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             ));
         }
         let floor = min_score * self.wand_factor;
-        if floor > self.sticky_floor {
+        if floor > self.wand.threshold {
             if self.wand.score_first_and_enabled && self.wand.threshold <= 0.0 && floor > 0.0 {
                 self.wand.up_to = None;
                 self.wand.invalidate_score_first_and_window();
             }
-            self.sticky_floor = floor;
+            self.wand.threshold = floor;
         }
-        self.apply_effective_threshold();
         Ok(())
-    }
-
-    fn apply_effective_threshold(&mut self) {
-        self.wand.threshold = self.sticky_floor.max(0.0);
     }
 }
 
@@ -7886,6 +7879,107 @@ mod tests {
             hits.len()
         );
         assert_eq!(hits.iter().filter(|&&(key, _)| key == 250).count(), 1);
+    }
+
+    #[test]
+    fn iu_tight_search_promotes_at_a_block_boundary_without_revisiting_docs() {
+        // 130 even-numbered MUST docs span two 128-posting blocks. The floor
+        // crosses the promotion threshold inside the first block, so
+        // start_doc (255) lands between the blocks. The lead SHOULD cursor
+        // is left mid-block at its last match (merge stops at the last
+        // candidate), and the promoted walk's seek guard must jump it past
+        // start_doc without re-emitting anything below it.
+        let mut docs = DocSet::default();
+        for doc_id in 0..300_u64 {
+            docs.append(doc_id, 1);
+        }
+        let must = iu_tight_posting("must", (0..130).map(|i| i * 2).collect(), 1.0, true);
+        let lead = iu_tight_posting("lead", vec![10, 100, 256, 258], 10.0, true);
+        let mut hits = Vec::new();
+        iu_tight::iu_tight_search(
+            &docs,
+            &IuTightUnitScorer,
+            must,
+            vec![lead],
+            &mut |key, score| {
+                hits.push((key, score));
+                Ok(true)
+            },
+            || 11.0,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 130, "every MUST doc exactly once: {hits:?}");
+        for key in [10_u64, 100, 256, 258] {
+            assert_eq!(
+                hits.iter().filter(|&&(k, _)| k == key).count(),
+                1,
+                "key {key} must appear exactly once"
+            );
+            assert_eq!(
+                hits.iter().find(|&&(k, _)| k == key).unwrap().1,
+                11.0,
+                "key {key} must carry the SHOULD contribution"
+            );
+        }
+    }
+
+    #[test]
+    fn iu_tight_search_promotes_after_the_tail_chunk_with_must_exhausted() {
+        // The floor only crosses the threshold on the last candidate of the
+        // tail block, so promotion fires once MUST is already exhausted. The
+        // promoted walk must handle the exhausted MUST cursor as a no-op and
+        // terminate through the exhausted lead.
+        let mut docs = DocSet::default();
+        for doc_id in 0..300_u64 {
+            docs.append(doc_id, 1);
+        }
+        let must = iu_tight_posting("must", (0..130).map(|i| i * 2).collect(), 1.0, true);
+        let lead = iu_tight_posting("lead", vec![259], 10.0, true);
+        let mut hits = Vec::new();
+        let floor = std::cell::Cell::new(f32::NEG_INFINITY);
+        iu_tight::iu_tight_search(
+            &docs,
+            &IuTightUnitScorer,
+            must,
+            vec![lead],
+            &mut |key, score| {
+                hits.push((key, score));
+                if key == 258 {
+                    floor.set(5.0);
+                }
+                Ok(true)
+            },
+            || floor.get(),
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 130, "every MUST doc exactly once: {hits:?}");
+        assert!(hits.iter().all(|&(_, score)| score == 1.0));
+    }
+
+    #[test]
+    fn iu_tight_search_finishes_normally_when_must_exhausts_without_promotion() {
+        // A two-doc MUST with a floor that never rises: no promotion fires
+        // and the kernel just completes after the single chunk.
+        let mut docs = DocSet::default();
+        for doc_id in 0..8_u64 {
+            docs.append(doc_id, 1);
+        }
+        let must = iu_tight_posting("must", vec![0, 2], 1.0, true);
+        let should = iu_tight_posting("should", vec![1], 1.0, true);
+        let mut hits = Vec::new();
+        iu_tight::iu_tight_search(
+            &docs,
+            &IuTightUnitScorer,
+            must,
+            vec![should],
+            &mut |key, score| {
+                hits.push((key, score));
+                Ok(true)
+            },
+            || f32::NEG_INFINITY,
+        )
+        .unwrap();
+        assert_eq!(hits, vec![(0, 1.0), (2, 1.0)]);
     }
 
     #[test]

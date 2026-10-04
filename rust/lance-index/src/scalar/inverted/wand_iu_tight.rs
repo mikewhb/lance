@@ -324,7 +324,7 @@ fn iu_tight_seek_eq(posting: &mut PostingIterator, doc: u64) -> Option<u32> {
 impl<'a, D: WandDocuments, S: Scorer> IuTightScoring<'a, D, S> {
     fn promoted(
         &self,
-        must: PostingIterator,
+        mut must: PostingIterator,
         mut shoulds: Vec<PostingIterator>,
         required: Vec<usize>,
         start_doc: u64,
@@ -337,9 +337,11 @@ impl<'a, D: WandDocuments, S: Scorer> IuTightScoring<'a, D, S> {
         else {
             return Ok(());
         };
-        // `take_docs_one_block_upto` already consumed the current MUST block, so
-        // the live MUST cursor may sit past `start_doc`. Fork and seek instead.
-        let mut must = must.fork_from_start();
+        // `take_docs_one_block_upto` consumed whole MUST blocks, so the live
+        // MUST cursor already sits at or past `start_doc`; the forward seek
+        // below is a no-op guard. The lead seek is load-bearing: the merge
+        // loop stops at the last candidate, which can leave the lead cursor
+        // mid-block below `start_doc`.
         if must.doc().is_none_or(|info| info.doc_id() < start_doc) {
             must.next(start_doc);
         }
