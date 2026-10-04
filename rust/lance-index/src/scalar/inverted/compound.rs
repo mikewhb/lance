@@ -4721,9 +4721,9 @@ fn iu_tight_clauses_ready(
 }
 
 /// Collect the mixed Boolean `K required + N optional` shape with the
-/// generalized IU kernel: the rarest required clause drives, the other
-/// required clauses are seeked per candidate, and the optional clauses are
-/// probed and summed.
+/// generalized IU kernel: the required cursors align on each candidate by
+/// seek-to-max in plan order (no lead selection), and the optional clauses
+/// are probed and summed.
 fn collect_iu_tight_multi<D, K>(
     documents: &D,
     mut leaves: Vec<LoadedLeaf>,
@@ -5285,10 +5285,10 @@ mod tests {
     use super::super::documents::{
         ordered_row_address_projection_for_test, resident_row_address_projection_for_test,
     };
+    use super::super::encoding::compress_posting_list;
     use super::super::index::{PlainPostingList, PostingList};
     use super::super::scorer::Scorer;
     use super::super::wand::GroupedTermScorer;
-    use super::super::encoding::compress_posting_list;
     use super::super::{CompressedPostingList, LEGACY_BLOCK_SIZE, PostingTailCodec};
     use super::*;
     use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
@@ -8242,10 +8242,7 @@ mod tests {
                 vec![compressed_unit_posting("must", (0..50).collect())],
                 None,
             ),
-            loaded_leaf(
-                vec![compressed_unit_posting("should", vec![3, 9])],
-                None,
-            ),
+            loaded_leaf(vec![compressed_unit_posting("should", vec![3, 9])], None),
         ];
         let (k1_must, k1_should) = iu_tight_clause_indices(&k1_plan).expect("1+1 shape");
         assert!(iu_tight_clauses_ready(&k1_leaves, &k1_must, &k1_should));
@@ -8263,7 +8260,10 @@ mod tests {
         .unwrap();
         assert_eq!(status, CollectionStatus::Complete);
         assert!(
-            metrics.comparisons.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            metrics
+                .comparisons
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
             "K=1 IU fast path must record comparisons"
         );
 
@@ -8279,13 +8279,13 @@ mod tests {
                 None,
             ),
             loaded_leaf(
-                vec![compressed_unit_posting("must_b", (0..50).step_by(2).collect())],
+                vec![compressed_unit_posting(
+                    "must_b",
+                    (0..50).step_by(2).collect(),
+                )],
                 None,
             ),
-            loaded_leaf(
-                vec![compressed_unit_posting("should", vec![3, 9])],
-                None,
-            ),
+            loaded_leaf(vec![compressed_unit_posting("should", vec![3, 9])], None),
         ];
         let (k2_must, k2_should) = iu_tight_clause_indices(&k2_plan).expect("2+1 shape");
         assert_eq!(k2_must.len(), 2);
@@ -8304,7 +8304,10 @@ mod tests {
         .unwrap();
         assert_eq!(status, CollectionStatus::Complete);
         assert!(
-            metrics.comparisons.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            metrics
+                .comparisons
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
             "K>=2 IU fast path must record comparisons"
         );
     }

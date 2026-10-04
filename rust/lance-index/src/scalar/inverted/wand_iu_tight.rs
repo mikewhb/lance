@@ -12,15 +12,17 @@
 use lance_core::Result;
 
 use super::super::scorer::Scorer;
-use super::{BulkAndMode, PostingIterator, TERMINATED_DOC_ID, WandDocuments, conservative_score_sum};
+use super::{
+    BulkAndMode, PostingIterator, TERMINATED_DOC_ID, WandDocuments, conservative_score_sum,
+};
 
 /// Env gate for the IU fast paths, following the `LANCE_FTS_BULK_AND`
 /// convention: `auto` (default) enables both kernels, `on`/`1` forces them
 /// on, `off`/`0` routes every IU-shaped Boolean back to the generic scorer
 /// tree. This is the A/B and rollout switch; it does not change results,
 /// only which engine computes them.
-static IU_TIGHT_MODE: std::sync::LazyLock<BulkAndMode> = std::sync::LazyLock::new(|| {
-    match std::env::var("LANCE_FTS_IU_TIGHT") {
+static IU_TIGHT_MODE: std::sync::LazyLock<BulkAndMode> =
+    std::sync::LazyLock::new(|| match std::env::var("LANCE_FTS_IU_TIGHT") {
         Ok(value) => BulkAndMode::parse(&value).unwrap_or_else(|| {
             log::warn!(
                 "Invalid LANCE_FTS_IU_TIGHT value {value:?}; expected auto, on/1, or off/0; \
@@ -36,8 +38,7 @@ static IU_TIGHT_MODE: std::sync::LazyLock<BulkAndMode> = std::sync::LazyLock::ne
             );
             BulkAndMode::Auto
         }
-    }
-});
+    });
 
 /// Whether the IU fast paths may run in this process.
 pub fn iu_tight_enabled() -> bool {
@@ -276,8 +277,7 @@ where
         }
         let current_floor = floor();
         if current_floor.is_finite()
-            && conservative_score_sum([required_sum, optional_ub_sum].into_iter())
-                < current_floor
+            && conservative_score_sum([required_sum, optional_ub_sum].into_iter()) < current_floor
         {
             candidate += 1;
             continue;
