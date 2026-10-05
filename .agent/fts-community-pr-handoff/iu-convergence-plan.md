@@ -134,3 +134,45 @@ RUSTC_WRAPPER= cargo test -p lance-index --lib inverted::
 cargo fmt --all -- --check
 # 943 dump / bench / 合成 12 条：复用 .agent/fts-community-pr-handoff 下 gate 脚本与 /tmp 复现台
 ```
+
+## 5. 历史对账（2026-10-04，读 `iu-framework-simplification.md`/提交历史后的修正）
+
+**历史已覆盖、我们已执行**：§4(d)「C2 归并用 `merge_optional_freqs`」= 本轮 `c7a004204`
+（历史称其为四点里最安全的一个）。
+
+**历史已覆盖、本轮提议需撤回**：`TermLeafScorer` 消融。历史 §5 称其不可替代，且提交
+`c68f74947`（把 SHOULD 叶准入扩展到 TermLeafScorer）自带实测：**intersection_union 40 条
+335.3ms → 189.3ms = −43.5%**（该 −43.5% 曾被 §5 误挂在 `88933c0dc` 名下）。结论：**不做
+TermLeafScorer 消融、不删该文件**——它恰好服务 drain 消融证明有价值的 ReqOpt 回落路径。
+
+**历史未执行、本轮应升级为第一优先**：§4(a)「提升后交给 main 的 AND 内核」
+（`Wand::new(And, [must, promoted_should])` → `and_bulk_search` 的 2 子句 SIMD 归并）。
+历史定性：「唯一『减代码 + 可能提性能』」；现状 `promoted()` 是「裸 PostingIterator 上第三个
+leapfrog 副本」；点名目标查询 `+global markets`/`electric +vehicles`（1+1 形态）。
+历史记录的两个陷阱必须先解决：① `Wand::new` 把 threshold 硬置 0、无公开 setter → floor
+带不过去（需 threshold-seeding API 或接受重填成本）；② `Wand::new` 静默丢弃已耗尽 posting
+→ 1+1 AND 退化成 MUST 单子句 = **错结果**，必须显式守卫。
+与本轮深挖发现（required 侧应复用 `wand_intersection::intersect` 块级 SIMD）**同一热点**：
+形态一致 = 「块级候选引擎产候选 + `merge_optional_freqs` 加 optional 分」。
+
+**历史已否决、与本轮一致**：ReqOptScorer 提速改造（BoxScorer 无块解码接口）、统一内层循环
+（收益全部来自特化）、emit-tail 提 helper（重新量后仅 ~30 行真正逐位相同，churn 不值得）。
+注意：§6 量化的 emit-tail 重复在 `wand.rs`（classic/bulk/lead-stream/maxscore ×6），
+我们的 `IuCollector` 不在其中（内核经 `on_hit` 产出，历史文档明说了这一点）。
+
+**历史决议 vs 当前分支的分歧（需在 PR 里正面回答）**：§7 决议 **K≥2+N 泛化「搁置」**，
+依据是 943 基准里 K≥2+N 查询为零、Lance 真实过滤模式走 RowAddrMask 预过滤而非 MUST 子句。
+用户后决定保留 K≥2（本轮维持）。社区评审若问起，答案应是：943 门禁不含该形状、合成 12 条
+−85.4% 是本分支自证，且它不参与社区基准叙事。
+
+**新发现（历史没有的）**：① 四处手写竞争谓词可换 main 的 `score_sum_cannot_compete` +
+`CompetitiveFloorMode::Inclusive`（语义已验证等价）；② `term_score` 每子句重复取同一 doc 的
+norm（K→1）；③ `promoted()` 的 `iu_tight_seek_eq` 仍走整块解码，漏了 `e8171cde2` 的懒频率；
+④ 两个 collect 入口可合一（门槛前提为 dispatch 条件，无需 decline 流）；⑤ `IuCollector`
+去内可变性；⑥ `sticky_floor` 的原始动机是窗口协议下的「max(sticky, window, 0) 与 main 等价」，
+但实现（重写 threshold）与该意图不符，本轮的删除恰恰**实现了原作者的声明意图**。
+
+**方法论修正**：历史复现命令带 `RUSTFLAGS='-C target-cpu=native'`；本轮收敛构建**未带**该
+标志（对比的两个二进制同源，比例不受影响，但绝对值可能偏低 ~2%：本轮 conv 943 = 1766.7ms
+vs 历史 -33.6% 对应的 1727.4ms）。**出 PR 数字前需带 native 标志重建一次。**
+
