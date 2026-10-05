@@ -261,6 +261,42 @@ impl CompetitiveFloorMode {
 // per-doc `next()` leapfrog. Results are identical to the classic AND loop.
 // LANCE_FTS_BULK_AND accepts auto (default), on/1, or off/0. Auto enables the
 // bulk path for two and three clauses and for wider current-format conjunctions.
+//
+// A skewed Auto conjunction of three or more clauses is the exception: it stays
+// on the per-document leapfrog. There the rarest clause sets the pace and each
+// candidate costs one advance of that clause plus a seek of the dense ones,
+// whereas the bulk merge materializes a block of *every* clause before it can
+// test a window. Measured on the SBG corpus this decision is worth ~13% of
+// aggregate top-10 latency over the 30 three-clause queries it moves.
+const AND_SKEW_RATIO: usize = 32;
+
+/// Frequency buckets for the lead contribution's length-independent upper
+/// bound (see `and_candidate_cannot_beat_threshold_by_freq` and the bulk
+/// route's frequency filter).
+const FREQ_LUT_BUCKETS: usize = 64;
+
+/// Quiet period, in windows, between wide-bound re-probes of the array lead
+/// after a check that did not skip. See the `wb_windows_since_check` field.
+const WB_REPROBE_INTERVAL: u32 = 32;
+
+/// A query whose check has skipped this many windows in total latches into
+/// always-check mode: measured skip counts are bimodal (skip-heavy queries
+/// skip hundreds of windows, most skip none), so a small latch count protects
+/// the skip-heavy ones at negligible cost for the rest.
+const WB_LATCH_SKIP_COUNT: u32 = 1;
+
+/// True when the conjunction's rarest and densest clauses differ by at least
+/// `AND_SKEW_RATIO`. `lead` is sorted by cost, so the ends are the extremes.
+fn conjunction_lists_are_skewed(lead: &[Box<PostingIterator>]) -> bool {
+    let (Some(min_cost), Some(max_cost)) = (
+        lead.first().map(|posting| posting.cost()),
+        lead.last().map(|posting| posting.cost()),
+    ) else {
+        return false;
+    };
+    min_cost.saturating_mul(AND_SKEW_RATIO) <= max_cost
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BulkAndMode {
     #[default]
@@ -385,6 +421,12 @@ fn find_next_geq_in_block(docs: &[u32], pos: usize, target: u32) -> usize {
 }
 
 #[inline]
+/// Advance an array-walk position to the first entry at or after `next`.
+fn skip_lead_docs(lead_docs: &[u32], pos: usize, next: u64) -> usize {
+    let next32 = u32::try_from(next).unwrap_or(u32::MAX);
+    pos + lead_docs[pos + 1..].partition_point(|&id| id < next32) + 1
+}
+
 fn conservative_bm25_upper_bound(query_weight: f32) -> f32 {
     if query_weight <= 0.0 {
         0.0
@@ -885,6 +927,48 @@ impl PostingIterator {
         // this method is called very frequently, so we prefer to use `UnsafeCell` instead of
         // `RefCell` to avoid the overhead of runtime borrow checking
         self.compressed.as_ref().unwrap().get()
+    }
+
+    /// Copy the remaining docs of the current decompressed block at or before
+    /// `window_max` into `docs`/`freqs` without moving the cursor, decoding the
+    /// block's frequencies too so every copied entry carries its real frequency.
+    /// Returns the absolute posting index of the first copied doc.
+    fn peek_remaining_block_docs_up_to(
+        &mut self,
+        window_max: u64,
+        docs: &mut Vec<u32>,
+        freqs: &mut Vec<u32>,
+    ) -> Option<usize> {
+        docs.clear();
+        freqs.clear();
+        let PostingList::Compressed(ref list) = self.list else {
+            return None;
+        };
+        let cur = self.current_doc?;
+        if cur.doc_id() > window_max {
+            return None;
+        }
+        let shift = list.block_shift();
+        let block_idx = self.index >> shift;
+        let block_offset = self.index & list.block_mask();
+        // SAFETY: `ensure_compressed_block_ptr` hands back a pointer into this
+        // iterator's own `UnsafeCell` state for `block_idx`, populated for both
+        // doc ids and frequencies. We hold `&mut self` and finish reading before
+        // the state is touched again.
+        let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+        for offset in block_offset..compressed.doc_ids.len() {
+            let doc_id = compressed.doc_ids[offset];
+            if u64::from(doc_id) > window_max {
+                break;
+            }
+            docs.push(doc_id);
+            freqs.push(compressed.freqs[offset]);
+        }
+        if docs.is_empty() {
+            None
+        } else {
+            Some((block_idx << shift) + block_offset)
+        }
     }
 
     #[inline]
@@ -1400,6 +1484,37 @@ impl PostingIterator {
                 debug_assert!(least_id <= u32::MAX as u64);
                 let least_id = least_id as u32;
                 let shift = list.block_shift();
+                // Cached-next fast path: when the target is the posting
+                // right after the cursor inside the already-decoded block,
+                // two loads answer it without block navigation; misses fall
+                // through to the general seek. Sorted entries pin the answer
+                // to `offset + 1`. Few seeks hit (probe: 19% skewed / 7.8%
+                // corpus), but the probe is cheaper than the search it
+                // replaces.
+                let cur_block = self.index >> shift;
+                // An exhausted block-aligned cursor points one past the last
+                // block; defer to the general path instead of decoding it.
+                if cur_block < list.blocks.len() {
+                    let cur_offset = self.index & list.block_mask();
+                    let fast = unsafe { &mut *self.ensure_compressed_doc_ids_ptr(list, cur_block) };
+                    if cur_offset + 1 < fast.doc_ids.len()
+                        && fast.doc_ids[cur_offset] < least_id
+                        && fast.doc_ids[cur_offset + 1] >= least_id
+                    {
+                        self.index = (cur_block << shift) + cur_offset + 1;
+                        self.block_idx = cur_block;
+                        let frequency = if fast.frequency_block_idx == Some(cur_block) {
+                            fast.freqs[cur_offset + 1]
+                        } else {
+                            0
+                        };
+                        self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                            doc_id: fast.doc_ids[cur_offset + 1],
+                            frequency,
+                        }));
+                        return;
+                    }
+                }
                 let block_idx = self.block_idx_for_doc(list, self.index >> shift, least_id);
                 self.index = self.index.max(block_idx << shift);
                 let length = list.length as usize;
@@ -1582,6 +1697,29 @@ impl PostingIterator {
                 if self.use_scorer_upper_bound {
                     return BlockMaxScore {
                         score: scorer_upper_bound(self.query_weight, scorer),
+                        #[cfg(test)]
+                        blocks_scanned: 0,
+                    };
+                }
+                // Hierarchical bound: walk level-1 groups (32 blocks per
+                // group) and level-0 entries up to `up_to` instead of
+                // dropping to the scorer ceiling. Sound: every covered
+                // block's max is a true upper bound of its docs, and the
+                // first block past the walk end is only over-covered.
+                if let Some(impacts) = list.impacts.as_ref() {
+                    let compressed = unsafe { &mut *self.compressed_state_ptr() };
+                    let bound = impacts.max_score_up_to_cached(
+                        &|block: usize| -> Option<u64> {
+                            Some(u64::from(list.block_least_doc_id(block)))
+                        },
+                        self.block_idx,
+                        up_to,
+                        self.query_weight,
+                        scorer,
+                        &mut compressed.block_max_window.impact_score_cache,
+                    );
+                    return BlockMaxScore {
+                        score: bound.score,
                         #[cfg(test)]
                         blocks_scanned: 0,
                     };
@@ -2373,6 +2511,7 @@ struct AndWindowStats {
     pairwise_intersections: usize,
     windows_sliced: usize,
     windows_frequency_pruned: usize,
+    lut_prepruned: usize,
 }
 
 impl Eq for TailPosting {}
@@ -2427,6 +2566,32 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Exact query-order score computed while progressively confirming a
     // conjunction candidate. This is valid only for `and_last_doc`.
     and_candidate_score: Option<f32>,
+    // Document length of the last conjunction candidate: read in the
+    // rejection test, consumed once by the scoring loop.
+    and_candidate_doc_length: Option<u32>,
+    // Length-independent upper bounds of the lead clause's score contribution
+    // per frequency bucket, for the arrayed route's frequency pre-filter.
+    and_lead_freq_bound: Option<[f32; FREQ_LUT_BUCKETS]>,
+    // Array-backed lead: for skewed conjunctions the lead clause's
+    // current block is copied into `lead_docs`/`lead_freqs` once per window and
+    // walked by index, so moving the lead to its next candidate costs an index
+    // bump instead of a cursor seek. `and_lead_arrayed` is set by the routing in
+    // `search`; every other field is owned by this route.
+    and_lead_arrayed: bool,
+    lead_docs: Vec<u32>,
+    lead_freqs: Vec<u32>,
+    lead_pos: usize,
+    lead_first_index: usize,
+    lead_window_end: u64,
+    lead_next_target: u64,
+    // Adaptive gate for the window-level wide-bound check in `open_lead_array`.
+    // Measured skip rates are bimodal: a few queries skip 67-78% of their
+    // windows, almost all others skip none. Re-probing every
+    // `WB_REPROBE_INTERVAL` windows keeps zero-skip queries from paying the
+    // check on every window while still catching isolated skippable ones.
+    wb_windows_since_check: u32,
+    wb_total_skips: u32,
+    wb_always_check: bool,
     // Score-first conjunction pruning is restricted to the current impact
     // format and scorers that expose the BM25 denominator contract.
     score_first_and_enabled: bool,
@@ -2556,6 +2721,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             and_max_score: f32::INFINITY,
             and_last_doc: None,
             and_candidate_score: None,
+            and_candidate_doc_length: None,
+            and_lead_freq_bound: None,
+            and_lead_arrayed: false,
+            lead_docs: Vec::new(),
+            lead_freqs: Vec::new(),
+            lead_pos: 0,
+            lead_first_index: 0,
+            lead_window_end: 0,
+            lead_next_target: 0,
+            wb_windows_since_check: WB_REPROBE_INTERVAL,
+            wb_total_skips: 0,
+            wb_always_check: false,
             score_first_and_enabled,
             #[cfg(test)]
             disable_score_first_and: false,
@@ -2673,6 +2850,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         if limit == 0 {
             return Ok(vec![]);
         }
+        // A `Wand` is searched once in practice, but the array-backed lead is
+        // state like any other: clearing it means a second `search` cannot
+        // inherit the previous one's array or its pending target.
+        self.and_lead_arrayed = false;
+        self.lead_pos = 0;
+        self.lead_next_target = 0;
+        self.lead_docs.clear();
+        self.lead_freqs.clear();
 
         if params.phrase_slop.is_some() {
             self.invalidate_score_first_and_window();
@@ -2705,7 +2890,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // Top-k conjunctions (AND and phrase) over compressed lists use the
         // bulk path: the same block-max window pruning, but candidates come
         // from a slice-level merge over decompressed blocks instead of per-doc
-        // `next()` leapfrogging through boxed iterators.
+        // `next()` leapfrogging through boxed iterators. A skewed three-or-more
+        // clause conjunction under `Auto` skips the merge and leapfrogs instead;
+        // `On` and `Off` still match the bulk decision exactly, so the override
+        // stays a faithful control.
         if self.operator == Operator::And
             && !self.lead.is_empty()
             && self
@@ -2716,13 +2904,31 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let mode = self
                     .bulk_and_mode_override
                     .unwrap_or_else(|| *BULK_AND_MODE);
-                mode.enabled_for(self.lead.len())
-                    || (mode == BulkAndMode::Auto
-                        && self.lead.len() >= 4
-                        && self.lead.iter().all(|posting| {
-                            matches!(&posting.list, PostingList::Compressed(list)
-                                if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
-                        }))
+                // The array route is semantics-preserving for any compressed
+                // list (byte-identical results on a 128-block corpus), so it
+                // carries no format guard; block_size is a tuning parameter.
+                let skewed_auto = mode == BulkAndMode::Auto
+                    && self.lead.len() >= 3
+                    && conjunction_lists_are_skewed(&self.lead);
+                if skewed_auto {
+                    // Pay for the window buffers only when the route is used.
+                    self.lead_docs.reserve(MAX_POSTING_BLOCK_SIZE);
+                    self.lead_freqs.reserve(MAX_POSTING_BLOCK_SIZE);
+                }
+                self.and_lead_arrayed = skewed_auto;
+                // Defensive reset of the array route's adaptive gate so a
+                // hypothetical second `search` on the same Wand starts clean.
+                self.wb_windows_since_check = WB_REPROBE_INTERVAL;
+                self.wb_total_skips = 0;
+                self.wb_always_check = false;
+                !skewed_auto
+                    && (mode.enabled_for(self.lead.len())
+                        || (mode == BulkAndMode::Auto
+                            && self.lead.len() >= 4
+                            && self.lead.iter().all(|posting| {
+                                matches!(&posting.list, PostingList::Compressed(list)
+                                    if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
+                            })))
             }
         {
             #[cfg(test)]
@@ -2749,8 +2955,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 continue;
             };
 
-            let doc_length = self.documents.doc_length(&doc);
-
+            // Reuse the length already read by the candidate loop.
+            let doc_length = self
+                .and_candidate_doc_length
+                .take()
+                .unwrap_or_else(|| self.documents.doc_length(&doc));
             let score = if self.operator == Operator::Or {
                 self.advance_all_tail(doc.doc_id(), None, None);
                 if let Some(slop) = params.phrase_slop {
@@ -3704,6 +3913,55 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         )
     }
 
+    /// Frequency-bucket pre-filter for the arrayed candidate loop: rejects
+    /// the candidate with the lead contribution's length-independent upper
+    /// bound (`doc_length = 0` maximizes the BM25 weight), skipping the
+    /// doc-length lookup and the exact lead score. Mirrors the bulk route's
+    /// frequency filter; rejecting here is sound because the actual
+    /// contribution with the real doc length is never larger.
+    fn and_candidate_cannot_beat_threshold_by_freq(&mut self, freq: u32) -> bool {
+        if self.operator != Operator::And
+            || self.threshold <= 0.0
+            || self.num_terms < 2
+            || self.lead.len() != self.num_terms
+        {
+            return false;
+        }
+        let lut_bound = self.and_lead_freq_bound.get_or_insert_with(|| {
+            let mut lut = [f32::INFINITY; FREQ_LUT_BUCKETS];
+            if let Some(first) = self.lead.first() {
+                for (freq, slot) in lut.iter_mut().enumerate().take(FREQ_LUT_BUCKETS - 1) {
+                    *slot = first.score(&self.scorer, freq as u32, 0);
+                }
+                lut[FREQ_LUT_BUCKETS - 1] = first.frequency_clamp_upper_bound(&self.scorer);
+            }
+            lut
+        })[(freq as usize).min(FREQ_LUT_BUCKETS - 1)];
+        if !lut_bound.is_finite() {
+            return false;
+        }
+        let Some((_, remaining)) = self.lead.split_first() else {
+            return false;
+        };
+        let remaining_upper_bound = remaining
+            .iter()
+            .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+            .sum::<f64>();
+        let cannot_compete = score_sum_cannot_compete(
+            lut_bound,
+            remaining_upper_bound,
+            self.threshold,
+            score_sum_upper_bound_factor(self.num_terms),
+            self.floor_mode,
+        );
+
+        #[cfg(test)]
+        if cannot_compete {
+            self.and_window_stats.lut_prepruned += 1;
+        }
+        cannot_compete
+    }
+
     fn invalidate_score_first_and_window(&mut self) {
         if self.score_first_and_enabled {
             self.score_first_and_suffix_bounds.clear();
@@ -3711,6 +3969,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             self.score_first_and_dense_range = None;
         }
         self.and_candidate_score = None;
+        self.and_candidate_doc_length = None;
     }
 
     fn prepare_score_first_and_window(&mut self) {
@@ -3920,14 +4179,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
     }
     fn next_and_candidate(&mut self) -> Option<DocInfo> {
+        if self.and_lead_arrayed {
+            return self.next_and_candidate_arrayed();
+        }
         self.and_candidate_score = None;
+        self.and_candidate_doc_length = None;
         if self.lead.len() < self.num_terms {
             return None;
         }
-        // Two- and three-clause conjunctions use the bulk SIMD kernels by
-        // default. Restrict this classic-path optimization to four and five
-        // clauses, keeping one clause as the benchmark's drift control.
-        let is_vectorized_search_enabled = matches!(self.lead.len(), 4 | 5);
+        // Three-clause conjunctions now reach this loop too (see the routing in
+        // `search`), so they get the in-block SIMD search as well. The flag only
+        // selects how a block is searched, never which documents match.
+        let is_vectorized_search_enabled = matches!(self.lead.len(), 3..=5);
         if let Some(last_doc) = self.and_last_doc
             && self
                 .lead
@@ -4060,9 +4323,169 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 self.and_candidate_score =
                     Some(score_contributions_in_query_order(score_contributions));
             }
+            self.and_candidate_doc_length = Some(doc_length);
             self.and_last_doc = Some(doc);
             return Some(lead_doc);
         }
+    }
+
+    /// Array-backed lead, for skewed conjunctions only.
+    ///
+    /// The lead clause's current block is copied into `lead_docs`/`lead_freqs`
+    /// once per window, then walked by index. Advancing the lead is an index
+    /// bump, and a follower leap skips the array by binary search, so the lead
+    /// never pays a cursor seek per candidate. Window-level pruning happens in
+    /// `open_lead_array` via the adaptive wide-bound check; candidates inside
+    /// an open window are tested exactly, without per-candidate pre-seek
+    /// pruning.
+    fn next_and_candidate_arrayed(&mut self) -> Option<DocInfo> {
+        self.and_candidate_score = None;
+        self.and_candidate_doc_length = None;
+        if self.lead.len() < self.num_terms {
+            return None;
+        }
+        let is_vectorized_search_enabled = matches!(self.lead.len(), 3..=5);
+
+        'advance_head: loop {
+            while self.lead_pos >= self.lead_docs.len() {
+                if !self.open_lead_array() {
+                    return None;
+                }
+            }
+            let doc = self.lead_docs[self.lead_pos];
+            let freq = self.lead_freqs[self.lead_pos];
+            // Park the lead clause on this entry so every downstream reader --
+            // `doc()`, `score_in_query_order`, `iter_term_freqs`, the phrase
+            // position check -- sees the candidate without another seek.
+            self.park_lead_at(self.lead_first_index + self.lead_pos, doc, freq);
+
+            for index in 1..self.lead.len() {
+                let posting = &mut self.lead[index];
+                if posting
+                    .current_doc_id()
+                    .is_none_or(|cur| cur < u64::from(doc))
+                {
+                    posting.next_doc_id(u64::from(doc), is_vectorized_search_enabled);
+                }
+                match posting.current_doc_id() {
+                    None => return None,
+                    Some(next) if next > u64::from(doc) => {
+                        self.lead_pos = skip_lead_docs(&self.lead_docs, self.lead_pos, next);
+                        if next > self.lead_window_end {
+                            self.lead_next_target = next;
+                            self.lead_pos = self.lead_docs.len();
+                        }
+                        continue 'advance_head;
+                    }
+                    Some(_) => {}
+                }
+            }
+
+            let lead_freq = self.lead_freqs[self.lead_pos];
+            if self.and_candidate_cannot_beat_threshold_by_freq(lead_freq) {
+                self.lead_pos += 1;
+                continue;
+            }
+            let lead_doc = self.lead.first().and_then(|posting| posting.doc())?;
+            let doc_length = self.documents.doc_length(&lead_doc);
+            if self.and_candidate_cannot_beat_threshold(doc_length) {
+                self.lead_pos += 1;
+                continue;
+            }
+            self.lead_pos += 1;
+            self.and_last_doc = None;
+            self.and_candidate_doc_length = Some(doc_length);
+            return Some(lead_doc);
+        }
+    }
+
+    /// Copy the lead clause's current block into the arrays and move the cursor
+    /// to the window's first entry. Returns false when the lead is exhausted.
+    fn open_lead_array(&mut self) -> bool {
+        loop {
+            if self.lead_next_target == TERMINATED_DOC_ID {
+                return false;
+            }
+            // The floor is raised by `search` before every `next()`, so it is
+            // already current here.
+            self.lead[0].next(self.lead_next_target);
+            let Some(lead_doc) = self.lead[0].doc() else {
+                return false;
+            };
+            let target = self.lead_next_target.max(lead_doc.doc_id());
+            // The window is the lead clause's own block end: the rarest clause
+            // sets the window, so one window serves many candidates.
+            let win_end = Self::posting_block_up_to(&self.lead[0], target);
+
+            if self.threshold > 0.0
+                && (self.wb_always_check || self.wb_windows_since_check >= WB_REPROBE_INTERVAL)
+            {
+                self.wb_windows_since_check = 0;
+                for posting in &mut self.lead {
+                    posting.shallow_next(target);
+                }
+                let wide_max = conservative_score_sum(self.lead.iter().map(|posting| {
+                    posting
+                        .block_max_score_up_to_with_stats(win_end, &self.scorer)
+                        .score
+                }));
+                if wide_max < self.threshold {
+                    self.wb_total_skips = self.wb_total_skips.saturating_add(1);
+                    if self.wb_total_skips >= WB_LATCH_SKIP_COUNT {
+                        self.wb_always_check = true;
+                    }
+                    // Stay hot: keep checking a run of skippable windows
+                    // (implied by always-check at the current latch count).
+                    self.wb_windows_since_check = WB_REPROBE_INTERVAL;
+                    if win_end == TERMINATED_DOC_ID {
+                        return false;
+                    }
+                    // doc u32::MAX makes win_end+1 overflow the u32 doc-id
+                    // domain; terminate instead of truncating to doc 0.
+                    self.lead_next_target = if win_end >= u32::MAX as u64 {
+                        TERMINATED_DOC_ID
+                    } else {
+                        win_end + 1
+                    };
+                    continue;
+                }
+            }
+            self.wb_windows_since_check = self.wb_windows_since_check.saturating_add(1);
+
+            let Some(first_index) = self.lead[0].peek_remaining_block_docs_up_to(
+                win_end,
+                &mut self.lead_docs,
+                &mut self.lead_freqs,
+            ) else {
+                if win_end == TERMINATED_DOC_ID {
+                    return false;
+                }
+                self.lead_next_target = win_end + 1;
+                continue;
+            };
+
+            self.lead_first_index = first_index;
+            self.lead_pos = 0;
+            self.lead_window_end = win_end;
+            self.lead_next_target = if win_end == TERMINATED_DOC_ID {
+                TERMINATED_DOC_ID
+            } else {
+                win_end + 1
+            };
+            return true;
+        }
+    }
+
+    /// Park the lead clause's cursor on an array entry without searching for it.
+    fn park_lead_at(&mut self, index: usize, doc: u32, freq: u32) {
+        self.lead[0].index = index;
+        if let PostingList::Compressed(ref list) = self.lead[0].list {
+            self.lead[0].block_idx = index >> list.block_shift();
+        }
+        self.lead[0].current_doc = Some(DocInfo::Raw(RawDocInfo {
+            doc_id: doc,
+            frequency: freq,
+        }));
     }
 
     fn posting_block_up_to(posting: &PostingIterator, target: u64) -> u64 {
@@ -4526,7 +4949,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // The last bucket holds the frequency-independent sup, so clamping
         // stays a valid upper bound. Skips only avoid work; every emitted
         // candidate still goes through the exact per-candidate prune below.
-        const FREQ_LUT_BUCKETS: usize = 64;
         let mut freq_bound_lut: Option<[f32; FREQ_LUT_BUCKETS]> = None;
         // Exclusive limit on the first clause's partial score for the current
         // window: scores at or below it cannot beat the floor. Recomputed only
@@ -7975,6 +8397,131 @@ mod tests {
         assert_eq!(classic_score, bulk_score);
     }
 
+    #[test]
+    fn test_frequency_prefilter_fires_and_matches_classic() {
+        // Rare lead clause (64 entries) vs two dense followers (2048 each):
+        // cost ratio 32, so the arrayed route and its pre-filter are active.
+        // The first eight candidates carry a high lead frequency and fill the
+        // (limit = 4) heap with score 66; every later candidate sits in the
+        // followers' first block (block max 1, so the bound is tight) and
+        // must be rejected by the bucket bound 1 + 2 = 3.
+        let lead_docs: Vec<u32> = (0..64).collect();
+        let lead_freqs: Vec<u32> = (0..64).map(|i| if i < 8 { 64 } else { 1 }).collect();
+        let follower_docs: Vec<u32> = (0..2048).collect();
+        let mut docs = DocSet::default();
+        for doc_id in 0..2048 {
+            docs.append(doc_id, 1);
+        }
+
+        let build = |mode| {
+            let postings = [
+                generate_posting_list_with_freqs(
+                    lead_docs.clone(),
+                    lead_freqs.clone(),
+                    64.0,
+                    None,
+                    true,
+                ),
+                generate_posting_list(follower_docs.clone(), 1.0, None, true),
+                generate_posting_list(follower_docs.clone(), 1.0, None, true),
+            ];
+            let postings = postings
+                .into_iter()
+                .enumerate()
+                .map(|(position, list)| {
+                    PostingIterator::with_query_weight(
+                        format!("t{position}"),
+                        position as u32,
+                        position as u32,
+                        1.0,
+                        list,
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode);
+            let hits = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(4)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            (
+                hits,
+                wand.and_window_stats.lut_prepruned,
+                wand.and_lead_arrayed,
+            )
+        };
+
+        let (auto_hits, prepruned, arrayed) = build(BulkAndMode::Auto);
+        let (off_hits, _, _) = build(BulkAndMode::Off);
+        assert!(arrayed, "the arrayed route must be active for this fixture");
+        assert!(
+            prepruned > 0,
+            "the frequency pre-filter must reject below-floor candidates"
+        );
+        assert!(!auto_hits.is_empty());
+        assert_eq!(format!("{auto_hits:?}"), format!("{off_hits:?}"));
+    }
+
+    #[test]
+    fn test_skewed_and_routes_to_arrayed_lead_and_matches_classic() {
+        // Three clauses over the same document range with a 32x cost skew:
+        // the intersection is docs 0..8 and the lead clause carries 256
+        // postings, so the routing predicate fires exactly at the ratio.
+        // All lists are current-format (MAX_POSTING_BLOCK_SIZE + impacts).
+        let clause_docs: [Vec<u32>; 3] = [(0..256).collect(), (0..16).collect(), (0..8).collect()];
+        let mut docs = DocSet::default();
+        for doc_id in 0..256 {
+            docs.append(doc_id, 1);
+        }
+
+        let build = |mode| {
+            let postings = clause_docs
+                .iter()
+                .enumerate()
+                .map(|(position, doc_ids)| {
+                    PostingIterator::with_query_weight(
+                        format!("t{position}"),
+                        position as u32,
+                        position as u32,
+                        1.0,
+                        generate_impact_posting_list_with_freqs_and_block_size(
+                            doc_ids.clone(),
+                            vec![1; doc_ids.len()],
+                            vec![1; doc_ids.len()],
+                            MAX_POSTING_BLOCK_SIZE,
+                        ),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode);
+            let hits = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(16)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            (hits, wand.and_lead_arrayed)
+        };
+
+        let (auto_hits, arrayed) = build(BulkAndMode::Auto);
+        let (off_hits, classic_arrayed) = build(BulkAndMode::Off);
+        assert!(
+            arrayed,
+            "skewed current-format routing must buffer the lead"
+        );
+        assert!(!classic_arrayed, "Off must keep the classic loop");
+
+        assert_eq!(auto_hits.len(), 8);
+        assert_eq!(off_hits.len(), 8);
+        // Identical documents and identical score bits, not just the same set.
+        assert_eq!(format!("{auto_hits:?}"), format!("{off_hits:?}"));
+    }
+
     struct PartialNormScorer;
 
     impl Scorer for PartialNormScorer {
@@ -8435,6 +8982,83 @@ mod tests {
                 Some(position_builder.finish()),
             ))
         }
+    }
+
+    #[test]
+    fn test_next_doc_id_after_exhaustion_block_aligned_length_is_safe() {
+        // Exactly one full block: an exhausted cursor ends with
+        // index == length == MAX_POSTING_BLOCK_SIZE, which is block-aligned
+        // and used to make the cached-next fast path decode one block past
+        // the end (LargeBinaryArray::value panics out of range).
+        let doc_ids: Vec<u32> = (0..MAX_POSTING_BLOCK_SIZE as u32).collect();
+        let frequencies: Vec<u32> = vec![10_u32; doc_ids.len()];
+        let blocks = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            frequencies.iter(),
+            std::iter::once(1.0),
+            crate::scalar::inverted::PostingTailCodec::VarintDelta,
+            MAX_POSTING_BLOCK_SIZE,
+        )
+        .unwrap();
+        let posting_list = PostingList::Compressed(CompressedPostingList::new(
+            blocks,
+            1.0,
+            doc_ids.len() as u32,
+            crate::scalar::inverted::PostingTailCodec::VarintDelta,
+            MAX_POSTING_BLOCK_SIZE,
+            None,
+            None,
+        ));
+        let mut posting =
+            PostingIterator::new(String::from("term"), 0, 0, posting_list, doc_ids.len());
+
+        // Exhaust: seek past the last doc; the cursor lands on
+        // index == length (block-aligned).
+        posting.next_doc_id(MAX_POSTING_BLOCK_SIZE as u64, false);
+        assert!(posting.current_doc_id().is_none());
+
+        // Repeated seeks after exhaustion must stay safe and stay exhausted.
+        posting.next_doc_id(MAX_POSTING_BLOCK_SIZE as u64, false);
+        assert!(posting.current_doc_id().is_none());
+        posting.next_doc_id(0, false);
+        assert!(posting.current_doc_id().is_none());
+    }
+
+    #[test]
+    fn test_next_doc_id_after_exhaustion_partial_tail_block_is_safe() {
+        // Non-aligned length: the exhausted index lands inside the last
+        // block, which the fast path must also answer without decoding
+        // anything new.
+        let doc_ids: Vec<u32> = (0..(MAX_POSTING_BLOCK_SIZE as u32 + 7)).collect();
+        let frequencies: Vec<u32> = vec![10_u32; doc_ids.len()];
+        let blocks = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            frequencies.iter(),
+            std::iter::once(1.0),
+            crate::scalar::inverted::PostingTailCodec::VarintDelta,
+            MAX_POSTING_BLOCK_SIZE,
+        )
+        .unwrap();
+        let posting_list = PostingList::Compressed(CompressedPostingList::new(
+            blocks,
+            1.0,
+            doc_ids.len() as u32,
+            crate::scalar::inverted::PostingTailCodec::VarintDelta,
+            MAX_POSTING_BLOCK_SIZE,
+            None,
+            None,
+        ));
+        let mut posting =
+            PostingIterator::new(String::from("term"), 0, 0, posting_list, doc_ids.len());
+
+        posting.next_doc_id(u64::from(u32::MAX), false);
+        assert!(posting.current_doc_id().is_none());
+        posting.next_doc_id(MAX_POSTING_BLOCK_SIZE as u64, false);
+        assert!(posting.current_doc_id().is_none());
+        posting.next_doc_id(0, false);
+        assert!(posting.current_doc_id().is_none());
     }
 
     #[rstest]

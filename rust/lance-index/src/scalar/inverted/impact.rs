@@ -41,11 +41,9 @@ impl PartialEq for ImpactSkipData {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub struct ImpactScore {
     pub score: f32,
-    pub entries_scanned: usize,
 }
 
 #[derive(Debug)]
@@ -307,9 +305,9 @@ impl ImpactSkipData {
         cache.entry_score(self, self.level0_len + group_idx, query_weight, scorer)
     }
 
-    #[cfg(test)]
-    pub fn max_score_up_to_cached<S>(
+    pub(crate) fn max_score_up_to_cached<S>(
         &self,
+        first_doc_of_block: &dyn Fn(usize) -> Option<u64>,
         start_block_idx: usize,
         up_to: u64,
         query_weight: f32,
@@ -321,7 +319,6 @@ impl ImpactSkipData {
     {
         let mut block_idx = start_block_idx;
         let mut max_score = 0.0_f32;
-        let mut entries_scanned = 0usize;
 
         while block_idx < self.level0_len {
             let group_idx = block_idx / IMPACT_LEVEL1_BLOCKS;
@@ -333,7 +330,6 @@ impl ImpactSkipData {
                     u32::MAX => {
                         return ImpactScore {
                             score: f32::INFINITY,
-                            entries_scanned: entries_scanned + 1,
                         };
                     }
                     doc_up_to if u64::from(doc_up_to) <= up_to => {
@@ -343,7 +339,6 @@ impl ImpactSkipData {
                             query_weight,
                             scorer,
                         ));
-                        entries_scanned += 1;
                         block_idx = group_end;
                         continue;
                     }
@@ -351,13 +346,19 @@ impl ImpactSkipData {
                 }
             }
 
+            // A block whose first document is above `up_to` has no
+            // contribution in the span; skip it instead of letting its full
+            // block bound (which may be far larger) loosen the result. When
+            // the first doc is unknown, include conservatively.
+            if first_doc_of_block(block_idx).is_some_and(|first| first > up_to) {
+                break;
+            }
+
             max_score = max_score.max(cache.entry_score(self, block_idx, query_weight, scorer));
-            entries_scanned += 1;
             match self.entry_doc_up_tos[block_idx] {
                 u32::MAX => {
                     return ImpactScore {
                         score: f32::INFINITY,
-                        entries_scanned,
                     };
                 }
                 doc_up_to if u64::from(doc_up_to) >= up_to => break,
@@ -366,10 +367,89 @@ impl ImpactSkipData {
             block_idx += 1;
         }
 
-        ImpactScore {
-            score: max_score,
-            entries_scanned,
+        ImpactScore { score: max_score }
+    }
+}
+
+#[cfg(test)]
+mod walk_bound_tests {
+    use super::*;
+    use crate::scalar::inverted::scorer::MemBM25Scorer;
+    use std::collections::HashMap;
+
+    fn scorer(num_doc: usize) -> MemBM25Scorer {
+        MemBM25Scorer::new(
+            num_doc as u64,
+            num_doc,
+            HashMap::from([(String::from("token"), 2usize)]),
+        )
+    }
+
+    /// A window ending in a document gap must not let the next block's (much
+    /// larger) bound loosen the result: the first-doc probe has to exclude a
+    /// block whose first document is above the window end.
+    #[test]
+    fn excludes_blocks_that_start_above_the_window_end() {
+        let blocks = vec![
+            (0u32..=4).map(|d| (d, 1u32, 10u32)).collect::<Vec<_>>(),
+            (10u32..=19).map(|d| (d, 10u32, 10u32)).collect::<Vec<_>>(),
+        ];
+        let impacts = build_impact_skip_data(&blocks).unwrap();
+        let scorer = scorer(20);
+        let mut cache = ImpactScoreCache::default();
+        let first_docs = |block: usize| -> Option<u64> { Some(if block == 0 { 0 } else { 10 }) };
+        let no_first_doc = |_: usize| -> Option<u64> { None };
+
+        // Window ends inside the gap between the blocks.
+        let tight = impacts
+            .max_score_up_to_cached(&first_docs, 0, 7, 1.0, &scorer, &mut cache)
+            .score;
+        let conservative = impacts
+            .max_score_up_to_cached(&no_first_doc, 0, 7, 1.0, &scorer, &mut cache)
+            .score;
+        assert!(tight <= conservative + 1e-6);
+        assert!(tight < conservative, "block 1 must be excluded");
+
+        // Upper-bound property: the bound covers the exact max of docs <= 7.
+        let exact = scorer.doc_weight(1, 10);
+        assert!(tight + 1e-6 >= exact);
+
+        // Boundary: up_to == block 1's first document keeps block 1.
+        let inclusive = impacts
+            .max_score_up_to_cached(&first_docs, 0, 10, 1.0, &scorer, &mut cache)
+            .score;
+        let exact_incl = scorer.doc_weight(1, 10).max(scorer.doc_weight(10, 10));
+        assert!(inclusive + 1e-6 >= exact_incl);
+        assert!(inclusive >= conservative - 1e-6);
+    }
+
+    /// The level-1 group jump must stay inside the span: a window ending at
+    /// the last document of group 0 must not pull in group 1's bound even
+    /// though the group entry is consulted first.
+    #[test]
+    fn group_jump_stays_inside_the_span() {
+        let mut blocks = Vec::new();
+        for block in 0..33usize {
+            let base = (block * 10) as u32;
+            let freq = if block < 32 { 1 } else { 10 };
+            blocks.push(vec![(base, freq, 10u32), (base + 1, freq, 10u32)]);
         }
+        let impacts = build_impact_skip_data(&blocks).unwrap();
+        let scorer = scorer(330);
+        let mut cache = ImpactScoreCache::default();
+        let first_docs = |block: usize| -> Option<u64> { Some((block * 10) as u64) };
+        let no_first_doc = |_: usize| -> Option<u64> { None };
+
+        let up_to = 31 * 10 + 1; // last document of group 0
+        let tight = impacts
+            .max_score_up_to_cached(&first_docs, 0, up_to, 1.0, &scorer, &mut cache)
+            .score;
+        let conservative = impacts
+            .max_score_up_to_cached(&no_first_doc, 0, up_to, 1.0, &scorer, &mut cache)
+            .score;
+        assert!(tight <= conservative + 1e-6);
+        assert!(tight < conservative, "group 1 must be excluded");
+        assert!(tight + 1e-6 >= scorer.doc_weight(1, 10));
     }
 }
 
@@ -754,8 +834,8 @@ mod tests {
         assert_eq!(impacts.level1_len(), 2);
         let scorer = MemBM25Scorer::new(400, 40, HashMap::from([(String::from("token"), 40usize)]));
         let mut cache = ImpactScoreCache::default();
-        let score = impacts.max_score_up_to_cached(0, 31, 1.0, &scorer, &mut cache);
-        assert!(score.entries_scanned < IMPACT_LEVEL1_BLOCKS);
+        let no_first_doc = |_: usize| -> Option<u64> { None };
+        let score = impacts.max_score_up_to_cached(&no_first_doc, 0, 31, 1.0, &scorer, &mut cache);
         assert!(score.score > 0.0);
     }
 
@@ -917,10 +997,10 @@ mod tests {
         let impacts = ImpactSkipData::new(entries, 2).unwrap();
         let scorer = MemBM25Scorer::new(10, 10, HashMap::from([(String::from("token"), 2usize)]));
         let mut cache = ImpactScoreCache::default();
+        let no_first_doc = |_: usize| -> Option<u64> { None };
 
-        let score = impacts.max_score_up_to_cached(0, 0, 1.0, &scorer, &mut cache);
+        let score = impacts.max_score_up_to_cached(&no_first_doc, 0, 0, 1.0, &scorer, &mut cache);
         assert!(score.score.is_finite());
-        assert_eq!(score.entries_scanned, 1);
 
         assert_eq!(
             impacts.level0_score_cached(1, 1.0, &scorer, &mut cache),
@@ -984,12 +1064,14 @@ mod tests {
         assert_eq!(impacts.level1_doc_up_to(0), Some(767));
         let scorer = MemBM25Scorer::new(400, 768, HashMap::from([(String::from("t"), 768usize)]));
         let mut cache = ImpactScoreCache::default();
+        let no_first_doc = |_: usize| -> Option<u64> { None };
         assert!(
             impacts
                 .level0_score_cached(0, 1.0, &scorer, &mut cache)
                 .is_finite()
         );
-        let level1 = impacts.max_score_up_to_cached(0, 767, 1.0, &scorer, &mut cache);
+        let level1 =
+            impacts.max_score_up_to_cached(&no_first_doc, 0, 767, 1.0, &scorer, &mut cache);
         assert!(level1.score.is_finite() && level1.score > 0.0);
     }
 
@@ -1018,6 +1100,7 @@ mod tests {
         let scorer = MemBM25Scorer::new(474, 31, HashMap::from([(String::from("token"), 4usize)]));
         let query_weight = scorer.query_weight("token");
         let mut cache = ImpactScoreCache::default();
+        let no_first_doc = |_: usize| -> Option<u64> { None };
 
         for start_block_idx in 0..blocks.len() {
             let up_to = blocks
@@ -1029,6 +1112,7 @@ mod tests {
                 .max()
                 .unwrap();
             let upper_bound = impacts.max_score_up_to_cached(
+                &no_first_doc,
                 start_block_idx,
                 u64::from(up_to),
                 query_weight,
