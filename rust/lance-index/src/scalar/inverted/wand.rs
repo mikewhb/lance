@@ -8466,6 +8466,94 @@ mod tests {
     }
 
     #[test]
+    fn test_frequency_prefilter_bm25_boundaries() {
+        // Real BM25: the head documents carry the boundary frequencies 62/63/64
+        // in very short documents, the tail carries frequency 1 in long ones.
+        // The bucket bound (score at doc_length = 0) plus the followers' tight
+        // block maxima must reject the tail once the head has raised the floor,
+        // and the results must match the classic route.
+        let lead_docs: Vec<u32> = (0..64).collect();
+        let lead_freqs: Vec<u32> = (0..64)
+            .map(|i| match i {
+                0 => 64,
+                1 => 63,
+                2 => 62,
+                3..=7 => 32,
+                _ => 1,
+            })
+            .collect();
+        let follower_docs: Vec<u32> = (0..2048).collect();
+        let mut docs = DocSet::default();
+        for doc_id in 0..8u32 {
+            docs.append(u64::from(doc_id), 1);
+        }
+        for doc_id in 8..2048u32 {
+            docs.append(u64::from(doc_id), 500);
+        }
+        let scorer = MemBM25Scorer::new(
+            1_024_000,
+            2048,
+            std::collections::HashMap::from([
+                (String::from("t0"), 64usize),
+                (String::from("t1"), 2048),
+                (String::from("t2"), 2048),
+            ]),
+        );
+        let follower_max = scorer.doc_weight(1, 1);
+
+        let build = |mode| {
+            let postings = [
+                generate_posting_list_with_freqs(
+                    lead_docs.clone(),
+                    lead_freqs.clone(),
+                    scorer.doc_weight(64, 1),
+                    None,
+                    true,
+                ),
+                generate_posting_list(follower_docs.clone(), follower_max, None, true),
+                generate_posting_list(follower_docs.clone(), follower_max, None, true),
+            ];
+            let postings = postings
+                .into_iter()
+                .enumerate()
+                .map(|(position, list)| {
+                    PostingIterator::with_query_weight(
+                        format!("t{position}"),
+                        position as u32,
+                        position as u32,
+                        1.0,
+                        list,
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, scorer.clone())
+                .with_bulk_and_mode(mode);
+            let hits = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(4)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            (
+                hits,
+                wand.and_window_stats.lut_prepruned,
+                wand.and_lead_arrayed,
+            )
+        };
+
+        let (auto_hits, prepruned, arrayed) = build(BulkAndMode::Auto);
+        let (off_hits, _, _) = build(BulkAndMode::Off);
+        assert!(arrayed, "the arrayed route must be active for this fixture");
+        assert!(
+            prepruned > 0,
+            "the BM25 bucket bound must reject the long-document tail"
+        );
+        assert!(!auto_hits.is_empty());
+        assert_eq!(format!("{auto_hits:?}"), format!("{off_hits:?}"));
+    }
+
+    #[test]
     fn test_skewed_and_routes_to_arrayed_lead_and_matches_classic() {
         // Three clauses over the same document range with a 32x cost skew:
         // the intersection is docs 0..8 and the lead clause carries 256
