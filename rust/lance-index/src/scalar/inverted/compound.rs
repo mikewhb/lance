@@ -4707,10 +4707,6 @@ fn iu_tight_clauses_ready(
 }
 
 /// Shared collection tail for the two IU kernels: floor-checked top-k
-/// insertion with overflow tracking, comparison counting, and the floor
-/// callback the kernels poll. Interior mutability lets a kernel hold its
-/// `on_hit` callback and its floor callback over the same instance.
-/// Shared collection tail for the two IU kernels: floor-checked top-k
 /// insertion with overflow tracking and comparison counting. The `floor`
 /// handle passed into [`Self::hit`] carries the latest competitive floor back
 /// to the kernels.
