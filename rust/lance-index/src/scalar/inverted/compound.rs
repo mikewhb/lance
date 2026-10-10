@@ -4614,35 +4614,21 @@ where
     if iu_tight_enabled()
         && let Some((must_indices, should_indices)) = iu_tight_clause_indices(plan)
         && iu_tight_clauses_ready(&leaves, &must_indices, &should_indices)
+        && (must_indices.len() >= 2
+            || iu_tight_should_switch(&leaves, must_indices[0], &should_indices))
     {
-        if must_indices.len() == 1
-            && iu_tight_should_switch(&leaves, must_indices[0], &should_indices)
-        {
-            return collect_iu_tight(
-                documents,
-                leaves,
-                must_indices[0],
-                &should_indices,
-                metrics,
-                collector,
-                map_document,
-            );
-        }
-        if must_indices.len() >= 2 {
-            // The mixed "K required + N optional" shape has no dedicated
-            // engine on main (it falls back to the generic ReqOptScorer
-            // path); the generalized kernel intersects the required clauses
-            // and sums the optional matches.
-            return collect_iu_tight_multi(
-                documents,
-                leaves,
-                &must_indices,
-                &should_indices,
-                metrics,
-                collector,
-                map_document,
-            );
-        }
+        // One required clause clears the relative cost gate; two or more have
+        // no dedicated engine on main (they fall back to the generic
+        // ReqOptScorer path) and always take the generalized kernel.
+        return collect_iu_tight(
+            documents,
+            leaves,
+            &must_indices,
+            &should_indices,
+            metrics,
+            collector,
+            map_document,
+        );
     }
     let mut leaf_scorers = leaves
         .into_iter()
@@ -4724,58 +4710,41 @@ fn iu_tight_clauses_ready(
 /// insertion with overflow tracking, comparison counting, and the floor
 /// callback the kernels poll. Interior mutability lets a kernel hold its
 /// `on_hit` callback and its floor callback over the same instance.
-struct IuCollector<'a, K: Copy + Ord> {
-    collector: RefCell<&'a mut TopKCollector<K>>,
-    map_document: RefCell<Box<dyn FnMut(u64) -> Result<K> + 'a>>,
-    floor: Cell<f32>,
-    overflow: Cell<bool>,
-    comparisons: Cell<usize>,
+/// Shared collection tail for the two IU kernels: floor-checked top-k
+/// insertion with overflow tracking and comparison counting. The `floor`
+/// handle passed into [`Self::hit`] carries the latest competitive floor back
+/// to the kernels.
+struct IuCollector<'a, K: Copy + Ord, F> {
+    collector: &'a mut TopKCollector<K>,
+    map_document: F,
+    overflow: bool,
+    comparisons: usize,
 }
 
-impl<'a, K: Copy + Ord> IuCollector<'a, K> {
-    fn new(
-        collector: &'a mut TopKCollector<K>,
-        map_document: impl FnMut(u64) -> Result<K> + 'a,
-    ) -> Self {
-        let floor = collector.min_competitive_score();
-        Self {
-            collector: RefCell::new(collector),
-            map_document: RefCell::new(Box::new(map_document)),
-            floor: Cell::new(floor),
-            overflow: Cell::new(false),
-            comparisons: Cell::new(0),
-        }
-    }
-
+impl<K: Copy + Ord, F: FnMut(u64) -> Result<K>> IuCollector<'_, K, F> {
     /// The kernels' `on_hit`.
-    fn hit(&self, key: u64, score: f32) -> Result<bool> {
-        self.comparisons.set(self.comparisons.get() + 1);
+    fn hit(&mut self, floor: &Cell<f32>, key: u64, score: f32) -> Result<bool> {
+        self.comparisons += 1;
         let score = checked_score(score, "iu_tight kernel")?;
-        let mut collector = self.collector.borrow_mut();
-        if score < collector.min_competitive_score() {
+        if score < self.collector.min_competitive_score() {
             return Ok(true);
         }
-        let row_id = (self.map_document.borrow_mut())(key)?;
-        let status = collector.insert(ScoredRow { row_id, score });
-        self.floor.set(collector.min_competitive_score());
+        let row_id = (self.map_document)(key)?;
+        let status = self.collector.insert(ScoredRow { row_id, score });
+        floor.set(self.collector.min_competitive_score());
         if status == CollectionStatus::ScoreFloorOverflow {
-            self.overflow.set(true);
+            self.overflow = true;
             return Ok(false);
         }
         Ok(true)
-    }
-
-    /// The kernels' `floor` callback.
-    fn floor_value(&self) -> f32 {
-        self.floor.get()
     }
 
     fn finish(&self, metrics: &dyn MetricsCollector) -> CollectionStatus {
         // Counted here: candidates scored (on_hit calls). WandCursor's
         // num_comparisons counts heap advances instead, so the two metrics
         // use different units and must not be compared directly.
-        metrics.record_comparisons(self.comparisons.get());
-        if self.overflow.get() {
+        metrics.record_comparisons(self.comparisons);
+        if self.overflow {
             CollectionStatus::ScoreFloorOverflow
         } else {
             CollectionStatus::Complete
@@ -4783,11 +4752,26 @@ impl<'a, K: Copy + Ord> IuCollector<'a, K> {
     }
 }
 
-/// Collect the mixed Boolean `K required + N optional` shape with the
-/// generalized IU kernel: the required cursors align on each candidate by
-/// seek-to-max in plan order (no lead selection), and the optional clauses
-/// are probed and summed.
-fn collect_iu_tight_multi<D, K>(
+fn iu_tight_should_switch(
+    leaves: &[LoadedLeaf],
+    must_index: usize,
+    should_indices: &[usize],
+) -> bool {
+    let must_cost = leaves[must_index].postings[0].cost();
+    let min_should = should_indices
+        .iter()
+        .map(|index| leaves[*index].postings[0].cost())
+        .min()
+        .unwrap_or(0);
+    iu_tight_lead_is_cheaper(must_cost, min_should)
+}
+
+/// Collect the IU shapes with the tight kernels: one required clause drives
+/// MUST blocks with a bulk optional merge; two or more required clauses align
+/// their cursors by seek-to-max. Both score the required clauses first and
+/// then the matching optional clauses, in plan order, so the f32 result
+/// matches the generic `ReqOptScorer` path.
+fn collect_iu_tight<D, K>(
     documents: &D,
     mut leaves: Vec<LoadedLeaf>,
     must_indices: &[usize],
@@ -4816,69 +4800,33 @@ where
         .map(|&leaf_index| take_posting(leaf_index))
         .collect::<Result<Vec<_>>>()?;
     let scorer = leaves[must_indices[0]].scorer.clone();
-    let iu = IuCollector::new(collector, map_document);
-    let result = iu_tight_search_multi(
-        documents,
-        scorer.as_ref(),
-        required,
-        optional,
-        &mut |key, score| iu.hit(key, score),
-        || iu.floor_value(),
-    );
-    let status = iu.finish(metrics);
-    result?;
-    Ok(status)
-}
-
-fn iu_tight_should_switch(
-    leaves: &[LoadedLeaf],
-    must_index: usize,
-    should_indices: &[usize],
-) -> bool {
-    let must_cost = leaves[must_index].postings[0].cost();
-    let min_should = should_indices
-        .iter()
-        .map(|index| leaves[*index].postings[0].cost())
-        .min()
-        .unwrap_or(0);
-    iu_tight_lead_is_cheaper(must_cost, min_should)
-}
-
-fn collect_iu_tight<D, K>(
-    documents: &D,
-    mut leaves: Vec<LoadedLeaf>,
-    must_index: usize,
-    should_indices: &[usize],
-    metrics: &dyn MetricsCollector,
-    collector: &mut TopKCollector<K>,
-    map_document: impl FnMut(u64) -> Result<K>,
-) -> Result<CollectionStatus>
-where
-    D: WandDocuments + Sync,
-    K: Copy + Ord,
-{
-    let mut take_posting = |index: usize| -> Result<PostingIterator> {
-        leaves[index]
-            .postings
-            .drain(..)
-            .next()
-            .ok_or_else(|| Error::internal("iu_tight_clauses_ready checked a single posting"))
+    let floor = Cell::new(collector.min_competitive_score());
+    let mut iu = IuCollector {
+        collector,
+        map_document,
+        overflow: false,
+        comparisons: 0,
     };
-    let must = take_posting(must_index)?;
-    let shoulds = should_indices
-        .iter()
-        .map(|&leaf_index| take_posting(leaf_index))
-        .collect::<Result<Vec<_>>>()?;
-    let scorer = leaves[must_index].scorer.clone();
-    let iu = IuCollector::new(collector, map_document);
-    let result = iu_tight_search(
-        documents,
-        scorer.as_ref(),
-        must,
-        shoulds,
-        &mut |key, score| iu.hit(key, score),
-        || iu.floor_value(),
-    );
+    let result = if required.len() == 1 {
+        let mut required = required;
+        iu_tight_search(
+            documents,
+            scorer.as_ref(),
+            required.pop().expect("checked one required clause"),
+            optional,
+            &mut |key, score| iu.hit(&floor, key, score),
+            || floor.get(),
+        )
+    } else {
+        iu_tight_search_multi(
+            documents,
+            scorer.as_ref(),
+            required,
+            optional,
+            &mut |key, score| iu.hit(&floor, key, score),
+            || floor.get(),
+        )
+    };
     let status = iu.finish(metrics);
     result?;
     Ok(status)

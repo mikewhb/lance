@@ -13,8 +13,23 @@ use lance_core::Result;
 
 use super::super::scorer::Scorer;
 use super::{
-    BulkAndMode, PostingIterator, TERMINATED_DOC_ID, WandDocuments, conservative_score_sum,
+    BulkAndMode, CompetitiveFloorMode, PostingIterator, TERMINATED_DOC_ID, WandDocuments,
+    conservative_score_sum, score_sum_cannot_compete, score_sum_upper_bound_factor,
 };
+
+/// Whether `partial + remaining` can no longer reach `floor`. Wraps the
+/// generic path's predicate so the widening and the inclusive floor semantics
+/// live in one audited place; a document scoring exactly at the floor still
+/// competes, which is the contract the IU kernels are tested against.
+fn iu_cannot_compete(partial: f32, remaining: f32, floor: f32) -> bool {
+    score_sum_cannot_compete(
+        partial,
+        f64::from(remaining),
+        floor,
+        score_sum_upper_bound_factor(2),
+        CompetitiveFloorMode::Inclusive,
+    )
+}
 
 /// Env gate for the IU fast paths, following the `LANCE_FTS_BULK_AND`
 /// convention: `auto` (default) enables both kernels, `on`/`1` forces them
@@ -140,7 +155,7 @@ where
             let must_score = scoring.term_score(&must, doc, freq);
             let current_floor = floor();
             if current_floor.is_finite()
-                && conservative_score_sum([must_score, should_ub_sum].into_iter()) < current_floor
+                && iu_cannot_compete(must_score, should_ub_sum, current_floor)
             {
                 continue;
             }
@@ -250,7 +265,7 @@ where
         }
         let current_floor = floor();
         if current_floor.is_finite()
-            && conservative_score_sum([required_sum, optional_ub_sum].into_iter()) < current_floor
+            && iu_cannot_compete(required_sum, optional_ub_sum, current_floor)
         {
             candidate += 1;
             continue;
@@ -289,7 +304,7 @@ pub fn iu_tight_required_shoulds(
         return None;
     }
     let sum_shoulds = conservative_score_sum(should_ubs.iter().copied());
-    if conservative_score_sum([must_ub, sum_shoulds].into_iter()) < floor {
+    if iu_cannot_compete(must_ub, sum_shoulds, floor) {
         return Some(Vec::new());
     }
     let required: Vec<usize> = should_ubs
@@ -303,7 +318,7 @@ pub fn iu_tight_required_shoulds(
                     .filter(|(other, _)| other != index)
                     .map(|(_, upper)| *upper),
             );
-            conservative_score_sum([must_ub, others].into_iter()) < floor
+            iu_cannot_compete(must_ub, others, floor)
         })
         .map(|(index, _)| index)
         .collect();
