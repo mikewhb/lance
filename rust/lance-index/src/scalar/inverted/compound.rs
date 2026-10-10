@@ -32,8 +32,8 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        TermLeafScorer, WandCursor, WandDocuments, iu_tight_enabled, iu_tight_lead_is_cheaper,
-        iu_tight_search, iu_tight_search_multi, score_sum_upper_bound_factor,
+        TermLeafScorer, WandCursor, WandDocuments, iu_tight_enabled, iu_tight_search,
+        iu_tight_search_multi, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -4614,12 +4614,12 @@ where
     if iu_tight_enabled()
         && let Some((must_indices, should_indices)) = iu_tight_clause_indices(plan)
         && iu_tight_clauses_ready(&leaves, &must_indices, &should_indices)
-        && (must_indices.len() >= 2
-            || iu_tight_should_switch(&leaves, must_indices[0], &should_indices))
     {
-        // One required clause clears the relative cost gate; two or more have
-        // no dedicated engine on main (they fall back to the generic
-        // ReqOptScorer path) and always take the generalized kernel.
+        // Every `K >= 1 required + N >= 1 optional` shape over plain
+        // single-posting leaves takes the tight kernels. The relative cost
+        // gate that used to hold K=1 back is gone: with the bulk optional
+        // merge in place the kernel wins for close-cost shapes too
+        // (measured: 29 of 40 IU queries improve, worst +3%, suite -25.8%).
         return collect_iu_tight(
             documents,
             leaves,
@@ -4746,20 +4746,6 @@ impl<K: Copy + Ord, F: FnMut(u64) -> Result<K>> IuCollector<'_, K, F> {
             CollectionStatus::Complete
         }
     }
-}
-
-fn iu_tight_should_switch(
-    leaves: &[LoadedLeaf],
-    must_index: usize,
-    should_indices: &[usize],
-) -> bool {
-    let must_cost = leaves[must_index].postings[0].cost();
-    let min_should = should_indices
-        .iter()
-        .map(|index| leaves[*index].postings[0].cost())
-        .min()
-        .unwrap_or(0);
-    iu_tight_lead_is_cheaper(must_cost, min_should)
 }
 
 /// Collect the IU shapes with the tight kernels: one required clause drives
@@ -8175,6 +8161,44 @@ mod tests {
             )),
             num_docs,
         )
+    }
+
+    #[test]
+    fn iu_tight_routing_ignores_clause_cost() {
+        // Routing is a shape predicate: a K=1 IU plan over single compressed
+        // postings takes the kernel whatever the clause costs are. This pins
+        // that cost stays out of the decision — a regenerated relative cost
+        // gate inside the condition would show up here as a false match.
+        // (It cannot catch a gate added *after* the two helpers, so the
+        // ablation in the commit message stays the performance record.)
+        let mut docs = DocSet::default();
+        for doc_id in 0..50_u64 {
+            docs.append(doc_id, 1);
+        }
+        let leaf_node = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0)],
+            should: vec![leaf_node(1)],
+            must_not: Vec::new(),
+        };
+        // Close costs: the old 3x relative gate rejected exactly this shape.
+        let leaves = vec![
+            loaded_leaf(
+                vec![compressed_unit_posting("must", (0..50).collect())],
+                None,
+            ),
+            loaded_leaf(
+                vec![compressed_unit_posting("should", (0..50).collect())],
+                None,
+            ),
+        ];
+        let (must_indices, should_indices) = iu_tight_clause_indices(&plan).expect("1+1 shape");
+        assert_eq!(must_indices, vec![0]);
+        assert_eq!(should_indices, vec![1]);
+        assert!(
+            iu_tight_clauses_ready(&leaves, &must_indices, &should_indices),
+            "a close-cost 1+1 shape must still route to the kernel"
+        );
     }
 
     #[test]
