@@ -176,3 +176,26 @@ norm（K→1）；③ `promoted()` 的 `iu_tight_seek_eq` 仍走整块解码，�
 标志（对比的两个二进制同源，比例不受影响，但绝对值可能偏低 ~2%：本轮 conv 943 = 1766.7ms
 vs 历史 -33.6% 对应的 1727.4ms）。**出 PR 数字前需带 native 标志重建一次。**
 
+## 6. IU 40 条的真实路由分布（2026-10-04，用 COUNT 量真实 df 后判定）
+
+用 main 二进制对 107 个查询词取真实 df，按代码里的门槛规则
+（`cheapest_should × 3 < must_cost`，`wand_iu_tight.rs:26`）分类：
+
+| 路径 | 条数 | 代表查询（cheapest_should → must，比值） |
+|---|---|---|
+| K=1 内核 + promotion | **20** | `solar +panel rebates`（rebates 362 → panel 26679，73.7x）、`wildfire +risk maps`（1387 → 43239，31.2x）、`+electric grid stability`（12750 → 44752，**3.5x 骑线**）、`+financial reporting standards`（23610 → 89386，**3.8x 骑线**） |
+| K=1 回落（门槛失败，走 ReqOpt + TermLeaf + drain） | **20** | `electric +vehicles`（44752 → 36751）、`+global markets`（29141 → 56628）、`urban +planning`（66740 → 56033）、`school +safety`（474769 → 55646）、`+consumer rights`（104798 → 18877）、`medical +devices`（90884 → 28656） |
+| K≥2（generic 树） | **0** | — |
+
+**两条重要推论**：
+
+1. **历史 §4(a) 的目标查询列表有误**：它点名的 `+global markets`、`electric +vehicles`
+   都**没过 3x 门槛**，根本不进 `promoted()`——它们走回落路径。§4(a)（提升后交 AND/块级引擎）
+   真正的受益面是上表那 20 条**高比值**查询的 B 段（`solar +panel rebates`、`wildfire +risk maps`
+   这类「稠密 MUST + 稀有 SHOULD」）。历史文档写于该门槛提交之前或未做 df 核对。
+2. **五条历史最差查询横跨两条路径**：`solar +panel rebates`/`wildfire +risk maps`/
+   `+electric grid stability` 在内核路径（后者仅 3.5x），`electric +vehicles`/`+global markets`
+   在回落路径。所以 §4(a) 与 drain/TermLeaf 两条线各自服务一半最差查询，不能互相替代。
+   也说明 **3x 门槛的消融有真实 blast radius**：骑线的 3.5x/3.8x 查询会在两条路径间搬家。
+
+
