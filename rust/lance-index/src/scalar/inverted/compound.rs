@@ -4820,7 +4820,6 @@ where
             required,
             optional,
             &mut |key, score| iu.hit(&floor, key, score),
-            || floor.get(),
         )
     };
     let status = iu.finish(metrics);

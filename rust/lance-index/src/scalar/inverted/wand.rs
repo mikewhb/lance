@@ -8031,7 +8031,6 @@ mod tests {
                 hits.push((key, score));
                 Ok(true)
             },
-            || f32::NEG_INFINITY,
         )
         .unwrap();
         assert_eq!(hits, vec![(2, 3.0), (4, 13.0), (6, 13.0)]);
@@ -8064,56 +8063,15 @@ mod tests {
                 hits.push((key, score));
                 Ok(true)
             },
-            || f32::NEG_INFINITY,
         )
         .unwrap();
         assert_eq!(hits, vec![(2, 3.0), (6, 13.0)]);
     }
 
     #[test]
-    fn iu_tight_search_multi_prunes_with_floor_and_keeps_exact_floor_hits() {
-        // Required sum is 3.0 for every candidate and the optional ub is 10.
-        // A floor of 13 prunes nothing (13 < 13 is false), so every candidate
-        // — including the one scoring exactly at the floor — reaches on_hit.
-        // A floor of 14 prunes every candidate before any optional probe.
-        // The kernel itself never filters hits: dropping sub-floor scores is
-        // the collector's job, pruning only skips probes that cannot compete.
-        let build = || {
-            (
-                iu_tight_posting("must_a", vec![2, 4, 6], 1.0, true),
-                iu_tight_posting("must_b", vec![2, 4, 6], 2.0, true),
-                iu_tight_posting("should", vec![4, 6, 7], 10.0, true),
-            )
-        };
-        let run = |floor: f32| {
-            let mut docs = DocSet::default();
-            for doc_id in 0..8_u64 {
-                docs.append(doc_id, 1);
-            }
-            let (must_a, must_b, should) = build();
-            let mut hits = Vec::new();
-            iu_tight::iu_tight_search_multi(
-                &docs,
-                &IuTightUnitScorer,
-                vec![must_a, must_b],
-                vec![should],
-                &mut |key, score| {
-                    hits.push((key, score));
-                    Ok(true)
-                },
-                || floor,
-            )
-            .unwrap();
-            hits
-        };
-        assert_eq!(run(13.0), vec![(2, 3.0), (4, 13.0), (6, 13.0)]);
-        assert_eq!(run(14.0), Vec::<(u64, f32)>::new());
-    }
-
-    #[test]
     fn iu_tight_search_multi_enumerates_every_required_doc_for_counting() {
-        // COUNT mode pins the floor at zero: pruning must stay silent so the
-        // kernel enumerates every aligned required document.
+        // COUNT enumerates every aligned required document: the multi kernel
+        // has no floor-driven pruning at all.
         let mut docs = DocSet::default();
         for doc_id in 0..8_u64 {
             docs.append(doc_id, 1);
@@ -8131,7 +8089,6 @@ mod tests {
                 hits.push((key, score));
                 Ok(true)
             },
-            || 0.0,
         )
         .unwrap();
         assert_eq!(hits, vec![(0, 2.0), (6, 2.0)]);

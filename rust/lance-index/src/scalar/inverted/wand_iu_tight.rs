@@ -110,7 +110,6 @@ where
         .iter()
         .map(|should| should.global_upper_bound(scorer))
         .collect();
-    let should_ub_sum = conservative_score_sum(should_ubs.iter().copied());
     let mut chunk = Vec::with_capacity(128);
     let mut last_doc = 0_u64;
     // Candidate doc ids of the current MUST block, ascending.
@@ -153,12 +152,6 @@ where
                 continue;
             };
             let must_score = scoring.term_score(&must, doc, freq);
-            let current_floor = floor();
-            if current_floor.is_finite()
-                && iu_cannot_compete(must_score, should_ub_sum, current_floor)
-            {
-                continue;
-            }
             let score = must_score + should_sums[candidate];
             if !on_hit(key, score)? {
                 return Ok(());
@@ -202,7 +195,6 @@ pub fn iu_tight_search_multi<D, S>(
     mut required: Vec<PostingIterator>,
     mut optional: Vec<PostingIterator>,
     on_hit: &mut dyn FnMut(u64, f32) -> Result<bool>,
-    floor: impl Fn() -> f32,
 ) -> Result<()>
 where
     D: WandDocuments,
@@ -210,15 +202,6 @@ where
 {
     debug_assert!(required.len() >= 2);
     let scoring = IuTightScoring { documents, scorer };
-    let optional_ub_sum = if optional.is_empty() {
-        0.0
-    } else {
-        conservative_score_sum(
-            optional
-                .iter()
-                .map(|posting| posting.global_upper_bound(scorer)),
-        )
-    };
 
     // Align every required cursor on one document: seek-to-max until they
     // agree. A required list running out empties the intersection. Alignment
@@ -262,13 +245,6 @@ where
                 return Ok(());
             };
             required_sum += scoring.term_score(posting, candidate, cur.frequency());
-        }
-        let current_floor = floor();
-        if current_floor.is_finite()
-            && iu_cannot_compete(required_sum, optional_ub_sum, current_floor)
-        {
-            candidate += 1;
-            continue;
         }
         let mut optional_sum = 0.0_f32;
         for posting in optional.iter_mut() {
