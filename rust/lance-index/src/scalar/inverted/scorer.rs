@@ -10,12 +10,41 @@ use std::sync::Arc;
 // sum over all query_weight(query_token) * doc_weight(freq, doc_tokens)
 pub trait Scorer: Send + Sync {
     fn query_weight(&self, token: &str) -> f32;
+
+    /// Per-token score contribution of one occurrence of a token in a
+    /// document of `doc_tokens` tokens.
+    ///
+    /// # Contract (required by the pruning paths)
+    ///
+    /// Implementations must return a **non-negative** value that is
+    /// **non-increasing in `doc_tokens`** for a fixed `freq`. The AND
+    /// conjunction's frequency-bucket bounds and the arrayed-lead LUT build
+    /// their upper bounds from `doc_weight(freq, 0)` and silently
+    /// under-score — i.e. drop valid results — for any scorer violating this
+    /// monotonicity. Length-independent scorers satisfy the contract
+    /// trivially; a scorer that rewards longer documents cannot be plugged
+    /// into those paths without first adding an explicit capability or a
+    /// conservative-bound mechanism.
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32;
 
     /// Finite upper bound for every non-negative value returned by
     /// [`Self::doc_weight`]. Returning `None` disables score-independent
     /// pruning where the posting format has no stored impact bounds.
     fn doc_weight_upper_bound(&self) -> Option<f32> {
+        None
+    }
+
+    /// Upper bound of [`Self::doc_weight`] for a **fixed `freq`**, over every
+    /// `doc_tokens`.
+    ///
+    /// The AND conjunction's frequency-bucket pre-filters bound a candidate's
+    /// lead contribution by `query_weight * this`. A scorer whose
+    /// `doc_weight` is **not** non-increasing in `doc_tokens` (see the
+    /// [`Self::doc_weight`] contract) must override this; the default `None`
+    /// makes those pre-filters fall back to [`Self::doc_weight_upper_bound`],
+    /// and to no pre-filter at all when that is also `None`.
+    fn doc_weight_upper_bound_for_freq(&self, freq: u32) -> Option<f32> {
+        let _ = freq;
         None
     }
 
@@ -50,6 +79,10 @@ impl<T: Scorer + ?Sized> Scorer for Arc<T> {
 
     fn doc_weight_upper_bound(&self) -> Option<f32> {
         self.as_ref().doc_weight_upper_bound()
+    }
+
+    fn doc_weight_upper_bound_for_freq(&self, freq: u32) -> Option<f32> {
+        self.as_ref().doc_weight_upper_bound_for_freq(freq)
     }
 
     fn doc_weight_cache_key(&self) -> Option<u64> {
@@ -158,6 +191,12 @@ impl Scorer for MemBM25Scorer {
         Some(BM25_DOC_WEIGHT_UPPER_BOUND)
     }
 
+    /// BM25's `doc_weight` is non-increasing in `doc_tokens`, so the length-0
+    /// weight is an exact per-frequency upper bound.
+    fn doc_weight_upper_bound_for_freq(&self, freq: u32) -> Option<f32> {
+        Some(self.doc_weight(freq, 0))
+    }
+
     fn doc_weight_cache_key(&self) -> Option<u64> {
         Some(u64::from(self.avg_doc_length().to_bits()))
     }
@@ -226,6 +265,12 @@ impl Scorer for IndexBM25Scorer<'_> {
 
     fn doc_weight_upper_bound(&self) -> Option<f32> {
         Some(BM25_DOC_WEIGHT_UPPER_BOUND)
+    }
+
+    /// BM25's `doc_weight` is non-increasing in `doc_tokens`, so the length-0
+    /// weight is an exact per-frequency upper bound.
+    fn doc_weight_upper_bound_for_freq(&self, freq: u32) -> Option<f32> {
+        Some(self.doc_weight(freq, 0))
     }
 
     fn doc_weight_cache_key(&self) -> Option<u64> {
