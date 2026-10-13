@@ -8,6 +8,7 @@
 //! shared scorer-tree internals via `super::*` while keeping compound.rs
 //! small.
 
+use super::super::wand::{IuBatchState, IuMultiBatchState};
 use super::*;
 
 /// Required-plus-optional scorer that only touches the optional side when it
@@ -42,10 +43,18 @@ pub(super) struct ReqOptScorer<'a> {
     /// clause alone, so the optional clause is mandatory for the rest of the
     /// scan and the query is an intersection.
     pub(super) optional_globally_required: bool,
-    /// K = 1 batch profile state (PLAN-V3 P2). `Some` = the batch FSM owns
-    /// this scorer: pure-data breakpoints, providers re-acquired per drain
-    /// call, one-way until exhaustion (I-1/I-2 option (a)).
-    batch: Option<IuBatchState>,
+    /// Batch profile state (PLAN-V3 P2/P3). `Some` = a batch FSM owns this
+    /// scorer: pure-data breakpoints, providers re-acquired per drain call,
+    /// one-way until exhaustion (I-1/I-2 option (a)).
+    batch: Option<IuBatchEngagement>,
+}
+
+/// Which batch engine owns the scorer. `Single` = K = 1 (one required
+/// provider, N optional probes); `Multi` = K >= 2 (seek-to-max alignment
+/// across required providers).
+enum IuBatchEngagement {
+    Single(IuBatchState),
+    Multi(IuMultiBatchState),
 }
 
 impl<'a> ReqOptScorer<'a> {
@@ -77,24 +86,44 @@ impl<'a> ReqOptScorer<'a> {
     /// Tier 1 (union promotion, `optional_globally_required`) outranks the
     /// batch: a latched shape is already an intersection driven from the
     /// sparse side, which is the R-G1 fix itself.
-    fn batch_engagement(&mut self) -> Option<IuBatchState> {
-        let required_batch = self.required.block_batch()?;
-        let optional_batch = self.optional.block_batch_children()?;
-        let required_cost = required_batch.cost();
-        let optional_cost: usize = optional_batch.iter().map(|p| p.cost()).sum();
-        // Tier 2 (mean formula, same as the collect_partition guard): sparse
-        // optionals against a dense required intersection yield to the
-        // generic per-document tree whose block-max skipping and union
-        // promotion own the shape.
-        if optional_cost.saturating_mul(8) < required_cost {
+    fn batch_engagement(&mut self) -> Option<IuBatchEngagement> {
+        // K = 1: the required side is itself one batch provider.
+        if let Some(required_batch) = self.required.block_batch() {
+            let optional_batch = self.optional.block_batch_children()?;
+            let required_cost = required_batch.cost();
+            let optional_cost: usize = optional_batch.iter().map(|p| p.cost()).sum();
+            // Tier 2 (mean formula, same as the collect_partition guard):
+            // sparse optionals against a dense required intersection yield
+            // to the generic per-document tree whose block-max skipping and
+            // union promotion own the shape.
+            if optional_cost.saturating_mul(8) < required_cost {
+                return None;
+            }
+            let must_ub = required_batch.global_upper_bound();
+            let should_ubs = optional_batch
+                .iter()
+                .map(|provider| provider.global_upper_bound())
+                .collect();
+            return Some(IuBatchEngagement::Single(IuBatchState::new(
+                must_ub, should_ubs,
+            )));
+        }
+        // K >= 2: the required side is a flat AND aggregate.
+        let mut requireds = self.required.block_batch_children()?;
+        if requireds.len() < 2 {
             return None;
         }
-        let must_ub = required_batch.global_upper_bound();
-        let should_ubs = optional_batch
-            .iter()
-            .map(|provider| provider.global_upper_bound())
-            .collect();
-        Some(IuBatchState::new(must_ub, should_ubs))
+        let mut optionals = self.optional.block_batch_children()?;
+        let required_cost: usize = requireds.iter().map(|p| p.cost()).sum();
+        let optional_cost: usize = optionals.iter().map(|p| p.cost()).sum();
+        if requireds.len() * optional_cost.saturating_mul(8) < required_cost {
+            return None;
+        }
+        let required_ubs: Vec<f32> = requireds.iter().map(|p| p.global_upper_bound()).collect();
+        let optional_ubs: Vec<f32> = optionals.iter().map(|p| p.global_upper_bound()).collect();
+        Some(IuBatchEngagement::Multi(IuMultiBatchState::new(
+            &required_ubs, &optional_ubs,
+        )))
     }
 
     fn set_current(&mut self, current: Option<u64>) {
@@ -546,31 +575,53 @@ impl ComposableScorer for ReqOptScorer<'_> {
                 optional_globally_required,
                 ..
             } = self;
-            debug_assert!(
-                !*optional_globally_required || batch.is_none(),
-                "a latched shape never engages the batch profile"
-            );
-            let Some(state) = batch.as_mut() else {
-                return Err(Error::internal("IU batch profile vanished while engaged"));
-            };
-            let Some(required_batch) = required.block_batch() else {
-                return Err(Error::internal(
-                    "IU batch profile lost its required block provider",
-                ));
-            };
-            let Some(mut optional_batch) = optional.block_batch_children() else {
-                return Err(Error::internal(
-                    "IU batch profile lost its optional block providers",
-                ));
-            };
+            // I-2 option (a): a promotion latch recorded mid-run (the floor
+            // crossing the required upper bound while the batch is engaged)
+            // is terminal bookkeeping. The batch keeps full-scanning — sound
+            // (nothing is dropped), just less pruning. The latch would only
+            // re-route a scorer that has not engaged the batch yet.
             let mut hits: Vec<(u64, f32)> = Vec::new();
-            let exhausted_now = state.next_batch(
-                required_batch,
-                optional_batch.as_mut_slice(),
-                min_score,
-                &mut hits,
-                max_hits,
-            );
+            let exhausted_now = match batch.as_mut() {
+                Some(IuBatchEngagement::Single(state)) => {
+                    let Some(required_batch) = required.block_batch() else {
+                        return Err(Error::internal(
+                            "IU batch profile lost its required block provider",
+                        ));
+                    };
+                    let Some(mut optional_batch) = optional.block_batch_children() else {
+                        return Err(Error::internal(
+                            "IU batch profile lost its optional block providers",
+                        ));
+                    };
+                    state.next_batch(
+                        required_batch,
+                        optional_batch.as_mut_slice(),
+                        min_score,
+                        &mut hits,
+                        max_hits,
+                    )
+                }
+                Some(IuBatchEngagement::Multi(state)) => {
+                    let Some(mut requireds) = required.block_batch_children() else {
+                        return Err(Error::internal(
+                            "IU batch profile lost its required block providers",
+                        ));
+                    };
+                    let Some(mut optionals) = optional.block_batch_children() else {
+                        return Err(Error::internal(
+                            "IU batch profile lost its optional block providers",
+                        ));
+                    };
+                    state.next_batch(
+                        &mut requireds,
+                        &mut optionals,
+                        min_score,
+                        &mut hits,
+                        max_hits,
+                    )
+                }
+                None => return Err(Error::internal("IU batch profile vanished while engaged")),
+            };
             for (document_key, score) in hits {
                 out.push(ConfirmedHit { document_key, score });
             }

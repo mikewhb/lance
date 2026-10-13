@@ -1159,6 +1159,15 @@ pub(crate) struct IuMultiBatchState {
     required_ub: f32,
     optional_ub: f32,
     dry: Vec<bool>,
+    /// N == 1 promotion latch: the lone optional has been promoted into the
+    /// required set. Stateful (unlike the kernel's vector surgery) because
+    /// the provider collections are re-acquired per drain call — the flag
+    /// must survive across calls.
+    promoted_optional: bool,
+    /// Promoted optional's frequency at the aligned candidate.
+    promoted_freq: u32,
+    /// Alignment flag for the promoted optional.
+    aligned_promoted: bool,
     /// Current alignment target.
     candidate: u64,
     exhausted: bool,
@@ -1172,6 +1181,9 @@ impl IuMultiBatchState {
             required_ub: conservative_score_sum(required_ubs.iter().copied()),
             optional_ub: conservative_score_sum(optional_ubs.iter().copied()),
             dry: vec![false; optional_ubs.len()],
+            promoted_optional: false,
+            promoted_freq: 0,
+            aligned_promoted: false,
             candidate: 0,
             exhausted: false,
         }
@@ -1197,12 +1209,10 @@ impl IuMultiBatchState {
         max_hits: usize,
     ) -> bool {
         debug_assert!(requireds.len() >= 2);
-        if self.exhausted {
-            return true;
-        }
         let mut hits = 0_usize;
         loop {
-            // Seek-to-max alignment across the required providers.
+            // Seek-to-max alignment across the required providers — plus the
+            // promoted optional once it joined the required set.
             let mut max_doc = self.candidate;
             for (index, posting) in requireds.iter_mut().enumerate() {
                 if !self.aligned[index] {
@@ -1222,11 +1232,34 @@ impl IuMultiBatchState {
                         }
                     }
                 }
-                max_doc = max_doc.max(posting.current_doc_id().unwrap_or(u64::MAX));
+                if self.aligned[index] {
+                    max_doc = max_doc.max(self.candidate);
+                }
+            }
+            if self.promoted_optional {
+                let optional = &mut optionals[0];
+                if !self.aligned_promoted {
+                    match optional.seek_eq(self.candidate) {
+                        Some(freq) => {
+                            self.promoted_freq = freq;
+                            self.aligned_promoted = true;
+                        }
+                        None => match optional.current_doc_id() {
+                            // The promoted optional ran out: with it being
+                            // required, the intersection is empty from here.
+                            None => {
+                                self.exhausted = true;
+                                return true;
+                            }
+                            Some(cur) => max_doc = max_doc.max(cur),
+                        },
+                    }
+                }
             }
             if max_doc > self.candidate {
                 self.candidate = max_doc;
                 self.aligned.iter_mut().for_each(|aligned| *aligned = false);
+                self.aligned_promoted = false;
                 continue;
             }
 
@@ -1238,41 +1271,43 @@ impl IuMultiBatchState {
                 };
                 required_sum += posting.term_score(self.candidate, freq);
             }
+            if self.promoted_optional {
+                required_sum += optionals[0].term_score(self.candidate, self.promoted_freq);
+            }
             let mut optional_sum = 0.0_f32;
             let mut newly_dry = false;
             for (index, posting) in optionals.iter_mut().enumerate() {
-                let hit = match posting.seek_eq(self.candidate) {
-                    Some(freq) => {
-                        optional_sum += posting.term_score(self.candidate, freq);
-                        true
-                    }
-                    None => posting.current_doc_id().is_none(),
-                };
-                if posting.current_doc_id().is_none() && !self.dry[index] {
-                    self.dry[index] = true;
+                if self.promoted_optional && index == 0 {
+                    // Promoted: its frequency is already in required_sum and
+                    // its hit is enforced by the alignment.
+                    continue;
+                }
+                if let Some(freq) = posting.seek_eq(self.candidate) {
+                    optional_sum += posting.term_score(self.candidate, freq);
+                } else if posting.current_doc_id().is_none() && !self.dry[index - usize::from(self.promoted_optional)] {
+                    self.dry[index - usize::from(self.promoted_optional)] = true;
                     newly_dry = true;
                 }
-                let _ = hit;
             }
             if newly_dry {
-                self.optional_ub =
-                    live_upper_bound(&self.dry, |index| optionals[index].global_upper_bound());
+                let live = |index: usize| -> f32 {
+                    let offset = usize::from(self.promoted_optional);
+                    optionals[index + offset].global_upper_bound()
+                };
+                self.optional_ub = live_upper_bound(&self.dry, live);
             }
             let current_floor = floor;
-            if current_floor.is_finite() {
-                if optionals.len() == 1 && iu_cannot_compete(self.required_ub, 0.0, current_floor)
+            if current_floor.is_finite() && !self.promoted_optional {
+                if optionals.len() == 1
+                    && iu_cannot_compete(self.required_ub, 0.0, current_floor)
                 {
-                    // N == 1 promotion: the optional joins the required set,
-                    // appended last (accumulation order unchanged).
-                    let promoted = optionals.remove(0);
-                    requireds.push(promoted);
-                    self.required_ub =
-                        conservative_score_sum(requireds.iter().map(|p| p.global_upper_bound()));
+                    // N == 1 promotion: MUST-only documents are provably
+                    // dead. Pure state — the provider collections are
+                    // re-acquired per drain call, so the flag (not vector
+                    // surgery) carries the promotion across calls.
+                    self.promoted_optional = true;
+                    self.required_ub += optionals[0].global_upper_bound();
                     self.optional_ub = 0.0;
-                    self.dry = Vec::new();
-                    // The aligned flags no longer include the promoted
-                    // clause; restart the alignment at the current candidate.
-                    self.aligned = vec![false; requireds.len()];
                     continue;
                 }
                 if iu_cannot_compete(self.required_ub, self.optional_ub, current_floor) {
@@ -1283,18 +1318,34 @@ impl IuMultiBatchState {
             let Some(key) = requireds[0].document_key_for_doc_id(self.candidate as u32) else {
                 self.candidate += 1;
                 self.aligned.iter_mut().for_each(|aligned| *aligned = false);
+                self.aligned_promoted = false;
                 continue;
             };
             out.push((key, required_sum + optional_sum));
             hits += 1;
+            self.candidate += 1;
+            self.aligned.iter_mut().for_each(|aligned| *aligned = false);
+            self.aligned_promoted = false;
             if hits >= max_hits {
                 for posting in requireds.iter_mut().chain(optionals.iter_mut()) {
                     posting.sync_after_batch();
                 }
                 return false;
             }
-            self.candidate += 1;
-            self.aligned.iter_mut().for_each(|aligned| *aligned = false);
+                self.aligned_promoted = false;
         }
+    }
+
+}
+
+#[cfg(test)]
+mod multi_proto_tests {
+    use super::IuMultiBatchState;
+
+    #[test]
+    fn multi_state_is_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let state = IuMultiBatchState::new(&[1.0, 1.0], &[1.0]);
+        assert_send(&state);
     }
 }

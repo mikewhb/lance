@@ -32,7 +32,7 @@ mod maxscore;
 mod term_leaf;
 
 pub(super) use iu_tight::{
-    iu_tight_enabled, iu_tight_search, iu_tight_search_multi, IuBatchState,
+    iu_tight_enabled, iu_tight_search, iu_tight_search_multi, IuBatchState, IuMultiBatchState,
 };
 pub(super) use term_leaf::TermLeafScorer;
 

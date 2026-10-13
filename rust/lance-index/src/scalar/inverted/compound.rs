@@ -32,7 +32,7 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        IuBatchState, TermLeafScorer, WandCursor, WandDocuments, iu_tight_enabled,
+        TermLeafScorer, WandCursor, WandDocuments, iu_tight_enabled,
         iu_tight_search, iu_tight_search_multi, score_sum_upper_bound_factor,
     },
 };
@@ -4230,17 +4230,20 @@ where
     // K >= 2 batch profile lands in P2. `batch_flag` marks the shapes the
     // batch profile owns so their leaves box as TermLeafScorers (the
     // BlockBatch providers the profile consumes).
+    // PLAN-V3 P3: the tight kernels no longer route at this level. Every
+    // IU shape builds the generic tree; its ReqOptScorer selects the batch
+    // profile at drain time from the same skew criterion. `batch_flag`
+    // marks the shape so its leaves box as TermLeafScorers — the
+    // BlockBatch providers the batch profile consumes. A skewed shape
+    // (sparse optionals against a dense required intersection) keeps
+    // batch_flag false: the per-document generic walk with block-max
+    // skipping and union promotion owns it (the R-G1 fix).
     let mut batch_flag = false;
     let mut batch_leaf_indices: Vec<usize> = Vec::new();
     if iu_tight_enabled()
         && let Some((must_indices, should_indices)) = iu_tight_clause_indices(plan)
         && iu_tight_clauses_ready(&leaves, &must_indices, &should_indices)
     {
-        // Every `K >= 1 required + N >= 1 optional` shape over plain
-        // single-posting leaves is an IU shape, with one skew guard: when
-        // every required list dwarfs the optional union (all optionals
-        // sparse against a dense intersection), full-intersection scoring
-        // loses to the generic path's window skipping.
         let required_cost: usize = must_indices
             .iter()
             .map(|&index| leaves[index].postings[0].cost())
@@ -4251,28 +4254,8 @@ where
             .sum();
         let sparse_optionals_vs_dense_required =
             must_indices.len() * optional_cost.saturating_mul(8) < required_cost;
-        if must_indices.len() >= 2 {
-            if !sparse_optionals_vs_dense_required {
-                return collect_iu_tight(
-                    documents,
-                    leaves,
-                    &must_indices,
-                    &should_indices,
-                    metrics,
-                    collector,
-                    map_document,
-                );
-            }
-            // K >= 2 skewed: fall through to the generic path below with
-            // WandCursor leaves (batch_flag stays false) — today's B-arm
-            // behavior, whose block-max window skipping prunes the dense
-            // required lists soundly.
-        } else {
-            // K = 1: the tree owns the shape now. The leaves are
-            // TermLeaf-admitted already; batch_flag hands the shape to P2's
-            // batch profile (a sparse-skewed K = 1 keeps flag-free generic
-            // promotion, which is exactly the B-arm R-G1 fix).
-            batch_flag = !sparse_optionals_vs_dense_required;
+        if !sparse_optionals_vs_dense_required {
+            batch_flag = true;
             batch_leaf_indices.extend(must_indices.iter().chain(should_indices.iter()).copied());
         }
     }
@@ -8752,6 +8735,68 @@ mod tests {
         let generic_rows = collector.into_rows();
         assert_eq!(rows[0].row_id, generic_rows[0].row_id);
         assert_eq!(rows[0].score, generic_rows[0].score);
+    }
+
+    #[test]
+    fn k2_multi_must_route_builds_batch_tree_and_matches_generic() {
+        // P3 wiring: a K >= 2 IU shape through the routing entry now builds
+        // the generic tree whose ReqOptScorer selects the multi batch
+        // profile. Results must agree bit-for-bit with the directly built
+        // generic (WandCursor) tree across the whole match set.
+        let n = 2000_u32;
+        let mut docs = DocSet::default();
+        for id in 0..n {
+            docs.append(id.into(), 1);
+        }
+        let leaf_node = |index| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        let routed_plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0), leaf_node(1)],
+            should: vec![leaf_node(2)],
+            must_not: Vec::new(),
+        };
+        let leaves = || {
+            vec![
+                loaded_leaf(vec![compressed_unit_posting("a", (0..n).collect())], None),
+                loaded_leaf(vec![compressed_unit_posting(
+                    "b",
+                    (0..n as u32).step_by(3).collect(),
+                )], None),
+                loaded_leaf(vec![compressed_unit_posting(
+                    "c",
+                    (0..n as u32).step_by(7).collect(),
+                )], None),
+            ]
+        };
+
+        // Routed entry (multi batch profile).
+        let metrics = LocalMetricsCollector::default();
+        let mut routed = TopKCollector::new(10);
+        collect_partition_with_documents(&docs, leaves(), &routed_plan, &metrics, &mut routed, Ok)
+            .unwrap();
+        let routed_rows = routed.into_rows();
+
+        // Directly built generic tree (WandCursor leaves), full walk.
+        let generic_metrics = NoOpMetricsCollector;
+        let mut generic_leaves = leaves()
+            .into_iter()
+            .map(|leaf| Some(box_leaf_scorer(leaf, &docs, &generic_metrics, false)))
+            .collect::<Vec<_>>();
+        let mut generic = routed_plan.build(&mut generic_leaves).unwrap();
+        let mut collector = TopKCollector::new(10);
+        let mut current = generic.next().unwrap();
+        while let Some(id) = current {
+            if generic.matches().unwrap() {
+                collector.insert(ScoredRow {
+                    row_id: generic.document_key().unwrap(),
+                    score: generic.score().unwrap(),
+                });
+            }
+            current = generic.next().unwrap();
+        }
+        let generic_rows = collector.into_rows();
+
+        assert_eq!(routed_rows.len(), generic_rows.len());
+        assert_eq!(routed_rows, generic_rows);
     }
 
 }
