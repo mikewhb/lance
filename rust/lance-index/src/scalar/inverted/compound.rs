@@ -32,8 +32,8 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        TermLeafScorer, WandCursor, WandDocuments, iu_tight_enabled, iu_tight_search,
-        iu_tight_search_multi, score_sum_upper_bound_factor,
+        IuBatchState, TermLeafScorer, WandCursor, WandDocuments, iu_tight_enabled,
+        iu_tight_search, iu_tight_search_multi, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};

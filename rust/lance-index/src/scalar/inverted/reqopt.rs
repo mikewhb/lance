@@ -42,6 +42,10 @@ pub(super) struct ReqOptScorer<'a> {
     /// clause alone, so the optional clause is mandatory for the rest of the
     /// scan and the query is an intersection.
     pub(super) optional_globally_required: bool,
+    /// K = 1 batch profile state (PLAN-V3 P2). `Some` = the batch FSM owns
+    /// this scorer: pure-data breakpoints, providers re-acquired per drain
+    /// call, one-way until exhaustion (I-1/I-2 option (a)).
+    batch: Option<IuBatchState>,
 }
 
 impl<'a> ReqOptScorer<'a> {
@@ -62,7 +66,35 @@ impl<'a> ReqOptScorer<'a> {
             min_competitive_score: f32::NEG_INFINITY,
             shallow_bounds: None,
             optional_globally_required: false,
+            batch: None,
         }
+    }
+
+    /// Capability probe + static skew criterion (tier 3 vs tier 2) on the
+    /// same raw-df source as the collect_partition guard (PLAN-V3 §1.3).
+    /// Returns the fresh batch state when the batch profile owns this shape.
+    ///
+    /// Tier 1 (union promotion, `optional_globally_required`) outranks the
+    /// batch: a latched shape is already an intersection driven from the
+    /// sparse side, which is the R-G1 fix itself.
+    fn batch_engagement(&mut self) -> Option<IuBatchState> {
+        let required_batch = self.required.block_batch()?;
+        let optional_batch = self.optional.block_batch_children()?;
+        let required_cost = required_batch.cost();
+        let optional_cost: usize = optional_batch.iter().map(|p| p.cost()).sum();
+        // Tier 2 (mean formula, same as the collect_partition guard): sparse
+        // optionals against a dense required intersection yield to the
+        // generic per-document tree whose block-max skipping and union
+        // promotion own the shape.
+        if optional_cost.saturating_mul(8) < required_cost {
+            return None;
+        }
+        let must_ub = required_batch.global_upper_bound();
+        let should_ubs = optional_batch
+            .iter()
+            .map(|provider| provider.global_upper_bound())
+            .collect();
+        Some(IuBatchState::new(must_ub, should_ubs))
     }
 
     fn set_current(&mut self, current: Option<u64>) {
@@ -475,6 +507,81 @@ impl ComposableScorer for ReqOptScorer<'_> {
 
     fn scores_non_negative(&self) -> bool {
         true
+    }
+
+    /// Batch profile (PLAN-V3 P2): when both sides are flat single-posting
+    /// providers and the static skew criterion does not yield, the drain is
+    /// driven by the IuBatchState FSM instead of the per-document walk.
+    ///
+    /// I-6: the entry runs the same decision hook as the default.
+    /// EXT R5: a non-positive floor keeps the collector's per-document
+    /// branch in charge, so the batch never engages there.
+    /// I-2 option (a): once the batch owns the scorer it runs to exhaustion;
+    /// a promotion latch recorded mid-run is terminal bookkeeping, not an
+    /// engine switch.
+    fn collect_confirmed_window(
+        &mut self,
+        min_score: f32,
+        out: &mut Vec<ConfirmedHit>,
+        max_hits: usize,
+    ) -> Result<WindowCollect> {
+        self.set_min_competitive_score(min_score)?;
+        if self.exhausted {
+            return Ok(WindowCollect { exhausted: true });
+        }
+        if self.batch.is_none()
+            && min_score > 0.0
+            && !self.optional_globally_required
+            && let Some(state) = self.batch_engagement()
+        {
+            self.batch = Some(state);
+        }
+        if self.batch.is_some() {
+            let Self {
+                required,
+                optional,
+                exhausted,
+                current,
+                batch,
+                optional_globally_required,
+                ..
+            } = self;
+            debug_assert!(
+                !*optional_globally_required || batch.is_none(),
+                "a latched shape never engages the batch profile"
+            );
+            let Some(state) = batch.as_mut() else {
+                return Err(Error::internal("IU batch profile vanished while engaged"));
+            };
+            let Some(required_batch) = required.block_batch() else {
+                return Err(Error::internal(
+                    "IU batch profile lost its required block provider",
+                ));
+            };
+            let Some(mut optional_batch) = optional.block_batch_children() else {
+                return Err(Error::internal(
+                    "IU batch profile lost its optional block providers",
+                ));
+            };
+            let mut hits: Vec<(u64, f32)> = Vec::new();
+            let exhausted_now = state.next_batch(
+                required_batch,
+                optional_batch.as_mut_slice(),
+                min_score,
+                &mut hits,
+                max_hits,
+            );
+            for (document_key, score) in hits {
+                out.push(ConfirmedHit { document_key, score });
+            }
+            if exhausted_now {
+                *exhausted = true;
+                *current = None;
+                return Ok(WindowCollect { exhausted: true });
+            }
+            return Ok(WindowCollect { exhausted: false });
+        }
+        collect_confirmed_window_default(self, min_score, out, max_hits)
     }
 
     #[cfg(test)]
