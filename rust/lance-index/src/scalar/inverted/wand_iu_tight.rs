@@ -18,6 +18,7 @@
 
 use lance_core::Result;
 
+use super::super::compound::BlockBatch;
 use super::super::scorer::Scorer;
 use super::{
     BulkAndMode, CompetitiveFloorMode, PostingIterator, TERMINATED_DOC_ID, WandDocuments,
@@ -538,5 +539,429 @@ mod tests {
         // SHOULD would be slower, so the switch stays relative, not absolute.
         assert!(!iu_tight_lead_is_cheaper(56_000, 77_000));
         assert!(!iu_tight_lead_is_cheaper(56_000, 56_000));
+    }
+}
+
+// ===== P0.5 prototype: K=1 pausable batch state machine (PLAN-V3 §2.3/§3.4) =====
+//
+// Pure-data breakpoints (borrow contract): this struct holds no borrows into
+// its children — providers (`BlockBatch`) are re-acquired by the host on
+// every collect_confirmed_window call; resumption always resumes from the
+// stored chunk/chunk-index breakpoint. Never use a forward posting seek as
+// recovery (the remaining chunk candidates would be silently skipped — the
+// kernel promoted() load-bearing seek comment at :418-431 is the mirror
+// image of this exact problem).
+//
+// Floor semantics (I-4): each `next_batch` call's entry `floor` is the emit
+// decision value for that segment, inclusive; the block-end dry-budget /
+// promotion decisions use the same value (I-7: floor refresh point = yield
+// boundary).
+pub(crate) struct IuBatchState {
+    must_ub: f32,
+    should_ubs: Vec<f32>,
+    /// SHOULD cursor exhaustion flags (irreversible; once set, the cursor's
+    /// bound leaves the live budget for good).
+    dry: Vec<bool>,
+    /// Promotion decision cached by floor (floor is monotonic ⇒ the decision
+    /// is never revoked).
+    promotion_decision: Option<(f32, Option<Vec<usize>>)>,
+    /// Candidates of the current MUST block ((doc, freq), ascending).
+    chunk: Vec<(u64, u32)>,
+    /// Doc id view of the chunk (merge_optional_freqs input).
+    candidates: Vec<u64>,
+    /// Merge scratch.
+    freqs: Vec<u32>,
+    /// Per-candidate Σ SHOULD scores (computed at block take; preserved
+    /// across pauses).
+    should_sums: Vec<f32>,
+    /// In-chunk candidate index (pause breakpoint; >= chunk.len() means this
+    /// block is fully consumed).
+    chunk_idx: usize,
+    /// Most recently processed candidate doc id (including invisible skipped
+    /// ones — the promotion boundary depends on it).
+    last_doc: u64,
+    /// Whether at least one block has been taken (distinguishes the first
+    /// call from a block-end check).
+    chunk_started: bool,
+    exhausted: bool,
+}
+
+impl IuBatchState {
+    pub(crate) fn new(must_ub: f32, should_ubs: Vec<f32>) -> Self {
+        Self {
+            must_ub,
+            dry: vec![false; should_ubs.len()],
+            should_ubs,
+            promotion_decision: None,
+            chunk: Vec::new(),
+            candidates: Vec::new(),
+            freqs: Vec::new(),
+            should_sums: Vec::new(),
+            chunk_idx: 0,
+            last_doc: 0,
+            chunk_started: false,
+            exhausted: false,
+        }
+    }
+
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Advances one segment: consumes the current chunk (resuming at the
+    /// breakpoint) or takes the next block, delivering at most `max_hits`
+    /// `(document_key, score)` pairs into `out` (score >= floor, inclusive;
+    /// I-4). Returns true = exhausted (I-7: every non-exhausted return
+    /// strictly advances the buffer offset).
+    ///
+    /// At a consumed block end: sync_after_batch (invalidate provider derived
+    /// caches) → dry-budget termination → promotion decision record (I-8:
+    /// record only, no switch; the promoted walk lands in P2).
+    pub(crate) fn next_batch<D: WandDocuments, B: BlockBatch>(
+        &mut self,
+        must: &mut B,
+        shoulds: &mut [B],
+        documents: &D,
+        floor: f32,
+        out: &mut Vec<(u64, f32)>,
+        max_hits: usize,
+    ) -> bool {
+        debug_assert!(max_hits > 0, "max_hits=0 has a separate contract (I-7)");
+        if self.exhausted {
+            return true;
+        }
+        loop {
+            // 1) In-chunk resumption (pause-breakpoint recovery lands here:
+            // chunk / should_sums already live in the state machine; the
+            // providers are untouched).
+            while self.chunk_idx < self.chunk.len() {
+                let (doc, freq) = self.chunk[self.chunk_idx];
+                let should_sum = self.should_sums[self.chunk_idx];
+                self.chunk_idx += 1;
+                self.last_doc = doc;
+                let Some(key) = documents.document_key_for_doc_id(doc as u32) else {
+                    continue;
+                };
+                let score = must.term_score(doc, freq) + should_sum;
+                if score >= floor {
+                    out.push((key, score));
+                    if out.len() >= max_hits {
+                        for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut()) {
+                            provider.sync_after_batch();
+                        }
+                        return false;
+                    }
+                }
+            }
+            // 2) Block fully consumed: block-end checks (only after really
+            // consuming a block).
+            if self.chunk_started {
+                if floor.is_finite() {
+                    let live_optional_ub =
+                        live_upper_bound(&self.dry, |index| self.should_ubs[index]);
+                    if iu_cannot_compete(self.must_ub, live_optional_ub, floor) {
+                        self.exhausted = true;
+                        for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut()) {
+                            provider.sync_after_batch();
+                        }
+                        return true;
+                    }
+                    if self
+                        .promotion_decision
+                        .as_ref()
+                        .is_none_or(|(decided_floor, _)| *decided_floor != floor)
+                    {
+                        self.promotion_decision = Some((
+                            floor,
+                            iu_tight_required_shoulds(self.must_ub, &self.should_ubs, floor),
+                        ));
+                    }
+                    // I-8 / I-2 (option a): P0.5 records the promotion decision
+                    // without switching. Some(empty) = MUST plus every SHOULD
+                    // still cannot reach the floor ⇒ terminate.
+                    if let Some(Some(required)) =
+                        self.promotion_decision.as_ref().map(|(_, decision)| decision)
+                        && required.is_empty()
+                    {
+                        self.exhausted = true;
+                        for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut()) {
+                            provider.sync_after_batch();
+                        }
+                        return true;
+                    }
+                }
+                for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut()) {
+                    provider.sync_after_batch();
+                }
+            }
+            // 3) Take the next block and rebuild the merge state.
+            must.take_docs_one_block_upto(TERMINATED_DOC_ID, &mut self.chunk);
+            if self.chunk.is_empty() {
+                self.exhausted = true;
+                return true;
+            }
+            self.candidates.clear();
+            self.candidates
+                .extend(self.chunk.iter().map(|(doc, _)| *doc));
+            self.should_sums.clear();
+            self.should_sums.resize(self.chunk.len(), 0.0);
+            for (index, should) in shoulds.iter_mut().enumerate() {
+                self.freqs.clear();
+                self.freqs.resize(self.candidates.len(), 0);
+                should.merge_optional_freqs(&self.candidates, &mut self.freqs);
+                if should.current_doc_id().is_none() {
+                    self.dry[index] = true;
+                }
+                for (candidate, &freq) in self.freqs.iter().enumerate() {
+                    if freq != 0 {
+                        self.should_sums[candidate] +=
+                            should.term_score(self.candidates[candidate], freq);
+                    }
+                }
+            }
+            self.chunk_idx = 0;
+            self.chunk_started = true;
+        }
+    }
+}
+
+// ===== P0.5 harness: protocol path walkthrough (first takeover / pause and
+// resume / latch no-op / exhaustion). Drives IuBatchState with mock
+// providers to verify the borrow design (FSM = pure data, Send), incremental
+// vs one-shot equivalence, and soundness under a dynamic floor. The real
+// provider (TermLeafScorer) lands in P1a/P2.
+
+#[cfg(test)]
+mod batch_proto_tests {
+    use std::collections::HashSet;
+
+    use super::super::super::DocInfo;
+    use super::super::{FlatDocuments, WandDocuments};
+    use super::{BlockBatch, IuBatchState};
+
+    /// Minimal documents with configurable visibility / num_tokens.
+    struct MockDocs {
+        hidden: HashSet<u32>,
+    }
+
+    impl MockDocs {
+        fn key(&self, doc_id: u32) -> Option<u64> {
+            (!self.hidden.contains(&doc_id)).then_some(doc_id as u64)
+        }
+    }
+
+    impl WandDocuments for MockDocs {
+        type Candidate = u64;
+
+        fn len(&self) -> usize {
+            1000
+        }
+
+        fn scoring_norms(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn scoring_num_tokens(&self, _doc_id: u32) -> u32 {
+            1
+        }
+
+        fn doc_length(&self, _doc: &DocInfo) -> u32 {
+            1
+        }
+
+        fn document_key(&self, doc: &DocInfo) -> Option<u64> {
+            self.key(doc.doc_id() as u32)
+        }
+
+        fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+            self.key(doc_id)
+        }
+
+        fn candidate_from_key(&self, key: u64) -> u64 {
+            key
+        }
+
+        fn flat_documents(&self) -> Option<FlatDocuments<'_>> {
+            None
+        }
+
+        fn flat_doc_length(&self, _doc_id: u64, _key: u64, _compressed: bool) -> u32 {
+            1
+        }
+    }
+
+    /// Mock provider: in-memory posting (term_score = freq as f32), simulating
+    /// block decoding `block` docs at a time. The sync counter supports
+    /// contract assertions.
+    struct MockBatch {
+        docs: Vec<(u64, u32)>,
+        pos: usize,
+        ub: f32,
+        block: usize,
+        syncs: usize,
+    }
+
+    impl MockBatch {
+        fn new(docs: Vec<(u64, u32)>, ub: f32, block: usize) -> Self {
+            Self {
+                docs,
+                pos: 0,
+                ub,
+                block,
+                syncs: 0,
+            }
+        }
+    }
+
+    impl BlockBatch for MockBatch {
+        fn take_docs_one_block_upto(&mut self, _upto: u64, out: &mut Vec<(u64, u32)>) {
+            out.clear();
+            let end = (self.pos + self.block).min(self.docs.len());
+            out.extend_from_slice(&self.docs[self.pos..end]);
+            self.pos = end;
+        }
+
+        fn merge_optional_freqs(&mut self, docs: &[u64], out_freqs: &mut [u32]) {
+            out_freqs.fill(0);
+            for (index, &doc) in docs.iter().enumerate() {
+                if let Ok(hit) = self.docs.binary_search_by_key(&doc, |&(d, _)| d) {
+                    out_freqs[index] = self.docs[hit].1;
+                }
+            }
+        }
+
+        fn current_doc_id(&self) -> Option<u64> {
+            self.docs.get(self.pos).map(|&(d, _)| d)
+        }
+
+        fn seek_eq(&mut self, doc: u64) -> Option<u32> {
+            if let Ok(hit) = self.docs.binary_search_by_key(&doc, |&(d, _)| d) {
+                self.pos = self.pos.max(hit + 1);
+                return Some(self.docs[hit].1);
+            }
+            None
+        }
+
+        fn global_upper_bound(&self) -> f32 {
+            self.ub
+        }
+
+        fn cost(&self) -> usize {
+            self.docs.len()
+        }
+
+        fn term_score(&self, _doc: u64, freq: u32) -> f32 {
+            freq as f32
+        }
+
+        fn sync_after_batch(&mut self) {
+            self.syncs += 1;
+        }
+    }
+
+    /// EXT R1 counterexample skeleton: MUST docs 1..=20 each freq 1;
+    /// SHOULD0 = {3,17} freq 10; SHOULD1 = {7} freq 10. Score = 1 + 10×hits.
+    fn fixtures() -> (MockBatch, Vec<MockBatch>, MockDocs, Vec<(u64, f32)>) {
+        let must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
+        let should0 = MockBatch::new(vec![(3, 10), (17, 10)], 10.0, 4);
+        let should1 = MockBatch::new(vec![(7, 10)], 10.0, 4);
+        let docs = MockDocs {
+            hidden: HashSet::new(),
+        };
+        // Enumeration oracle (all visible): doc d scores 1 + 10×(SHOULD hits).
+        let oracle: Vec<(u64, f32)> = (1..=20)
+            .map(|d| {
+                let s = [vec![3, 17], vec![7]]
+                    .iter()
+                    .filter(|docs| docs.contains(&d))
+                    .count() as f32;
+                (d as u64, 1.0 + 10.0 * s)
+            })
+            .collect();
+        (must, vec![should0, should1], docs, oracle)
+    }
+
+    #[test]
+    fn batch_first_takeover_delivers_hits_above_floor() {
+        let (mut must, mut shoulds, docs, _oracle) = fixtures();
+        let mut state = IuBatchState::new(1.0, vec![10.0, 10.0]);
+        let mut out = Vec::new();
+        let exhausted = state.next_batch(&mut must, &mut shoulds, &docs, 11.0, &mut out, 100);
+        assert!(!exhausted || !out.is_empty());
+        assert_eq!(
+            out,
+            vec![(3, 11.0), (7, 11.0), (17, 11.0)],
+            "EXT R1 counterexample shape: candidates tying (=) the floor must be kept (I-4)"
+        );
+    }
+
+    #[test]
+    fn batch_pause_resume_matches_one_shot() {
+        let (mut must, mut shoulds, docs, oracle) = fixtures();
+        let mut state = IuBatchState::new(1.0, vec![10.0, 10.0]);
+        let mut incremental = Vec::new();
+        let floor = 11.0;
+        loop {
+            let mut out = Vec::new();
+            let exhausted = state.next_batch(&mut must, &mut shoulds, &docs, floor, &mut out, 1);
+            incremental.extend(out);
+            if exhausted {
+                break;
+            }
+        }
+        let expected: Vec<(u64, f32)> = oracle
+            .iter()
+            .copied()
+            .filter(|(_, score)| *score >= floor)
+            .collect();
+        assert_eq!(
+            incremental, expected,
+            "incremental (max_hits=1) and one-shot delivery must match"
+        );
+    }
+
+    #[test]
+    fn batch_keeps_walking_when_floor_rises_past_must_ub() {
+        // ③→① precondition: after floor (11.0) crosses must_ub (1.0), the FSM
+        // performs no union→intersection pruning and keeps scanning MUST —
+        // docs hit by should0 (11.0, tying the floor) must be kept (dropping
+        // them is the EXT R1 recall loss).
+        let (mut must, mut shoulds, docs, oracle) = fixtures();
+        let mut state = IuBatchState::new(1.0, vec![10.0, 10.0]);
+        let mut out = Vec::new();
+        let exhausted = state.next_batch(&mut must, &mut shoulds, &docs, 11.0, &mut out, 100);
+        assert!(exhausted, "must exhaust after the full scan");
+        let expected: Vec<(u64, f32)> = oracle
+            .iter()
+            .copied()
+            .filter(|(_, score)| *score >= 11.0)
+            .collect();
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn batch_exhausts_and_respects_visibility() {
+        let mut must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
+        let mut shoulds = vec![MockBatch::new(vec![(3, 10), (17, 10)], 10.0, 4)];
+        let docs = MockDocs {
+            hidden: HashSet::from([3, 17]),
+        };
+        let mut state = IuBatchState::new(1.0, vec![10.0]);
+        let mut out = Vec::new();
+        let exhausted = state.next_batch(&mut must, &mut shoulds, &docs, 5.0, &mut out, 100);
+        assert!(exhausted);
+        assert!(
+            out.is_empty(),
+            "the only hits (score 11) are invisible; nothing else clears floor=5.0"
+        );
+    }
+
+    #[test]
+    fn batch_state_is_send() {
+        // Compile-time proof of the borrow contract: the FSM is pure data ⇒
+        // Send (it can move across threads with the host).
+        fn assert_send<T: Send>(_: &T) {}
+        let state = IuBatchState::new(1.0, vec![1.0]);
+        assert_send(&state);
     }
 }

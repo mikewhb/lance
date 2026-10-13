@@ -11,7 +11,7 @@ use std::sync::Arc;
 use lance_core::{Error, Result};
 
 use super::super::DocInfo;
-use super::super::compound::{ComposableScorer, ScoreBounds};
+use super::super::compound::{BlockBatch, ComposableScorer, ScoreBounds};
 use super::super::scorer::MemBM25Scorer;
 use crate::metrics::MetricsCollector;
 
@@ -213,7 +213,63 @@ impl<D: WandDocuments> Drop for TermLeafScorer<'_, D> {
     }
 }
 
+/// Block-batch supply (PLAN-V3 §3.2): drives the inner posting directly,
+/// method-for-method identical to the iu_tight kernel's usage
+/// (take_docs_one_block_upto / merge_optional_freqs /
+/// score(scorer, freq, scoring_num_tokens)). After batch stepping the
+impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
+    fn take_docs_one_block_upto(&mut self, upto: u64, out: &mut Vec<(u64, u32)>) {
+        self.posting.take_docs_one_block_upto(upto, out);
+        self.clear_current();
+    }
+
+    fn merge_optional_freqs(&mut self, docs: &[u64], out_freqs: &mut [u32]) {
+        self.posting.merge_optional_freqs(docs, out_freqs);
+        self.clear_current();
+    }
+
+    fn current_doc_id(&self) -> Option<u64> {
+        self.posting.current_doc_id()
+    }
+
+    fn seek_eq(&mut self, doc: u64) -> Option<u32> {
+        if self.posting.doc().is_some_and(|info| info.doc_id() < doc) {
+            self.posting.next(doc);
+        }
+        match self.posting.doc() {
+            Some(info) if info.doc_id() == doc => Some(info.frequency()),
+            _ => None,
+        }
+    }
+
+    fn global_upper_bound(&self) -> f32 {
+        self.posting.global_upper_bound(self.scorer.as_ref())
+    }
+
+    fn cost(&self) -> usize {
+        /// leaf's derived caches (the current family) are all invalidated — the
+        /// host state machine never reads them; resumption relies on pure-data
+        self.posting.cost()
+    }
+
+    fn term_score(&self, doc: u64, freq: u32) -> f32 {
+        self.posting.score(
+            self.scorer.as_ref(),
+            freq,
+            self.documents.scoring_num_tokens(doc as u32),
+        )
+    }
+
+    fn sync_after_batch(&mut self) {
+        self.clear_current();
+    }
+}
+
 impl<D: WandDocuments + Sync> ComposableScorer for TermLeafScorer<'_, D> {
+    fn block_batch(&mut self) -> Option<&mut dyn BlockBatch> {
+        Some(self)
+    }
+
     fn doc(&self) -> Option<u64> {
         self.doc()
     }

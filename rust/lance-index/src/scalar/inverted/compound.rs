@@ -319,6 +319,22 @@ pub(super) trait ComposableScorer: Send {
         collect_confirmed_window_default(self, min_score, out, max_hits)
     }
 
+    /// Block-batch capability (PLAN-V3 §3.2): implemented only by the
+    /// "single compressed posting leaf" form (TermLeafScorer). Defaults to
+    /// None — nested/Max/boost≠1/phrase/cross-column structures are rejected
+    /// naturally and can never acquire it through recursive propagation
+    /// (EXT R4).
+    fn block_batch(&mut self) -> Option<&mut dyn BlockBatch> {
+        None
+    }
+
+    /// Aggregate capability: flat composite nodes (RequiredConjunction /
+    /// Disjunction-Sum) collect the direct children's batch providers into a
+    /// list; any child returning None makes the whole None.
+    fn block_batch_children(&mut self) -> Option<Vec<&mut dyn BlockBatch>> {
+        None
+    }
+
     #[cfg(test)]
     fn debug_type_name(&self) -> &'static str {
         std::any::type_name::<Self>()
@@ -357,6 +373,51 @@ pub(super) struct WindowCollect {
 }
 
 pub(super) type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
+
+// ===== Block-batch supply capability (PLAN-V3 §3.2/§3.4, P0.5 prototype) =====
+
+/// Block-batch supply capability (PLAN-V3 §3.2): the implementor holds a
+/// **single compressed posting** plus its scoring context; it is the tree
+/// node's controlled outlet for the iu_tight kernel moves
+/// (`take_docs_one_block_upto` / `merge_optional_freqs`).
+///
+/// Implementation contract (PLAN-V3 §3.4 / invariants I-5, I-9, host
+/// contract):
+/// - `take_docs_one_block_upto` copies one posting block after the cursor
+///   (or up to `upto`) in ascending doc order, parking the cursor at the
+///   block end; visibility is decided per candidate by the **host** (the
+///   provider carries no visibility logic);
+/// - after `merge_optional_freqs` the cursor may park mid-block; resumption
+///   reads the host state machine's pure-data breakpoint and must never use
+///   a forward seek as recovery (that would skip the remaining chunk);
+/// - `sync_after_batch` is called by the host at batch pauses/block ends and
+///   invalidates every derived cache (TermLeafScorer = clear_current); the
+///   posting cursor itself is never moved by the host;
+/// - scoring must match the generic path in order and units (resolved via
+///   `documents.scoring_num_tokens`).
+pub(super) trait BlockBatch {
+    /// Copies one posting block after the cursor (or up to `upto`), parking
+    /// the cursor at the block end.
+    fn take_docs_one_block_upto(&mut self, upto: u64, out: &mut Vec<(u64, u32)>);
+    /// Block-continuous merge: this posting's frequency at ascending `docs`
+    /// (0 = miss).
+    fn merge_optional_freqs(&mut self, docs: &[u64], out_freqs: &mut [u32]);
+    fn current_doc_id(&self) -> Option<u64>;
+    /// Forward-seek equivalent (promoted mode): position on `doc`, return
+    /// its frequency; None on a miss.
+    fn seek_eq(&mut self, doc: u64) -> Option<u32>;
+    /// Conservative list-wide score upper bound (same source as the generic
+    /// path's global_score_upper_bound).
+    fn global_upper_bound(&self) -> f32;
+    /// Raw posting df (kernel convention; not the visibility-truncated
+    /// value).
+    fn cost(&self) -> usize;
+    /// Per-hit scoring (documents.scoring_num_tokens resolved internally).
+    fn term_score(&self, doc: u64, freq: u32) -> f32;
+    /// Invalidates derived caches after batch stepping; resumption is the
+    /// host state machine's pure-data breakpoint's responsibility.
+    fn sync_after_batch(&mut self);
+}
 
 fn collect_confirmed_window_default<S: ComposableScorer + ?Sized>(
     scorer: &mut S,
