@@ -1163,7 +1163,6 @@ mod batch_proto_tests {
     }
 
     #[test]
-    #[ignore = "open: the promoted optional's contribution is missing at the first promoted delivery (term_score sees promoted_freq=0); needs an interactive debug session with a breakpoint on the promoted alignment. Repro: IU_DBG=1 cargo test -- batch_multi_seek --nocapture"]
     fn batch_multi_seek_crosses_u32_domain_boundary() {
         // The multi FSM aligns candidates near the u32 doc-id domain edge:
         // a sparse required hit at u32::MAX must survive alignment and
@@ -1266,15 +1265,7 @@ impl IuMultiBatchState {
             return true;
         }
         let mut hits = 0_usize;
-        let dbg = std::env::var("IU_DBG").is_ok();
         loop {
-            if dbg {
-                eprintln!(
-                    "[multi] iter cand={} promoted={} p_aligned={} p_freq={} req_ub={} opt_ub={} floor={floor}",
-                    self.candidate, self.promoted_optional, self.aligned_promoted,
-                    self.promoted_freq, self.required_ub, self.optional_ub
-                );
-            }
             // Seek-to-max alignment across the required providers — plus
             // the promoted optional once it joined the required set.
             let mut max_doc = self.candidate;
@@ -1332,6 +1323,12 @@ impl IuMultiBatchState {
                 };
                 required_sum += posting.term_score(self.candidate, freq);
             }
+            if self.promoted_optional {
+                // The promoted clause's contribution: after the N == 1
+                // promotion it is a required clause — its aligned frequency
+                // feeds required_sum exactly like the others.
+                required_sum += optionals[0].term_score(self.candidate, self.promoted_freq);
+            }
             let mut optional_sum = 0.0_f32;
             let mut newly_dry = false;
             for (index, posting) in optionals.iter_mut().enumerate() {
@@ -1377,12 +1374,6 @@ impl IuMultiBatchState {
                 self.aligned.iter_mut().for_each(|aligned| *aligned = false);
                 continue;
             };
-            if std::env::var("IU_DBG").is_ok() {
-                eprintln!(
-                    "[multi] deliver cand={} req_sum={} opt_sum={} promoted={}",
-                    self.candidate, required_sum, optional_sum, self.promoted_optional
-                );
-            }
             out.push((key, required_sum + optional_sum));
             hits += 1;
             self.candidate += 1;
