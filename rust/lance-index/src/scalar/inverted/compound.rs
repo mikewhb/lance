@@ -7589,6 +7589,20 @@ mod tests {
         }
     }
 
+    fn loaded_leaf_with_scorer(
+        postings: Vec<PostingIterator>,
+        phrase_slop: Option<u32>,
+        scorer: Arc<MemBM25Scorer>,
+    ) -> LoadedLeaf {
+        let params = FtsSearchParams::default().with_phrase_slop(phrase_slop);
+        LoadedLeaf {
+            postings,
+            params: Arc::new(params),
+            operator: Operator::Or,
+            scorer,
+        }
+    }
+
     #[test]
     fn term_leaf_optional_probe_matches_wand_cursor() {
         // After the ReqOpt change a SHOULD leaf of a 1-MUST Boolean is driven by
@@ -8647,6 +8661,97 @@ mod tests {
         let generic_rows = walk(generic_scorer.as_mut());
         assert_eq!(flagged_rows.len(), 3, "exactly the b hits survive the AND");
         assert_eq!(flagged_rows, generic_rows);
+    }
+
+    #[test]
+    fn rg1_k1_sparse_disjoint_optionals_drive_from_the_sparse_side() {
+        // The R-G1 shape with realistic BM25 statistics (PLAN-V3 P2
+        // reproducer): K = 1 dense required (every document) plus two
+        // disjoint sparse optionals, top-1. Once a boosted optional hit
+        // lands in the heap, required_ub < floor fires tier 1 and the walk
+        // drives from the optional-union side: routed work must stay
+        // bounded while a full intersection scan would touch all 65,536
+        // members, and the winner must be an optional-hit document.
+        let n = 65_536_u64;
+        let mut token_docs = HashMap::new();
+        token_docs.insert("m".to_owned(), n as usize);
+        token_docs.insert("o0".to_owned(), 2);
+        token_docs.insert("o1".to_owned(), 2);
+        let scorer = Arc::new(MemBM25Scorer::new(10 * n, n as usize, token_docs));
+
+        let mut docs = DocSet::default();
+        for id in 0..n {
+            docs.append(id, 10);
+        }
+
+        let leaf_node = |index| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        let routed_plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0)],
+            should: vec![leaf_node(1), leaf_node(2)],
+            must_not: Vec::new(),
+        };
+        let leaves = || {
+            vec![
+                loaded_leaf_with_scorer(
+                    vec![compressed_unit_posting("m", (0..n as u32).collect())],
+                    None,
+                    scorer.clone(),
+                ),
+                loaded_leaf_with_scorer(
+                    vec![compressed_unit_posting("o0", vec![0, n as u32 - 1])],
+                    None,
+                    scorer.clone(),
+                ),
+                loaded_leaf_with_scorer(
+                    vec![compressed_unit_posting("o1", vec![1, n as u32 - 2])],
+                    None,
+                    scorer.clone(),
+                ),
+            ]
+        };
+
+        // Through the routing entry (the real planner path).
+        let metrics = LocalMetricsCollector::default();
+        let mut tight = TopKCollector::new(1);
+        collect_partition_with_documents(&docs, leaves(), &routed_plan, &metrics, &mut tight, Ok)
+            .unwrap();
+        let rows = tight.into_rows();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            [0_u64, 1, n - 2, n - 1].contains(&rows[0].row_id),
+            "the winner must hit an optional clause, got {:?}",
+            rows[0]
+        );
+        let routed_work = metrics.comparisons.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            routed_work < 1_000,
+            "tier 1 must drive from the sparse side; routed work {routed_work} \
+             suggests a full dense scan"
+        );
+
+        // Differential: the directly built generic tree must agree on the
+        // winner and its score.
+        let generic_metrics = NoOpMetricsCollector;
+        let mut generic_leaves = leaves()
+            .into_iter()
+            .map(|leaf| Some(box_leaf_scorer(leaf, &docs, &generic_metrics, false)))
+            .collect::<Vec<_>>();
+        let mut generic = routed_plan.build(&mut generic_leaves).unwrap();
+        let mut collector = TopKCollector::new(1);
+        let mut current = generic.next().unwrap();
+        while let Some(id) = current {
+            if generic.matches().unwrap() {
+                let score = generic.score().unwrap();
+                collector.insert(ScoredRow {
+                    row_id: generic.document_key().unwrap(),
+                    score,
+                });
+            }
+            current = generic.next().unwrap();
+        }
+        let generic_rows = collector.into_rows();
+        assert_eq!(rows[0].row_id, generic_rows[0].row_id);
+        assert_eq!(rows[0].score, generic_rows[0].score);
     }
 
 }
