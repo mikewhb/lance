@@ -1143,3 +1143,158 @@ mod batch_proto_tests {
         assert_send(&state);
     }
 }
+
+// ===== P3 prototype: K>=2 pausable batch state machine (PLAN-V3 P3) =====
+//
+// The multi kernel (iu_tight_search_multi) in provider form: seek-to-max
+// alignment across the required providers, per-candidate optional probes,
+// N == 1 promotion (the optional joins the required set — appended last so
+// the accumulation order is unchanged), and the live-budget termination.
+// Pure-data breakpoints; providers are re-acquired per drain call.
+pub(crate) struct IuMultiBatchState {
+    /// Per required provider: does its cursor sit on the aligned candidate?
+    aligned: Vec<bool>,
+    /// Per required provider: the frequency at the aligned candidate.
+    freqs: Vec<u32>,
+    required_ub: f32,
+    optional_ub: f32,
+    dry: Vec<bool>,
+    /// Current alignment target.
+    candidate: u64,
+    exhausted: bool,
+}
+
+impl IuMultiBatchState {
+    pub(crate) fn new(required_ubs: &[f32], optional_ubs: &[f32]) -> Self {
+        Self {
+            aligned: vec![false; required_ubs.len()],
+            freqs: vec![0; required_ubs.len()],
+            required_ub: conservative_score_sum(required_ubs.iter().copied()),
+            optional_ub: conservative_score_sum(optional_ubs.iter().copied()),
+            dry: vec![false; optional_ubs.len()],
+            candidate: 0,
+            exhausted: false,
+        }
+    }
+
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Advances one candidate (or a bounded run of candidates), delivering
+    /// at most `max_hits` `(document_key, score)` pairs into `out`. Returns
+    /// true = exhausted.
+    ///
+    /// Promotion (N == 1) mirrors the kernel: MUST-only documents are
+    /// provably dead (`required_ub < floor` strictly), so the optional joins
+    /// the required set — appended last, keeping the accumulation order.
+    pub(crate) fn next_batch<'s>(
+        &mut self,
+        requireds: &'s mut Vec<&'s mut dyn BlockBatch>,
+        optionals: &'s mut Vec<&'s mut dyn BlockBatch>,
+        floor: f32,
+        out: &mut Vec<(u64, f32)>,
+        max_hits: usize,
+    ) -> bool {
+        debug_assert!(requireds.len() >= 2);
+        if self.exhausted {
+            return true;
+        }
+        let mut hits = 0_usize;
+        loop {
+            // Seek-to-max alignment across the required providers.
+            let mut max_doc = self.candidate;
+            for (index, posting) in requireds.iter_mut().enumerate() {
+                if !self.aligned[index] {
+                    match posting.seek_eq(self.candidate) {
+                        Some(freq) => {
+                            self.freqs[index] = freq;
+                            self.aligned[index] = true;
+                        }
+                        None => {
+                            let Some(cur) = posting.current_doc_id() else {
+                                // A required list ran out: the intersection
+                                // is empty from here on.
+                                self.exhausted = true;
+                                return true;
+                            };
+                            max_doc = max_doc.max(cur);
+                        }
+                    }
+                }
+                max_doc = max_doc.max(posting.current_doc_id().unwrap_or(u64::MAX));
+            }
+            if max_doc > self.candidate {
+                self.candidate = max_doc;
+                self.aligned.iter_mut().for_each(|aligned| *aligned = false);
+                continue;
+            }
+
+            let mut required_sum = 0.0_f32;
+            for (index, posting) in requireds.iter().enumerate() {
+                let Some(freq) = (self.aligned[index]).then(|| self.freqs[index]) else {
+                    self.exhausted = true;
+                    return true;
+                };
+                required_sum += posting.term_score(self.candidate, freq);
+            }
+            let mut optional_sum = 0.0_f32;
+            let mut newly_dry = false;
+            for (index, posting) in optionals.iter_mut().enumerate() {
+                let hit = match posting.seek_eq(self.candidate) {
+                    Some(freq) => {
+                        optional_sum += posting.term_score(self.candidate, freq);
+                        true
+                    }
+                    None => posting.current_doc_id().is_none(),
+                };
+                if posting.current_doc_id().is_none() && !self.dry[index] {
+                    self.dry[index] = true;
+                    newly_dry = true;
+                }
+                let _ = hit;
+            }
+            if newly_dry {
+                self.optional_ub =
+                    live_upper_bound(&self.dry, |index| optionals[index].global_upper_bound());
+            }
+            let current_floor = floor;
+            if current_floor.is_finite() {
+                if optionals.len() == 1 && iu_cannot_compete(self.required_ub, 0.0, current_floor)
+                {
+                    // N == 1 promotion: the optional joins the required set,
+                    // appended last (accumulation order unchanged).
+                    let promoted = optionals.remove(0);
+                    requireds.push(promoted);
+                    self.required_ub =
+                        conservative_score_sum(requireds.iter().map(|p| p.global_upper_bound()));
+                    self.optional_ub = 0.0;
+                    self.dry = Vec::new();
+                    // The aligned flags no longer include the promoted
+                    // clause; restart the alignment at the current candidate.
+                    self.aligned = vec![false; requireds.len()];
+                    continue;
+                }
+                if iu_cannot_compete(self.required_ub, self.optional_ub, current_floor) {
+                    self.exhausted = true;
+                    return true;
+                }
+            }
+            let Some(key) = requireds[0].document_key_for_doc_id(self.candidate as u32) else {
+                self.candidate += 1;
+                self.aligned.iter_mut().for_each(|aligned| *aligned = false);
+                continue;
+            };
+            out.push((key, required_sum + optional_sum));
+            hits += 1;
+            if hits >= max_hits {
+                for posting in requireds.iter_mut().chain(optionals.iter_mut()) {
+                    posting.sync_after_batch();
+                }
+                return false;
+            }
+            self.candidate += 1;
+            self.aligned.iter_mut().for_each(|aligned| *aligned = false);
+        }
+    }
+}
