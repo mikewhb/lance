@@ -215,9 +215,16 @@ impl<D: WandDocuments> Drop for TermLeafScorer<'_, D> {
 
 /// Block-batch supply (PLAN-V3 §3.2): drives the inner posting directly,
 /// method-for-method identical to the iu_tight kernel's usage
-/// (take_docs_one_block_upto / merge_optional_freqs /
-/// score(scorer, freq, scoring_num_tokens)). After batch stepping the
+/// (`take_docs_one_block_upto` / `merge_optional_freqs` /
+/// `score(scorer, freq, scoring_num_tokens)`). After batch stepping the
+/// leaf's derived caches (the `current` family) are all invalidated — the
+/// host state machine never reads them; resumption relies on pure-data
+/// breakpoints.
 impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
+    fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+        self.documents.document_key_for_doc_id(doc_id)
+    }
+
     fn take_docs_one_block_upto(&mut self, upto: u64, out: &mut Vec<(u64, u32)>) {
         self.posting.take_docs_one_block_upto(upto, out);
         self.clear_current();
@@ -247,8 +254,9 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
     }
 
     fn cost(&self) -> usize {
-        /// leaf's derived caches (the current family) are all invalidated — the
-        /// host state machine never reads them; resumption relies on pure-data
+        // Raw posting df (kernel convention; both the iu_tight cost and lead
+        // criteria use it, not TermLeafScorer::cost's visibility-truncated
+        // value).
         self.posting.cost()
     }
 

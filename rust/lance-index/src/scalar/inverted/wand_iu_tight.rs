@@ -556,6 +556,102 @@ mod tests {
 // decision value for that segment, inclusive; the block-end dry-budget /
 // promotion decisions use the same value (I-7: floor refresh point = yield
 // boundary).
+/// Promoted sub-mode (I-8): drive the cheaper lead clause block-wise and
+/// seek every required clause per candidate (the kernel `promoted()` walk
+/// in provider form). Pure data — providers are re-acquired per call, and
+/// resumption always resumes from the stored lead chunk/index.
+struct PromotedWalk {
+    lead_index: usize,
+    required: Vec<usize>,
+    start_doc: u64,
+    lead_chunk: Vec<(u64, u32)>,
+    lead_idx: usize,
+}
+
+impl PromotedWalk {
+    fn new(lead_index: usize, required: Vec<usize>, start_doc: u64) -> Self {
+        Self {
+            lead_index,
+            required,
+            start_doc,
+            lead_chunk: Vec::new(),
+            lead_idx: 0,
+        }
+    }
+
+    /// Runs to exhaustion or pause. Returns true = exhausted.
+    fn run<'s>(
+        &mut self,
+        must: &'s mut dyn BlockBatch,
+        shoulds: &'s mut [&'s mut dyn BlockBatch],
+        floor: f32,
+        out: &mut Vec<(u64, f32)>,
+        max_hits: usize,
+    ) -> bool {
+        loop {
+            while self.lead_idx < self.lead_chunk.len() {
+                let (doc, lead_freq) = self.lead_chunk[self.lead_idx];
+                self.lead_idx += 1;
+                if doc < self.start_doc {
+                    continue;
+                }
+                // Forward seeks only: every cursor sits at or past the start
+                // of its promoted region (I-1); a miss skips the candidate.
+                let Some(must_freq) = must.seek_eq(doc) else {
+                    continue;
+                };
+                let mut all_required = true;
+                for &index in &self.required {
+                    if index == self.lead_index {
+                        continue;
+                    }
+                    if shoulds[index].seek_eq(doc).is_none() {
+                        all_required = false;
+                        break;
+                    }
+                }
+                if !all_required {
+                    continue;
+                }
+                let Some(key) = must.document_key_for_doc_id(doc as u32) else {
+                    continue;
+                };
+                let mut score = must.term_score(doc, must_freq);
+                for (index, should) in shoulds.iter_mut().enumerate() {
+                    let freq = if index == self.lead_index {
+                        Some(lead_freq)
+                    } else {
+                        should.seek_eq(doc)
+                    };
+                    if let Some(freq) = freq {
+                        score += should.term_score(doc, freq);
+                    }
+                }
+                if score >= floor {
+                    out.push((key, score));
+                    if out.len() >= max_hits {
+                        must.sync_after_batch();
+                        for should in shoulds.iter_mut() {
+                            should.sync_after_batch();
+                        }
+                        return false;
+                    }
+                }
+            }
+            shoulds[self.lead_index]
+                .take_docs_one_block_upto(TERMINATED_DOC_ID, &mut self.lead_chunk);
+            if self.lead_chunk.is_empty() {
+                must.sync_after_batch();
+                for should in shoulds.iter_mut() {
+                    should.sync_after_batch();
+                }
+                return true;
+            }
+            self.lead_idx = 0;
+        }
+    }
+}
+
 pub(crate) struct IuBatchState {
     must_ub: f32,
     should_ubs: Vec<f32>,
@@ -583,6 +679,9 @@ pub(crate) struct IuBatchState {
     /// Whether at least one block has been taken (distinguishes the first
     /// call from a block-end check).
     chunk_started: bool,
+    /// Promoted sub-mode state; the MUST walk is dead once this is Some
+    /// (I-1: the engine is one-way, and the promoted walk owns everything).
+    promoted: Option<PromotedWalk>,
     exhausted: bool,
 }
 
@@ -600,6 +699,7 @@ impl IuBatchState {
             chunk_idx: 0,
             last_doc: 0,
             chunk_started: false,
+            promoted: None,
             exhausted: false,
         }
     }
@@ -615,13 +715,14 @@ impl IuBatchState {
     /// strictly advances the buffer offset).
     ///
     /// At a consumed block end: sync_after_batch (invalidate provider derived
-    /// caches) → dry-budget termination → promotion decision record (I-8:
-    /// record only, no switch; the promoted walk lands in P2).
-    pub(crate) fn next_batch<D: WandDocuments, B: BlockBatch>(
+    /// caches) → dry-budget termination → promotion decision (I-8: only the
+    /// per-should necessity proof; a fired proof with a cheaper lead hands
+    /// the walk to the promoted sub-mode, I-2 option (a) — the MUST walk
+    /// never interleaves with it again).
+    pub(crate) fn next_batch<'s>(
         &mut self,
-        must: &mut B,
-        shoulds: &mut [B],
-        documents: &D,
+        must: &'s mut dyn BlockBatch,
+        shoulds: &'s mut [&'s mut dyn BlockBatch],
         floor: f32,
         out: &mut Vec<(u64, f32)>,
         max_hits: usize,
@@ -629,6 +730,15 @@ impl IuBatchState {
         debug_assert!(max_hits > 0, "max_hits=0 has a separate contract (I-7)");
         if self.exhausted {
             return true;
+        }
+        if let Some(mut walk) = self.promoted.take() {
+            let exhausted = walk.run(must, shoulds, floor, out, max_hits);
+            if exhausted {
+                self.exhausted = true;
+                return true;
+            }
+            self.promoted = Some(walk);
+            return false;
         }
         loop {
             // 1) In-chunk resumption (pause-breakpoint recovery lands here:
@@ -639,14 +749,14 @@ impl IuBatchState {
                 let should_sum = self.should_sums[self.chunk_idx];
                 self.chunk_idx += 1;
                 self.last_doc = doc;
-                let Some(key) = documents.document_key_for_doc_id(doc as u32) else {
+                let Some(key) = must.document_key_for_doc_id(doc as u32) else {
                     continue;
                 };
                 let score = must.term_score(doc, freq) + should_sum;
                 if score >= floor {
                     out.push((key, score));
                     if out.len() >= max_hits {
-                        for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut()) {
+                        for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s)) {
                             provider.sync_after_batch();
                         }
                         return false;
@@ -661,7 +771,7 @@ impl IuBatchState {
                         live_upper_bound(&self.dry, |index| self.should_ubs[index]);
                     if iu_cannot_compete(self.must_ub, live_optional_ub, floor) {
                         self.exhausted = true;
-                        for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut()) {
+                        for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s)) {
                             provider.sync_after_batch();
                         }
                         return true;
@@ -676,21 +786,45 @@ impl IuBatchState {
                             iu_tight_required_shoulds(self.must_ub, &self.should_ubs, floor),
                         ));
                     }
-                    // I-8 / I-2 (option a): P0.5 records the promotion decision
-                    // without switching. Some(empty) = MUST plus every SHOULD
-                    // still cannot reach the floor ⇒ terminate.
                     if let Some(Some(required)) =
                         self.promotion_decision.as_ref().map(|(_, decision)| decision)
-                        && required.is_empty()
                     {
-                        self.exhausted = true;
-                        for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut()) {
-                            provider.sync_after_batch();
+                        if required.is_empty() {
+                            self.exhausted = true;
+                            for provider in std::iter::once(&mut *must)
+                                .chain(shoulds.iter_mut().map(|s| &mut **s))
+                            {
+                                provider.sync_after_batch();
+                            }
+                            return true;
                         }
-                        return true;
+                        let lead_cost = required
+                            .iter()
+                            .map(|&index| shoulds[index].cost())
+                            .min()
+                            .unwrap_or(usize::MAX);
+                        if iu_tight_lead_is_cheaper(must.cost(), lead_cost) {
+                            let lead = *required
+                                .iter()
+                                .min_by_key(|&&index| shoulds[index].cost())
+                                .expect("checked non-empty");
+                            self.promoted = Some(PromotedWalk::new(
+                                lead,
+                                required.clone(),
+                                self.last_doc.saturating_add(1),
+                            ));
+                            let mut walk = self.promoted.take().expect("just set");
+                            let exhausted = walk.run(must, shoulds, floor, out, max_hits);
+                            if exhausted {
+                                self.exhausted = true;
+                                return true;
+                            }
+                            self.promoted = Some(walk);
+                            return false;
+                        }
                     }
                 }
-                for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut()) {
+                for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s)) {
                     provider.sync_after_batch();
                 }
             }
@@ -799,6 +933,7 @@ mod batch_proto_tests {
         ub: f32,
         block: usize,
         syncs: usize,
+        hidden: HashSet<u32>,
     }
 
     impl MockBatch {
@@ -809,11 +944,16 @@ mod batch_proto_tests {
                 ub,
                 block,
                 syncs: 0,
+                hidden: HashSet::new(),
             }
         }
     }
 
     impl BlockBatch for MockBatch {
+        fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+            (!self.hidden.contains(&doc_id)).then_some(doc_id as u64)
+        }
+
         fn take_docs_one_block_upto(&mut self, _upto: u64, out: &mut Vec<(u64, u32)>) {
             out.clear();
             let end = (self.pos + self.block).min(self.docs.len());
@@ -885,8 +1025,10 @@ mod batch_proto_tests {
     fn batch_first_takeover_delivers_hits_above_floor() {
         let (mut must, mut shoulds, docs, _oracle) = fixtures();
         let mut state = IuBatchState::new(1.0, vec![10.0, 10.0]);
+        let mut providers: Vec<&mut dyn BlockBatch> =
+            shoulds.iter_mut().map(|should| should as &mut dyn BlockBatch).collect();
         let mut out = Vec::new();
-        let exhausted = state.next_batch(&mut must, &mut shoulds, &docs, 11.0, &mut out, 100);
+        let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), 11.0, &mut out, 100);
         assert!(!exhausted || !out.is_empty());
         assert_eq!(
             out,
@@ -902,8 +1044,12 @@ mod batch_proto_tests {
         let mut incremental = Vec::new();
         let floor = 11.0;
         loop {
+            // Providers are re-acquired per drain call (the borrow contract:
+            // the FSM stores pure-data breakpoints, never borrows).
+            let mut providers: Vec<&mut dyn BlockBatch> =
+                shoulds.iter_mut().map(|should| should as &mut dyn BlockBatch).collect();
             let mut out = Vec::new();
-            let exhausted = state.next_batch(&mut must, &mut shoulds, &docs, floor, &mut out, 1);
+            let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), floor, &mut out, 1);
             incremental.extend(out);
             if exhausted {
                 break;
@@ -928,8 +1074,10 @@ mod batch_proto_tests {
         // them is the EXT R1 recall loss).
         let (mut must, mut shoulds, docs, oracle) = fixtures();
         let mut state = IuBatchState::new(1.0, vec![10.0, 10.0]);
+        let mut providers: Vec<&mut dyn BlockBatch> =
+            shoulds.iter_mut().map(|should| should as &mut dyn BlockBatch).collect();
         let mut out = Vec::new();
-        let exhausted = state.next_batch(&mut must, &mut shoulds, &docs, 11.0, &mut out, 100);
+        let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), 11.0, &mut out, 100);
         assert!(exhausted, "must exhaust after the full scan");
         let expected: Vec<(u64, f32)> = oracle
             .iter()
@@ -941,19 +1089,49 @@ mod batch_proto_tests {
 
     #[test]
     fn batch_exhausts_and_respects_visibility() {
+        let hidden: HashSet<u32> = HashSet::from([3, 17]);
         let mut must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
+        must.hidden = hidden.clone();
         let mut shoulds = vec![MockBatch::new(vec![(3, 10), (17, 10)], 10.0, 4)];
-        let docs = MockDocs {
-            hidden: HashSet::from([3, 17]),
-        };
+        shoulds[0].hidden = hidden;
         let mut state = IuBatchState::new(1.0, vec![10.0]);
+        let mut providers: Vec<&mut dyn BlockBatch> =
+            shoulds.iter_mut().map(|should| should as &mut dyn BlockBatch).collect();
         let mut out = Vec::new();
-        let exhausted = state.next_batch(&mut must, &mut shoulds, &docs, 5.0, &mut out, 100);
+        let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), 5.0, &mut out, 100);
         assert!(exhausted);
         assert!(
             out.is_empty(),
             "the only hits (score 11) are invisible; nothing else clears floor=5.0"
         );
+    }
+
+
+    #[test]
+    fn batch_promoted_walk_drives_the_cheaper_sparse_lead() {
+        // I-8 promoted sub-mode: once MUST-only (1.0) cannot reach floor
+        // (1.5) and the sparse SHOULD is individually necessary, the walk
+        // drives the lead (cost 3 < MUST 20) and seeks MUST per candidate.
+        // MUST-only docs never clear the floor, so only the lead hits come
+        // out.
+        let mut must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
+        let mut shoulds = vec![MockBatch::new(vec![(3, 1), (17, 1), (25, 1)], 1.0, 2)];
+        let docs = MockDocs {
+            hidden: HashSet::new(),
+        };
+        let mut state = IuBatchState::new(1.0, vec![1.0]);
+        let mut out = Vec::new();
+        let mut providers: Vec<&mut dyn BlockBatch> =
+            shoulds.iter_mut().map(|should| should as &mut dyn BlockBatch).collect();
+        let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), 1.5, &mut out, 100);
+        assert!(exhausted);
+        assert_eq!(
+            out,
+            vec![(3, 2.0), (17, 2.0)],
+            "doc 25 misses MUST and is excluded by the intersection"
+        );
+        assert!(state.is_exhausted());
+        let _ = docs;
     }
 
     #[test]

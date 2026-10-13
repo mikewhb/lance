@@ -396,6 +396,11 @@ pub(super) type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
 /// - scoring must match the generic path in order and units (resolved via
 ///   `documents.scoring_num_tokens`).
 pub(super) trait BlockBatch {
+    /// Document-domain visibility probe shared by every provider of one
+    /// partition (delegates to the implementor's documents context). The
+    /// batch state machine calls this per candidate — providers carry the
+    /// erased documents context so the machine stays free of generics.
+    fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64>;
     /// Copies one posting block after the cursor (or up to `upto`), parking
     /// the cursor at the block end.
     fn take_docs_one_block_upto(&mut self, upto: u64, out: &mut Vec<(u64, u32)>);
