@@ -2729,6 +2729,16 @@ impl<'a> DisjunctionScorer<'a> {
 }
 
 impl ComposableScorer for DisjunctionScorer<'_> {
+    fn block_batch_children(&mut self) -> Option<Vec<&mut dyn BlockBatch>> {
+        // Flat Sum-OR aggregation (PLAN-V3 §3.2): every child must itself be
+        // a batch provider; any None (nested / Max / wrapped) rejects the
+        // whole node so the batch profile never sees a wrong combiner.
+        self.children
+            .iter_mut()
+            .map(|child| child.block_batch())
+            .collect()
+    }
+
     fn doc(&self) -> Option<u64> {
         self.current
     }
@@ -3077,6 +3087,15 @@ impl<'a> RequiredConjunctionScorer<'a> {
 }
 
 impl ComposableScorer for RequiredConjunctionScorer<'_> {
+    fn block_batch_children(&mut self) -> Option<Vec<&mut dyn BlockBatch>> {
+        // Flat AND aggregation (PLAN-V3 §3.2): same all-or-nothing rule as
+        // the disjunction side.
+        self.children
+            .iter_mut()
+            .map(|child| child.block_batch())
+            .collect()
+    }
+
     fn doc(&self) -> Option<u64> {
         self.current
     }
