@@ -2583,6 +2583,19 @@ impl ComposableScorer for ScaleScorer<'_> {
         self.child.doc()
     }
 
+    // Identity-boost wrappers forward the batch capability: IU shapes are
+    // always identity-boost (iu_tight_clause_indices checks identity boost),
+    // and scaling by 1.0 keeps every batch contract bit-identical. A real
+    // rescaling wrapper must not pretend to be a flat term leaf, so any
+    // other factor returns None (EXT R4).
+    fn block_batch(&mut self) -> Option<&mut dyn BlockBatch> {
+        if self.factor == 1.0 {
+            self.child.block_batch()
+        } else {
+            None
+        }
+    }
+
     fn document_key(&self) -> Option<u64> {
         self.child.document_key()
     }
@@ -4205,17 +4218,24 @@ where
     // large upper bound keeps the multi kernel's floor prune inert and the
     // generic path's block-max window skipping can win; an optional-driven
     // intersection is the planned fix, the env switch is the escape hatch.
+    //
+    // PLAN-V3 P1b narrows the kernels to K >= 2: every K = 1 shape moves to
+    // the generic tree, whose ReqOptScorer union promotion (see
+    // `promote_optional_if_required`) is the R-G1 K = 1 fix, and whose
+    // K >= 2 batch profile lands in P2. `batch_flag` marks the shapes the
+    // batch profile owns so their leaves box as TermLeafScorers (the
+    // BlockBatch providers the profile consumes).
+    let mut batch_flag = false;
+    let mut batch_leaf_indices: Vec<usize> = Vec::new();
     if iu_tight_enabled()
         && let Some((must_indices, should_indices)) = iu_tight_clause_indices(plan)
         && iu_tight_clauses_ready(&leaves, &must_indices, &should_indices)
     {
         // Every `K >= 1 required + N >= 1 optional` shape over plain
-        // single-posting leaves takes the tight kernels, with one skew
-        // guard: when every required list dwarfs the optional union (all
-        // optionals sparse against a dense intersection), scoring the
-        // whole intersection loses to the generic path's window skipping
-        // and those shapes stay on the generic tree. The bulk optional
-        // merge still lets close-cost shapes take the kernel.
+        // single-posting leaves is an IU shape, with one skew guard: when
+        // every required list dwarfs the optional union (all optionals
+        // sparse against a dense intersection), full-intersection scoring
+        // loses to the generic path's window skipping.
         let required_cost: usize = must_indices
             .iter()
             .map(|&index| leaves[index].postings[0].cost())
@@ -4226,26 +4246,40 @@ where
             .sum();
         let sparse_optionals_vs_dense_required =
             must_indices.len() * optional_cost.saturating_mul(8) < required_cost;
-        if !sparse_optionals_vs_dense_required {
-            return collect_iu_tight(
-                documents,
-                leaves,
-                &must_indices,
-                &should_indices,
-                metrics,
-                collector,
-                map_document,
-            );
+        if must_indices.len() >= 2 {
+            if !sparse_optionals_vs_dense_required {
+                return collect_iu_tight(
+                    documents,
+                    leaves,
+                    &must_indices,
+                    &should_indices,
+                    metrics,
+                    collector,
+                    map_document,
+                );
+            }
+            // K >= 2 skewed: fall through to the generic path below with
+            // WandCursor leaves (batch_flag stays false) — today's B-arm
+            // behavior, whose block-max window skipping prunes the dense
+            // required lists soundly.
+        } else {
+            // K = 1: the tree owns the shape now. The leaves are
+            // TermLeaf-admitted already; batch_flag hands the shape to P2's
+            // batch profile (a sparse-skewed K = 1 keeps flag-free generic
+            // promotion, which is exactly the B-arm R-G1 fix).
+            batch_flag = !sparse_optionals_vs_dense_required;
+            batch_leaf_indices.extend(must_indices.iter().chain(should_indices.iter()).copied());
         }
-        // Skewed shape: fall through to the generic path below, whose
-        // block-max window skipping prunes the dense required lists
-        // soundly.
+    }
+    let mut batch_leaf_set = vec![false; leaves.len()];
+    for &index in &batch_leaf_indices {
+        batch_leaf_set[index] = true;
     }
     let mut leaf_scorers = leaves
         .into_iter()
         .enumerate()
         .map(|(index, leaf)| {
-            let admits = leaf_admits_term_leaf(plan, index);
+            let admits = batch_leaf_set[index] || leaf_admits_term_leaf(plan, index);
             Some(box_leaf_scorer(leaf, documents, metrics, admits))
         })
         .collect::<Vec<_>>();
@@ -8484,4 +8518,130 @@ mod tests {
             rows(&[(0, 4.0)])
         );
     }
+    #[test]
+    fn batch_flagged_multi_must_boxes_term_leaf_and_matches_wand_cursor() {
+        // P1b structural + differential sanity (the cheap half of the P1b
+        // hard gate): multi-MUST leaves flagged for the batch profile box as
+        // TermLeafScorers, and the resulting tree must agree bit-for-bit
+        // with the WandCursor-built generic tree.
+        let n = 2000_u32;
+        let mut docs = DocSet::default();
+        for id in 0..n {
+            docs.append(id.into(), 1);
+        }
+        let leaf_node = |index| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0), leaf_node(1)],
+            should: Vec::new(),
+            must_not: Vec::new(),
+        };
+        let leaves = || {
+            vec![
+                loaded_leaf(vec![compressed_unit_posting("a", (0..n).collect())], None),
+                loaded_leaf(vec![compressed_unit_posting("b", (0..n).collect())], None),
+            ]
+        };
+
+        // flag=true: TermLeafScorer providers.
+        let metrics = LocalMetricsCollector::default();
+        let mut flagged = leaves()
+            .into_iter()
+            .map(|leaf| Some(box_leaf_scorer(leaf, &docs, &metrics, true)))
+            .collect::<Vec<_>>();
+        let mut flagged_scorer = plan.build(&mut flagged).unwrap();
+        assert!(
+            flagged_scorer.debug_type_name().contains("RequiredConjunctionScorer"),
+            "got {}",
+            flagged_scorer.debug_type_name()
+        );
+        // The capability contract (EXT R4) is checked at the host boundary:
+        // the flagged tree exposes two batch providers even though the direct
+        // children are identity-boost ScaleScorer wrappers (they forward at
+        // factor == 1.0 down to the TermLeafScorers).
+        let providers = flagged_scorer
+            .block_batch_children()
+            .expect("flagged K >= 2 tree must expose batch providers");
+        assert_eq!(
+            providers.len(),
+            2,
+            "got {:?}",
+            flagged_scorer.debug_child_type_names()
+        );
+
+        // flag=false: the untouched generic build (WandCursor children).
+        let generic_metrics = NoOpMetricsCollector;
+        let mut generic = leaves()
+            .into_iter()
+            .map(|leaf| Some(box_leaf_scorer(leaf, &docs, &generic_metrics, false)))
+            .collect::<Vec<_>>();
+        let mut generic_scorer = plan.build(&mut generic).unwrap();
+
+        let walk = |scorer: &mut dyn ComposableScorer| -> Vec<(u64, f32)> {
+            let mut rows = Vec::new();
+            let mut current = scorer.next().unwrap();
+            while let Some(id) = current {
+                if scorer.matches().unwrap() {
+                    rows.push((scorer.document_key().unwrap(), scorer.score().unwrap()));
+                }
+                current = scorer.next().unwrap();
+            }
+            rows
+        };
+        assert_eq!(walk(flagged_scorer.as_mut()), walk(generic_scorer.as_mut()));
+    }
+
+    #[test]
+    fn batch_flagged_floor_never_rises_shape_matches_generic() {
+        // R-O1 at unit scale: top-k=100 over only three matching docs — the
+        // heap never fills, collect_mapped stays on the per-document branch
+        // the whole way, and the flagged (TermLeaf) build must still agree
+        // with the generic WandCursor build.
+        let n = 5000_u32;
+        let mut docs = DocSet::default();
+        for id in 0..n {
+            docs.append(id.into(), 1);
+        }
+        let leaf_node = |index| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0), leaf_node(1)],
+            should: Vec::new(),
+            must_not: Vec::new(),
+        };
+        let leaves = || {
+            vec![
+                loaded_leaf(vec![compressed_unit_posting("a", (0..n).collect())], None),
+                loaded_leaf(vec![compressed_unit_posting("b", vec![0, 1, 2])], None),
+            ]
+        };
+
+        let flagged_metrics = LocalMetricsCollector::default();
+        let generic_metrics = NoOpMetricsCollector;
+        let mut flagged = Vec::new();
+        for leaf in leaves() {
+            flagged.push(Some(box_leaf_scorer(leaf, &docs, &flagged_metrics, true)));
+        }
+        let mut flagged_scorer = plan.build(&mut flagged).unwrap();
+        let mut generic = Vec::new();
+        for leaf in leaves() {
+            generic.push(Some(box_leaf_scorer(leaf, &docs, &generic_metrics, false)));
+        }
+        let mut generic_scorer = plan.build(&mut generic).unwrap();
+        let _ = (&mut flagged_scorer, &mut generic_scorer);
+        let walk = |scorer: &mut dyn ComposableScorer| -> Vec<(u64, f32)> {
+            let mut rows = Vec::new();
+            let mut current = scorer.next().unwrap();
+            while let Some(id) = current {
+                if scorer.matches().unwrap() {
+                    rows.push((scorer.document_key().unwrap(), scorer.score().unwrap()));
+                }
+                current = scorer.next().unwrap();
+            }
+            rows
+        };
+        let flagged_rows = walk(flagged_scorer.as_mut());
+        let generic_rows = walk(generic_scorer.as_mut());
+        assert_eq!(flagged_rows.len(), 3, "exactly the b hits survive the AND");
+        assert_eq!(flagged_rows, generic_rows);
+    }
+
 }
