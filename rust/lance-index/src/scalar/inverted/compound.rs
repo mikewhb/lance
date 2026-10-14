@@ -405,8 +405,22 @@ pub(super) trait BlockBatch {
     /// the cursor at the block end.
     fn take_docs_one_block_upto(&mut self, upto: u64, out: &mut Vec<(u64, u32)>);
     /// Block-continuous merge: this posting's frequency at ascending `docs`
-    /// (0 = miss).
+    /// (0 = miss). All entries are written (misses as 0).
     fn merge_optional_freqs(&mut self, docs: &[u64], out_freqs: &mut [u32]);
+    /// Fused [`BlockBatch::merge_optional_freqs`] + scoring: for ascending
+    /// `docs`, adds this posting's BM25 score at every hit doc into `sums[i]`
+    /// (a miss leaves `sums[i]` untouched). Accumulation order (ascending doc
+    /// per call) matches the separated merge + scoring passes, so results are
+    /// bit-identical. Default = merge into scratch, then score per entry.
+    fn fold_optional_scores(&mut self, docs: &[u64], sums: &mut [f32]) {
+        let mut freqs = vec![0u32; docs.len()];
+        self.merge_optional_freqs(docs, &mut freqs);
+        for (i, &freq) in freqs.iter().enumerate() {
+            if freq != 0 {
+                sums[i] += self.term_score(docs[i], freq);
+            }
+        }
+    }
     fn current_doc_id(&self) -> Option<u64>;
     /// Forward-seek equivalent (promoted mode): position on `doc`, return
     /// its frequency; None on a miss.

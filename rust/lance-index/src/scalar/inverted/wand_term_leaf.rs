@@ -28,6 +28,9 @@ pub struct TermLeafScorer<'a, D: WandDocuments> {
     documents: &'a D,
     scorer: Arc<MemBM25Scorer>,
     cost: usize,
+    /// Reused frequency scratch for the fused fold_optional_scores pass
+    /// (plain capacity; contents are fully rewritten per call).
+    fold_scratch: Vec<u32>,
     global_score_upper_bound: OnceCell<Option<f32>>,
     current_doc: Option<DocInfo>,
     current_document_key: Option<u64>,
@@ -52,6 +55,7 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
             documents,
             scorer,
             cost,
+            fold_scratch: Vec::new(),
             global_score_upper_bound: OnceCell::new(),
             current_doc: None,
             current_document_key: None,
@@ -232,6 +236,25 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
 
     fn merge_optional_freqs(&mut self, docs: &[u64], out_freqs: &mut [u32]) {
         self.posting.merge_optional_freqs(docs, out_freqs);
+        self.clear_current();
+    }
+
+    fn fold_optional_scores(&mut self, docs: &[u64], sums: &mut [f32]) {
+        // Fused form: merge into reused scratch, then one tight scoring loop
+        // with scorer state hoisted out. merge_optional_freqs zeroes every
+        // entry itself, so a plain resize (no clear) suffices.
+        self.fold_scratch.resize(docs.len(), 0);
+        self.posting.merge_optional_freqs(docs, &mut self.fold_scratch);
+        let scorer = self.scorer.as_ref();
+        for (i, &freq) in self.fold_scratch.iter().enumerate() {
+            if freq != 0 {
+                sums[i] += self.posting.score(
+                    scorer,
+                    freq,
+                    self.documents.scoring_num_tokens(docs[i] as u32),
+                );
+            }
+        }
         self.clear_current();
     }
 

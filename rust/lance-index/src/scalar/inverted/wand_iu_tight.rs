@@ -665,8 +665,6 @@ pub(crate) struct IuBatchState {
     chunk: Vec<(u64, u32)>,
     /// Doc id view of the chunk (merge_optional_freqs input).
     candidates: Vec<u64>,
-    /// Merge scratch.
-    freqs: Vec<u32>,
     /// Per-candidate Σ SHOULD scores (computed at block take; preserved
     /// across pauses).
     should_sums: Vec<f32>,
@@ -678,8 +676,6 @@ pub(crate) struct IuBatchState {
     /// Per-candidate visibility keys, batch-computed at block take (None =
     /// invisible).
     keys: Vec<Option<u64>>,
-    /// Batch-scoring scratch for the per-SHOULD merge-score pass.
-    scratch_scores: Vec<f32>,
     /// In-chunk candidate index (pause breakpoint; >= chunk.len() means this
     /// block is fully consumed).
     chunk_idx: usize,
@@ -704,12 +700,10 @@ impl IuBatchState {
             promotion_decision: None,
             chunk: Vec::new(),
             candidates: Vec::new(),
-            freqs: Vec::new(),
             should_sums: Vec::new(),
             chunk_freqs: Vec::new(),
             must_scores: Vec::new(),
             keys: Vec::new(),
-            scratch_scores: Vec::new(),
             chunk_idx: 0,
             last_doc: 0,
             chunk_started: false,
@@ -857,26 +851,21 @@ impl IuBatchState {
                 .extend(self.chunk.iter().map(|(doc, _)| *doc));
             self.chunk_freqs.clear();
             self.chunk_freqs.extend(self.chunk.iter().map(|(_, f)| *f));
-            self.must_scores.clear();
+            // must_scores carries no independent zero semantics — every
+            // entry is rewritten by term_scores_batch below — so a plain
+            // resize (no clear) avoids a per-block memset.
             self.must_scores.resize(self.candidates.len(), 0.0);
             must.term_scores_batch(&self.candidates, &self.chunk_freqs, &mut self.must_scores);
             must.document_keys_batch(&self.candidates, &mut self.keys);
             self.should_sums.clear();
             self.should_sums.resize(self.chunk.len(), 0.0);
             for (index, should) in shoulds.iter_mut().enumerate() {
-                self.freqs.clear();
-                self.freqs.resize(self.candidates.len(), 0);
-                should.merge_optional_freqs(&self.candidates, &mut self.freqs);
+                // One fused dispatch per SHOULD: merge + score + accumulate
+                // in the provider, in the same accumulation order as the
+                // separated passes.
+                should.fold_optional_scores(&self.candidates, &mut self.should_sums);
                 if should.current_doc_id().is_none() {
                     self.dry[index] = true;
-                }
-                self.scratch_scores.clear();
-                self.scratch_scores.resize(self.candidates.len(), 0.0);
-                should.term_scores_batch(&self.candidates, &self.freqs, &mut self.scratch_scores);
-                for (candidate, &freq) in self.freqs.iter().enumerate() {
-                    if freq != 0 {
-                        self.should_sums[candidate] += self.scratch_scores[candidate];
-                    }
                 }
             }
             self.chunk_idx = 0;
