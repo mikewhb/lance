@@ -9,6 +9,13 @@
 //! small.
 
 use super::super::wand::{IuBatchState, IuMultiBatchState};
+
+/// Test-only: how many times the batch profile took over a scorer. Capability
+/// routing must be assertable directly instead of being inferred from work
+/// metrics that the generic path can also move.
+#[cfg(test)]
+pub(super) static BATCH_ENGAGEMENTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 use super::*;
 
 /// Required-plus-optional scorer that only touches the optional side when it
@@ -575,6 +582,8 @@ impl ComposableScorer for ReqOptScorer<'_> {
             && !self.optional_globally_required
             && let Some(state) = self.batch_engagement()
         {
+            #[cfg(test)]
+            BATCH_ENGAGEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.batch = Some(state);
         }
         if self.batch.is_some() {

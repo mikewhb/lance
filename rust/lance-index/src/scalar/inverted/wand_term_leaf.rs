@@ -323,7 +323,20 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
 
 impl<D: WandDocuments + Sync> ComposableScorer for TermLeafScorer<'_, D> {
     fn block_batch(&mut self) -> Option<&mut dyn BlockBatch> {
-        Some(self)
+        // The capability contract above is a *compressed* single-posting leaf:
+        // batch steps address candidates as dense u32 doc-ids and resolve them
+        // through `document_key_for_doc_id` / `scoring_num_tokens`. Plain
+        // postings store row-ids in the legacy domain (a `DocInfo::Raw`
+        // doc-id is a row-id there), so handing one to the batch FSM feeds
+        // row-ids into dense-index lookups — a wrong mapping or an
+        // out-of-bounds panic. Refuse here: this is the single capability
+        // entry every batch consumer probes; the generic per-document walk
+        // keeps using this leaf.
+        if self.posting.is_compressed() {
+            Some(self)
+        } else {
+            None
+        }
     }
 
     fn doc(&self) -> Option<u64> {

@@ -7908,6 +7908,117 @@ mod tests {
     }
 
     #[test]
+    fn plain_posting_is_refused_at_the_batch_capability_entry() {
+        // F1: batch steps address candidates as dense u32 doc-ids and resolve
+        // them through document_key_for_doc_id / scoring_num_tokens. Plain
+        // postings live in the legacy row-id domain, so the capability entry
+        // must refuse them; the generic walk keeps using the same leaf.
+        let metrics = NoOpMetricsCollector;
+        let mut docs = DocSet::default();
+        for row in [100_u64, 200, 300, 400] {
+            docs.append(row, 1);
+        }
+        let mut plain = box_leaf_scorer(
+            loaded_leaf(vec![plain_unit_posting("m", vec![0, 1, 2])], None),
+            &docs,
+            &metrics,
+            true,
+        );
+        assert!(
+            plain.block_batch().is_none(),
+            "a Plain posting must not expose the batch capability"
+        );
+        let mut compressed = box_leaf_scorer(
+            loaded_leaf(vec![compressed_unit_posting("m", vec![0, 1, 2])], None),
+            &docs,
+            &metrics,
+            true,
+        );
+        assert!(
+            compressed.block_batch().is_some(),
+            "a compressed posting keeps the batch capability"
+        );
+    }
+
+    #[test]
+    fn batch_engagement_requires_the_compressed_domain() {
+        // F1 guard with a positive floor (the batch only engages above zero):
+        // the same non-skew 1+2 shape engages the profile with compressed
+        // clauses and must be refused with Plain clauses. Asserted directly on
+        // the entry counter, not inferred from work metrics.
+        use std::sync::atomic::Ordering;
+        let metrics = NoOpMetricsCollector;
+        let mut docs = DocSet::default();
+        for i in 0..60_u64 {
+            docs.append(i * 10, 1);
+        }
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![CompoundScorerPlan::Leaf {
+                index: 0,
+                boost: 1.0,
+            }],
+            should: vec![
+                CompoundScorerPlan::Leaf {
+                    index: 1,
+                    boost: 1.0,
+                },
+                CompoundScorerPlan::Leaf {
+                    index: 2,
+                    boost: 1.0,
+                },
+            ],
+            must_not: Vec::new(),
+        };
+        let run = |leaves: Vec<LoadedLeaf>| {
+            let score = Arc::new(CompetitiveScore::default());
+            score.raise(0.5);
+            let mut collector = TopKCollector::with_competitive_score(10, score);
+            let before = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
+            collect_partition_with_documents(&docs, leaves, &plan, &metrics, &mut collector, Ok)
+                .unwrap();
+            let after = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
+            (after - before, collector.into_rows())
+        };
+
+        // Control: compressed clauses, close costs -> the profile engages.
+        let (engagements, rows) = run(vec![
+            loaded_leaf(vec![compressed_unit_posting("m", (0..50).collect())], None),
+            loaded_leaf(vec![compressed_unit_posting("s0", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
+            loaded_leaf(vec![compressed_unit_posting("s1", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
+        ]);
+        assert!(
+            engagements > 0,
+            "control: a compressed non-skew 1+2 shape must engage the batch profile"
+        );
+        let expected: Vec<u64> = rows.iter().map(|row| row.row_id).collect();
+        assert!(!expected.is_empty());
+
+        // Plain clauses: refused at the capability entry. The key domains of
+        // Plain and compressed leaves legitimately differ (row-ids vs dense
+        // doc-ids) — that difference is exactly why the batch profile, which
+        // only speaks the dense domain, must refuse Plain. Assert the refusal
+        // and that the Plain run stays deterministic.
+        let (engagements, plain_rows) = run(vec![
+            loaded_leaf(vec![plain_unit_posting("m", (0..50).collect())], None),
+            loaded_leaf(vec![plain_unit_posting("s0", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
+            loaded_leaf(vec![plain_unit_posting("s1", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
+        ]);
+        assert_eq!(
+            engagements, 0,
+            "the Plain row-id domain must never enter the batch profile"
+        );
+        let plain_keys: Vec<u64> = plain_rows.iter().map(|row| row.row_id).collect();
+        assert!(!plain_keys.is_empty());
+        let (_, plain_again) = run(vec![
+            loaded_leaf(vec![plain_unit_posting("m", (0..50).collect())], None),
+            loaded_leaf(vec![plain_unit_posting("s0", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
+            loaded_leaf(vec![plain_unit_posting("s1", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
+        ]);
+        let plain_again: Vec<u64> = plain_again.iter().map(|row| row.row_id).collect();
+        assert_eq!(plain_keys, plain_again, "the generic walk must stay deterministic");
+    }
+
+    #[test]
     fn iu_tight_fast_paths_record_comparisons() {
         // The IU fast paths bypass the scorer tree, so they must report their
         // own comparison counts; a zero here means the metric was dropped.
