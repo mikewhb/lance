@@ -616,7 +616,12 @@ impl PromotedWalk {
                 let Some(key) = must.document_key_for_doc_id(doc as u32) else {
                     continue;
                 };
-                let mut score = must.term_score(doc, must_freq);
+                // Generic accumulation contract: optional contributions
+                // accumulate from zero and the MUST term is added once at the
+                // end. Folding MUST first (as this walk used to) changes the
+                // f32 association and can drift by one ULP from the generic
+                // ReqOpt scorer and the non-promoted batch path.
+                let mut optional_sum = 0.0f32;
                 for (index, should) in shoulds.iter_mut().enumerate() {
                     let freq = if index == self.lead_index {
                         Some(lead_freq)
@@ -624,9 +629,10 @@ impl PromotedWalk {
                         should.seek_eq(doc)
                     };
                     if let Some(freq) = freq {
-                        score += should.term_score(doc, freq);
+                        optional_sum += should.term_score(doc, freq);
                     }
                 }
+                let score = must.term_score(doc, must_freq) + optional_sum;
                 if score >= floor {
                     out.push((key, score));
                     if out.len() >= max_hits {
@@ -1150,6 +1156,70 @@ mod batch_proto_tests {
         );
         assert!(state.is_exhausted());
         let _ = docs;
+    }
+
+    #[test]
+    fn batch_promoted_incremental_matches_one_shot() {
+        // The promoted sub-mode must honour the same pause/resume contract as
+        // the MUST walk: max_hits=1 drains concatenate to the one-shot drain,
+        // with providers re-acquired per call (pure-data breakpoints only).
+        let make = || {
+            let must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
+            let shoulds = vec![MockBatch::new(vec![(3, 1), (17, 1), (25, 1)], 1.0, 2)];
+            (must, shoulds)
+        };
+
+        let (mut must, mut shoulds) = make();
+        let mut providers: Vec<&mut dyn BlockBatch> =
+            shoulds.iter_mut().map(|s| s as &mut dyn BlockBatch).collect();
+        let mut one_shot = Vec::new();
+        let mut state = IuBatchState::new(1.0, vec![1.0]);
+        let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), 1.5, &mut one_shot, 100);
+        assert!(exhausted);
+        assert_eq!(one_shot, vec![(3, 2.0), (17, 2.0)]);
+
+        let (mut must, mut shoulds) = make();
+        let mut state = IuBatchState::new(1.0, vec![1.0]);
+        let mut incremental = Vec::new();
+        loop {
+            let mut providers: Vec<&mut dyn BlockBatch> =
+                shoulds.iter_mut().map(|s| s as &mut dyn BlockBatch).collect();
+            let mut out = Vec::new();
+            let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), 1.5, &mut out, 1);
+            incremental.extend(out);
+            if exhausted {
+                break;
+            }
+        }
+        assert_eq!(
+            incremental, one_shot,
+            "promoted pause/resume (max_hits=1) must match the one-shot drain"
+        );
+    }
+
+    #[test]
+    fn batch_promoted_scores_required_and_optional_clauses() {
+        // Promoted walk with one necessary and one unnecessary clause: the
+        // necessary clause is seek-checked first and must still be scored
+        // (its frequency is reused, not re-sought), and the unnecessary
+        // clause contributes in query order. Oracle = generic association
+        // must + (s0 + s1).
+        let mut must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
+        let mut shoulds = vec![
+            MockBatch::new(vec![(3, 2)], 2.0, 4), // necessary (single clause cannot clear floor)
+            MockBatch::new(vec![(3, 1)], 1.0, 4), // unnecessary but scored when present
+        ];
+        let mut state = IuBatchState::new(1.0, vec![2.0, 1.0]);
+        let mut providers: Vec<&mut dyn BlockBatch> =
+            shoulds.iter_mut().map(|s| s as &mut dyn BlockBatch).collect();
+        let mut out = Vec::new();
+        let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), 2.5, &mut out, 100);
+        assert!(exhausted);
+        assert_eq!(
+            out,
+            vec![(3, 4.0)],
+            "must(1) + (s0(2) + s1(1)) = 4.0; the lead clause's frequency must not be re-sought"
+        );
     }
 
     #[test]
