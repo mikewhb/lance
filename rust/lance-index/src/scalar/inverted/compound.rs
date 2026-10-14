@@ -413,6 +413,7 @@ pub(super) trait BlockBatch {
     /// per call) matches the separated merge + scoring passes, so results are
     /// bit-identical. Default = merge into scratch, then score per entry.
     fn fold_optional_scores(&mut self, docs: &[u64], sums: &mut [f32]) {
+        debug_assert_eq!(docs.len(), sums.len());
         let mut freqs = vec![0u32; docs.len()];
         self.merge_optional_freqs(docs, &mut freqs);
         for (i, &freq) in freqs.iter().enumerate() {
@@ -440,6 +441,8 @@ pub(super) trait BlockBatch {
     /// the loop — one dispatch per block instead of per candidate, with
     /// bit-identical arithmetic.
     fn term_scores_batch(&self, docs: &[u64], freqs: &[u32], out: &mut [f32]) {
+        debug_assert_eq!(docs.len(), freqs.len());
+        debug_assert_eq!(docs.len(), out.len());
         for (i, (&doc, &freq)) in docs.iter().zip(freqs.iter()).enumerate() {
             out[i] = if freq != 0 { self.term_score(doc, freq) } else { 0.0 };
         }

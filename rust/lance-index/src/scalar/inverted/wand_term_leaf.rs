@@ -243,6 +243,7 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
         // Fused form: merge into reused scratch, then one tight scoring loop
         // with scorer state hoisted out. merge_optional_freqs zeroes every
         // entry itself, so a plain resize (no clear) suffices.
+        debug_assert_eq!(docs.len(), sums.len());
         self.fold_scratch.resize(docs.len(), 0);
         self.posting.merge_optional_freqs(docs, &mut self.fold_scratch);
         let scorer = self.scorer.as_ref();
@@ -294,6 +295,8 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
     fn term_scores_batch(&self, docs: &[u64], freqs: &[u32], out: &mut [f32]) {
         // Hoist scorer state out of the loop: identical per-entry arithmetic
         // to term_score, one dispatch per block.
+        debug_assert_eq!(docs.len(), freqs.len());
+        debug_assert_eq!(docs.len(), out.len());
         let scorer = self.scorer.as_ref();
         for ((&doc, &freq), slot) in docs.iter().zip(freqs.iter()).zip(out.iter_mut()) {
             *slot = if freq != 0 {
