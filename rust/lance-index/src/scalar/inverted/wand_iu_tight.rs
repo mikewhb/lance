@@ -728,6 +728,12 @@ impl IuBatchState {
     /// I-4). Returns true = exhausted (I-7: every non-exhausted return
     /// strictly advances the buffer offset).
     ///
+    /// `out` contract: the caller passes a fresh (empty) window per call;
+    /// the walk yields as soon as this call produced a hit so the driver can
+    /// refresh its competitive floor (the driver inserts produced hits only
+    /// after the call returns, so a long call would re-check promotion and
+    /// cannot-compete against an obsolete floor).
+    ///
     /// At a consumed block end: sync_after_batch (invalidate provider derived
     /// caches) → dry-budget termination → promotion decision (I-8: only the
     /// per-should necessity proof; a fired proof with a cheaper lead hands
@@ -1377,6 +1383,7 @@ impl IuMultiBatchState {
         max_hits: usize,
     ) -> bool {
         debug_assert!(requireds.len() >= 2);
+        debug_assert!(max_hits > 0, "max_hits=0 has a separate contract (I-7)");
         if self.exhausted {
             return true;
         }
