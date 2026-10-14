@@ -7750,7 +7750,7 @@ mod tests {
         // document. Plain postings fail `iu_tight_clauses_ready` (not
         // compressed), so this exercises the ReqOptScorer fallback; the
         // kernel side is pinned by
-        // `iu_tight_search_sums_must_and_matching_shoulds` (floor = -inf).
+        // flat-AND shape with a non-positive floor.
         let mut docs = DocSet::default();
         for doc_id in 0..50_u64 {
             docs.append(doc_id, 1);

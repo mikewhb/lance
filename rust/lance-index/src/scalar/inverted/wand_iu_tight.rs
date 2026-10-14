@@ -1138,7 +1138,7 @@ mod batch_proto_tests {
 
 // ===== P3 prototype: K>=2 pausable batch state machine (PLAN-V3 P3) =====
 //
-// The multi kernel (iu_tight_search_multi) in provider form: seek-to-max
+// The multi walk in provider form: seek-to-max
 // alignment across the required providers, per-candidate optional probes,
 // N == 1 promotion (the optional joins the required set — appended last so
 // the accumulation order is unchanged), and the live-budget termination.
