@@ -268,6 +268,28 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
         )
     }
 
+    fn term_scores_batch(&self, docs: &[u64], freqs: &[u32], out: &mut [f32]) {
+        // Hoist scorer state out of the loop: identical per-entry arithmetic
+        // to term_score, one dispatch per block.
+        let scorer = self.scorer.as_ref();
+        for ((&doc, &freq), slot) in docs.iter().zip(freqs.iter()).zip(out.iter_mut()) {
+            *slot = if freq != 0 {
+                self.posting
+                    .score(scorer, freq, self.documents.scoring_num_tokens(doc as u32))
+            } else {
+                0.0
+            };
+        }
+    }
+
+    fn document_keys_batch(&self, docs: &[u64], out: &mut Vec<Option<u64>>) {
+        out.clear();
+        out.reserve(docs.len());
+        for &doc in docs {
+            out.push(self.documents.document_key_for_doc_id(doc as u32));
+        }
+    }
+
     fn sync_after_batch(&mut self) {
         self.clear_current();
     }

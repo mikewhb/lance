@@ -670,6 +670,16 @@ pub(crate) struct IuBatchState {
     /// Per-candidate Σ SHOULD scores (computed at block take; preserved
     /// across pauses).
     should_sums: Vec<f32>,
+    /// Frequency view of the chunk (batch must-scoring input).
+    chunk_freqs: Vec<u32>,
+    /// Per-candidate MUST scores, batch-computed at block take (one dispatch
+    /// per block; preserved across pauses).
+    must_scores: Vec<f32>,
+    /// Per-candidate visibility keys, batch-computed at block take (None =
+    /// invisible).
+    keys: Vec<Option<u64>>,
+    /// Batch-scoring scratch for the per-SHOULD merge-score pass.
+    scratch_scores: Vec<f32>,
     /// In-chunk candidate index (pause breakpoint; >= chunk.len() means this
     /// block is fully consumed).
     chunk_idx: usize,
@@ -696,6 +706,10 @@ impl IuBatchState {
             candidates: Vec::new(),
             freqs: Vec::new(),
             should_sums: Vec::new(),
+            chunk_freqs: Vec::new(),
+            must_scores: Vec::new(),
+            keys: Vec::new(),
+            scratch_scores: Vec::new(),
             chunk_idx: 0,
             last_doc: 0,
             chunk_started: false,
@@ -742,17 +756,19 @@ impl IuBatchState {
         }
         loop {
             // 1) In-chunk resumption (pause-breakpoint recovery lands here:
-            // chunk / should_sums already live in the state machine; the
-            // providers are untouched).
+            // chunk / should_sums / must_scores / keys already live in the
+            // state machine; the providers are untouched). All per-candidate
+            // tables were batch-computed at block take — the emit loop does
+            // no provider dispatch at all.
             while self.chunk_idx < self.chunk.len() {
-                let (doc, freq) = self.chunk[self.chunk_idx];
-                let should_sum = self.should_sums[self.chunk_idx];
+                let idx = self.chunk_idx;
+                let (doc, _freq) = self.chunk[idx];
                 self.chunk_idx += 1;
                 self.last_doc = doc;
-                let Some(key) = must.document_key_for_doc_id(doc as u32) else {
+                let Some(key) = self.keys[idx] else {
                     continue;
                 };
-                let score = must.term_score(doc, freq) + should_sum;
+                let score = self.must_scores[idx] + self.should_sums[idx];
                 if score >= floor {
                     out.push((key, score));
                     if out.len() >= max_hits {
@@ -828,7 +844,9 @@ impl IuBatchState {
                     provider.sync_after_batch();
                 }
             }
-            // 3) Take the next block and rebuild the merge state.
+            // 3) Take the next block and rebuild the merge state. All
+            // per-candidate provider exits (must scores, visibility keys,
+            // per-SHOULD scoring) collapse to one dispatch per block.
             must.take_docs_one_block_upto(TERMINATED_DOC_ID, &mut self.chunk);
             if self.chunk.is_empty() {
                 self.exhausted = true;
@@ -837,6 +855,12 @@ impl IuBatchState {
             self.candidates.clear();
             self.candidates
                 .extend(self.chunk.iter().map(|(doc, _)| *doc));
+            self.chunk_freqs.clear();
+            self.chunk_freqs.extend(self.chunk.iter().map(|(_, f)| *f));
+            self.must_scores.clear();
+            self.must_scores.resize(self.candidates.len(), 0.0);
+            must.term_scores_batch(&self.candidates, &self.chunk_freqs, &mut self.must_scores);
+            must.document_keys_batch(&self.candidates, &mut self.keys);
             self.should_sums.clear();
             self.should_sums.resize(self.chunk.len(), 0.0);
             for (index, should) in shoulds.iter_mut().enumerate() {
@@ -846,10 +870,12 @@ impl IuBatchState {
                 if should.current_doc_id().is_none() {
                     self.dry[index] = true;
                 }
+                self.scratch_scores.clear();
+                self.scratch_scores.resize(self.candidates.len(), 0.0);
+                should.term_scores_batch(&self.candidates, &self.freqs, &mut self.scratch_scores);
                 for (candidate, &freq) in self.freqs.iter().enumerate() {
                     if freq != 0 {
-                        self.should_sums[candidate] +=
-                            should.term_score(self.candidates[candidate], freq);
+                        self.should_sums[candidate] += self.scratch_scores[candidate];
                     }
                 }
             }

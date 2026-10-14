@@ -419,6 +419,26 @@ pub(super) trait BlockBatch {
     fn cost(&self) -> usize;
     /// Per-hit scoring (documents.scoring_num_tokens resolved internally).
     fn term_score(&self, doc: u64, freq: u32) -> f32;
+    /// Batch form of [`BlockBatch::term_score`]: `out[i]` is the score of
+    /// (`docs[i]`, `freqs[i]`); frequency-0 entries are written as 0.0 (the
+    /// same skip rule as the state machine's per-document loop). The default
+    /// delegates per entry; providers override to hoist scorer state out of
+    /// the loop — one dispatch per block instead of per candidate, with
+    /// bit-identical arithmetic.
+    fn term_scores_batch(&self, docs: &[u64], freqs: &[u32], out: &mut [f32]) {
+        for (i, (&doc, &freq)) in docs.iter().zip(freqs.iter()).enumerate() {
+            out[i] = if freq != 0 { self.term_score(doc, freq) } else { 0.0 };
+        }
+    }
+    /// Batch form of [`BlockBatch::document_key_for_doc_id`] over ascending
+    /// doc ids; per-entry semantics (None = invisible) are unchanged.
+    fn document_keys_batch(&self, docs: &[u64], out: &mut Vec<Option<u64>>) {
+        out.clear();
+        out.extend(
+            docs.iter()
+                .map(|&doc| self.document_key_for_doc_id(doc as u32)),
+        );
+    }
     /// Invalidates derived caches after batch stepping; resumption is the
     /// host state machine's pure-data breakpoint's responsibility.
     fn sync_after_batch(&mut self);
