@@ -7973,10 +7973,6 @@ mod tests {
         );
     }
 
-    /// The batch-engagement counter is process-wide; tests that assert on it
-    /// must not interleave with each other.
-    static BATCH_ENGAGEMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Scores every document of the K=2/N=2 fixture through the batch
     /// primitives with the generic association (required summed, then
     /// optionals from zero), so a routed run can be compared against it.
@@ -8078,7 +8074,6 @@ mod tests {
 
     #[test]
     fn multi_never_emits_sub_floor_candidates_and_bounds_its_drains() {
-        let _serial = BATCH_ENGAGEMENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::sync::atomic::Ordering;
         let mut docs = DocSet::default();
         for row in 0..40_u64 {
@@ -8128,12 +8123,12 @@ mod tests {
         let score = Arc::new(CompetitiveScore::default());
         score.raise(floor);
         let mut collector = TopKCollector::with_competitive_score(40, score);
-        let engagements_before = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
-        let drains_before = super::reqopt::BATCH_DRAINS.load(Ordering::Relaxed);
+        let engagements_before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
+        let drains_before = super::reqopt::BATCH_DRAINS.with(std::cell::Cell::get);
         collect_partition_with_documents(&docs, make_leaves(), &plan, &metrics, &mut collector, Ok)
             .unwrap();
-        let engagements = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed) - engagements_before;
-        let drains = super::reqopt::BATCH_DRAINS.load(Ordering::Relaxed) - drains_before;
+        let engagements = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) - engagements_before;
+        let drains = super::reqopt::BATCH_DRAINS.with(std::cell::Cell::get) - drains_before;
 
         assert!(engagements > 0, "the K=2/N=2 non-skew shape must engage the batch profile");
         assert!(metrics.batch_steps() > 0, "the batch profile must account its work");
@@ -8151,7 +8146,6 @@ mod tests {
 
     #[test]
     fn multi_keeps_candidates_tying_the_floor() {
-        let _serial = BATCH_ENGAGEMENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::sync::atomic::Ordering;
         let mut docs = DocSet::default();
         for row in 0..40_u64 {
@@ -8214,11 +8208,11 @@ mod tests {
         let score = Arc::new(CompetitiveScore::default());
         score.raise(required_only);
         let mut collector = TopKCollector::with_competitive_score(40, score);
-        let engagements_before = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
+        let engagements_before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
         collect_partition_with_documents(&docs, make_leaves(), &plan, &metrics, &mut collector, Ok)
             .unwrap();
         assert!(
-            super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed) > engagements_before,
+            super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) > engagements_before,
             "the fixture must route through the batch profile"
         );
         assert_eq!(
@@ -8230,7 +8224,6 @@ mod tests {
 
     #[test]
     fn plain_posting_is_refused_at_the_batch_capability_entry() {
-        let _serial = BATCH_ENGAGEMENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // F1: batch steps address candidates as dense u32 doc-ids and resolve
         // them through document_key_for_doc_id / scoring_num_tokens. Plain
         // postings live in the legacy row-id domain, so the capability entry
@@ -8264,7 +8257,6 @@ mod tests {
 
     #[test]
     fn batch_engagement_requires_the_compressed_domain() {
-        let _serial = BATCH_ENGAGEMENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // F1 guard with a positive floor (the batch only engages above zero):
         // the same non-skew 1+2 shape engages the profile with compressed
         // clauses and must be refused with Plain clauses. Asserted directly on
@@ -8299,7 +8291,7 @@ mod tests {
             let score = Arc::new(CompetitiveScore::default());
             score.raise(0.5);
             let mut collector = TopKCollector::with_competitive_score(10, score);
-            let before = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
+            let before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
             collect_partition_with_documents(
                 &docs,
                 leaves,
@@ -8309,7 +8301,7 @@ mod tests {
                 Ok,
             )
             .unwrap();
-            let after = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
+            let after = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
             (after - before, collector.into_rows(), run_metrics.batch_steps())
         };
 
@@ -8361,7 +8353,6 @@ mod tests {
 
     #[test]
     fn iu_tight_fast_paths_record_comparisons() {
-        let _serial = BATCH_ENGAGEMENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The IU fast paths bypass the scorer tree, so they must report their
         // own comparison counts; a zero here means the metric was dropped.
         let mut docs = DocSet::default();
@@ -8395,7 +8386,7 @@ mod tests {
         let score = Arc::new(CompetitiveScore::default());
         score.raise(0.5);
         let mut collector = TopKCollector::with_competitive_score(10, score);
-        let before = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
+        let before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
         let status = collect_partition_with_documents(
             &docs,
             k1_leaves,
@@ -8407,7 +8398,7 @@ mod tests {
         .unwrap();
         assert_eq!(status, CollectionStatus::Complete);
         assert!(
-            super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed) > before,
+            super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) > before,
             "K=1 non-skew IU shape must engage the batch profile"
         );
         assert!(
@@ -8443,7 +8434,7 @@ mod tests {
         let score = Arc::new(CompetitiveScore::default());
         score.raise(0.5);
         let mut collector = TopKCollector::with_competitive_score(10, score);
-        let before = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
+        let before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
         let status = collect_partition_with_documents(
             &docs,
             k2_leaves,
@@ -8455,7 +8446,7 @@ mod tests {
         .unwrap();
         assert_eq!(status, CollectionStatus::Complete);
         assert!(
-            super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed) > before,
+            super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) > before,
             "K>=2 non-skew IU shape must engage the batch profile"
         );
         assert!(

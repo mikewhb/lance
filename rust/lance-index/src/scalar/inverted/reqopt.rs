@@ -10,19 +10,21 @@
 
 use super::super::wand::{IuBatchState, IuMultiBatchState};
 
-/// Test-only: how many times the batch profile took over a scorer. Capability
-/// routing must be assertable directly instead of being inferred from work
-/// metrics that the generic path can also move.
 #[cfg(test)]
-pub(super) static BATCH_ENGAGEMENTS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+std::thread_local! {
+    /// Test-only: how many times the batch profile took over a scorer.
+    /// Capability routing must be assertable directly instead of being
+    /// inferred from work metrics that the generic path can also move.
+    /// Thread-local so parallel tests cannot pollute each other's counts.
+    pub(super) static BATCH_ENGAGEMENTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 
-/// Test-only: how many times the engaged batch profile was drained. Each drain
-/// costs the host a provider re-acquisition and a window copy, so a candidate
-/// that cannot raise the floor must not buy one.
-#[cfg(test)]
-pub(super) static BATCH_DRAINS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+    /// Test-only: how many times the engaged batch profile was drained. Each
+    /// drain costs the host a provider re-acquisition and a window copy, so a
+    /// candidate that cannot raise the floor must not buy one.
+    pub(super) static BATCH_DRAINS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 use super::*;
 
 /// Required-plus-optional scorer that only touches the optional side when it
@@ -590,7 +592,7 @@ impl ComposableScorer for ReqOptScorer<'_> {
             && let Some(state) = self.batch_engagement()
         {
             #[cfg(test)]
-            BATCH_ENGAGEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            BATCH_ENGAGEMENTS.with(|count| count.set(count.get() + 1));
             self.batch = Some(state);
         }
         if self.batch.is_some() {
@@ -610,7 +612,7 @@ impl ComposableScorer for ReqOptScorer<'_> {
             // (nothing is dropped), just less pruning. The latch would only
             // re-route a scorer that has not engaged the batch yet.
             #[cfg(test)]
-            BATCH_DRAINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            BATCH_DRAINS.with(|count| count.set(count.get() + 1));
             batch_hits.clear();
             let exhausted_now = match batch.as_mut() {
                 Some(IuBatchEngagement::Single(state)) => {
