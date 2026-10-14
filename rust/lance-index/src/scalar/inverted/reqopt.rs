@@ -16,6 +16,13 @@ use super::super::wand::{IuBatchState, IuMultiBatchState};
 #[cfg(test)]
 pub(super) static BATCH_ENGAGEMENTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only: how many times the engaged batch profile was drained. Each drain
+/// costs the host a provider re-acquisition and a window copy, so a candidate
+/// that cannot raise the floor must not buy one.
+#[cfg(test)]
+pub(super) static BATCH_DRAINS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 use super::*;
 
 /// Required-plus-optional scorer that only touches the optional side when it
@@ -602,6 +609,8 @@ impl ComposableScorer for ReqOptScorer<'_> {
             // is terminal bookkeeping. The batch keeps full-scanning — sound
             // (nothing is dropped), just less pruning. The latch would only
             // re-route a scorer that has not engaged the batch yet.
+            #[cfg(test)]
+            BATCH_DRAINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             batch_hits.clear();
             let exhausted_now = match batch.as_mut() {
                 Some(IuBatchEngagement::Single(state)) => {

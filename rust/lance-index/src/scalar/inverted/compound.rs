@@ -7730,6 +7730,39 @@ mod tests {
         );
     }
 
+    /// Like `compressed_unit_posting` but with an inflated list-wide score
+    /// upper bound: the actual scores are unchanged, so a caller can hold the
+    /// floor above the real scores while staying below the bound (the batch
+    /// profile is skipped once the floor passes the required bound).
+    fn compressed_loose_ub_posting(token: &str, doc_ids: Vec<u32>, max_score: f32) -> PostingIterator {
+        let freqs = vec![1_u32; doc_ids.len()];
+        let block_max_scores = vec![max_score; doc_ids.len()];
+        let blocks = compress_posting_list(
+            doc_ids.len(),
+            doc_ids.iter(),
+            freqs.iter(),
+            block_max_scores.into_iter(),
+        )
+        .unwrap();
+        let num_docs = doc_ids.iter().copied().max().unwrap_or(0) as usize + 1;
+        PostingIterator::with_query_weight(
+            token.to_owned(),
+            0,
+            0,
+            1.0,
+            PostingList::Compressed(CompressedPostingList::new(
+                blocks,
+                max_score,
+                doc_ids.len() as u32,
+                PostingTailCodec::VarintDelta,
+                LEGACY_BLOCK_SIZE,
+                None,
+                None,
+            )),
+            num_docs,
+        )
+    }
+
     fn compressed_unit_posting(token: &str, doc_ids: Vec<u32>) -> PostingIterator {
         let max_score = 1.0_f32;
         let freqs = vec![1_u32; doc_ids.len()];
@@ -7943,6 +7976,257 @@ mod tests {
     /// The batch-engagement counter is process-wide; tests that assert on it
     /// must not interleave with each other.
     static BATCH_ENGAGEMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Scores every document of the K=2/N=2 fixture through the batch
+    /// primitives with the generic association (required summed, then
+    /// optionals from zero), so a routed run can be compared against it.
+    fn multi_fixture_oracle(
+        docs: &DocSet,
+        required_ids: &[u32],
+        optional_ids: &[u32],
+    ) -> Vec<(u64, f32)> {
+        let metrics = NoOpMetricsCollector;
+        let required_ids: Vec<u32> = required_ids.to_vec();
+        let optional_ids: Vec<u32> = optional_ids.to_vec();
+        let mut leaves = vec![
+            loaded_leaf(vec![compressed_unit_posting("m0", required_ids.clone())], None),
+            loaded_leaf(vec![compressed_unit_posting("m1", required_ids.clone())], None),
+            loaded_leaf(vec![compressed_unit_posting("s0", optional_ids.clone())], None),
+            loaded_leaf(vec![compressed_unit_posting("s1", optional_ids.clone())], None),
+        ]
+        .into_iter();
+        let mut scorers: Vec<BoxScorer> = (0..4)
+            .map(|_| box_leaf_scorer(leaves.next().unwrap(), docs, &metrics, true))
+            .collect();
+        let mut out = Vec::new();
+        for doc in 0..docs.len() as u64 {
+            let mut required_sum = 0.0_f32;
+            for scorer in scorers.iter_mut().take(2) {
+                if required_ids.contains(&(doc as u32)) {
+                    required_sum += scorer
+                        .block_batch()
+                        .expect("TermLeafScorer exposes the batch capability")
+                        .term_score(doc, 1);
+                }
+            }
+            let mut optional_sum = 0.0_f32;
+            for scorer in scorers.iter_mut().skip(2) {
+                if optional_ids.contains(&(doc as u32)) {
+                    optional_sum += scorer
+                        .block_batch()
+                        .expect("TermLeafScorer exposes the batch capability")
+                        .term_score(doc, 1);
+                }
+            }
+            out.push((doc, required_sum + optional_sum));
+        }
+        out
+    }
+
+    #[test]
+    fn fused_optional_fold_matches_the_separate_merge_and_score() {
+        // G2 regression: the fused fold reuses one frequency scratch across a
+        // long block, a short tail, an all-miss window and an empty input. It
+        // must stay bit-identical to the separate merge+score path, leave a
+        // miss untouched, and never leak a previous window's frequencies.
+        let metrics = NoOpMetricsCollector;
+        let mut docs = DocSet::default();
+        for row in 0..64_u64 {
+            docs.append(row, 1);
+        }
+        let ids: Vec<u32> = (0..48).chain([50, 51, 52]).collect();
+        let leaf = || loaded_leaf(vec![compressed_unit_posting("t", ids.clone())], None);
+        let mut fused = box_leaf_scorer(leaf(), &docs, &metrics, true);
+        let mut separate = box_leaf_scorer(leaf(), &docs, &metrics, true);
+
+        let windows: Vec<Vec<u64>> = vec![
+            (0..32).collect(),  // long block
+            (40..56).collect(), // short tail mixed with misses
+            (60..64).collect(), // all miss
+            Vec::new(),         // empty input
+        ];
+        for window in windows {
+            // Pre-filled, non-zero sums: a miss must leave them alone and a
+            // stale scratch must not change them.
+            let mut fused_sums = vec![1.5_f32; window.len()];
+            let mut separate_sums = vec![1.5_f32; window.len()];
+            fused
+                .block_batch()
+                .expect("TermLeafScorer exposes the batch capability")
+                .fold_optional_scores(&window, &mut fused_sums);
+            {
+                let provider = separate
+                    .block_batch()
+                    .expect("TermLeafScorer exposes the batch capability");
+                let mut freqs = vec![0_u32; window.len()];
+                provider.merge_optional_freqs(&window, &mut freqs);
+                for (index, &freq) in freqs.iter().enumerate() {
+                    if freq != 0 {
+                        separate_sums[index] += provider.term_score(window[index], freq);
+                    }
+                }
+            }
+            for (fused, separate) in fused_sums.iter().zip(separate_sums.iter()) {
+                assert_eq!(
+                    fused.to_bits(),
+                    separate.to_bits(),
+                    "the fused fold must match the separate merge+score bit-wise"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multi_never_emits_sub_floor_candidates_and_bounds_its_drains() {
+        let _serial = BATCH_ENGAGEMENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::sync::atomic::Ordering;
+        let mut docs = DocSet::default();
+        for row in 0..40_u64 {
+            docs.append(row, 1);
+        }
+        let required_ids: Vec<u32> = (0..40).collect();
+        let optional_ids: Vec<u32> = (0..8).collect();
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![
+                CompoundScorerPlan::Leaf { index: 0, boost: 1.0 },
+                CompoundScorerPlan::Leaf { index: 1, boost: 1.0 },
+            ],
+            should: vec![
+                CompoundScorerPlan::Leaf { index: 2, boost: 1.0 },
+                CompoundScorerPlan::Leaf { index: 3, boost: 1.0 },
+            ],
+            must_not: Vec::new(),
+        };
+        let make_leaves = || {
+            vec![
+                loaded_leaf(
+                    vec![compressed_loose_ub_posting("m0", required_ids.clone(), 5.0)],
+                    None,
+                ),
+                loaded_leaf(
+                    vec![compressed_loose_ub_posting("m1", required_ids.clone(), 5.0)],
+                    None,
+                ),
+                loaded_leaf(vec![compressed_unit_posting("s0", optional_ids.clone())], None),
+                loaded_leaf(vec![compressed_unit_posting("s1", optional_ids.clone())], None),
+            ]
+        };
+
+        // Oracle, then a floor that keeps exactly the six best documents and
+        // leaves most of the dense required intersection below it.
+        let mut oracle = multi_fixture_oracle(&docs, &required_ids, &optional_ids);
+        oracle.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        // Above the real required score (2.0) so the dense intersection leaves
+        // a sub-floor tail, but below the required list bound (10.0) so the
+        // batch profile still owns the shape.
+        let floor = 3.0_f32;
+        let expected: Vec<(u64, f32)> =
+            oracle.iter().copied().filter(|(_, score)| *score >= floor).collect();
+        assert!(expected.len() < 20, "the fixture must leave a sub-floor tail");
+
+        let metrics = LocalMetricsCollector::default();
+        let score = Arc::new(CompetitiveScore::default());
+        score.raise(floor);
+        let mut collector = TopKCollector::with_competitive_score(40, score);
+        let engagements_before = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
+        let drains_before = super::reqopt::BATCH_DRAINS.load(Ordering::Relaxed);
+        collect_partition_with_documents(&docs, make_leaves(), &plan, &metrics, &mut collector, Ok)
+            .unwrap();
+        let engagements = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed) - engagements_before;
+        let drains = super::reqopt::BATCH_DRAINS.load(Ordering::Relaxed) - drains_before;
+
+        assert!(engagements > 0, "the K=2/N=2 non-skew shape must engage the batch profile");
+        assert!(metrics.batch_steps() > 0, "the batch profile must account its work");
+        assert_eq!(
+            collector.into_rows(),
+            rows(&expected),
+            "the routed run must return exactly the oracle's above-floor rows"
+        );
+        assert!(
+            drains <= expected.len() + 3,
+            "a sub-floor candidate must not buy a drain: {drains} drains for {} above-floor rows",
+            expected.len()
+        );
+    }
+
+    #[test]
+    fn multi_keeps_candidates_tying_the_floor() {
+        let _serial = BATCH_ENGAGEMENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::sync::atomic::Ordering;
+        let mut docs = DocSet::default();
+        for row in 0..40_u64 {
+            docs.append(row, 1);
+        }
+        let required_ids: Vec<u32> = (0..40).collect();
+        let optional_ids: Vec<u32> = (0..8).collect();
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![
+                CompoundScorerPlan::Leaf { index: 0, boost: 1.0 },
+                CompoundScorerPlan::Leaf { index: 1, boost: 1.0 },
+            ],
+            should: vec![
+                CompoundScorerPlan::Leaf { index: 2, boost: 1.0 },
+                CompoundScorerPlan::Leaf { index: 3, boost: 1.0 },
+            ],
+            must_not: Vec::new(),
+        };
+        let make_leaves = || {
+            vec![
+                loaded_leaf(
+                    vec![compressed_loose_ub_posting("m0", required_ids.clone(), 5.0)],
+                    None,
+                ),
+                loaded_leaf(
+                    vec![compressed_loose_ub_posting("m1", required_ids.clone(), 5.0)],
+                    None,
+                ),
+                loaded_leaf(vec![compressed_unit_posting("s0", optional_ids.clone())], None),
+                loaded_leaf(vec![compressed_unit_posting("s1", optional_ids.clone())], None),
+            ]
+        };
+
+        // Every required-only document shares one score; setting the floor to
+        // exactly that score makes them all tie the floor, so an exclusive
+        // comparison in the walk would silently drop them.
+        let oracle = multi_fixture_oracle(&docs, &required_ids, &optional_ids);
+        let required_only = oracle
+            .iter()
+            .filter(|(doc, _)| !optional_ids.contains(&(*doc as u32)))
+            .map(|(_, score)| *score)
+            .next()
+            .expect("required-only documents exist");
+        assert!(required_only > 0.0, "the tie floor must be positive");
+        let expected: Vec<(u64, f32)> = oracle
+            .iter()
+            .copied()
+            .filter(|(_, score)| *score >= required_only)
+            .collect();
+        let tying = expected
+            .iter()
+            .filter(|(_, score)| (*score - required_only).abs() <= f32::EPSILON)
+            .count();
+        assert!(
+            tying > 1,
+            "the fixture must contain several candidates exactly at the floor"
+        );
+
+        let metrics = LocalMetricsCollector::default();
+        let score = Arc::new(CompetitiveScore::default());
+        score.raise(required_only);
+        let mut collector = TopKCollector::with_competitive_score(40, score);
+        let engagements_before = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
+        collect_partition_with_documents(&docs, make_leaves(), &plan, &metrics, &mut collector, Ok)
+            .unwrap();
+        assert!(
+            super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed) > engagements_before,
+            "the fixture must route through the batch profile"
+        );
+        assert_eq!(
+            collector.into_rows(),
+            rows(&expected),
+            "candidates tying the floor must be kept (inclusive comparison)"
+        );
+    }
 
     #[test]
     fn plain_posting_is_refused_at_the_batch_capability_entry() {

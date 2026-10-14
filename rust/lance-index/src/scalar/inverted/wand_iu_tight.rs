@@ -914,7 +914,7 @@ mod batch_proto_tests {
 
     use super::super::super::DocInfo;
     use super::super::{FlatDocuments, WandDocuments};
-    use super::{BlockBatch, IuBatchState};
+    use super::{BlockBatch, IuBatchState, PromotedWalk};
 
     /// Minimal documents with configurable visibility / num_tokens.
     struct MockDocs {
@@ -976,6 +976,8 @@ mod batch_proto_tests {
         ub: f32,
         block: usize,
         syncs: usize,
+        /// Block takes, so a test can bound the scanned work.
+        takes: usize,
         hidden: HashSet<u32>,
     }
 
@@ -987,6 +989,7 @@ mod batch_proto_tests {
                 ub,
                 block,
                 syncs: 0,
+                takes: 0,
                 hidden: HashSet::new(),
             }
         }
@@ -999,6 +1002,7 @@ mod batch_proto_tests {
 
         fn take_docs_one_block_upto(&mut self, _upto: u64, out: &mut Vec<(u64, u32)>) {
             out.clear();
+            self.takes += 1;
             let end = (self.pos + self.block).min(self.docs.len());
             out.extend_from_slice(&self.docs[self.pos..end]);
             self.pos = end;
@@ -1278,6 +1282,124 @@ mod batch_proto_tests {
     }
 
     #[test]
+    fn promoted_walk_adds_the_must_term_last() {
+        // d34358a2a regression (arithmetic isolated): the promoted walk must
+        // accumulate optionals from zero and add MUST once. At 2^24 the two
+        // associations differ by an ULP: optionals-first yields 2^24 + 2
+        // (= floor, emitted); MUST-first rounds the 2^24 + 1 intermediate to
+        // 2^24, so the score stays below the floor and the hit is lost.
+        let mut must = MockBatch::new(vec![(1, 16_777_216)], 16_777_216.0, 4);
+        let mut shoulds = vec![
+            MockBatch::new(vec![(1, 1)], 1.0, 4),
+            MockBatch::new(vec![(1, 1)], 1.0, 4),
+        ];
+        let mut walk = PromotedWalk::new(0, vec![0, 1], 0);
+        let mut providers: Vec<&mut dyn BlockBatch> = shoulds
+            .iter_mut()
+            .map(|should| should as &mut dyn BlockBatch)
+            .collect();
+        let mut out = Vec::new();
+        let exhausted = walk.run(&mut must, providers.as_mut_slice(), 16_777_218.0, &mut out, 100);
+        assert!(exhausted);
+        assert_eq!(
+            out,
+            vec![(1, 16_777_218.0)],
+            "optionals accumulate from zero, then MUST is added once"
+        );
+        assert_eq!(out[0].1.to_bits(), (16_777_216.0_f32 + 2.0).to_bits());
+    }
+
+    #[test]
+    fn batch_promoted_resume_with_a_trailing_lead_matches_one_shot() {
+        // The promoted lead is not the first optional, two optionals are
+        // necessary, and the lead hits span blocks: incremental (max_hits = 1)
+        // and one-shot delivery must agree exactly, with the optionals still
+        // scored in query order on every resumed call.
+        let make = || {
+            let must = MockBatch::new((1..=40).map(|d| (d, 1)).collect(), 1.0, 4);
+            let shoulds = vec![
+                // Not necessary: dropping it still leaves the other two ubs
+                // above the floor.
+                MockBatch::new(vec![(5, 1)], 1.0, 4),
+                // Necessary and cheapest -> the promoted lead.
+                MockBatch::new(vec![(3, 6), (9, 6), (15, 6)], 6.0, 4),
+                // Necessary.
+                MockBatch::new(vec![(3, 6), (9, 6), (15, 6)], 6.0, 4),
+            ];
+            (must, shoulds)
+        };
+        let floor = 13.0;
+
+        let (mut must, mut shoulds) = make();
+        let mut state = IuBatchState::new(1.0, vec![1.0, 6.0, 6.0]);
+        let one_shot = drain_all(&mut state, &mut must, &mut shoulds, floor, 100);
+
+        let (mut must, mut shoulds) = make();
+        let mut state = IuBatchState::new(1.0, vec![1.0, 6.0, 6.0]);
+        let mut incremental = Vec::new();
+        loop {
+            let mut providers: Vec<&mut dyn BlockBatch> = shoulds
+                .iter_mut()
+                .map(|should| should as &mut dyn BlockBatch)
+                .collect();
+            let mut out = Vec::new();
+            let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), floor, &mut out, 1);
+            incremental.extend(out);
+            if exhausted {
+                break;
+            }
+        }
+        assert_eq!(incremental, one_shot, "promoted resume must match one-shot");
+        for (left, right) in incremental.iter().zip(one_shot.iter()) {
+            assert_eq!(left.1.to_bits(), right.1.to_bits(), "score bits must be stable");
+        }
+        assert!(
+            !one_shot.is_empty(),
+            "the promoted walk (lead index 1) must have delivered the necessary hits"
+        );
+    }
+
+    #[test]
+    fn batch_yields_for_a_fresh_floor_instead_of_scanning_the_tail() {
+        // 95f0ba312 regression: both sparse optionals hit only inside the first
+        // MUST block, neither is individually necessary (so no promotion can
+        // mask the effect), and the MUST upper bound is loose (10 >= the real
+        // 1.0), so a frozen floor cannot prove the tail dead. The driver raises
+        // its floor after the produced hit (the collector's behaviour); only a
+        // freshness yield lets the walk terminate at the next call. Without it
+        // the first call scans all 60 blocks.
+        let mut must = MockBatch::new((1..=240).map(|d| (d, 1)).collect(), 10.0, 4);
+        let mut shoulds = vec![
+            MockBatch::new(vec![(3, 10)], 10.0, 4),
+            MockBatch::new(vec![(3, 10)], 10.0, 4),
+        ];
+        let mut state = IuBatchState::new(10.0, vec![10.0, 10.0]);
+        let mut floor = 1.5_f32;
+        let mut out = Vec::new();
+        loop {
+            let mut providers: Vec<&mut dyn BlockBatch> = shoulds
+                .iter_mut()
+                .map(|should| should as &mut dyn BlockBatch)
+                .collect();
+            let mut window = Vec::new();
+            let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), floor, &mut window, 10);
+            for &(_, score) in &window {
+                floor = floor.max(score + 0.5);
+            }
+            out.extend(window);
+            if exhausted {
+                break;
+            }
+        }
+        assert_eq!(out, vec![(3, 21.0)], "the far tail must not produce hits");
+        assert!(
+            must.takes <= 3,
+            "the walk must stop soon after the driver's floor rises (took {} blocks)",
+            must.takes
+        );
+    }
+
+    #[test]
     fn batch_multi_seek_crosses_u32_domain_boundary() {
         // The multi FSM aligns candidates near the u32 doc-id domain edge:
         // a sparse required hit at u32::MAX must survive alignment and
@@ -1501,18 +1623,31 @@ impl IuMultiBatchState {
                 self.aligned_promoted = false;
                 continue;
             };
-            out.push((key, required_sum + optional_sum));
-            hits += 1;
+            // Only candidates that reach this call's floor enter the window
+            // and the freshness yield. Sub-floor candidates are pushed by
+            // neither: the driver re-checks every window entry against its
+            // live floor and would discard them anyway, so emitting them only
+            // bought a host round trip — provider re-acquisition, syncs and a
+            // window copy — per candidate. Dropping them cannot lose a result
+            // because the competitive floor only rises, so the driver's live
+            // floor is never below this call's snapshot. Equality is kept
+            // (I-4): a candidate tying the floor can still win the row-id
+            // tie-break.
+            let score = required_sum + optional_sum;
+            if score >= floor {
+                out.push((key, score));
+                hits += 1;
+            }
             self.candidate += 1;
             self.aligned.iter_mut().for_each(|aligned| *aligned = false);
             self.aligned_promoted = false;
             // Floor-freshness yield (same rule as the K = 1 walk): the driver
             // only refreshes its competitive floor between drains, and the
-            // block-end decisions above read this call's frozen floor. Once a
-            // hit exists — the only way the floor can rise — hand control back
-            // with the cursor strictly advanced (I-7) so the next call
-            // re-checks promotion and cannot-compete against a fresh floor.
-            // max_hits stays honored as an upper bound on this call.
+            // block-end decisions above read this call's frozen floor. Once
+            // this call produced a hit — the only way the floor can rise —
+            // hand control back with the cursor strictly advanced (I-7) so
+            // the next call re-checks promotion and cannot-compete against a
+            // fresh floor. max_hits stays honored as an upper bound.
             if hits >= max_hits.min(1) {
                 for posting in requireds.iter_mut().chain(optionals.iter_mut()) {
                     posting.sync_after_batch();
