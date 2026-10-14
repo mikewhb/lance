@@ -6,6 +6,7 @@
 //! See [`TermLeafScorer`] for the floor contract.
 
 use std::cell::OnceCell;
+use std::cell::Cell;
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
@@ -31,6 +32,11 @@ pub struct TermLeafScorer<'a, D: WandDocuments> {
     /// Reused frequency scratch for the fused fold_optional_scores pass
     /// (plain capacity; contents are fully rewritten per call).
     fold_scratch: Vec<u32>,
+    /// Block-batch work steps taken by the batch profile (candidates taken,
+    /// merged, sought or scored). Reported through
+    /// `MetricsCollector::record_batch_steps` so batch routing is never
+    /// inferred from the generic comparison counter.
+    batch_steps: Cell<usize>,
     global_score_upper_bound: OnceCell<Option<f32>>,
     current_doc: Option<DocInfo>,
     current_document_key: Option<u64>,
@@ -56,6 +62,7 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
             scorer,
             cost,
             fold_scratch: Vec::new(),
+            batch_steps: Cell::new(0),
             global_score_upper_bound: OnceCell::new(),
             current_doc: None,
             current_document_key: None,
@@ -87,6 +94,10 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
     fn record_metrics(&mut self) {
         if !self.metrics_recorded {
             self.metrics.record_comparisons(self.comparisons);
+            let batch_steps = self.batch_steps.get();
+            if batch_steps > 0 {
+                self.metrics.record_batch_steps(batch_steps);
+            }
             self.metrics_recorded = true;
         }
     }
@@ -226,16 +237,20 @@ impl<D: WandDocuments> Drop for TermLeafScorer<'_, D> {
 /// breakpoints.
 impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
     fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+        self.batch_steps.set(self.batch_steps.get() + 1);
         self.documents.document_key_for_doc_id(doc_id)
     }
 
     fn take_docs_one_block_upto(&mut self, upto: u64, out: &mut Vec<(u64, u32)>) {
         self.posting.take_docs_one_block_upto(upto, out);
+        self.batch_steps.set(self.batch_steps.get() + out.len());
         self.clear_current();
     }
 
     fn merge_optional_freqs(&mut self, docs: &[u64], out_freqs: &mut [u32]) {
         self.posting.merge_optional_freqs(docs, out_freqs);
+        self.batch_steps
+            .set(self.batch_steps.get() + docs.len() + out_freqs.iter().filter(|f| **f != 0).count());
         self.clear_current();
     }
 
@@ -264,6 +279,7 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
     }
 
     fn seek_eq(&mut self, doc: u64) -> Option<u32> {
+        self.batch_steps.set(self.batch_steps.get() + 1);
         if self.posting.doc().is_some_and(|info| info.doc_id() < doc) {
             self.posting.next(doc);
         }
@@ -285,6 +301,7 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
     }
 
     fn term_score(&self, doc: u64, freq: u32) -> f32 {
+        self.batch_steps.set(self.batch_steps.get() + 1);
         self.posting.score(
             self.scorer.as_ref(),
             freq,

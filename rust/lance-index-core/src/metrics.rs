@@ -130,6 +130,14 @@ pub trait MetricsCollector: Send + Sync {
     /// The goal is to provide some visibility into the compute cost of the search
     fn record_comparisons(&self, num_comparisons: usize);
 
+    /// Record block-batch work steps: candidates taken, merged or sought by
+    /// the IU batch profile.
+    ///
+    /// Kept separate from [`Self::record_comparisons`] so that *routing* (did
+    /// the batch own this partition?) is never inferred from a work counter
+    /// that the generic path also moves. Default: no-op.
+    fn record_batch_steps(&self, _num_steps: usize) {}
+
     /// Record index cache hits observed while serving this query.
     ///
     /// A "hit" is one page-level lookup (partition, posting list, BTree page, etc.)
@@ -224,6 +232,7 @@ pub struct LocalMetricsCollector {
     pub(crate) index_cache_misses: AtomicUsize,
     pub(crate) batch_reads: AtomicUsize,
     pub(crate) single_page_reads: AtomicUsize,
+    pub(crate) batch_steps: AtomicUsize,
 }
 
 impl LocalMetricsCollector {
@@ -241,6 +250,7 @@ impl LocalMetricsCollector {
         other.record_index_cache_misses(self.index_cache_misses.load(Ordering::Relaxed));
         other.record_batch_reads(self.batch_reads.load(Ordering::Relaxed));
         other.record_single_page_reads(self.single_page_reads.load(Ordering::Relaxed));
+        other.record_batch_steps(self.batch_steps.load(Ordering::Relaxed));
     }
 
     /// Cumulative index cache hits recorded so far.
@@ -262,6 +272,11 @@ impl LocalMetricsCollector {
     pub fn single_page_reads(&self) -> usize {
         self.single_page_reads.load(Ordering::Relaxed)
     }
+
+    /// Cumulative block-batch work steps recorded so far.
+    pub fn batch_steps(&self) -> usize {
+        self.batch_steps.load(Ordering::Relaxed)
+    }
 }
 
 impl MetricsCollector for LocalMetricsCollector {
@@ -280,6 +295,10 @@ impl MetricsCollector for LocalMetricsCollector {
     fn record_comparisons(&self, num_comparisons: usize) {
         self.comparisons
             .fetch_add(num_comparisons, Ordering::Relaxed);
+    }
+
+    fn record_batch_steps(&self, num_steps: usize) {
+        self.batch_steps.fetch_add(num_steps, Ordering::Relaxed);
     }
 
     fn record_index_cache_hits(&self, num_hits: usize) {

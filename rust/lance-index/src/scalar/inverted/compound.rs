@@ -2416,9 +2416,12 @@ impl<K: Copy + Ord> TopKCollector<K> {
         loop {
             let min_score = self.competitive_score.get();
             if min_score <= 0.0 {
-                // No usable floor: the drain filters nothing, so its per-window
-                // bookkeeping is pure cost -- measured ~4x slower on COUNT for
-                // small match sets. Walk the scorer document by document.
+                // No *filtering* floor: the drain's window bookkeeping is pure
+                // cost (measured ~4x slower on COUNT for small match sets), so
+                // walk the scorer document by document. A finite non-positive
+                // floor is not the same as no floor though — signed scorers
+                // can still prove a window or a document cannot compete — so
+                // both prunes below stay, exactly as the general drain does.
                 scorer.set_min_competitive_score(min_score)?;
                 let Some(doc_id) = (match scorer.doc() {
                     Some(doc) => Some(doc),
@@ -2429,7 +2432,30 @@ impl<K: Copy + Ord> TopKCollector<K> {
                 let up_to = scorer.advance_shallow(doc_id)?;
                 // score_bounds positions the two-phase match cost; the drain
                 // does the same before deciding whether a window can compete.
-                let _bounds = scorer.score_bounds(up_to)?;
+                let bounds = scorer.score_bounds(up_to)?;
+                if bounds.upper < min_score {
+                    if up_to == u64::MAX {
+                        break;
+                    }
+                    if scorer.advance(up_to + 1)?.is_none() {
+                        break;
+                    }
+                    continue;
+                }
+                // Doc-local upper bounds let a strict miss bypass every
+                // pending position confirmation (equality stays live: row id
+                // is the final top-k tie breaker).
+                if min_score.is_finite()
+                    && scorer.supports_doc_local_confirmation_pruning()
+                    && scorer
+                        .current_score_upper_bound()?
+                        .is_some_and(|upper| upper < min_score)
+                {
+                    if scorer.next()?.is_none() {
+                        break;
+                    }
+                    continue;
+                }
                 if let Some(match_cost) = scorer.match_cost()
                     && (!match_cost.is_finite() || match_cost < 0.0)
                 {
@@ -4166,44 +4192,45 @@ fn boolean_leaf_split(plan: &CompoundScorerPlan) -> Option<BooleanLeafSplit> {
 /// correctness-safe either way but have no measurement behind the swap. Note
 /// that a MUST_NOT Boolean still drives through `ReqOptScorer`; excluding it is
 /// deliberate conservatism, not a structural difference.
+#[cfg(test)]
 fn leaf_admits_term_leaf(plan: &CompoundScorerPlan, index: usize) -> bool {
+    leaf_admission_set(plan, index + 1)[index]
+}
+
+/// The same admission decision for every leaf of one plan, computed with a
+/// single leaf-split derivation. Shapes the swap does not cover stay false.
+fn leaf_admission_set(plan: &CompoundScorerPlan, leaf_count: usize) -> Vec<bool> {
+    let mut admits = vec![false; leaf_count];
     match plan {
         CompoundScorerPlan::Boolean { .. } => {
             let Some(split) = boolean_leaf_split(plan) else {
-                return false;
+                return admits;
             };
             if split.must_children != 1 {
-                return false;
+                return admits;
             }
-            // The single MUST leaf keeps its existing admission.
             let Some(&(must_index, _)) = split.must_leaves.first() else {
-                return false;
+                return admits;
             };
-            if must_index == index {
-                return true;
+            if must_index < leaf_count {
+                admits[must_index] = true;
             }
-            // In a 1-MUST ReqOpt, the SHOULD leaves are probed by
-            // `advance(doc)` once per required document, and the ReqOpt scorer
-            // holds the floor itself (it forwards it to neither side). A direct
-            // posting seek beats the WAND machine there, so admit them too.
-            // MUST_NOT is deliberately excluded — the ReqOpt scorer still drives
-            // in that case, but admitting it is unmeasured — and a multi-MUST
-            // conjunction or a SHOULD-only union stays on the WAND cursor, which
-            // the parent's or the union's block skipping steers.
-            !split.has_must_not
-                && split
-                    .should_leaves
-                    .iter()
-                    .any(|&(should_index, _)| should_index == index)
+            if !split.has_must_not {
+                for &(should_index, _) in &split.should_leaves {
+                    if should_index < leaf_count {
+                        admits[should_index] = true;
+                    }
+                }
+            }
         }
-        // A standalone single-leaf plan (one term query): TermLeafScorer is
-        // the whole scorer, so there is no wrapper bookkeeping to save.
-        CompoundScorerPlan::Leaf {
-            index: leaf_index,
-            boost: _,
-        } => *leaf_index == index,
-        _ => false,
+        CompoundScorerPlan::Leaf { index, .. } => {
+            if *index < leaf_count {
+                admits[*index] = true;
+            }
+        }
+        _ => {}
     }
+    admits
 }
 
 fn box_leaf_scorer<'a, D>(
@@ -4300,11 +4327,15 @@ where
     for &index in &batch_leaf_indices {
         batch_leaf_set[index] = true;
     }
+    // One plan scan for the whole admission decision: the per-leaf predicate
+    // re-derives the plan's leaf split every time, which is O(L^2) over a
+    // plan that never changes.
+    let term_leaf_admits = leaf_admission_set(plan, leaves.len());
     let mut leaf_scorers = leaves
         .into_iter()
         .enumerate()
         .map(|(index, leaf)| {
-            let admits = batch_leaf_set[index] || leaf_admits_term_leaf(plan, index);
+            let admits = batch_leaf_set[index] || term_leaf_admits[index];
             Some(box_leaf_scorer(leaf, documents, metrics, admits))
         })
         .collect::<Vec<_>>();
@@ -7947,7 +7978,7 @@ mod tests {
         // clauses and must be refused with Plain clauses. Asserted directly on
         // the entry counter, not inferred from work metrics.
         use std::sync::atomic::Ordering;
-        let metrics = NoOpMetricsCollector;
+        let metrics = LocalMetricsCollector::default();
         let mut docs = DocSet::default();
         for i in 0..60_u64 {
             docs.append(i * 10, 1);
@@ -7970,18 +8001,28 @@ mod tests {
             must_not: Vec::new(),
         };
         let run = |leaves: Vec<LoadedLeaf>| {
+            // Fresh metrics per run so the accounted batch work belongs to
+            // exactly one collection.
+            let run_metrics = LocalMetricsCollector::default();
             let score = Arc::new(CompetitiveScore::default());
             score.raise(0.5);
             let mut collector = TopKCollector::with_competitive_score(10, score);
             let before = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
-            collect_partition_with_documents(&docs, leaves, &plan, &metrics, &mut collector, Ok)
-                .unwrap();
+            collect_partition_with_documents(
+                &docs,
+                leaves,
+                &plan,
+                &run_metrics,
+                &mut collector,
+                Ok,
+            )
+            .unwrap();
             let after = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
-            (after - before, collector.into_rows())
+            (after - before, collector.into_rows(), run_metrics.batch_steps())
         };
 
         // Control: compressed clauses, close costs -> the profile engages.
-        let (engagements, rows) = run(vec![
+        let (engagements, rows, batch_steps) = run(vec![
             loaded_leaf(vec![compressed_unit_posting("m", (0..50).collect())], None),
             loaded_leaf(vec![compressed_unit_posting("s0", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
             loaded_leaf(vec![compressed_unit_posting("s1", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
@@ -7989,6 +8030,10 @@ mod tests {
         assert!(
             engagements > 0,
             "control: a compressed non-skew 1+2 shape must engage the batch profile"
+        );
+        assert!(
+            batch_steps > 0,
+            "control: the batch profile must account its work steps"
         );
         let expected: Vec<u64> = rows.iter().map(|row| row.row_id).collect();
         assert!(!expected.is_empty());
@@ -7998,7 +8043,7 @@ mod tests {
         // doc-ids) — that difference is exactly why the batch profile, which
         // only speaks the dense domain, must refuse Plain. Assert the refusal
         // and that the Plain run stays deterministic.
-        let (engagements, plain_rows) = run(vec![
+        let (engagements, plain_rows, plain_steps) = run(vec![
             loaded_leaf(vec![plain_unit_posting("m", (0..50).collect())], None),
             loaded_leaf(vec![plain_unit_posting("s0", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
             loaded_leaf(vec![plain_unit_posting("s1", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
@@ -8007,9 +8052,13 @@ mod tests {
             engagements, 0,
             "the Plain row-id domain must never enter the batch profile"
         );
+        assert_eq!(
+            plain_steps, 0,
+            "no batch work may be accounted for a Plain shape"
+        );
         let plain_keys: Vec<u64> = plain_rows.iter().map(|row| row.row_id).collect();
         assert!(!plain_keys.is_empty());
-        let (_, plain_again) = run(vec![
+        let (_, plain_again, _) = run(vec![
             loaded_leaf(vec![plain_unit_posting("m", (0..50).collect())], None),
             loaded_leaf(vec![plain_unit_posting("s0", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
             loaded_leaf(vec![plain_unit_posting("s1", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
@@ -8028,25 +8077,32 @@ mod tests {
         }
         let leaf_node = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
 
-        // K=1: the dense MUST clause against two sparse should clauses
-        // clears the 3x gate.
+        // K=1: a dense MUST against a close-cost SHOULD clears the skew
+        // gate, so the profile must actually take over (asserted on the entry
+        // counter) and account its own work (batch steps), independently of
+        // the generic comparison counter.
+        use std::sync::atomic::Ordering;
         let k1_plan = CompoundScorerPlan::Boolean {
             must: vec![leaf_node(0)],
             should: vec![leaf_node(1)],
             must_not: Vec::new(),
         };
+        let should_close_cost = || loaded_leaf(vec![compressed_unit_posting("should", (0..8).collect())], None);
         let k1_leaves = vec![
             loaded_leaf(
                 vec![compressed_unit_posting("must", (0..50).collect())],
                 None,
             ),
-            loaded_leaf(vec![compressed_unit_posting("should", vec![3, 9])], None),
+            should_close_cost(),
         ];
         let (k1_must, k1_should) = iu_tight_clause_indices(&k1_plan).expect("1+1 shape");
         assert!(iu_tight_clauses_ready(&k1_leaves, &k1_must, &k1_should));
 
         let metrics = LocalMetricsCollector::default();
-        let mut collector = TopKCollector::new(10);
+        let score = Arc::new(CompetitiveScore::default());
+        score.raise(0.5);
+        let mut collector = TopKCollector::with_competitive_score(10, score);
+        let before = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
         let status = collect_partition_with_documents(
             &docs,
             k1_leaves,
@@ -8058,11 +8114,12 @@ mod tests {
         .unwrap();
         assert_eq!(status, CollectionStatus::Complete);
         assert!(
-            metrics
-                .comparisons
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0,
-            "K=1 IU fast path must record comparisons"
+            super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed) > before,
+            "K=1 non-skew IU shape must engage the batch profile"
+        );
+        assert!(
+            metrics.batch_steps() > 0,
+            "the batch profile must account its own work steps"
         );
 
         // K>=2: two dense MUSTs plus a sparse SHOULD take the multi kernel.
@@ -8083,14 +8140,17 @@ mod tests {
                 )],
                 None,
             ),
-            loaded_leaf(vec![compressed_unit_posting("should", vec![3, 9])], None),
+            loaded_leaf(vec![compressed_unit_posting("should", (0..8).collect())], None),
         ];
         let (k2_must, k2_should) = iu_tight_clause_indices(&k2_plan).expect("2+1 shape");
         assert_eq!(k2_must.len(), 2);
         assert!(iu_tight_clauses_ready(&k2_leaves, &k2_must, &k2_should));
 
         let metrics = LocalMetricsCollector::default();
-        let mut collector = TopKCollector::new(10);
+        let score = Arc::new(CompetitiveScore::default());
+        score.raise(0.5);
+        let mut collector = TopKCollector::with_competitive_score(10, score);
+        let before = super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed);
         let status = collect_partition_with_documents(
             &docs,
             k2_leaves,
@@ -8102,11 +8162,12 @@ mod tests {
         .unwrap();
         assert_eq!(status, CollectionStatus::Complete);
         assert!(
-            metrics
-                .comparisons
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0,
-            "K>=2 IU fast path must record comparisons"
+            super::reqopt::BATCH_ENGAGEMENTS.load(Ordering::Relaxed) > before,
+            "K>=2 non-skew IU shape must engage the batch profile"
+        );
+        assert!(
+            metrics.batch_steps() > 0,
+            "the multi batch profile must account its own work steps"
         );
     }
 
