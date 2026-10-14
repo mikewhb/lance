@@ -1386,9 +1386,13 @@ impl PostingIterator {
             PostingList::Compressed(ref list) => {
                 // Doc ids live in the u32 domain; a seek past the whole u32
                 // domain exhausts the cursor instead of truncating back to
-                // the bottom of the space.
+                // the bottom of the space. Exhaustion here is terminal: the
+                // cursor index moves to the list end (the same terminal value
+                // the natural end-of-list path uses), so a later seek back
+                // into the domain cannot revive the last document.
                 if least_id > u32::MAX as u64 {
                     self.current_doc = None;
+                    self.index = list.length as usize;
                     return;
                 }
                 let least_id = least_id as u32;
@@ -1484,9 +1488,13 @@ impl PostingIterator {
             PostingList::Compressed(ref list) => {
                 // Doc ids live in the u32 domain; a seek past the whole u32
                 // domain exhausts the cursor instead of truncating back to
-                // the bottom of the space.
+                // the bottom of the space, and the exhaustion is terminal
+                // (index moves to the list end, as on the natural end-of-list
+                // path) so a later in-domain seek cannot revive the last
+                // document.
                 if least_id > u32::MAX as u64 {
                     self.current_doc = None;
+                    self.index = list.length as usize;
                     return;
                 }
                 let least_id = least_id as u32;
@@ -1544,11 +1552,12 @@ impl PostingIterator {
     fn shallow_next(&mut self, least_id: u64) {
         match self.list {
             PostingList::Compressed(ref list) => {
-                // Doc ids live in the u32 domain; a seek past the whole u32
-                // domain exhausts the cursor instead of truncating back to
-                // the bottom of the space.
+                // A shallow seek only moves the bound window: past the whole
+                // u32 domain there is no bound left to advance, so leave the
+                // cursor untouched. Clearing `current_doc` here would destroy
+                // the exact position that the shallow contract promises to
+                // preserve.
                 if least_id > u32::MAX as u64 {
-                    self.current_doc = None;
                     return;
                 }
                 let least_id = least_id as u32;
@@ -6764,6 +6773,52 @@ mod tests {
             .fold(0.0_f32, |score, value| score + value);
         assert_eq!(reordered_score.to_bits(), 0x3da7_6086);
         assert!(bound >= reordered_score);
+    }
+
+    #[test]
+    fn u32_domain_overflow_exhausts_exactly_and_sparinglies_the_shallow_bound() {
+        // Real PostingIterator (not a mock): a seek past the u32 domain is a
+        // terminal exhaustion, so a later in-domain seek cannot revive the
+        // last document; a shallow overflow only moves the bound window and
+        // must leave the exact cursor untouched.
+        let mut docs = DocSet::default();
+        for row in [1_u64, 2, u32::MAX as u64] {
+            docs.append(row, 1);
+        }
+        let ids = vec![1_u32, 2, u32::MAX];
+
+        let mut posting = PostingIterator::with_query_weight(
+            String::from("t"),
+            0,
+            0,
+            1.0,
+            generate_posting_list(ids.clone(), 1.0, None, true),
+            docs.len(),
+        );
+        posting.next(u32::MAX as u64 + 1);
+        assert!(posting.current_doc.is_none(), "seek past the domain exhausts");
+        posting.next(0);
+        assert!(
+            posting.current_doc.is_none(),
+            "an in-domain seek after the terminal exhaustion must not revive the last document"
+        );
+
+        let mut shallow = PostingIterator::with_query_weight(
+            String::from("t"),
+            0,
+            0,
+            1.0,
+            generate_posting_list(ids, 1.0, None, true),
+            docs.len(),
+        );
+        shallow.next(2);
+        assert_eq!(shallow.current_doc.map(|doc| doc.doc_id()), Some(2));
+        shallow.shallow_next(u32::MAX as u64 + 1);
+        assert_eq!(
+            shallow.current_doc.map(|doc| doc.doc_id()),
+            Some(2),
+            "a shallow overflow must not clear the exact cursor"
+        );
     }
 
     #[test]
