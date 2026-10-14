@@ -47,6 +47,11 @@ pub(super) struct ReqOptScorer<'a> {
     /// scorer: pure-data breakpoints, providers re-acquired per drain call,
     /// one-way until exhaustion (I-1/I-2 option (a)).
     batch: Option<IuBatchEngagement>,
+    /// Reused scratch for the batch drain's hit window. The batch yields on
+    /// every produced hit (floor-freshness), so this vector is touched on
+    /// every drain — keeping its capacity across calls avoids a per-drain
+    /// allocation.
+    batch_hits: Vec<(u64, f32)>,
 }
 
 /// Which batch engine owns the scorer. `Single` = K = 1 (one required
@@ -76,6 +81,7 @@ impl<'a> ReqOptScorer<'a> {
             shallow_bounds: None,
             optional_globally_required: false,
             batch: None,
+            batch_hits: Vec::new(),
         }
     }
 
@@ -579,6 +585,7 @@ impl ComposableScorer for ReqOptScorer<'_> {
                 current,
                 batch,
                 optional_globally_required,
+                batch_hits,
                 ..
             } = self;
             // I-2 option (a): a promotion latch recorded mid-run (the floor
@@ -586,7 +593,7 @@ impl ComposableScorer for ReqOptScorer<'_> {
             // is terminal bookkeeping. The batch keeps full-scanning — sound
             // (nothing is dropped), just less pruning. The latch would only
             // re-route a scorer that has not engaged the batch yet.
-            let mut hits: Vec<(u64, f32)> = Vec::new();
+            batch_hits.clear();
             #[cfg(test)]
             eprintln!("[iu-batch] drain call floor={min_score} max_hits={max_hits}");
             let exhausted_now = match batch.as_mut() {
@@ -605,7 +612,7 @@ impl ComposableScorer for ReqOptScorer<'_> {
                         required_batch,
                         optional_batch.as_mut_slice(),
                         min_score,
-                        &mut hits,
+                        batch_hits,
                         max_hits,
                     )
                 }
@@ -624,17 +631,17 @@ impl ComposableScorer for ReqOptScorer<'_> {
                         &mut requireds,
                         &mut optionals,
                         min_score,
-                        &mut hits,
+                        batch_hits,
                         max_hits,
                     )
                 }
                 None => return Err(Error::internal("IU batch profile vanished while engaged")),
             };
             #[cfg(test)]
-            for (document_key, score) in &hits {
+            for (document_key, score) in batch_hits.iter() {
                 eprintln!("[iu-batch] emit {} {}", document_key, score);
             }
-            for (document_key, score) in hits {
+            for &(document_key, score) in batch_hits.iter() {
                 out.push(ConfirmedHit { document_key, score });
             }
             if exhausted_now {
