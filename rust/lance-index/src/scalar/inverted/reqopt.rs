@@ -87,6 +87,12 @@ impl<'a> ReqOptScorer<'a> {
     /// batch: a latched shape is already an intersection driven from the
     /// sparse side, which is the R-G1 fix itself.
     fn batch_engagement(&mut self) -> Option<IuBatchEngagement> {
+        // Env gate: LANCE_FTS_IU_TIGHT=off must disable the batch profile
+        // entirely (the escape hatch the PR promises). Capability alone is
+        // not authorization.
+        if !iu_tight_enabled() {
+            return None;
+        }
         // K = 1: the required side is itself one batch provider.
         if let Some(required_batch) = self.required.block_batch() {
             let optional_batch = self.optional.block_batch_children()?;

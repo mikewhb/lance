@@ -1312,6 +1312,7 @@ impl IuMultiBatchState {
             if max_doc > self.candidate {
                 self.candidate = max_doc;
                 self.aligned.iter_mut().for_each(|aligned| *aligned = false);
+                self.aligned_promoted = false;
                 continue;
             }
 
@@ -1350,7 +1351,9 @@ impl IuMultiBatchState {
             }
             let current_floor = floor;
             if current_floor.is_finite() {
-                if optionals.len() == 1 && iu_cannot_compete(self.required_ub, 0.0, current_floor)
+                if !self.promoted_optional
+                    && optionals.len() == 1
+                    && iu_cannot_compete(self.required_ub, 0.0, current_floor)
                 {
                     // N == 1 promotion: MUST-only documents are provably
                     // dead. Pure state — the provider collections are
@@ -1372,6 +1375,7 @@ impl IuMultiBatchState {
             let Some(key) = requireds[0].document_key_for_doc_id(self.candidate as u32) else {
                 self.candidate += 1;
                 self.aligned.iter_mut().for_each(|aligned| *aligned = false);
+                self.aligned_promoted = false;
                 continue;
             };
             out.push((key, required_sum + optional_sum));
