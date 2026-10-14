@@ -124,7 +124,8 @@ impl<'a> ReqOptScorer<'a> {
             // sparse optionals against a dense required intersection yield
             // to the generic per-document tree whose block-max skipping and
             // union promotion own the shape.
-            if optional_cost.saturating_mul(8) < required_cost {
+            // K = 1: the required side is a single provider.
+            if super::optionals_are_sparse(1, optional_cost, required_cost) {
                 return None;
             }
             let must_ub = required_batch.global_upper_bound();
@@ -144,7 +145,7 @@ impl<'a> ReqOptScorer<'a> {
         let mut optionals = self.optional.block_batch_children()?;
         let required_cost: usize = requireds.iter().map(|p| p.cost()).sum();
         let optional_cost: usize = optionals.iter().map(|p| p.cost()).sum();
-        if requireds.len() * optional_cost.saturating_mul(8) < required_cost {
+        if super::optionals_are_sparse(requireds.len(), optional_cost, required_cost) {
             return None;
         }
         let required_ubs: Vec<f32> = requireds.iter().map(|p| p.global_upper_bound()).collect();

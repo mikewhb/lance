@@ -258,6 +258,32 @@ fn checked_score(score: f32, context: &str) -> Result<f32> {
 /// `matches` is the optional two-phase confirmation hook: cheap approximations
 /// return a candidate from `next` / `advance` and defer expensive checks such
 /// as phrase positions until confirmation.
+///
+/// # Terminal-state contract
+///
+/// `doc() == None` does not by itself mean "no more documents": a scorer that
+/// is still unpositioned (fresh), one whose exact cursor has run out
+/// (exhausted) and one whose derived caches were invalidated by batch stepping
+/// all report `None` here. Each implementation must distinguish them
+/// internally:
+/// - a *fresh* scorer may position from the start (`next()` / `advance()`);
+/// - an *exhausted* exact cursor must stay exhausted (the domain-overflow
+///   guard moves the index to the list end so a later in-domain seek cannot
+///   revive the last document);
+/// - a scorer *owned by the batch profile* exposes its providers through
+///   `block_batch()` and must not be driven document-by-document until the
+///   batch yields ownership back.
+///
+/// # Batch exclusivity
+///
+/// Batch stepping is one-way per engagement: once a host owns the providers
+/// (`block_batch()` / `block_batch_children()` returned them), that host
+/// drives them to exhaustion and the derived per-document caches stay
+/// invalid; the collector protocol (`collect_confirmed_window`) and the
+/// per-document protocol must not interleave on the same scorer. The
+/// engagement itself is monotone (the driver's competitive floor only rises),
+/// which is why a batch host may assume its snapshot floor is never above the
+/// live one.
 pub(super) trait ComposableScorer: Send {
     fn doc(&self) -> Option<u64>;
     fn document_key(&self) -> Option<u64> {
@@ -335,6 +361,13 @@ pub(super) trait ComposableScorer: Send {
         None
     }
 
+    // The `debug_*` hooks below are test-only: they are `#[cfg(test)]`-gated
+    // here and in every implementation, so release builds do not carry them
+    // (and the trait has no release-visible debug surface). They stay on this
+    // trait rather than moving to a test-only extension trait because their
+    // consumers call them through `&mut dyn ComposableScorer`; a blanket
+    // extension impl would resolve `type_name::<Self>()` to
+    // `"dyn ComposableScorer"` and break the type-name assertions.
     #[cfg(test)]
     fn debug_type_name(&self) -> &'static str {
         std::any::type_name::<Self>()
@@ -426,11 +459,20 @@ pub(super) trait BlockBatch {
     /// Forward-seek equivalent (promoted mode): position on `doc`, return
     /// its frequency; None on a miss.
     fn seek_eq(&mut self, doc: u64) -> Option<u32>;
-    /// Conservative list-wide score upper bound (same source as the generic
-    /// path's global_score_upper_bound).
+    /// Conservative list-wide score upper bound.
+    ///
+    /// This is the **raw** bound of the underlying posting list, not the
+    /// outward-extended value the generic path hands to a parent: any consumer
+    /// that folds several bounds together is responsible for its own outward
+    /// extension (see `conservative_score_sum`). The IU gates compare this raw
+    /// value with the raw `cost()` below, so both sides of the skew criterion
+    /// stay in the same domain.
     fn global_upper_bound(&self) -> f32;
-    /// Raw posting df (kernel convention; not the visibility-truncated
-    /// value).
+    /// Raw posting df (kernel convention), **not** the visibility-truncated
+    /// value that `ComposableScorer::cost()` returns for the same leaf. The IU
+    /// gates (shape router and drain-time engagement) read this raw value on
+    /// both sides of the skew criterion; a future consumer mixing the two
+    /// domains would silently misjudge the criterion.
     fn cost(&self) -> usize;
     /// Per-hit scoring (documents.scoring_num_tokens resolved internally).
     fn term_score(&self, doc: u64, freq: u32) -> f32;
@@ -4235,6 +4277,13 @@ fn leaf_admission_set(plan: &CompoundScorerPlan, leaf_count: usize) -> Vec<bool>
     admits
 }
 
+/// Leaf capability check: the single source of the "one ungrouped single
+/// posting" judgement is `is_compound_term_leaf` (plus `is_compressed` where
+/// the dense u32 batch domain is required), see the routing site in
+/// `collect_partition_with_documents` and `iu_tight_clauses_ready`.
+/// `leaf_admission_set` answers a *plan-shape* question (is this a 1-MUST
+/// Boolean?) and must not grow into a second leaf-capability answer; the
+/// second check below (plus its phrase/grouped test) keeps them from diverging.
 fn box_leaf_scorer<'a, D>(
     leaf: LoadedLeaf,
     documents: &'a D,
@@ -4247,6 +4296,12 @@ where
     if leaf.postings.is_empty() {
         return Box::new(EmptyScorer);
     }
+    // `admits_term_leaf` is an *intent* flag: the plan shape (1-MUST Boolean)
+    // or the batch capability layer says "this index would like a TermLeaf".
+    // The leaf's own shape is checked here a second time on purpose, and
+    // `box_leaf_scorer_keeps_wand_cursor_for_phrase_grouped_and_multi_term`
+    // pins that a phrase / grouped / multi-posting leaf still keeps its WAND
+    // cursor. Do not collapse the two questions into one.
     if admits_term_leaf && is_compound_term_leaf(&leaf) {
         let posting = leaf
             .postings
@@ -4319,7 +4374,7 @@ where
             .map(|&index| leaves[index].postings[0].cost())
             .sum();
         let sparse_optionals_vs_dense_required =
-            must_indices.len() * optional_cost.saturating_mul(8) < required_cost;
+            optionals_are_sparse(must_indices.len(), optional_cost, required_cost);
         if !sparse_optionals_vs_dense_required {
             batch_flag = true;
             batch_leaf_indices.extend(must_indices.iter().chain(should_indices.iter()).copied());
@@ -4348,6 +4403,25 @@ where
         ));
     }
     collector.collect_mapped(scorer.as_mut(), &mut map_document)
+}
+
+/// The IU skew criterion: when every required list dwarfs the optional union
+/// (all optionals sparse against a dense required intersection), scoring the
+/// whole intersection loses to the generic path's block-max window skipping,
+/// so those shapes stay on the generic tree.
+///
+/// Single source for the predicate: the shape router below, the drain-time
+/// engagement gate in `ReqOptScorer::batch_engagement` and the unit tests all
+/// call this instead of re-deriving the inequality. The expression is kept
+/// verbatim (`k` multiplies with a plain `*`; only the `* 8` saturates) so the
+/// arithmetic and overflow behaviour do not drift.
+#[inline]
+fn optionals_are_sparse(
+    k_required: usize,
+    optional_cost: usize,
+    required_cost: usize,
+) -> bool {
+    k_required * optional_cost.saturating_mul(8) < required_cost
 }
 
 /// IU clause indices for K >= 1 required clauses plus N >= 1 optional
@@ -4817,6 +4891,8 @@ mod tests {
     use super::super::encoding::compress_posting_list;
     use super::super::index::{PlainPostingList, PostingList};
     use super::super::scorer::Scorer;
+    use super::super::wand::FlatDocuments;
+    use super::super::DocInfo;
     use super::super::wand::GroupedTermScorer;
     use super::super::{CompressedPostingList, LEGACY_BLOCK_SIZE, PostingTailCodec};
     use super::*;
@@ -7925,11 +8001,28 @@ mod tests {
 
     #[test]
     fn skew_guard_predicate_flags_disjoint_sparse_optionals() {
+        // Both arms call the shared predicate: the router (compound.rs) and the
+        // drain-time engagement gate (reqopt.rs). The test must not re-derive
+        // the inequality, or a threshold change would leave it testing the old
+        // formula.
         let k = 2_usize;
         let optional_cost: usize = 2 + 2;
         let required_cost = 65_536 * k;
-        assert!(k * optional_cost.saturating_mul(8) < required_cost);
-        assert!(!(k * 40_000_usize.saturating_mul(8) < required_cost));
+        assert!(optionals_are_sparse(k, optional_cost, required_cost));
+        assert!(!optionals_are_sparse(k, 40_000, required_cost));
+        // K = 1: the drain gate passes `k = 1` explicitly (one required
+        // provider), so the K = 1 branch is the k = 1 case of the same rule.
+        assert!(optionals_are_sparse(1, optional_cost, required_cost));
+    }
+
+    #[test]
+    fn skew_guard_predicate_is_strict_at_the_equality_boundary() {
+        // Pin the strict `<`: at `k * optional_cost * 8 == required_cost` the
+        // optionals are not sparse (the shape still takes the kernel). This is
+        // the case a `<` -> `<=` mutation would silently flip, and the older
+        // assertions never reached the boundary.
+        assert!(!optionals_are_sparse(1, 16_384, 131_072));
+        assert!(optionals_are_sparse(1, 16_383, 131_072));
     }
 
 
@@ -8069,6 +8162,134 @@ mod tests {
                     "the fused fold must match the separate merge+score bit-wise"
                 );
             }
+        }
+    }
+
+    /// A documents fixture whose visible-cost upper bound is smaller than the
+    /// posting df, so the two cost domains (raw df vs visibility-truncated)
+    /// are distinguishable. Minimal on purpose; B2.2 of the convergence plan
+    /// would fold this into a shared test fixture.
+    struct CostDomainDocs<'a> {
+        inner: &'a DocSet,
+        visible_cost_upper_bound: usize,
+    }
+
+    impl WandDocuments for CostDomainDocs<'_> {
+        type Candidate = u64;
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+
+        fn scoring_norms(&self) -> Option<&[u8]> {
+            self.inner.scoring_norms()
+        }
+
+        fn scoring_num_tokens(&self, doc_id: u32) -> u32 {
+            self.inner.scoring_num_tokens(doc_id)
+        }
+
+        fn doc_length(&self, doc: &DocInfo) -> u32 {
+            self.inner.doc_length(doc)
+        }
+
+        fn document_key(&self, doc: &DocInfo) -> Option<u64> {
+            self.inner.document_key(doc)
+        }
+
+        fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+            self.inner.document_key_for_doc_id(doc_id)
+        }
+
+        fn candidate_from_key(&self, key: u64) -> Self::Candidate {
+            key
+        }
+
+        fn visible_cost_upper_bound(&self) -> usize {
+            self.visible_cost_upper_bound
+        }
+
+        fn flat_documents(&self) -> Option<FlatDocuments<'_>> {
+            None
+        }
+
+        fn flat_doc_length(&self, doc_id: u64, _key: u64, _compressed: bool) -> u32 {
+            self.inner.scoring_num_tokens(doc_id as u32)
+        }
+    }
+
+    #[test]
+    fn batch_cost_is_raw_while_the_composable_cost_is_visibility_truncated() {
+        // The IU gates read the raw posting df on both sides of the skew
+        // criterion; `ComposableScorer::cost` is the visibility-truncated value
+        // for the same leaf. Pin both domains so a future consumer cannot mix
+        // them silently.
+        let metrics = NoOpMetricsCollector;
+        let mut dense = DocSet::default();
+        for row in 0..64_u64 {
+            dense.append(row, 1);
+        }
+        let docs = CostDomainDocs {
+            inner: &dense,
+            visible_cost_upper_bound: 10,
+        };
+
+        let mut compressed = box_leaf_scorer(
+            loaded_leaf(
+                vec![compressed_unit_posting("m", (0..40).collect())],
+                None,
+            ),
+            &docs,
+            &metrics,
+            true,
+        );
+        let raw_cost = compressed
+            .block_batch()
+            .expect("a compressed single-posting leaf exposes the batch capability")
+            .cost();
+        assert_eq!(raw_cost, 40, "the batch domain reports the raw posting df");
+        assert_eq!(
+            compressed.cost(),
+            10,
+            "the composable domain reports the visibility-truncated cost"
+        );
+        assert!(compressed.cost() <= raw_cost);
+
+        // Plain postings are refused at the capability entry, so only the
+        // composable domain is observable for them.
+        let mut plain = box_leaf_scorer(
+            loaded_leaf(vec![plain_unit_posting("m", (0..40).collect())], None),
+            &docs,
+            &metrics,
+            true,
+        );
+        assert!(plain.block_batch().is_none());
+        assert_eq!(plain.cost(), 10);
+    }
+
+    #[test]
+    fn both_tie_modes_keep_equalities_and_break_by_row_id() {
+        // Inclusive floor contract: when the k-th score is tied, row id decides.
+        // Both tie modes must agree here - the batch FSM keeps candidates tying
+        // the floor for the same reason (`multi_keeps_candidates_tying_the_floor`).
+        let modes: Vec<TieHandling> = vec![
+            TieHandling::ResolveByKey,
+            TieHandling::RetainScoreFloor { max_buffered: 8 },
+        ];
+        for mode in modes {
+            let score = Arc::new(CompetitiveScore::default());
+            let mut collector = TopKCollector::with_tie_handling(1, score, mode);
+            assert_eq!(
+                collector.insert(ScoredRow::new(5, 1.0).unwrap()),
+                CollectionStatus::Complete
+            );
+            assert_eq!(
+                collector.insert(ScoredRow::new(3, 1.0).unwrap()),
+                CollectionStatus::Complete
+            );
+            let rows = collector.into_rows();
+            assert_eq!(rows.len(), 1, "limit 1 keeps exactly one row");
+            assert_eq!(rows[0].row_id, 3, "the smaller row id wins the tie");
         }
     }
 
