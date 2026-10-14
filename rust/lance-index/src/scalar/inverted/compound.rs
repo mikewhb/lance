@@ -2812,8 +2812,10 @@ impl<'a> DisjunctionScorer<'a> {
 impl ComposableScorer for DisjunctionScorer<'_> {
     fn block_batch_children(&mut self) -> Option<Vec<&mut dyn BlockBatch>> {
         // Flat Sum-OR aggregation (PLAN-V3 §3.2): every child must itself be
-        // a batch provider; any None (nested / Max / wrapped) rejects the
-        // whole node so the batch profile never sees a wrong combiner.
+        // a batch provider; any None rejects the whole node so the batch
+        // profile never sees a wrong combiner. This node is the Sum
+        // disjunction only - a Max variant does not override this method, so
+        // its default None keeps the SUM contract explicit.
         self.children
             .iter_mut()
             .map(|child| child.block_batch())

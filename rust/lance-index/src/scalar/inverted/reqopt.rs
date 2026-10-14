@@ -603,8 +603,6 @@ impl ComposableScorer for ReqOptScorer<'_> {
             // (nothing is dropped), just less pruning. The latch would only
             // re-route a scorer that has not engaged the batch yet.
             batch_hits.clear();
-            #[cfg(test)]
-            eprintln!("[iu-batch] drain call floor={min_score} max_hits={max_hits}");
             let exhausted_now = match batch.as_mut() {
                 Some(IuBatchEngagement::Single(state)) => {
                     let Some(required_batch) = required.block_batch() else {
@@ -646,10 +644,6 @@ impl ComposableScorer for ReqOptScorer<'_> {
                 }
                 None => return Err(Error::internal("IU batch profile vanished while engaged")),
             };
-            #[cfg(test)]
-            for (document_key, score) in batch_hits.iter() {
-                eprintln!("[iu-batch] emit {} {}", document_key, score);
-            }
             for &(document_key, score) in batch_hits.iter() {
                 out.push(ConfirmedHit { document_key, score });
             }
