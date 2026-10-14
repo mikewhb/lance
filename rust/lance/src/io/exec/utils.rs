@@ -1060,6 +1060,14 @@ impl MetricsCollector for IndexMetrics {
     fn record_comparisons(&self, num_comparisons: usize) {
         self.index_comparisons.add(num_comparisons);
     }
+
+    /// Batch-profile work steps are index work: fold them into the shared
+    /// comparison counter so the exported query metric is not under-counted
+    /// when a partition is served by the batch profile alone. The local
+    /// collector keeps the two counters separate for routing assertions.
+    fn record_batch_steps(&self, num_steps: usize) {
+        self.index_comparisons.add(num_steps);
+    }
     fn record_index_cache_hits(&self, num_hits: usize) {
         self.index_cache_hits.add(num_hits);
     }

@@ -7940,8 +7940,13 @@ mod tests {
         );
     }
 
+    /// The batch-engagement counter is process-wide; tests that assert on it
+    /// must not interleave with each other.
+    static BATCH_ENGAGEMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn plain_posting_is_refused_at_the_batch_capability_entry() {
+        let _serial = BATCH_ENGAGEMENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // F1: batch steps address candidates as dense u32 doc-ids and resolve
         // them through document_key_for_doc_id / scoring_num_tokens. Plain
         // postings live in the legacy row-id domain, so the capability entry
@@ -7975,6 +7980,7 @@ mod tests {
 
     #[test]
     fn batch_engagement_requires_the_compressed_domain() {
+        let _serial = BATCH_ENGAGEMENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // F1 guard with a positive floor (the batch only engages above zero):
         // the same non-skew 1+2 shape engages the profile with compressed
         // clauses and must be refused with Plain clauses. Asserted directly on
@@ -8071,6 +8077,7 @@ mod tests {
 
     #[test]
     fn iu_tight_fast_paths_record_comparisons() {
+        let _serial = BATCH_ENGAGEMENT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // The IU fast paths bypass the scorer tree, so they must report their
         // own comparison counts; a zero here means the metric was dropped.
         let mut docs = DocSet::default();

@@ -1393,6 +1393,7 @@ impl PostingIterator {
                 if least_id > u32::MAX as u64 {
                     self.current_doc = None;
                     self.index = list.length as usize;
+                    self.block_idx = self.index >> list.block_shift();
                     return;
                 }
                 let least_id = least_id as u32;
@@ -1495,6 +1496,7 @@ impl PostingIterator {
                 if least_id > u32::MAX as u64 {
                     self.current_doc = None;
                     self.index = list.length as usize;
+                    self.block_idx = self.index >> list.block_shift();
                     return;
                 }
                 let least_id = least_id as u32;

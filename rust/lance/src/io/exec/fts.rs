@@ -2706,6 +2706,10 @@ impl MetricsCollector for FtsIndexMetrics {
         self.index_metrics.record_comparisons(num_comparisons);
     }
 
+    fn record_batch_steps(&self, num_steps: usize) {
+        self.index_metrics.record_batch_steps(num_steps);
+    }
+
     fn record_index_cache_hits(&self, num_hits: usize) {
         self.index_metrics.record_index_cache_hits(num_hits);
     }
