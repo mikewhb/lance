@@ -86,6 +86,14 @@ pub fn iu_tight_enabled() -> bool {
 /// walk than finishing MUST.
 pub const IU_TIGHT_LEAD_COST_RATIO: usize = 3;
 
+/// Candidates one multi-walk call may scan before handing control back even
+/// without producing a hit. The driver only refreshes its competitive floor
+/// between calls (and the floor is shared across partitions), so an unbounded
+/// scan of a sub-floor tail would ignore a floor that rose elsewhere. One
+/// block's worth of candidates matches the granularity the K = 1 walk already
+/// has through its block takes.
+pub(crate) const MULTI_CANDIDATE_BUDGET: usize = 128;
+
 pub fn iu_tight_lead_is_cheaper(must_cost: usize, lead_cost: usize) -> bool {
     lead_cost.saturating_mul(IU_TIGHT_LEAD_COST_RATIO) < must_cost
 }
@@ -914,7 +922,7 @@ mod batch_proto_tests {
 
     use super::super::super::DocInfo;
     use super::super::{FlatDocuments, WandDocuments};
-    use super::{BlockBatch, IuBatchState, PromotedWalk};
+    use super::{BlockBatch, IuBatchState, IuMultiBatchState, PromotedWalk};
 
     /// Minimal documents with configurable visibility / num_tokens.
     struct MockDocs {
@@ -978,6 +986,8 @@ mod batch_proto_tests {
         syncs: usize,
         /// Block takes, so a test can bound the scanned work.
         takes: usize,
+        /// Per-candidate seeks, so a test can bound the scanned candidates.
+        seeks: usize,
         hidden: HashSet<u32>,
     }
 
@@ -990,6 +1000,7 @@ mod batch_proto_tests {
                 block,
                 syncs: 0,
                 takes: 0,
+                seeks: 0,
                 hidden: HashSet::new(),
             }
         }
@@ -1022,6 +1033,7 @@ mod batch_proto_tests {
         }
 
         fn seek_eq(&mut self, doc: u64) -> Option<u32> {
+            self.seeks += 1;
             // Mirror the real provider contract: on a hit the cursor parks ON
             // the found document (current_doc_id == doc), so the alignment
             // tail's current_doc_id max never overshoots the candidate.
@@ -1400,6 +1412,43 @@ mod batch_proto_tests {
     }
 
     #[test]
+    fn multi_bounds_its_scan_so_an_external_floor_rise_is_seen() {
+        // Shape B (delta review §4.3): a long sub-floor tail while the
+        // competitive floor rises *outside* this walk (the floor is shared
+        // across partitions). The per-call candidate budget hands control
+        // back at block granularity so the driver re-checks with the fresh
+        // floor; without it the whole tail is scanned against a frozen floor.
+        let mut must0 = MockBatch::new((1..=400).map(|d| (d, 1)).collect(), 1.0, 4);
+        let mut must1 = MockBatch::new((1..=400).map(|d| (d, 1)).collect(), 1.0, 4);
+        // The optional's only hit sits far beyond the required candidates, so
+        // it never contributes and never runs dry: the frozen floor cannot
+        // prove the tail dead, while the externally raised floor can. Every
+        // required candidate therefore scores 2.0, below the 2.5 floor.
+        let mut optionals = vec![MockBatch::new(vec![(10_000, 1)], 1.0, 4)];
+        // Loose required bound (4.0 >= the real 2.0): the frozen 2.5 floor
+        // can neither prove the tail dead nor trigger the N == 1 promotion.
+        let mut state = IuMultiBatchState::new(&[2.0, 2.0], &[1.0]);
+        let mut floor = 2.5_f32; // above the real required sum (2.0)
+        loop {
+            let mut requireds: Vec<&mut dyn BlockBatch> = vec![&mut must0, &mut must1];
+            let mut optionals_ref: Vec<&mut dyn BlockBatch> = vec![&mut optionals[0]];
+            let mut out = Vec::new();
+            let exhausted =
+                state.next_batch(&mut requireds, &mut optionals_ref, floor, &mut out, 10);
+            assert!(out.is_empty(), "every candidate is below the floor");
+            floor = 6.0; // simulated external rise of the shared floor
+            if exhausted {
+                break;
+            }
+        }
+        let scanned = must0.seeks + must1.seeks;
+        assert!(
+            scanned <= 2 * super::MULTI_CANDIDATE_BUDGET + 16,
+            "the walk must hand back at the budget so the fresh floor is seen (scanned {scanned})"
+        );
+    }
+
+    #[test]
     fn batch_multi_seek_crosses_u32_domain_boundary() {
         // The multi FSM aligns candidates near the u32 doc-id domain edge:
         // a sparse required hit at u32::MAX must survive alignment and
@@ -1510,6 +1559,8 @@ impl IuMultiBatchState {
             return true;
         }
         let mut hits = 0_usize;
+        // Scanned candidates of this call only (cooperation budget).
+        let mut scanned = 0_usize;
         loop {
             // Seek-to-max alignment across the required providers — plus
             // the promoted optional once it joined the required set.
@@ -1634,6 +1685,7 @@ impl IuMultiBatchState {
             // (I-4): a candidate tying the floor can still win the row-id
             // tie-break.
             let score = required_sum + optional_sum;
+            scanned += 1;
             if score >= floor {
                 out.push((key, score));
                 hits += 1;
@@ -1648,7 +1700,7 @@ impl IuMultiBatchState {
             // hand control back with the cursor strictly advanced (I-7) so
             // the next call re-checks promotion and cannot-compete against a
             // fresh floor. max_hits stays honored as an upper bound.
-            if hits >= max_hits.min(1) {
+            if hits >= max_hits.min(1) || scanned >= MULTI_CANDIDATE_BUDGET {
                 for posting in requireds.iter_mut().chain(optionals.iter_mut()) {
                     posting.sync_after_batch();
                 }
