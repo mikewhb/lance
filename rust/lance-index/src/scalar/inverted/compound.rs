@@ -271,8 +271,9 @@ fn checked_score(score: f32, context: &str) -> Result<f32> {
 ///   guard moves the index to the list end so a later in-domain seek cannot
 ///   revive the last document);
 /// - a scorer *owned by the batch profile* exposes its providers through
-///   `block_batch()` and must not be driven document-by-document until the
-///   batch yields ownership back.
+///   `block_batch()`; once that hand-off happened the ownership is one-way
+///   (the engagement is never abandoned), so the per-document protocol must
+///   not drive such a scorer again.
 ///
 /// # Batch exclusivity
 ///
@@ -470,9 +471,10 @@ pub(super) trait BlockBatch {
     fn global_upper_bound(&self) -> f32;
     /// Raw posting df (kernel convention), **not** the visibility-truncated
     /// value that `ComposableScorer::cost()` returns for the same leaf. The IU
-    /// gates (shape router and drain-time engagement) read this raw value on
-    /// both sides of the skew criterion; a future consumer mixing the two
-    /// domains would silently misjudge the criterion.
+    /// gates read the same raw df on both sides of the skew criterion (the
+    /// shape router through `PostingIterator::cost`, the drain-time engagement
+    /// through this method - numerically the same value); a future consumer
+    /// mixing the two domains would silently misjudge the criterion.
     fn cost(&self) -> usize;
     /// Per-hit scoring (documents.scoring_num_tokens resolved internally).
     fn term_score(&self, doc: u64, freq: u32) -> f32;
@@ -8023,6 +8025,14 @@ mod tests {
         // assertions never reached the boundary.
         assert!(!optionals_are_sparse(1, 16_384, 131_072));
         assert!(optionals_are_sparse(1, 16_383, 131_072));
+        // The * 8 stays saturating: with an optional cost at the ceiling the
+        // saturated product equals usize::MAX, which is not below the ceiling
+        // either. This is the case a `saturating_mul(8)` -> `* 8` mutation
+        // would turn into a debug overflow panic, so the "kept verbatim"
+        // promise is guarded rather than only documented. (The k side is a
+        // plain multiply by design; no test feeds it a value that would
+        // overflow, because that is the preserved behaviour, not a contract.)
+        assert!(!optionals_are_sparse(1, usize::MAX, usize::MAX));
     }
 
 
