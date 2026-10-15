@@ -345,6 +345,27 @@ pub(super) trait ComposableScorer: Send {
         collect_confirmed_window_default(self, min_score, out, max_hits)
     }
 
+    /// Live-floor takeover: run this scorer's whole walk inside this call and
+    /// hand confirmed hits to `emit`. `floor` is the collector's own shared
+    /// lower bound, so reading it between blocks (or per candidate) always
+    /// yields the current cutoff — including rises that came from another
+    /// partition, not just from this walk's own hits.
+    ///
+    /// Returning `Ok(true)` means the scorer drove itself to exhaustion, or
+    /// stopped because `emit` returned `false` — either way the caller must
+    /// stop driving this scorer. `Ok(false)` declines, and the caller's own
+    /// loop stays in charge of the scorer.
+    ///
+    /// Only the required/optional IU node overrides this today; everything
+    /// else declines, so the drain protocol below remains their only path.
+    fn collect_top_k(
+        &mut self,
+        _floor: &CompetitiveScore,
+        _emit: &mut dyn FnMut(u64, f32) -> Result<bool>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Block-batch capability: implemented only by the "single compressed
     /// posting leaf" form (`TermLeafScorer`). Defaults to `None`, so
     /// nested / Max / boost≠1 / phrase / cross-column structures are rejected
@@ -2233,11 +2254,11 @@ impl Default for CompetitiveScore {
 }
 
 impl CompetitiveScore {
-    fn get(&self) -> f32 {
+    pub(super) fn get(&self) -> f32 {
         f32::from_bits(self.bits.load(AtomicOrdering::Relaxed))
     }
 
-    fn raise(&self, score: f32) {
+    pub(super) fn raise(&self, score: f32) {
         debug_assert!(!score.is_nan());
         let mut current = self.bits.load(AtomicOrdering::Relaxed);
         while score > f32::from_bits(current) {
@@ -2531,6 +2552,42 @@ impl<K: Copy + Ord> TopKCollector<K> {
                     break;
                 }
                 continue;
+            }
+            // Live-floor takeover: a node that can drive its own walk emits
+            // hits straight into the heap and reads the collector's shared
+            // floor between blocks, so it never has to hand control back just
+            // to see a refreshed value.
+            //
+            // Attempted per window rather than once: the floor only turns
+            // positive after the heap fills (the branch above), so the first
+            // window(s) are per-document by construction — exactly the point
+            // where the earlier drain-based batch engaged. Declining (`false`)
+            // leaves the drain below untouched.
+            {
+                // Cloned so the emit closure can hold `&mut self` while the
+                // walk reads the very same shared floor.
+                let floor = Arc::clone(&self.competitive_score);
+                let mut overflow = false;
+                let mut emit = |document_key: u64, score: f32| -> Result<bool> {
+                    if score >= floor.get() {
+                        let status = self.insert(ScoredRow {
+                            row_id: map_document(document_key)?,
+                            score,
+                        });
+                        if status == CollectionStatus::ScoreFloorOverflow {
+                            overflow = true;
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                };
+                if scorer.collect_top_k(&floor, &mut emit)? {
+                    return Ok(if overflow {
+                        CollectionStatus::ScoreFloorOverflow
+                    } else {
+                        CollectionStatus::Complete
+                    });
+                }
             }
             window.clear();
             let collect = scorer.collect_confirmed_window(min_score, &mut window, window_cap)?;
@@ -3858,6 +3915,26 @@ impl ComposableScorer for BooleanScorer<'_> {
             return Ok(status);
         }
         collect_confirmed_window_default(self, min_score, out, max_hits)
+    }
+
+    /// Forwards the live-floor takeover to the driver when this node adds
+    /// nothing on top of it. A live `optional` / `prohibited` side would be
+    /// bypassed by a takeover, so those shapes decline and stay on the drain.
+    fn collect_top_k(
+        &mut self,
+        floor: &CompetitiveScore,
+        emit: &mut dyn FnMut(u64, f32) -> Result<bool>,
+    ) -> Result<bool> {
+        if self.optional.is_some() || self.prohibited.is_some() {
+            return Ok(false);
+        }
+        if !self.driver.collect_top_k(floor, emit)? {
+            return Ok(false);
+        }
+        self.current = None;
+        self.confirmed_doc = None;
+        self.confirmed = false;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -8418,12 +8495,10 @@ mod tests {
         score.raise(floor);
         let mut collector = TopKCollector::with_competitive_score(40, score);
         let engagements_before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
-        let drains_before = super::reqopt::BATCH_DRAINS.with(std::cell::Cell::get);
         collect_partition_with_documents(&docs, make_leaves(), &plan, &metrics, &mut collector, Ok)
             .unwrap();
         let engagements =
             super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) - engagements_before;
-        let drains = super::reqopt::BATCH_DRAINS.with(std::cell::Cell::get) - drains_before;
 
         assert!(
             engagements > 0,
@@ -8438,11 +8513,10 @@ mod tests {
             rows(&expected),
             "the routed run must return exactly the oracle's above-floor rows"
         );
-        assert!(
-            drains <= expected.len() + 3,
-            "a sub-floor candidate must not buy a drain: {drains} drains for {} above-floor rows",
-            expected.len()
-        );
+        // The walk owns its loop now, so "a sub-floor candidate must not buy a
+        // round trip" is structural rather than a drain count: the walk filters
+        // on the live floor before it ever calls `emit`, and it never returns
+        // control mid-walk.
     }
 
     #[test]

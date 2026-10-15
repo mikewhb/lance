@@ -5,18 +5,23 @@
 //! clauses plus N optional ones (named after the Search Benchmark Game's
 //! query of that shape).
 //!
-//! The IU batch profile: a suspendable, pure-data state machine that drives
-//! flat MUST/SHOULD shapes from the scorer tree's `BlockBatch` providers.
+//! The IU batch profile: a pure-data state machine that drives flat
+//! MUST/SHOULD shapes from the scorer tree's `BlockBatch` providers.
 //!
 //! `IuBatchState` owns the K = 1 walk (plus the promoted sub-mode) and
 //! `IuMultiBatchState` the K >= 2 seek-to-max walk; both consume block-wise
 //! provider capabilities (`take_docs_one_block_upto`, `merge_optional_freqs`,
 //! `seek_eq`, batch scoring) instead of driving the per-document protocol.
-//! The walk yields as soon as a call produced a hit so the collection driver
-//! can refresh its competitive floor, and it never hands provider ownership
-//! back: batch engagement is one-way per scorer.
+//!
+//! The walk owns its loop for the whole shape: hits are handed straight to the
+//! collector through `emit`, and the floor is re-read between blocks, so the
+//! walk prunes with a value that is never older than the heap it prunes for.
+//! Nothing has to be handed back mid-walk, and batch engagement stays one-way
+//! per scorer.
 
-use super::super::compound::BlockBatch;
+use lance_core::Result;
+
+use super::super::compound::{BlockBatch, CompetitiveScore};
 use super::{
     BulkAndMode, CompetitiveFloorMode, TERMINATED_DOC_ID, conservative_score_sum,
     score_sum_cannot_compete, score_sum_upper_bound_factor,
@@ -82,14 +87,6 @@ pub fn iu_tight_enabled() -> bool {
 /// MUST. A medium-df SHOULD that just barely becomes required is slower to
 /// walk than finishing MUST.
 pub const IU_TIGHT_LEAD_COST_RATIO: usize = 3;
-
-/// Candidates one multi-walk call may scan before handing control back even
-/// without producing a hit. The driver only refreshes its competitive floor
-/// between calls (and the floor is shared across partitions), so an unbounded
-/// scan of a sub-floor tail would ignore a floor that rose elsewhere. One
-/// block's worth of candidates matches the granularity the K = 1 walk already
-/// has through its block takes.
-pub const MULTI_CANDIDATE_BUDGET: usize = 128;
 
 pub fn iu_tight_lead_is_cheaper(must_cost: usize, lead_cost: usize) -> bool {
     lead_cost.saturating_mul(IU_TIGHT_LEAD_COST_RATIO) < must_cost
@@ -231,15 +228,15 @@ impl PromotedWalk {
         }
     }
 
-    /// Runs to exhaustion or pause. Returns true = exhausted.
+    /// Runs to exhaustion. Returns `true` = exhausted, `false` = `emit` asked
+    /// to stop because the collector can take no more.
     fn run<'s>(
         &mut self,
         must: &'s mut dyn BlockBatch,
         shoulds: &'s mut [&'s mut dyn BlockBatch],
-        floor: f32,
-        out: &mut Vec<(u64, f32)>,
-        max_hits: usize,
-    ) -> bool {
+        floor: &CompetitiveScore,
+        emit: &mut dyn FnMut(u64, f32) -> Result<bool>,
+    ) -> Result<bool> {
         loop {
             while self.lead_idx < self.lead_chunk.len() {
                 let (doc, lead_freq) = self.lead_chunk[self.lead_idx];
@@ -285,15 +282,12 @@ impl PromotedWalk {
                     }
                 }
                 let score = must.term_score(doc, must_freq) + optional_sum;
-                if score >= floor {
-                    out.push((key, score));
-                    if out.len() >= max_hits {
-                        must.sync_after_batch();
-                        for should in shoulds.iter_mut() {
-                            should.sync_after_batch();
-                        }
-                        return false;
+                if score >= floor.get() && !emit(key, score)? {
+                    must.sync_after_batch();
+                    for should in shoulds.iter_mut() {
+                        should.sync_after_batch();
                     }
+                    return Ok(false);
                 }
             }
             shoulds[self.lead_index]
@@ -303,7 +297,7 @@ impl PromotedWalk {
                 for should in shoulds.iter_mut() {
                     should.sync_after_batch();
                 }
-                return true;
+                return Ok(true);
             }
             self.lead_idx = 0;
         }
@@ -377,17 +371,16 @@ impl IuBatchState {
         self.exhausted
     }
 
-    /// Advances one segment: consumes the current chunk (resuming at the
-    /// breakpoint) or takes the next block, delivering at most `max_hits`
-    /// `(document_key, score)` pairs into `out` (score >= floor, inclusive;
-    /// a candidate tying the floor still competes). Returns true = exhausted;
-    /// every non-exhausted return strictly advances the buffer offset.
+    /// Runs the walk to exhaustion. Every candidate at or above the live floor
+    /// (`floor.get()`, inclusive — a candidate tying the floor still competes)
+    /// is handed to `emit` as `(document_key, score)`. Returns `true` when the
+    /// walk finished on its own; `false` when `emit` asked to stop because the
+    /// collector can take no more (heap overflow).
     ///
-    /// `out` contract: the caller passes a fresh (empty) window per call;
-    /// the walk yields as soon as this call produced a hit so the driver can
-    /// refresh its competitive floor (the driver inserts produced hits only
-    /// after the call returns, so a long call would re-check promotion and
-    /// cannot-compete against an obsolete floor).
+    /// The floor is re-read at each block end, so a hit emitted earlier in this
+    /// same call has already raised the value the dry-budget termination and
+    /// the promotion decision prune with — nothing has to be handed back to the
+    /// driver for a refresh.
     ///
     /// At a consumed block end: sync_after_batch (invalidate provider derived
     /// caches) → dry-budget termination → promotion decision (the per-should
@@ -398,30 +391,25 @@ impl IuBatchState {
         &mut self,
         must: &'s mut dyn BlockBatch,
         shoulds: &'s mut [&'s mut dyn BlockBatch],
-        floor: f32,
-        out: &mut Vec<(u64, f32)>,
-        max_hits: usize,
-    ) -> bool {
-        debug_assert!(max_hits > 0, "max_hits must be positive");
+        floor: &CompetitiveScore,
+        emit: &mut dyn FnMut(u64, f32) -> Result<bool>,
+    ) -> Result<bool> {
         if self.exhausted {
-            return true;
+            return Ok(true);
         }
         if let Some(mut walk) = self.promoted.take() {
-            let exhausted = walk.run(must, shoulds, floor, out, max_hits);
+            let exhausted = walk.run(must, shoulds, floor, emit)?;
             if exhausted {
                 self.exhausted = true;
-                return true;
+                return Ok(true);
             }
             self.promoted = Some(walk);
-            return false;
+            return Ok(false);
         }
-        let out_start_len = out.len();
         loop {
-            // 1) In-chunk resumption (pause-breakpoint recovery lands here:
-            // chunk / should_sums / must_scores / keys already live in the
-            // state machine; the providers are untouched). All per-candidate
-            // tables were batch-computed at block take — the emit loop does
-            // no provider dispatch at all.
+            // 1) Emit the candidates of the block already in the state's
+            // chunk. All per-candidate tables were batch-computed at block
+            // take — this loop does no provider dispatch at all.
             while self.chunk_idx < self.chunk.len() {
                 let idx = self.chunk_idx;
                 let (doc, _freq) = self.chunk[idx];
@@ -431,57 +419,41 @@ impl IuBatchState {
                     continue;
                 };
                 let score = self.must_scores[idx] + self.should_sums[idx];
-                if score >= floor {
-                    out.push((key, score));
-                    if out.len() >= max_hits {
-                        for provider in
-                            std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s))
-                        {
-                            provider.sync_after_batch();
-                        }
-                        return false;
+                if score >= floor.get() && !emit(key, score)? {
+                    for provider in
+                        std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s))
+                    {
+                        provider.sync_after_batch();
                     }
+                    return Ok(false);
                 }
-            }
-            // 1b) Floor-freshness yield: the driver refreshes its competitive
-            // floor only between drains (produced hits are inserted into the
-            // collector after this call returns), so scanning on would make
-            // the block-end decisions below re-check promotion and
-            // cannot-compete against a floor that is already stale. Once this
-            // call produced a hit (the only way the driver's floor can rise)
-            // hand control back; the buffer strictly advanced, so the driver
-            // re-issues with the fresh floor.
-            if out.len() > out_start_len {
-                for provider in
-                    std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s))
-                {
-                    provider.sync_after_batch();
-                }
-                return false;
             }
             // 2) Block fully consumed: block-end checks (only after really
-            // consuming a block).
+            // consuming a block). The floor is read here, at the block
+            // boundary, so a hit emitted earlier in this call has already
+            // raised the value these gates prune with.
             if self.chunk_started {
-                if floor.is_finite() {
+                let floor_now = floor.get();
+                if floor_now.is_finite() {
                     let live_optional_ub =
                         live_upper_bound(&self.dry, |index| self.should_ubs[index]);
-                    if iu_cannot_compete(self.must_ub, live_optional_ub, floor) {
+                    if iu_cannot_compete(self.must_ub, live_optional_ub, floor_now) {
                         self.exhausted = true;
                         for provider in
                             std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s))
                         {
                             provider.sync_after_batch();
                         }
-                        return true;
+                        return Ok(true);
                     }
                     if self
                         .promotion_decision
                         .as_ref()
-                        .is_none_or(|(decided_floor, _)| *decided_floor != floor)
+                        .is_none_or(|(decided_floor, _)| *decided_floor != floor_now)
                     {
                         self.promotion_decision = Some((
-                            floor,
-                            iu_tight_required_shoulds(self.must_ub, &self.should_ubs, floor),
+                            floor_now,
+                            iu_tight_required_shoulds(self.must_ub, &self.should_ubs, floor_now),
                         ));
                     }
                     if let Some(Some(required)) = self
@@ -496,7 +468,7 @@ impl IuBatchState {
                             {
                                 provider.sync_after_batch();
                             }
-                            return true;
+                            return Ok(true);
                         }
                         let lead_cost = required
                             .iter()
@@ -514,13 +486,13 @@ impl IuBatchState {
                                 self.last_doc.saturating_add(1),
                             ));
                             let mut walk = self.promoted.take().expect("just set");
-                            let exhausted = walk.run(must, shoulds, floor, out, max_hits);
+                            let exhausted = walk.run(must, shoulds, floor, emit)?;
                             if exhausted {
                                 self.exhausted = true;
-                                return true;
+                                return Ok(true);
                             }
                             self.promoted = Some(walk);
-                            return false;
+                            return Ok(false);
                         }
                     }
                 }
@@ -536,7 +508,7 @@ impl IuBatchState {
             must.take_docs_one_block_upto(TERMINATED_DOC_ID, &mut self.chunk);
             if self.chunk.is_empty() {
                 self.exhausted = true;
-                return true;
+                return Ok(true);
             }
             self.candidates.clear();
             self.candidates
@@ -577,7 +549,7 @@ mod batch_proto_tests {
 
     use super::super::super::DocInfo;
     use super::super::{FlatDocuments, WandDocuments};
-    use super::{BlockBatch, IuBatchState, IuMultiBatchState, PromotedWalk};
+    use super::{BlockBatch, CompetitiveScore, IuBatchState, IuMultiBatchState, PromotedWalk};
 
     /// Minimal documents with configurable visibility / num_tokens.
     struct MockDocs {
@@ -738,39 +710,54 @@ mod batch_proto_tests {
         (must, vec![should0, should1], docs, oracle)
     }
 
-    /// Drain the K=1 FSM the way the collection driver does: re-acquire the
-    /// providers per call and loop until exhaustion. The FSM yields on every
-    /// produced hit (floor-freshness), so delivery must never be assumed
-    /// complete in one call.
-    fn drain_all(
+    /// A shared floor raised to `value`, mirroring what the collector exposes.
+    /// The walk reads it live, so a rise is honoured at the next block end
+    /// (K = 1) or the next candidate (K >= 2).
+    fn competitive_score_at(value: f32) -> CompetitiveScore {
+        let score = CompetitiveScore::default();
+        score.raise(value);
+        score
+    }
+
+    /// One-shot drive of the K = 1 walk, the way the collector drives it now:
+    /// one call owns the loop, so delivery is complete when it returns.
+    fn run_once(
         state: &mut IuBatchState,
         must: &mut MockBatch,
         shoulds: &mut [MockBatch],
         floor: f32,
-        max_hits: usize,
+    ) -> (bool, Vec<(u64, f32)>) {
+        let floor = competitive_score_at(floor);
+        let mut providers: Vec<&mut dyn BlockBatch> = shoulds
+            .iter_mut()
+            .map(|should| should as &mut dyn BlockBatch)
+            .collect();
+        let mut hits = Vec::new();
+        let exhausted = state
+            .next_batch(must, providers.as_mut_slice(), &floor, &mut |key, score| {
+                hits.push((key, score));
+                Ok(true)
+            })
+            .expect("the K = 1 walk must not fail");
+        (exhausted, hits)
+    }
+
+    fn run_all(
+        state: &mut IuBatchState,
+        must: &mut MockBatch,
+        shoulds: &mut [MockBatch],
+        floor: f32,
     ) -> Vec<(u64, f32)> {
-        let mut all = Vec::new();
-        loop {
-            let mut providers: Vec<&mut dyn BlockBatch> = shoulds
-                .iter_mut()
-                .map(|should| should as &mut dyn BlockBatch)
-                .collect();
-            let mut out = Vec::new();
-            let exhausted =
-                state.next_batch(must, providers.as_mut_slice(), floor, &mut out, max_hits);
-            all.extend(out);
-            if exhausted {
-                break;
-            }
-        }
-        all
+        let (exhausted, hits) = run_once(state, must, shoulds, floor);
+        assert!(exhausted, "a one-shot drive runs to exhaustion");
+        hits
     }
 
     #[test]
     fn batch_first_takeover_delivers_hits_above_floor() {
         let (mut must, mut shoulds, _docs, _oracle) = fixtures();
         let mut state = IuBatchState::new(1.0, vec![10.0, 10.0]);
-        let out = drain_all(&mut state, &mut must, &mut shoulds, 11.0, 100);
+        let out = run_all(&mut state, &mut must, &mut shoulds, 11.0);
         assert_eq!(
             out,
             vec![(3, 11.0), (7, 11.0), (17, 11.0)],
@@ -779,35 +766,25 @@ mod batch_proto_tests {
     }
 
     #[test]
-    fn batch_pause_resume_matches_one_shot() {
+    fn batch_one_call_delivers_every_above_floor_hit_once_in_order() {
         let (mut must, mut shoulds, _docs, oracle) = fixtures();
         let mut state = IuBatchState::new(1.0, vec![10.0, 10.0]);
-        let mut incremental = Vec::new();
         let floor = 11.0;
-        loop {
-            // Providers are re-acquired per drain call (the borrow contract:
-            // the FSM stores pure-data breakpoints, never borrows).
-            let mut providers: Vec<&mut dyn BlockBatch> = shoulds
-                .iter_mut()
-                .map(|should| should as &mut dyn BlockBatch)
-                .collect();
-            let mut out = Vec::new();
-            let exhausted =
-                state.next_batch(&mut must, providers.as_mut_slice(), floor, &mut out, 1);
-            incremental.extend(out);
-            if exhausted {
-                break;
-            }
-        }
+        let out = run_all(&mut state, &mut must, &mut shoulds, floor);
         let expected: Vec<(u64, f32)> = oracle
             .iter()
             .copied()
             .filter(|(_, score)| *score >= floor)
             .collect();
         assert_eq!(
-            incremental, expected,
-            "incremental (max_hits=1) and one-shot delivery must match"
+            out, expected,
+            "one call must deliver every above-floor hit exactly once"
         );
+        assert!(
+            out.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "delivery stays in ascending doc order"
+        );
+        assert!(state.is_exhausted(), "the walk is terminal once it returns");
     }
 
     #[test]
@@ -818,7 +795,7 @@ mod batch_proto_tests {
         // dropping them would lose a result.
         let (mut must, mut shoulds, _docs, oracle) = fixtures();
         let mut state = IuBatchState::new(1.0, vec![10.0, 10.0]);
-        let out = drain_all(&mut state, &mut must, &mut shoulds, 11.0, 100);
+        let out = run_all(&mut state, &mut must, &mut shoulds, 11.0);
         assert!(state.is_exhausted(), "must exhaust after the full scan");
         let expected: Vec<(u64, f32)> = oracle
             .iter()
@@ -836,12 +813,7 @@ mod batch_proto_tests {
         let mut shoulds = [MockBatch::new(vec![(3, 10), (17, 10)], 10.0, 4)];
         shoulds[0].hidden = hidden;
         let mut state = IuBatchState::new(1.0, vec![10.0]);
-        let mut providers: Vec<&mut dyn BlockBatch> = shoulds
-            .iter_mut()
-            .map(|should| should as &mut dyn BlockBatch)
-            .collect();
-        let mut out = Vec::new();
-        let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), 5.0, &mut out, 100);
+        let (exhausted, out) = run_once(&mut state, &mut must, &mut shoulds, 5.0);
         assert!(exhausted);
         assert!(
             out.is_empty(),
@@ -862,7 +834,7 @@ mod batch_proto_tests {
             hidden: HashSet::new(),
         };
         let mut state = IuBatchState::new(1.0, vec![1.0]);
-        let out = drain_all(&mut state, &mut must, &mut shoulds, 1.5, 100);
+        let out = run_all(&mut state, &mut must, &mut shoulds, 1.5);
         assert_eq!(
             out,
             vec![(3, 2.0), (17, 2.0)],
@@ -872,40 +844,15 @@ mod batch_proto_tests {
     }
 
     #[test]
-    fn batch_promoted_incremental_matches_one_shot() {
-        // The promoted sub-mode must honour the same pause/resume contract as
-        // the MUST walk: max_hits=1 drains concatenate to the one-shot drain,
-        // with providers re-acquired per call (pure-data breakpoints only).
-        let make = || {
-            let must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
-            let shoulds = vec![MockBatch::new(vec![(3, 1), (17, 1), (25, 1)], 1.0, 2)];
-            (must, shoulds)
-        };
-
-        let (mut must, mut shoulds) = make();
+    fn batch_promoted_walk_delivers_in_one_call() {
+        // The promoted sub-mode owns the loop too: one call delivers every hit
+        // its lead walk produces, and the promoted decision is terminal.
+        let mut must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
+        let mut shoulds = vec![MockBatch::new(vec![(3, 1), (17, 1), (25, 1)], 1.0, 2)];
         let mut state = IuBatchState::new(1.0, vec![1.0]);
-        let one_shot = drain_all(&mut state, &mut must, &mut shoulds, 1.5, 100);
-        assert_eq!(one_shot, vec![(3, 2.0), (17, 2.0)]);
-
-        let (mut must, mut shoulds) = make();
-        let mut state = IuBatchState::new(1.0, vec![1.0]);
-        let mut incremental = Vec::new();
-        loop {
-            let mut providers: Vec<&mut dyn BlockBatch> = shoulds
-                .iter_mut()
-                .map(|s| s as &mut dyn BlockBatch)
-                .collect();
-            let mut out = Vec::new();
-            let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), 1.5, &mut out, 1);
-            incremental.extend(out);
-            if exhausted {
-                break;
-            }
-        }
-        assert_eq!(
-            incremental, one_shot,
-            "promoted pause/resume (max_hits=1) must match the one-shot drain"
-        );
+        let (exhausted, out) = run_once(&mut state, &mut must, &mut shoulds, 1.5);
+        assert!(exhausted);
+        assert_eq!(out, vec![(3, 2.0), (17, 2.0)]);
     }
 
     #[test]
@@ -921,7 +868,7 @@ mod batch_proto_tests {
             MockBatch::new(vec![(3, 1)], 1.0, 4), // unnecessary but scored when present
         ];
         let mut state = IuBatchState::new(1.0, vec![2.0, 1.0]);
-        let out = drain_all(&mut state, &mut must, &mut shoulds, 2.5, 100);
+        let out = run_all(&mut state, &mut must, &mut shoulds, 2.5);
         assert_eq!(
             out,
             vec![(3, 4.0)],
@@ -942,12 +889,7 @@ mod batch_proto_tests {
             hidden: (1..=199).collect(),
         };
         let mut state = IuBatchState::new(1.0, vec![10.0]);
-        let mut providers: Vec<&mut dyn BlockBatch> = shoulds
-            .iter_mut()
-            .map(|should| should as &mut dyn BlockBatch)
-            .collect();
-        let mut out = Vec::new();
-        let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), 5.0, &mut out, 100);
+        let (exhausted, out) = run_once(&mut state, &mut must, &mut shoulds, 5.0);
         assert!(exhausted);
         assert_eq!(out, vec![(200, 11.0)], "the far visible hit must survive");
     }
@@ -969,14 +911,19 @@ mod batch_proto_tests {
             .iter_mut()
             .map(|should| should as &mut dyn BlockBatch)
             .collect();
+        let floor = competitive_score_at(16_777_218.0);
         let mut out = Vec::new();
-        let exhausted = walk.run(
-            &mut must,
-            providers.as_mut_slice(),
-            16_777_218.0,
-            &mut out,
-            100,
-        );
+        let exhausted = walk
+            .run(
+                &mut must,
+                providers.as_mut_slice(),
+                &floor,
+                &mut |key, score| {
+                    out.push((key, score));
+                    Ok(true)
+                },
+            )
+            .expect("the promoted walk must not fail");
         assert!(exhausted);
         assert_eq!(
             out,
@@ -1009,26 +956,14 @@ mod batch_proto_tests {
 
         let (mut must, mut shoulds) = make();
         let mut state = IuBatchState::new(1.0, vec![1.0, 6.0, 6.0]);
-        let one_shot = drain_all(&mut state, &mut must, &mut shoulds, floor, 100);
+        let one_shot = run_all(&mut state, &mut must, &mut shoulds, floor);
 
         let (mut must, mut shoulds) = make();
         let mut state = IuBatchState::new(1.0, vec![1.0, 6.0, 6.0]);
-        let mut incremental = Vec::new();
-        loop {
-            let mut providers: Vec<&mut dyn BlockBatch> = shoulds
-                .iter_mut()
-                .map(|should| should as &mut dyn BlockBatch)
-                .collect();
-            let mut out = Vec::new();
-            let exhausted =
-                state.next_batch(&mut must, providers.as_mut_slice(), floor, &mut out, 1);
-            incremental.extend(out);
-            if exhausted {
-                break;
-            }
-        }
-        assert_eq!(incremental, one_shot, "promoted resume must match one-shot");
-        for (left, right) in incremental.iter().zip(one_shot.iter()) {
+        let second = run_all(&mut state, &mut must, &mut shoulds, floor);
+
+        assert_eq!(second, one_shot, "the promoted walk is deterministic");
+        for (left, right) in second.iter().zip(one_shot.iter()) {
             assert_eq!(
                 left.1.to_bits(),
                 right.1.to_bits(),
@@ -1042,80 +977,88 @@ mod batch_proto_tests {
     }
 
     #[test]
-    fn batch_yields_for_a_fresh_floor_instead_of_scanning_the_tail() {
-        // Regression: both sparse optionals hit only inside the first
-        // MUST block, neither is individually necessary (so no promotion can
-        // mask the effect), and the MUST upper bound is loose (10 >= the real
-        // 1.0), so a frozen floor cannot prove the tail dead. The driver raises
-        // its floor after the produced hit (the collector's behaviour); only a
-        // freshness yield lets the walk terminate at the next call. Without it
-        // the first call scans all 60 blocks.
+    fn batch_honours_a_floor_rise_from_its_own_emits() {
+        // Both sparse optionals hit early and the MUST bound is loose
+        // (10 >= the real 1.0), so nothing but the raised floor can prove the
+        // 60-block tail dead. The collector raises the floor on insert; the
+        // walk reads that same shared value at the next block end, so the tail
+        // is cut without any round trip to the driver.
         let mut must = MockBatch::new((1..=240).map(|d| (d, 1)).collect(), 10.0, 4);
         let mut shoulds = [
             MockBatch::new(vec![(3, 10)], 10.0, 4),
             MockBatch::new(vec![(3, 10)], 10.0, 4),
         ];
         let mut state = IuBatchState::new(10.0, vec![10.0, 10.0]);
-        let mut floor = 1.5_f32;
+        let floor = competitive_score_at(1.5);
         let mut out = Vec::new();
-        loop {
+        let exhausted = {
             let mut providers: Vec<&mut dyn BlockBatch> = shoulds
                 .iter_mut()
                 .map(|should| should as &mut dyn BlockBatch)
                 .collect();
-            let mut window = Vec::new();
-            let exhausted =
-                state.next_batch(&mut must, providers.as_mut_slice(), floor, &mut window, 10);
-            for &(_, score) in &window {
-                floor = floor.max(score + 0.5);
-            }
-            out.extend(window);
-            if exhausted {
-                break;
-            }
-        }
+            state
+                .next_batch(
+                    &mut must,
+                    providers.as_mut_slice(),
+                    &floor,
+                    &mut |key, score| {
+                        out.push((key, score));
+                        floor.raise(score + 0.5); // what the collector does on insert
+                        Ok(true)
+                    },
+                )
+                .expect("the K = 1 walk must not fail")
+        };
+        assert!(exhausted);
         assert_eq!(out, vec![(3, 21.0)], "the far tail must not produce hits");
         assert!(
             must.takes <= 3,
-            "the walk must stop soon after the driver's floor rises (took {} blocks)",
+            "the walk must stop soon after the floor rises (took {} blocks)",
             must.takes
         );
     }
 
     #[test]
-    fn multi_bounds_its_scan_so_an_external_floor_rise_is_seen() {
-        // A long sub-floor tail while the
-        // competitive floor rises *outside* this walk (the floor is shared
-        // across partitions). The per-call candidate budget hands control
-        // back at block granularity so the driver re-checks with the fresh
-        // floor; without it the whole tail is scanned against a frozen floor.
+    fn multi_honours_a_floor_rise_from_its_own_emits() {
+        // The multi walk reads the shared floor per candidate, so a rise the
+        // collector performs on insert prunes the remaining sub-floor tail at
+        // the very next candidate — no round trip to the driver is needed for
+        // the walk to see the fresh value.
         let mut must0 = MockBatch::new((1..=400).map(|d| (d, 1)).collect(), 1.0, 4);
         let mut must1 = MockBatch::new((1..=400).map(|d| (d, 1)).collect(), 1.0, 4);
         // The optional's only hit sits far beyond the required candidates, so
-        // it never contributes and never runs dry: the frozen floor cannot
-        // prove the tail dead, while the externally raised floor can. Every
-        // required candidate therefore scores 2.0, below the 2.5 floor.
+        // it never contributes and never runs dry.
         let mut optionals = [MockBatch::new(vec![(10_000, 1)], 1.0, 4)];
-        // Loose required bound (4.0 >= the real 2.0): the frozen 2.5 floor
-        // can neither prove the tail dead nor trigger the N == 1 promotion.
+        // Loose required bound (sum 4.0 >= the real 2.0) so the pre-rise floor
+        // can prove nothing; the raised floor (6.0 > 4.0 + 1.0) can.
         let mut state = IuMultiBatchState::new(&[2.0, 2.0], &[1.0]);
-        let mut floor = 2.5_f32; // above the real required sum (2.0)
-        loop {
+        let floor = competitive_score_at(1.5);
+        let mut hits = Vec::new();
+        let exhausted = {
             let mut requireds: Vec<&mut dyn BlockBatch> = vec![&mut must0, &mut must1];
             let mut optionals_ref: Vec<&mut dyn BlockBatch> = vec![&mut optionals[0]];
-            let mut out = Vec::new();
-            let exhausted =
-                state.next_batch(&mut requireds, &mut optionals_ref, floor, &mut out, 10);
-            assert!(out.is_empty(), "every candidate is below the floor");
-            floor = 6.0; // simulated external rise of the shared floor
-            if exhausted {
-                break;
-            }
-        }
+            state
+                .next_batch(
+                    &mut requireds,
+                    &mut optionals_ref,
+                    &floor,
+                    &mut |key, score| {
+                        hits.push((key, score));
+                        floor.raise(6.0); // what the collector does on insert
+                        Ok(true)
+                    },
+                )
+                .expect("the multi walk must not fail")
+        };
+        assert_eq!(hits, vec![(1, 2.0)], "every candidate scores 2.0");
+        assert!(
+            exhausted,
+            "the raised floor proves the rest of the intersection dead"
+        );
         let scanned = must0.seeks + must1.seeks;
         assert!(
-            scanned <= 2 * super::MULTI_CANDIDATE_BUDGET + 16,
-            "the walk must hand back at the budget so the fresh floor is seen (scanned {scanned})"
+            scanned < 20,
+            "the raised floor must stop the tail at the next candidate (scanned {scanned})"
         );
     }
 
@@ -1129,19 +1072,24 @@ mod batch_proto_tests {
         let mut must1 = MockBatch::new(vec![(top - 5, 1), (top, 1)], 1.0, 4);
         let mut optionals = [MockBatch::new(vec![(top - 5, 4)], 4.0, 4)];
         let mut state = super::IuMultiBatchState::new(&[1.0, 1.0], &[4.0]);
+        let floor = competitive_score_at(3.0);
         let mut out = Vec::new();
-        // The multi FSM yields on every produced hit (floor freshness), so
-        // drain until exhaustion the way the collection driver does, with the
-        // providers re-acquired per call.
-        loop {
+        let exhausted = {
             let mut requireds: Vec<&mut dyn BlockBatch> = vec![&mut must0, &mut must1];
             let mut optionals_ref: Vec<&mut dyn BlockBatch> = vec![&mut optionals[0]];
-            let exhausted =
-                state.next_batch(&mut requireds, &mut optionals_ref, 3.0, &mut out, 100);
-            if exhausted {
-                break;
-            }
-        }
+            state
+                .next_batch(
+                    &mut requireds,
+                    &mut optionals_ref,
+                    &floor,
+                    &mut |key, score| {
+                        out.push((key, score));
+                        Ok(true)
+                    },
+                )
+                .expect("the multi walk must not fail")
+        };
+        assert!(exhausted, "the walk exhausts past the domain edge");
         assert_eq!(out, vec![(top - 5, 6.0)]);
     }
 
@@ -1211,18 +1159,13 @@ impl IuMultiBatchState {
         &mut self,
         requireds: &'s mut Vec<&'s mut dyn BlockBatch>,
         optionals: &'s mut Vec<&'s mut dyn BlockBatch>,
-        floor: f32,
-        out: &mut Vec<(u64, f32)>,
-        max_hits: usize,
-    ) -> bool {
+        floor: &CompetitiveScore,
+        emit: &mut dyn FnMut(u64, f32) -> Result<bool>,
+    ) -> Result<bool> {
         debug_assert!(requireds.len() >= 2);
-        debug_assert!(max_hits > 0, "max_hits must be positive");
         if self.exhausted {
-            return true;
+            return Ok(true);
         }
-        let mut hits = 0_usize;
-        // Scanned candidates of this call only (cooperation budget).
-        let mut scanned = 0_usize;
         loop {
             // Seek-to-max alignment across the required providers — plus
             // the promoted optional once it joined the required set.
@@ -1240,7 +1183,7 @@ impl IuMultiBatchState {
                             // required, the intersection is empty from here.
                             None => {
                                 self.exhausted = true;
-                                return true;
+                                return Ok(true);
                             }
                             Some(cur) => max_doc = max_doc.max(cur),
                         },
@@ -1259,7 +1202,7 @@ impl IuMultiBatchState {
                                 // A required list ran out: the intersection
                                 // is empty from here on.
                                 self.exhausted = true;
-                                return true;
+                                return Ok(true);
                             };
                             max_doc = max_doc.max(cur);
                         }
@@ -1278,7 +1221,7 @@ impl IuMultiBatchState {
             for (index, posting) in requireds.iter().enumerate() {
                 let Some(freq) = (self.aligned[index]).then(|| self.freqs[index]) else {
                     self.exhausted = true;
-                    return true;
+                    return Ok(true);
                 };
                 required_sum += posting.term_score(self.candidate, freq);
             }
@@ -1307,7 +1250,7 @@ impl IuMultiBatchState {
                 self.optional_ub =
                     live_upper_bound(&self.dry, |index| optionals[index].global_upper_bound());
             }
-            let current_floor = floor;
+            let current_floor = floor.get();
             if current_floor.is_finite() {
                 if !self.promoted_optional
                     && optionals.len() == 1
@@ -1327,7 +1270,7 @@ impl IuMultiBatchState {
                 }
                 if iu_cannot_compete(self.required_ub, self.optional_ub, current_floor) {
                     self.exhausted = true;
-                    return true;
+                    return Ok(true);
                 }
             }
             let Some(key) = requireds[0].document_key_for_doc_id(self.candidate as u32) else {
@@ -1346,29 +1289,18 @@ impl IuMultiBatchState {
             // floor is never below this call's snapshot. Equality is kept: a
             // candidate tying the floor can still win the row-id tie-break.
             let score = required_sum + optional_sum;
-            scanned += 1;
-            if score >= floor {
-                out.push((key, score));
-                hits += 1;
+            if score >= current_floor && !emit(key, score)? {
+                // The collector can take no more (heap overflow). This run is
+                // over: the caller retries the partition with resolved keys.
+                for posting in requireds.iter_mut().chain(optionals.iter_mut()) {
+                    posting.sync_after_batch();
+                }
+                self.exhausted = true;
+                return Ok(true);
             }
             self.candidate += 1;
             self.aligned.iter_mut().for_each(|aligned| *aligned = false);
             self.aligned_promoted = false;
-            // Floor-freshness yield (same rule as the K = 1 walk): the driver
-            // only refreshes its competitive floor between drains, and the
-            // block-end decisions above read this call's frozen floor. Once
-            // this call produced a hit — the only way the floor can rise —
-            // hand control back with the cursor strictly advanced, so the
-            // next call re-checks promotion and cannot-compete against a
-            // fresh floor. When no hit is produced the yield falls to
-            // `MULTI_CANDIDATE_BUDGET`, which bounds how much work a frozen
-            // floor can buy.
-            if hits >= max_hits.min(1) || scanned >= MULTI_CANDIDATE_BUDGET {
-                for posting in requireds.iter_mut().chain(optionals.iter_mut()) {
-                    posting.sync_after_batch();
-                }
-                return false;
-            }
         }
     }
 }

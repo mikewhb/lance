@@ -19,11 +19,6 @@ std::thread_local! {
     pub(super) static BATCH_ENGAGEMENTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 
-    /// Test-only: how many times the engaged batch profile was drained. Each
-    /// drain costs the host a provider re-acquisition and a window copy, so a
-    /// candidate that cannot raise the floor must not buy one.
-    pub(super) static BATCH_DRAINS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
 }
 use super::*;
 
@@ -63,11 +58,6 @@ pub(super) struct ReqOptScorer<'a> {
     /// breakpoints, providers re-acquired per drain call, and the walk is
     /// one-way until exhaustion.
     batch: Option<IuBatchEngagement>,
-    /// Reused scratch for the batch drain's hit window. The batch yields on
-    /// every produced hit (floor-freshness), so this vector is touched on
-    /// every drain — keeping its capacity across calls avoids a per-drain
-    /// allocation.
-    batch_hits: Vec<(u64, f32)>,
 }
 
 /// Which batch engine owns the scorer. `Single` = K = 1 (one required
@@ -99,7 +89,6 @@ impl<'a> ReqOptScorer<'a> {
             shallow_bounds: None,
             optional_globally_required: false,
             batch: None,
-            batch_hits: Vec::new(),
         }
     }
 
@@ -569,27 +558,25 @@ impl ComposableScorer for ReqOptScorer<'_> {
         true
     }
 
-    /// When both sides are flat single-posting providers and the skew
-    /// criterion does not yield, the drain is driven by the batch FSM instead
-    /// of the per-document walk.
+    /// Live-floor takeover: the batch walk runs to exhaustion inside this call
+    /// and hands each hit straight to the collector, re-reading `floor` at
+    /// every block end. That removes the reason the drain had to yield — the
+    /// value the walk prunes with is never older than the heap it prunes for.
     ///
-    /// The entry runs the same decision hook as the default. A non-positive
-    /// floor keeps the collector's per-document branch in charge, so the
-    /// batch never engages there. Once the batch owns the scorer it runs to
-    /// exhaustion; a promotion latch recorded mid-run is terminal
-    /// bookkeeping, not an engine switch.
-    fn collect_confirmed_window(
+    /// The engagement gate matches the drain override exactly, including the
+    /// non-positive-floor carve-out (the collector keeps the per-document
+    /// branch there). Declining leaves the drain path in charge untouched.
+    fn collect_top_k(
         &mut self,
-        min_score: f32,
-        out: &mut Vec<ConfirmedHit>,
-        max_hits: usize,
-    ) -> Result<WindowCollect> {
-        self.set_min_competitive_score(min_score)?;
+        floor: &CompetitiveScore,
+        emit: &mut dyn FnMut(u64, f32) -> Result<bool>,
+    ) -> Result<bool> {
+        self.set_min_competitive_score(floor.get())?;
         if self.exhausted {
-            return Ok(WindowCollect { exhausted: true });
+            return Ok(true);
         }
         if self.batch.is_none()
-            && min_score > 0.0
+            && floor.get() > 0.0
             && !self.optional_globally_required
             && let Some(state) = self.batch_engagement()
         {
@@ -597,79 +584,52 @@ impl ComposableScorer for ReqOptScorer<'_> {
             BATCH_ENGAGEMENTS.with(|count| count.set(count.get() + 1));
             self.batch = Some(state);
         }
-        if self.batch.is_some() {
-            let Self {
-                required,
-                optional,
-                exhausted,
-                current,
-                batch,
-                batch_hits,
-                ..
-            } = self;
-            // A promotion latch recorded mid-run (the floor crossing the
-            // required upper bound while the batch is engaged)
-            // is terminal bookkeeping. The batch keeps full-scanning — sound
-            // (nothing is dropped), just less pruning. The latch would only
-            // re-route a scorer that has not engaged the batch yet.
-            #[cfg(test)]
-            BATCH_DRAINS.with(|count| count.set(count.get() + 1));
-            batch_hits.clear();
-            let exhausted_now = match batch.as_mut() {
-                Some(IuBatchEngagement::Single(state)) => {
-                    let Some(required_batch) = required.block_batch() else {
-                        return Err(Error::internal(
-                            "IU batch profile lost its required block provider",
-                        ));
-                    };
-                    let Some(mut optional_batch) = optional.block_batch_children() else {
-                        return Err(Error::internal(
-                            "IU batch profile lost its optional block providers",
-                        ));
-                    };
-                    state.next_batch(
-                        required_batch,
-                        optional_batch.as_mut_slice(),
-                        min_score,
-                        batch_hits,
-                        max_hits,
-                    )
-                }
-                Some(IuBatchEngagement::Multi(state)) => {
-                    let Some(mut requireds) = required.block_batch_children() else {
-                        return Err(Error::internal(
-                            "IU batch profile lost its required block providers",
-                        ));
-                    };
-                    let Some(mut optionals) = optional.block_batch_children() else {
-                        return Err(Error::internal(
-                            "IU batch profile lost its optional block providers",
-                        ));
-                    };
-                    state.next_batch(
-                        &mut requireds,
-                        &mut optionals,
-                        min_score,
-                        batch_hits,
-                        max_hits,
-                    )
-                }
-                None => return Err(Error::internal("IU batch profile vanished while engaged")),
-            };
-            for &(document_key, score) in batch_hits.iter() {
-                out.push(ConfirmedHit {
-                    document_key,
-                    score,
-                });
-            }
-            if exhausted_now {
-                *exhausted = true;
-                *current = None;
-                return Ok(WindowCollect { exhausted: true });
-            }
-            return Ok(WindowCollect { exhausted: false });
+        if self.batch.is_none() {
+            // Not a shape the batch owns: the caller keeps driving.
+            return Ok(false);
         }
-        collect_confirmed_window_default(self, min_score, out, max_hits)
+        let Self {
+            required,
+            optional,
+            exhausted,
+            current,
+            batch,
+            ..
+        } = self;
+        let exhausted_now = match batch.as_mut() {
+            Some(IuBatchEngagement::Single(state)) => {
+                let Some(required_batch) = required.block_batch() else {
+                    return Err(Error::internal(
+                        "IU batch profile lost its required block provider",
+                    ));
+                };
+                let Some(mut optional_batch) = optional.block_batch_children() else {
+                    return Err(Error::internal(
+                        "IU batch profile lost its optional block providers",
+                    ));
+                };
+                state.next_batch(required_batch, optional_batch.as_mut_slice(), floor, emit)?
+            }
+            Some(IuBatchEngagement::Multi(state)) => {
+                let Some(mut requireds) = required.block_batch_children() else {
+                    return Err(Error::internal(
+                        "IU batch profile lost its required block providers",
+                    ));
+                };
+                let Some(mut optionals) = optional.block_batch_children() else {
+                    return Err(Error::internal(
+                        "IU batch profile lost its optional block providers",
+                    ));
+                };
+                state.next_batch(&mut requireds, &mut optionals, floor, emit)?
+            }
+            None => return Err(Error::internal("IU batch profile vanished while engaged")),
+        };
+        if exhausted_now {
+            *exhausted = true;
+            *current = None;
+        }
+        Ok(true)
     }
 
     #[cfg(test)]
