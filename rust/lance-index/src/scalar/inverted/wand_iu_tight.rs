@@ -434,7 +434,9 @@ impl IuBatchState {
                 if score >= floor {
                     out.push((key, score));
                     if out.len() >= max_hits {
-                        for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s)) {
+                        for provider in
+                            std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s))
+                        {
                             provider.sync_after_batch();
                         }
                         return false;
@@ -450,7 +452,9 @@ impl IuBatchState {
             // hand control back; the buffer strictly advanced, so the driver
             // re-issues with the fresh floor.
             if out.len() > out_start_len {
-                for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s)) {
+                for provider in
+                    std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s))
+                {
                     provider.sync_after_batch();
                 }
                 return false;
@@ -463,7 +467,9 @@ impl IuBatchState {
                         live_upper_bound(&self.dry, |index| self.should_ubs[index]);
                     if iu_cannot_compete(self.must_ub, live_optional_ub, floor) {
                         self.exhausted = true;
-                        for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s)) {
+                        for provider in
+                            std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s))
+                        {
                             provider.sync_after_batch();
                         }
                         return true;
@@ -478,8 +484,10 @@ impl IuBatchState {
                             iu_tight_required_shoulds(self.must_ub, &self.should_ubs, floor),
                         ));
                     }
-                    if let Some(Some(required)) =
-                        self.promotion_decision.as_ref().map(|(_, decision)| decision)
+                    if let Some(Some(required)) = self
+                        .promotion_decision
+                        .as_ref()
+                        .map(|(_, decision)| decision)
                     {
                         if required.is_empty() {
                             self.exhausted = true;
@@ -516,7 +524,9 @@ impl IuBatchState {
                         }
                     }
                 }
-                for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s)) {
+                for provider in
+                    std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s))
+                {
                     provider.sync_after_batch();
                 }
             }
@@ -746,7 +756,8 @@ mod batch_proto_tests {
                 .map(|should| should as &mut dyn BlockBatch)
                 .collect();
             let mut out = Vec::new();
-            let exhausted = state.next_batch(must, providers.as_mut_slice(), floor, &mut out, max_hits);
+            let exhausted =
+                state.next_batch(must, providers.as_mut_slice(), floor, &mut out, max_hits);
             all.extend(out);
             if exhausted {
                 break;
@@ -776,10 +787,13 @@ mod batch_proto_tests {
         loop {
             // Providers are re-acquired per drain call (the borrow contract:
             // the FSM stores pure-data breakpoints, never borrows).
-            let mut providers: Vec<&mut dyn BlockBatch> =
-                shoulds.iter_mut().map(|should| should as &mut dyn BlockBatch).collect();
+            let mut providers: Vec<&mut dyn BlockBatch> = shoulds
+                .iter_mut()
+                .map(|should| should as &mut dyn BlockBatch)
+                .collect();
             let mut out = Vec::new();
-            let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), floor, &mut out, 1);
+            let exhausted =
+                state.next_batch(&mut must, providers.as_mut_slice(), floor, &mut out, 1);
             incremental.extend(out);
             if exhausted {
                 break;
@@ -822,8 +836,10 @@ mod batch_proto_tests {
         let mut shoulds = [MockBatch::new(vec![(3, 10), (17, 10)], 10.0, 4)];
         shoulds[0].hidden = hidden;
         let mut state = IuBatchState::new(1.0, vec![10.0]);
-        let mut providers: Vec<&mut dyn BlockBatch> =
-            shoulds.iter_mut().map(|should| should as &mut dyn BlockBatch).collect();
+        let mut providers: Vec<&mut dyn BlockBatch> = shoulds
+            .iter_mut()
+            .map(|should| should as &mut dyn BlockBatch)
+            .collect();
         let mut out = Vec::new();
         let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), 5.0, &mut out, 100);
         assert!(exhausted);
@@ -832,7 +848,6 @@ mod batch_proto_tests {
             "the only hits (score 11) are invisible; nothing else clears floor=5.0"
         );
     }
-
 
     #[test]
     fn batch_promoted_walk_drives_the_cheaper_sparse_lead() {
@@ -876,8 +891,10 @@ mod batch_proto_tests {
         let mut state = IuBatchState::new(1.0, vec![1.0]);
         let mut incremental = Vec::new();
         loop {
-            let mut providers: Vec<&mut dyn BlockBatch> =
-                shoulds.iter_mut().map(|s| s as &mut dyn BlockBatch).collect();
+            let mut providers: Vec<&mut dyn BlockBatch> = shoulds
+                .iter_mut()
+                .map(|s| s as &mut dyn BlockBatch)
+                .collect();
             let mut out = Vec::new();
             let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), 1.5, &mut out, 1);
             incremental.extend(out);
@@ -918,19 +935,17 @@ mod batch_proto_tests {
         // blocks is invisible; a valid optional hit sits far beyond them.
         // The walk must skip all hidden candidates (advancing last_doc),
         // keep the optional probes alive, and still deliver the far hit.
-        let mut must = MockBatch::new(
-            (1..=200).map(|d| (d, 1)).collect(),
-            1.0,
-            32,
-        );
+        let mut must = MockBatch::new((1..=200).map(|d| (d, 1)).collect(), 1.0, 32);
         must.hidden = (1..=199).collect();
         let mut shoulds = [MockBatch::new(vec![(200, 10)], 10.0, 32)];
         let _docs = MockDocs {
             hidden: (1..=199).collect(),
         };
         let mut state = IuBatchState::new(1.0, vec![10.0]);
-        let mut providers: Vec<&mut dyn BlockBatch> =
-            shoulds.iter_mut().map(|should| should as &mut dyn BlockBatch).collect();
+        let mut providers: Vec<&mut dyn BlockBatch> = shoulds
+            .iter_mut()
+            .map(|should| should as &mut dyn BlockBatch)
+            .collect();
         let mut out = Vec::new();
         let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), 5.0, &mut out, 100);
         assert!(exhausted);
@@ -955,7 +970,13 @@ mod batch_proto_tests {
             .map(|should| should as &mut dyn BlockBatch)
             .collect();
         let mut out = Vec::new();
-        let exhausted = walk.run(&mut must, providers.as_mut_slice(), 16_777_218.0, &mut out, 100);
+        let exhausted = walk.run(
+            &mut must,
+            providers.as_mut_slice(),
+            16_777_218.0,
+            &mut out,
+            100,
+        );
         assert!(exhausted);
         assert_eq!(
             out,
@@ -999,7 +1020,8 @@ mod batch_proto_tests {
                 .map(|should| should as &mut dyn BlockBatch)
                 .collect();
             let mut out = Vec::new();
-            let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), floor, &mut out, 1);
+            let exhausted =
+                state.next_batch(&mut must, providers.as_mut_slice(), floor, &mut out, 1);
             incremental.extend(out);
             if exhausted {
                 break;
@@ -1007,7 +1029,11 @@ mod batch_proto_tests {
         }
         assert_eq!(incremental, one_shot, "promoted resume must match one-shot");
         for (left, right) in incremental.iter().zip(one_shot.iter()) {
-            assert_eq!(left.1.to_bits(), right.1.to_bits(), "score bits must be stable");
+            assert_eq!(
+                left.1.to_bits(),
+                right.1.to_bits(),
+                "score bits must be stable"
+            );
         }
         assert!(
             !one_shot.is_empty(),
@@ -1038,7 +1064,8 @@ mod batch_proto_tests {
                 .map(|should| should as &mut dyn BlockBatch)
                 .collect();
             let mut window = Vec::new();
-            let exhausted = state.next_batch(&mut must, providers.as_mut_slice(), floor, &mut window, 10);
+            let exhausted =
+                state.next_batch(&mut must, providers.as_mut_slice(), floor, &mut window, 10);
             for &(_, score) in &window {
                 floor = floor.max(score + 0.5);
             }
@@ -1109,13 +1136,8 @@ mod batch_proto_tests {
         loop {
             let mut requireds: Vec<&mut dyn BlockBatch> = vec![&mut must0, &mut must1];
             let mut optionals_ref: Vec<&mut dyn BlockBatch> = vec![&mut optionals[0]];
-            let exhausted = state.next_batch(
-                &mut requireds,
-                &mut optionals_ref,
-                3.0,
-                &mut out,
-                100,
-            );
+            let exhausted =
+                state.next_batch(&mut requireds, &mut optionals_ref, 3.0, &mut out, 100);
             if exhausted {
                 break;
             }

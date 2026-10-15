@@ -5,8 +5,8 @@
 //! posting steps its posting directly instead of paying the WAND wrapper.
 //! See [`TermLeafScorer`] for the floor contract.
 
-use std::cell::OnceCell;
 use std::cell::Cell;
+use std::cell::OnceCell;
 use std::sync::Arc;
 
 use lance_core::{Error, Result};
@@ -251,8 +251,9 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
 
     fn merge_optional_freqs(&mut self, docs: &[u64], out_freqs: &mut [u32]) {
         self.posting.merge_optional_freqs(docs, out_freqs);
-        self.batch_steps
-            .set(self.batch_steps.get() + docs.len() + out_freqs.iter().filter(|f| **f != 0).count());
+        self.batch_steps.set(
+            self.batch_steps.get() + docs.len() + out_freqs.iter().filter(|f| **f != 0).count(),
+        );
         self.clear_current();
     }
 
@@ -263,7 +264,8 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
         debug_assert_eq!(docs.len(), sums.len());
         self.batch_steps.set(self.batch_steps.get() + docs.len());
         self.fold_scratch.resize(docs.len(), 0);
-        self.posting.merge_optional_freqs(docs, &mut self.fold_scratch);
+        self.posting
+            .merge_optional_freqs(docs, &mut self.fold_scratch);
         let scorer = self.scorer.as_ref();
         for (i, &freq) in self.fold_scratch.iter().enumerate() {
             if freq != 0 {

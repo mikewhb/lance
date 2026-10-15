@@ -31,7 +31,7 @@ mod maxscore;
 #[path = "wand_term_leaf.rs"]
 mod term_leaf;
 
-pub(super) use iu_tight::{iu_tight_enabled, IuBatchState, IuMultiBatchState};
+pub(super) use iu_tight::{IuBatchState, IuMultiBatchState, iu_tight_enabled};
 pub(super) use term_leaf::TermLeafScorer;
 
 use super::{
@@ -6798,7 +6798,10 @@ mod tests {
             docs.len(),
         );
         posting.next(u32::MAX as u64 + 1);
-        assert!(posting.current_doc.is_none(), "seek past the domain exhausts");
+        assert!(
+            posting.current_doc.is_none(),
+            "seek past the domain exhausts"
+        );
         posting.next(0);
         assert!(
             posting.current_doc.is_none(),

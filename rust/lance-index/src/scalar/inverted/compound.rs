@@ -32,8 +32,7 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        TermLeafScorer, WandCursor, WandDocuments, iu_tight_enabled,
-        score_sum_upper_bound_factor,
+        TermLeafScorer, WandCursor, WandDocuments, iu_tight_enabled, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -486,7 +485,11 @@ pub(super) trait BlockBatch {
         debug_assert_eq!(docs.len(), freqs.len());
         debug_assert_eq!(docs.len(), out.len());
         for (i, (&doc, &freq)) in docs.iter().zip(freqs.iter()).enumerate() {
-            out[i] = if freq != 0 { self.term_score(doc, freq) } else { 0.0 };
+            out[i] = if freq != 0 {
+                self.term_score(doc, freq)
+            } else {
+                0.0
+            };
         }
     }
     /// Batch form of [`BlockBatch::document_key_for_doc_id`] over ascending
@@ -4413,11 +4416,7 @@ where
 /// verbatim (`k` multiplies with a plain `*`; only the `* 8` saturates) so the
 /// arithmetic and overflow behaviour do not drift.
 #[inline]
-fn optionals_are_sparse(
-    k_required: usize,
-    optional_cost: usize,
-    required_cost: usize,
-) -> bool {
+fn optionals_are_sparse(k_required: usize, optional_cost: usize, required_cost: usize) -> bool {
     k_required * optional_cost.saturating_mul(8) < required_cost
 }
 
@@ -4467,9 +4466,6 @@ fn iu_tight_clauses_ready(
             is_compound_term_leaf(leaf) && leaf.postings[0].is_compressed()
         })
 }
-
-
-
 
 fn collect_loaded_partitions(
     partitions: Vec<LoadedPartition>,
@@ -4882,6 +4878,7 @@ mod tests {
     use arrow::buffer::ScalarBuffer;
     use rand::{Rng, SeedableRng, rngs::SmallRng};
 
+    use super::super::DocInfo;
     use super::super::documents::{
         ordered_row_address_projection_for_test, resident_row_address_projection_for_test,
     };
@@ -4889,7 +4886,6 @@ mod tests {
     use super::super::index::{PlainPostingList, PostingList};
     use super::super::scorer::Scorer;
     use super::super::wand::FlatDocuments;
-    use super::super::DocInfo;
     use super::super::wand::GroupedTermScorer;
     use super::super::{CompressedPostingList, LEGACY_BLOCK_SIZE, PostingTailCodec};
     use super::*;
@@ -7806,7 +7802,11 @@ mod tests {
     /// upper bound: the actual scores are unchanged, so a caller can hold the
     /// floor above the real scores while staying below the bound (the batch
     /// profile is skipped once the floor passes the required bound).
-    fn compressed_loose_ub_posting(token: &str, doc_ids: Vec<u32>, max_score: f32) -> PostingIterator {
+    fn compressed_loose_ub_posting(
+        token: &str,
+        doc_ids: Vec<u32>,
+        max_score: f32,
+    ) -> PostingIterator {
         let freqs = vec![1_u32; doc_ids.len()];
         let block_max_scores = vec![max_score; doc_ids.len()];
         let blocks = compress_posting_list(
@@ -7865,8 +7865,6 @@ mod tests {
         )
     }
 
-
-
     #[test]
     fn gate_signed_window_exhaustion_keeps_base_result() {
         // Regression: window draining seeked an exhausted materialized
@@ -7894,7 +7892,6 @@ mod tests {
             rows(&[(0, 10.0)])
         );
     }
-
 
     #[test]
     fn routing_diverts_disjoint_sparse_optionals_to_generic() {
@@ -8069,8 +8066,6 @@ mod tests {
         assert!(!optionals_are_sparse(1, usize::MAX, usize::MAX));
     }
 
-
-
     #[test]
     fn iu_tight_routing_ignores_clause_cost() {
         // `iu_tight_clause_indices` is a shape predicate: a K=1 IU plan over
@@ -8124,10 +8119,22 @@ mod tests {
         let required_ids: Vec<u32> = required_ids.to_vec();
         let optional_ids: Vec<u32> = optional_ids.to_vec();
         let mut leaves = vec![
-            loaded_leaf(vec![compressed_unit_posting("m0", required_ids.clone())], None),
-            loaded_leaf(vec![compressed_unit_posting("m1", required_ids.clone())], None),
-            loaded_leaf(vec![compressed_unit_posting("s0", optional_ids.clone())], None),
-            loaded_leaf(vec![compressed_unit_posting("s1", optional_ids.clone())], None),
+            loaded_leaf(
+                vec![compressed_unit_posting("m0", required_ids.clone())],
+                None,
+            ),
+            loaded_leaf(
+                vec![compressed_unit_posting("m1", required_ids.clone())],
+                None,
+            ),
+            loaded_leaf(
+                vec![compressed_unit_posting("s0", optional_ids.clone())],
+                None,
+            ),
+            loaded_leaf(
+                vec![compressed_unit_posting("s1", optional_ids.clone())],
+                None,
+            ),
         ]
         .into_iter();
         let mut scorers: Vec<BoxScorer> = (0..4)
@@ -8281,10 +8288,7 @@ mod tests {
         };
 
         let mut compressed = box_leaf_scorer(
-            loaded_leaf(
-                vec![compressed_unit_posting("m", (0..40).collect())],
-                None,
-            ),
+            loaded_leaf(vec![compressed_unit_posting("m", (0..40).collect())], None),
             &docs,
             &metrics,
             true,
@@ -8349,12 +8353,24 @@ mod tests {
         let optional_ids: Vec<u32> = (0..8).collect();
         let plan = CompoundScorerPlan::Boolean {
             must: vec![
-                CompoundScorerPlan::Leaf { index: 0, boost: 1.0 },
-                CompoundScorerPlan::Leaf { index: 1, boost: 1.0 },
+                CompoundScorerPlan::Leaf {
+                    index: 0,
+                    boost: 1.0,
+                },
+                CompoundScorerPlan::Leaf {
+                    index: 1,
+                    boost: 1.0,
+                },
             ],
             should: vec![
-                CompoundScorerPlan::Leaf { index: 2, boost: 1.0 },
-                CompoundScorerPlan::Leaf { index: 3, boost: 1.0 },
+                CompoundScorerPlan::Leaf {
+                    index: 2,
+                    boost: 1.0,
+                },
+                CompoundScorerPlan::Leaf {
+                    index: 3,
+                    boost: 1.0,
+                },
             ],
             must_not: Vec::new(),
         };
@@ -8368,8 +8384,14 @@ mod tests {
                     vec![compressed_loose_ub_posting("m1", required_ids.clone(), 5.0)],
                     None,
                 ),
-                loaded_leaf(vec![compressed_unit_posting("s0", optional_ids.clone())], None),
-                loaded_leaf(vec![compressed_unit_posting("s1", optional_ids.clone())], None),
+                loaded_leaf(
+                    vec![compressed_unit_posting("s0", optional_ids.clone())],
+                    None,
+                ),
+                loaded_leaf(
+                    vec![compressed_unit_posting("s1", optional_ids.clone())],
+                    None,
+                ),
             ]
         };
 
@@ -8381,9 +8403,15 @@ mod tests {
         // a sub-floor tail, but below the required list bound (10.0) so the
         // batch profile still owns the shape.
         let floor = 3.0_f32;
-        let expected: Vec<(u64, f32)> =
-            oracle.iter().copied().filter(|(_, score)| *score >= floor).collect();
-        assert!(expected.len() < 20, "the fixture must leave a sub-floor tail");
+        let expected: Vec<(u64, f32)> = oracle
+            .iter()
+            .copied()
+            .filter(|(_, score)| *score >= floor)
+            .collect();
+        assert!(
+            expected.len() < 20,
+            "the fixture must leave a sub-floor tail"
+        );
 
         let metrics = LocalMetricsCollector::default();
         let score = Arc::new(CompetitiveScore::default());
@@ -8393,11 +8421,18 @@ mod tests {
         let drains_before = super::reqopt::BATCH_DRAINS.with(std::cell::Cell::get);
         collect_partition_with_documents(&docs, make_leaves(), &plan, &metrics, &mut collector, Ok)
             .unwrap();
-        let engagements = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) - engagements_before;
+        let engagements =
+            super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) - engagements_before;
         let drains = super::reqopt::BATCH_DRAINS.with(std::cell::Cell::get) - drains_before;
 
-        assert!(engagements > 0, "the K=2/N=2 non-skew shape must engage the batch profile");
-        assert!(metrics.batch_steps() > 0, "the batch profile must account its work");
+        assert!(
+            engagements > 0,
+            "the K=2/N=2 non-skew shape must engage the batch profile"
+        );
+        assert!(
+            metrics.batch_steps() > 0,
+            "the batch profile must account its work"
+        );
         assert_eq!(
             collector.into_rows(),
             rows(&expected),
@@ -8420,12 +8455,24 @@ mod tests {
         let optional_ids: Vec<u32> = (0..8).collect();
         let plan = CompoundScorerPlan::Boolean {
             must: vec![
-                CompoundScorerPlan::Leaf { index: 0, boost: 1.0 },
-                CompoundScorerPlan::Leaf { index: 1, boost: 1.0 },
+                CompoundScorerPlan::Leaf {
+                    index: 0,
+                    boost: 1.0,
+                },
+                CompoundScorerPlan::Leaf {
+                    index: 1,
+                    boost: 1.0,
+                },
             ],
             should: vec![
-                CompoundScorerPlan::Leaf { index: 2, boost: 1.0 },
-                CompoundScorerPlan::Leaf { index: 3, boost: 1.0 },
+                CompoundScorerPlan::Leaf {
+                    index: 2,
+                    boost: 1.0,
+                },
+                CompoundScorerPlan::Leaf {
+                    index: 3,
+                    boost: 1.0,
+                },
             ],
             must_not: Vec::new(),
         };
@@ -8439,8 +8486,14 @@ mod tests {
                     vec![compressed_loose_ub_posting("m1", required_ids.clone(), 5.0)],
                     None,
                 ),
-                loaded_leaf(vec![compressed_unit_posting("s0", optional_ids.clone())], None),
-                loaded_leaf(vec![compressed_unit_posting("s1", optional_ids.clone())], None),
+                loaded_leaf(
+                    vec![compressed_unit_posting("s0", optional_ids.clone())],
+                    None,
+                ),
+                loaded_leaf(
+                    vec![compressed_unit_posting("s1", optional_ids.clone())],
+                    None,
+                ),
             ]
         };
 
@@ -8597,14 +8650,24 @@ mod tests {
             )
             .unwrap();
             let after = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
-            (after - before, collector.into_rows(), run_metrics.batch_steps())
+            (
+                after - before,
+                collector.into_rows(),
+                run_metrics.batch_steps(),
+            )
         };
 
         // Control: compressed clauses, close costs -> the profile engages.
         let (engagements, rows, batch_steps) = run(vec![
             loaded_leaf(vec![compressed_unit_posting("m", (0..50).collect())], None),
-            loaded_leaf(vec![compressed_unit_posting("s0", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
-            loaded_leaf(vec![compressed_unit_posting("s1", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
+            loaded_leaf(
+                vec![compressed_unit_posting("s0", vec![1, 2, 3, 4, 5, 6, 7, 8])],
+                None,
+            ),
+            loaded_leaf(
+                vec![compressed_unit_posting("s1", vec![1, 2, 3, 4, 5, 6, 7, 8])],
+                None,
+            ),
         ]);
         assert!(
             engagements > 0,
@@ -8624,8 +8687,14 @@ mod tests {
         // and that the Plain run stays deterministic.
         let (engagements, plain_rows, plain_steps) = run(vec![
             loaded_leaf(vec![plain_unit_posting("m", (0..50).collect())], None),
-            loaded_leaf(vec![plain_unit_posting("s0", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
-            loaded_leaf(vec![plain_unit_posting("s1", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
+            loaded_leaf(
+                vec![plain_unit_posting("s0", vec![1, 2, 3, 4, 5, 6, 7, 8])],
+                None,
+            ),
+            loaded_leaf(
+                vec![plain_unit_posting("s1", vec![1, 2, 3, 4, 5, 6, 7, 8])],
+                None,
+            ),
         ]);
         assert_eq!(
             engagements, 0,
@@ -8639,11 +8708,20 @@ mod tests {
         assert!(!plain_keys.is_empty());
         let (_, plain_again, _) = run(vec![
             loaded_leaf(vec![plain_unit_posting("m", (0..50).collect())], None),
-            loaded_leaf(vec![plain_unit_posting("s0", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
-            loaded_leaf(vec![plain_unit_posting("s1", vec![1, 2, 3, 4, 5, 6, 7, 8])], None),
+            loaded_leaf(
+                vec![plain_unit_posting("s0", vec![1, 2, 3, 4, 5, 6, 7, 8])],
+                None,
+            ),
+            loaded_leaf(
+                vec![plain_unit_posting("s1", vec![1, 2, 3, 4, 5, 6, 7, 8])],
+                None,
+            ),
         ]);
         let plain_again: Vec<u64> = plain_again.iter().map(|row| row.row_id).collect();
-        assert_eq!(plain_keys, plain_again, "the generic walk must stay deterministic");
+        assert_eq!(
+            plain_keys, plain_again,
+            "the generic walk must stay deterministic"
+        );
     }
 
     #[test]
@@ -8667,7 +8745,12 @@ mod tests {
             should: vec![leaf_node(1)],
             must_not: Vec::new(),
         };
-        let should_close_cost = || loaded_leaf(vec![compressed_unit_posting("should", (0..8).collect())], None);
+        let should_close_cost = || {
+            loaded_leaf(
+                vec![compressed_unit_posting("should", (0..8).collect())],
+                None,
+            )
+        };
         let k1_leaves = vec![
             loaded_leaf(
                 vec![compressed_unit_posting("must", (0..50).collect())],
@@ -8720,7 +8803,10 @@ mod tests {
                 )],
                 None,
             ),
-            loaded_leaf(vec![compressed_unit_posting("should", (0..8).collect())], None),
+            loaded_leaf(
+                vec![compressed_unit_posting("should", (0..8).collect())],
+                None,
+            ),
         ];
         let (k2_must, k2_should) = iu_tight_clause_indices(&k2_plan).expect("2+1 shape");
         assert_eq!(k2_must.len(), 2);
@@ -8768,8 +8854,14 @@ mod tests {
         };
         let leaves = || {
             vec![
-                loaded_leaf(vec![compressed_unit_posting("must", (0..50).collect())], None),
-                loaded_leaf(vec![compressed_unit_posting("should", (0..8).collect())], None),
+                loaded_leaf(
+                    vec![compressed_unit_posting("must", (0..50).collect())],
+                    None,
+                ),
+                loaded_leaf(
+                    vec![compressed_unit_posting("should", (0..8).collect())],
+                    None,
+                ),
             ]
         };
 
@@ -9023,7 +9115,9 @@ mod tests {
             .collect::<Vec<_>>();
         let mut flagged_scorer = plan.build(&mut flagged).unwrap();
         assert!(
-            flagged_scorer.debug_type_name().contains("RequiredConjunctionScorer"),
+            flagged_scorer
+                .debug_type_name()
+                .contains("RequiredConjunctionScorer"),
             "got {}",
             flagged_scorer.debug_type_name()
         );
@@ -9176,7 +9270,9 @@ mod tests {
             "the winner must hit an optional clause, got {:?}",
             rows[0]
         );
-        let routed_work = metrics.comparisons.load(std::sync::atomic::Ordering::Relaxed);
+        let routed_work = metrics
+            .comparisons
+            .load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             routed_work < 1_000,
             "the union promotion must drive from the sparse side; routed work {routed_work} \
@@ -9228,14 +9324,14 @@ mod tests {
         let leaves = || {
             vec![
                 loaded_leaf(vec![compressed_unit_posting("a", (0..n).collect())], None),
-                loaded_leaf(vec![compressed_unit_posting(
-                    "b",
-                    (0..n).step_by(3).collect(),
-                )], None),
-                loaded_leaf(vec![compressed_unit_posting(
-                    "c",
-                    (0..n).step_by(7).collect(),
-                )], None),
+                loaded_leaf(
+                    vec![compressed_unit_posting("b", (0..n).step_by(3).collect())],
+                    None,
+                ),
+                loaded_leaf(
+                    vec![compressed_unit_posting("c", (0..n).step_by(7).collect())],
+                    None,
+                ),
             ]
         };
 
@@ -9276,5 +9372,4 @@ mod tests {
         assert_eq!(routed_rows.len(), generic_rows.len());
         assert_eq!(routed_rows, generic_rows);
     }
-
 }

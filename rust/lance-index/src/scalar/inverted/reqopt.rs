@@ -152,7 +152,8 @@ impl<'a> ReqOptScorer<'a> {
         let required_ubs: Vec<f32> = requireds.iter().map(|p| p.global_upper_bound()).collect();
         let optional_ubs: Vec<f32> = optionals.iter().map(|p| p.global_upper_bound()).collect();
         Some(IuBatchEngagement::Multi(IuMultiBatchState::new(
-            &required_ubs, &optional_ubs,
+            &required_ubs,
+            &optional_ubs,
         )))
     }
 
@@ -656,7 +657,10 @@ impl ComposableScorer for ReqOptScorer<'_> {
                 None => return Err(Error::internal("IU batch profile vanished while engaged")),
             };
             for &(document_key, score) in batch_hits.iter() {
-                out.push(ConfirmedHit { document_key, score });
+                out.push(ConfirmedHit {
+                    document_key,
+                    score,
+                });
             }
             if exhausted_now {
                 *exhausted = true;
