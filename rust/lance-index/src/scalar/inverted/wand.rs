@@ -6778,7 +6778,7 @@ mod tests {
     }
 
     #[test]
-    fn u32_domain_overflow_exhausts_exactly_and_sparinglies_the_shallow_bound() {
+    fn u32_domain_overflow_exhausts_terminally_and_leaves_the_shallow_bound_intact() {
         // Real PostingIterator (not a mock): a seek past the u32 domain is a
         // terminal exhaustion, so a later in-domain seek cannot revive the
         // last document; a shallow overflow only moves the bound window and

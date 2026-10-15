@@ -346,11 +346,10 @@ pub(super) trait ComposableScorer: Send {
         collect_confirmed_window_default(self, min_score, out, max_hits)
     }
 
-    /// Block-batch capability (PLAN-V3 §3.2): implemented only by the
-    /// "single compressed posting leaf" form (TermLeafScorer). Defaults to
-    /// None — nested/Max/boost≠1/phrase/cross-column structures are rejected
-    /// naturally and can never acquire it through recursive propagation
-    /// (EXT R4).
+    /// Block-batch capability: implemented only by the "single compressed
+    /// posting leaf" form (`TermLeafScorer`). Defaults to `None`, so
+    /// nested / Max / boost≠1 / phrase / cross-column structures are rejected
+    /// and can never acquire it through recursive propagation.
     fn block_batch(&mut self) -> Option<&mut dyn BlockBatch> {
         None
     }
@@ -408,15 +407,14 @@ pub(super) struct WindowCollect {
 
 pub(super) type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
 
-// ===== Block-batch supply capability (PLAN-V3 §3.2/§3.4, P0.5 prototype) =====
+// ===== Block-batch supply capability =====
 
-/// Block-batch supply capability (PLAN-V3 §3.2): the implementor holds a
-/// **single compressed posting** plus its scoring context; it is the tree
-/// node's controlled outlet for the iu_tight kernel moves
-/// (`take_docs_one_block_upto` / `merge_optional_freqs`).
+/// Block-batch supply capability: the implementor holds a **single compressed
+/// posting** plus its scoring context, and exposes the posting's block-level
+/// moves (`take_docs_one_block_upto` / `merge_optional_freqs`) to the batch
+/// state machines.
 ///
-/// Implementation contract (PLAN-V3 §3.4 / invariants I-5, I-9, host
-/// contract):
+/// Implementation contract:
 /// - `take_docs_one_block_upto` copies one posting block after the cursor
 ///   (or up to `upto`) in ascending doc order, parking the cursor at the
 ///   block end; visibility is decided per candidate by the **host** (the
@@ -469,8 +467,8 @@ pub(super) trait BlockBatch {
     /// value with the raw `cost()` below, so both sides of the skew criterion
     /// stay in the same domain.
     fn global_upper_bound(&self) -> f32;
-    /// Raw posting df (kernel convention), **not** the visibility-truncated
-    /// value that `ComposableScorer::cost()` returns for the same leaf. The IU
+    /// Raw posting df, **not** the visibility-truncated value that
+    /// `ComposableScorer::cost()` returns for the same leaf. The IU
     /// gates read the same raw df on both sides of the skew criterion (the
     /// shape router through `PostingIterator::cost`, the drain-time engagement
     /// through this method - numerically the same value); a future consumer
@@ -2701,7 +2699,7 @@ impl ComposableScorer for ScaleScorer<'_> {
     // always identity-boost (iu_tight_clause_indices checks identity boost),
     // and scaling by 1.0 keeps every batch contract bit-identical. A real
     // rescaling wrapper must not pretend to be a flat term leaf, so any
-    // other factor returns None (EXT R4).
+    // other factor returns None.
     fn block_batch(&mut self) -> Option<&mut dyn BlockBatch> {
         if self.factor == 1.0 {
             self.child.block_batch()
@@ -2857,11 +2855,15 @@ impl<'a> DisjunctionScorer<'a> {
 
 impl ComposableScorer for DisjunctionScorer<'_> {
     fn block_batch_children(&mut self) -> Option<Vec<&mut dyn BlockBatch>> {
-        // Flat Sum-OR aggregation (PLAN-V3 §3.2): every child must itself be
-        // a batch provider; any None rejects the whole node so the batch
-        // profile never sees a wrong combiner. This node is the Sum
-        // disjunction only - a Max variant does not override this method, so
-        // its default None keeps the SUM contract explicit.
+        // Flat Sum-OR aggregation. Max (DisMax / MultiMatch) is a `mode` on
+        // this same type, not a separate type, so it shares this impl and has
+        // to opt out explicitly: feeding a max-combined node's children to the
+        // batch profile would score them as a sum.
+        if !matches!(self.mode, DisjunctionScore::Sum) {
+            return None;
+        }
+        // Every child must itself be a batch provider; any `None` rejects the
+        // whole node so the batch profile never sees a wrong combiner.
         self.children
             .iter_mut()
             .map(|child| child.block_batch())
@@ -3217,8 +3219,8 @@ impl<'a> RequiredConjunctionScorer<'a> {
 
 impl ComposableScorer for RequiredConjunctionScorer<'_> {
     fn block_batch_children(&mut self) -> Option<Vec<&mut dyn BlockBatch>> {
-        // Flat AND aggregation (PLAN-V3 §3.2): same all-or-nothing rule as
-        // the disjunction side.
+        // Flat AND aggregation: same all-or-nothing rule as the disjunction
+        // side.
         self.children
             .iter_mut()
             .map(|child| child.block_batch())
@@ -4341,27 +4343,23 @@ where
     D: WandDocuments + Sync,
     K: Copy + Ord,
 {
-    // The IU fast paths replace the generic scorer tree for the "K required
-    // + N optional" shapes over plain single-posting leaves. `LANCE_FTS_IU_TIGHT`
-    // gates them for A/B and rollout. Known imbalance: when every required
-    // list is dense while an optional list is rare, the optional clause's
-    // large upper bound keeps the multi kernel's floor prune inert and the
-    // generic path's block-max window skipping can win; an optional-driven
-    // intersection is the planned fix, the env switch is the escape hatch.
+    // The batch profile replaces the per-document generic walk for the
+    // "K required + N optional" Boolean shapes over single compressed
+    // postings. `LANCE_FTS_IU_TIGHT` gates it for A/B and rollout.
     //
-    // PLAN-V3 P1b narrows the kernels to K >= 2: every K = 1 shape moves to
-    // the generic tree, whose ReqOptScorer union promotion (see
-    // `promote_optional_if_required`) is the R-G1 K = 1 fix, and whose
-    // K >= 2 batch profile lands in P2.
-    // PLAN-V3 P3: the tight kernels no longer route at this level. Every
-    // IU shape builds the generic tree; its ReqOptScorer selects the batch
-    // profile at drain time from the same skew criterion.
-    // `batch_leaf_indices` collects the shape's clauses so their leaves box
-    // as TermLeafScorers — the BlockBatch providers the batch profile
-    // consumes. A skewed shape (sparse optionals against a dense required
-    // intersection) leaves the collection empty: the per-document generic
-    // walk with block-max skipping and union promotion owns it (the R-G1
-    // fix).
+    // Every IU shape builds the generic tree; the ReqOptScorer picks the
+    // batch profile at drain time using the same skew criterion the router
+    // applies here (`optionals_are_sparse`). `batch_leaf_indices` collects
+    // the shape's clauses so their leaves box as TermLeafScorers — the
+    // BlockBatch providers the batch profile consumes.
+    //
+    // Known imbalance: when every required list is dense while an optional
+    // list is rare, the optional clause's large upper bound keeps the batch
+    // walk's floor prune inert, and the generic walk's block-max window
+    // skipping wins instead. That is what the skew criterion detects: a
+    // skewed shape leaves the collection empty, so the per-document walk with
+    // block-max skipping and union promotion (see
+    // `promote_optional_if_required`) owns it.
     let mut batch_leaf_indices: Vec<usize> = Vec::new();
     if iu_tight_enabled()
         && let Some((must_indices, should_indices)) = iu_tight_clause_indices(plan)
@@ -7744,12 +7742,11 @@ mod tests {
 
     #[test]
     fn reqopt_fallback_enumerates_every_must_doc_for_counting() {
-        // The COUNT path has no competitive floor: it relies on the IU fast
-        // path and the ReqOptScorer fallback both enumerating every MUST
-        // document. Plain postings fail `iu_tight_clauses_ready` (not
-        // compressed), so this exercises the ReqOptScorer fallback; the
-        // kernel side is pinned by
-        // flat-AND shape with a non-positive floor.
+        // The COUNT path has no competitive floor: with a non-positive floor
+        // the collector walks the scorer document by document and the batch
+        // profile never engages. Plain postings fail `iu_tight_clauses_ready`
+        // (they are not compressed), so this exercises the per-document
+        // walk.
         let mut docs = DocSet::default();
         for doc_id in 0..50_u64 {
             docs.append(doc_id, 1);
@@ -7874,8 +7871,8 @@ mod tests {
 
     #[test]
     fn gate_signed_window_exhaustion_keeps_base_result() {
-        // R-G2 reproducer (gatekeeper): window draining seeked an exhausted
-        // materialized subtree back to life — row 130 re-entered the
+        // Regression: window draining seeked an exhausted materialized
+        // subtree back to life — row 130 re-entered the
         // negative subtree after exhaustion and won with a spurious boost
         // (130, 40.0); the per-document base collector returns (0, 10.0).
         let positives: Vec<_> = (0..131)
@@ -7989,13 +7986,59 @@ mod tests {
                 }
                 current = generic.next().unwrap();
             }
-            // Both sides must agree on the top result. The work-bound
-            // assertion lives in the CI reproducer with realistic BM25
-            // statistics; unit-level uniform scoring cannot discriminate
-            // window skipping, so only result identity is asserted here.
+            // Both sides must agree on the top result. Only result identity
+            // is asserted here: uniform unit-level scoring cannot
+            // discriminate window skipping, so a work bound would need
+            // realistic BM25 statistics to mean anything.
             assert_eq!(tight.into_rows(), collector.into_rows());
             let _ = generic_work;
         }
+    }
+
+    #[test]
+    fn skew_guard_keeps_the_batch_profile_disengaged() {
+        // The counter only discriminates when the batch path is reachable at
+        // all, which needs a positive competitive floor: with a non-positive
+        // floor `collect_mapped` stays on the per-document branch and never
+        // probes `batch_engagement`, so a zero there would be vacuous.
+        let n = 65_536_u64;
+        let mut docs = DocSet::default();
+        for id in 0..n {
+            docs.append(id, 2 + u32::from(id <= 1 || id >= n - 2));
+        }
+        let leaf_node = |index| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0)],
+            should: vec![leaf_node(1), leaf_node(2)],
+            must_not: Vec::new(),
+        };
+        let leaves = vec![
+            loaded_leaf(
+                vec![compressed_unit_posting("m", (0..n as u32).collect())],
+                None,
+            ),
+            loaded_leaf(
+                vec![compressed_unit_posting("o0", vec![0, n as u32 - 1])],
+                None,
+            ),
+            loaded_leaf(
+                vec![compressed_unit_posting("o1", vec![1, n as u32 - 2])],
+                None,
+            ),
+        ];
+
+        let metrics = LocalMetricsCollector::default();
+        let score = Arc::new(CompetitiveScore::default());
+        score.raise(0.5);
+        let mut collector = TopKCollector::with_competitive_score(1, score);
+        let before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
+        collect_partition_with_documents(&docs, leaves, &plan, &metrics, &mut collector, Ok)
+            .unwrap();
+        let engagements = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) - before;
+        assert_eq!(
+            engagements, 0,
+            "the skew guard must keep a sparse-optional shape off the batch profile"
+        );
     }
 
     #[test]
@@ -8017,18 +8060,14 @@ mod tests {
     #[test]
     fn skew_guard_predicate_is_strict_at_the_equality_boundary() {
         // Pin the strict `<`: at `k * optional_cost * 8 == required_cost` the
-        // optionals are not sparse (the shape still takes the kernel). This is
-        // the case a `<` -> `<=` mutation would silently flip, and the older
-        // assertions never reached the boundary.
+        // optionals are not sparse, so the shape stays on the generic walk.
+        // This is the case a `<` -> `<=` mutation would silently flip.
         assert!(!optionals_are_sparse(1, 16_384, 131_072));
         assert!(optionals_are_sparse(1, 16_383, 131_072));
-        // The * 8 stays saturating: with an optional cost at the ceiling the
-        // saturated product equals usize::MAX, which is not below the ceiling
-        // either. This is the case a `saturating_mul(8)` -> `* 8` mutation
-        // would turn into a debug overflow panic, so the "kept verbatim"
-        // promise is guarded rather than only documented. (The k side is a
-        // plain multiply by design; no test feeds it a value that would
-        // overflow, because that is the preserved behaviour, not a contract.)
+        // The `* 8` stays saturating: with an optional cost at the ceiling the
+        // saturated product equals `usize::MAX`, which is not below the
+        // ceiling either. This is the case a `saturating_mul(8)` -> `* 8`
+        // mutation would turn into a debug overflow panic.
         assert!(!optionals_are_sparse(1, usize::MAX, usize::MAX));
     }
 
@@ -8036,12 +8075,13 @@ mod tests {
 
     #[test]
     fn iu_tight_routing_ignores_clause_cost() {
-        // Routing is a shape predicate: a K=1 IU plan over single compressed
-        // postings takes the kernel whatever the clause costs are. This pins
-        // that cost stays out of the decision — a regenerated relative cost
+        // `iu_tight_clause_indices` is a shape predicate: a K=1 IU plan over
+        // single compressed postings matches whatever the clause costs are.
+        // This pins that cost stays out of *this* decision — a relative cost
         // gate inside the condition would show up here as a false match.
-        // (It cannot catch a gate added *after* the two helpers, so the
-        // ablation in the commit message stays the performance record.)
+        // (The separate skew criterion in `optionals_are_sparse` does read
+        // cost — it decides both the leaf boxing here and the engagement at
+        // drain time.)
         let mut docs = DocSet::default();
         for doc_id in 0..50_u64 {
             docs.append(doc_id, 1);
@@ -8052,8 +8092,9 @@ mod tests {
             should: vec![leaf_node(1)],
             must_not: Vec::new(),
         };
-        // Close-cost shapes measured faster through the kernel than through
-        // the fallback path, so clause cost stays out of the decision.
+        // Close-cost shapes measured faster through the batch profile than
+        // through the per-document walk, so clause cost stays out of this
+        // decision.
         let leaves = vec![
             loaded_leaf(
                 vec![compressed_unit_posting("must", (0..50).collect())],
@@ -8069,7 +8110,7 @@ mod tests {
         assert_eq!(should_indices, vec![1]);
         assert!(
             iu_tight_clauses_ready(&leaves, &must_indices, &should_indices),
-            "a close-cost 1+1 shape must still route to the kernel"
+            "a close-cost 1+1 shape must still reach the batch profile"
         );
     }
 
@@ -8174,8 +8215,8 @@ mod tests {
 
     /// A documents fixture whose visible-cost upper bound is smaller than the
     /// posting df, so the two cost domains (raw df vs visibility-truncated)
-    /// are distinguishable. Minimal on purpose; B2.2 of the convergence plan
-    /// would fold this into a shared test fixture.
+    /// are distinguishable. Minimal on purpose: it only needs to make the two
+    /// domains differ.
     struct CostDomainDocs<'a> {
         inner: &'a DocSet,
         visible_cost_upper_bound: usize,
@@ -8482,6 +8523,38 @@ mod tests {
     }
 
     #[test]
+    fn max_disjunction_refuses_the_batch_capability() {
+        // Sum and Max are a `mode` on the same type, not two types, so Max
+        // shares `block_batch_children` and has to opt out explicitly:
+        // handing a max-combined node's children to the batch profile would
+        // score them as a sum.
+        let mut docs = DocSet::default();
+        for id in 0..50_u64 {
+            docs.append(id, 1);
+        }
+        let metrics = NoOpMetricsCollector;
+        let leaf = || loaded_leaf(vec![compressed_unit_posting("m", (0..50).collect())], None);
+        let mut sum = DisjunctionScorer::try_new(
+            vec![box_leaf_scorer(leaf(), &docs, &metrics, true)],
+            DisjunctionScore::Sum,
+        )
+        .unwrap();
+        assert!(
+            sum.block_batch_children().is_some(),
+            "a Sum disjunction of compressed leaves supplies batch providers"
+        );
+        let mut max = DisjunctionScorer::try_new(
+            vec![box_leaf_scorer(leaf(), &docs, &metrics, true)],
+            DisjunctionScore::Max,
+        )
+        .unwrap();
+        assert!(
+            max.block_batch_children().is_none(),
+            "a Max (DisMax / MultiMatch) disjunction must not be summed by the batch profile"
+        );
+    }
+
+    #[test]
     fn batch_engagement_requires_the_compressed_domain() {
         // F1 guard with a positive floor (the batch only engages above zero):
         // the same non-skew 1+2 shape engages the profile with compressed
@@ -8576,9 +8649,11 @@ mod tests {
     }
 
     #[test]
-    fn iu_tight_fast_paths_record_comparisons() {
-        // The IU fast paths bypass the scorer tree, so they must report their
-        // own comparison counts; a zero here means the metric was dropped.
+    fn iu_batch_profile_records_batch_steps() {
+        // The batch profile drives the leaves through `BlockBatch` instead of
+        // the per-document walk, so the generic comparison counter does not
+        // account its work; it reports batch steps instead. A zero here means
+        // the metric was dropped.
         let mut docs = DocSet::default();
         for doc_id in 0..50_u64 {
             docs.append(doc_id, 1);
@@ -8629,7 +8704,7 @@ mod tests {
             "the batch profile must account its own work steps"
         );
 
-        // K>=2: two dense MUSTs plus a sparse SHOULD take the multi kernel.
+        // K>=2: two dense MUSTs plus a sparse SHOULD take the multi walk.
         let k2_plan = CompoundScorerPlan::Boolean {
             must: vec![leaf_node(0), leaf_node(1)],
             should: vec![leaf_node(2)],
@@ -8675,6 +8750,77 @@ mod tests {
         assert!(
             metrics.batch_steps() > 0,
             "the multi batch profile must account its own work steps"
+        );
+    }
+
+    #[test]
+    fn k1_batch_profile_matches_the_generic_walk() {
+        // A K=1 non-skew IU shape: the batch profile must own the drain
+        // (asserted on the entry counter) and still agree with the
+        // per-document generic walk on every row, not just on engagement.
+        let mut docs = DocSet::default();
+        for id in 0..50_u64 {
+            docs.append(id, 1);
+        }
+        let leaf_node = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        let plan = CompoundScorerPlan::Boolean {
+            must: vec![leaf_node(0)],
+            should: vec![leaf_node(1)],
+            must_not: Vec::new(),
+        };
+        let leaves = || {
+            vec![
+                loaded_leaf(vec![compressed_unit_posting("must", (0..50).collect())], None),
+                loaded_leaf(vec![compressed_unit_posting("should", (0..8).collect())], None),
+            ]
+        };
+
+        // Routed entry (batch profile).
+        let metrics = LocalMetricsCollector::default();
+        let score = Arc::new(CompetitiveScore::default());
+        score.raise(0.5);
+        let mut routed = TopKCollector::with_competitive_score(10, score);
+        let engagements_before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
+        collect_partition_with_documents(&docs, leaves(), &plan, &metrics, &mut routed, Ok)
+            .unwrap();
+        assert!(
+            super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) > engagements_before,
+            "a K=1 non-skew IU shape must engage the batch profile"
+        );
+        // The bulk passes (scores / keys / fold) each account their candidate
+        // slice, so the total must exceed the 50 taken MUST candidates that
+        // the block take alone would report.
+        assert!(
+            metrics.batch_steps() > 50,
+            "the batch bulk passes must account their candidate slices, got {}",
+            metrics.batch_steps()
+        );
+        let routed_rows = routed.into_rows();
+
+        // Directly built generic tree, same starting floor, full walk.
+        let generic_metrics = NoOpMetricsCollector;
+        let mut generic_leaves = leaves()
+            .into_iter()
+            .map(|leaf| Some(box_leaf_scorer(leaf, &docs, &generic_metrics, false)))
+            .collect::<Vec<_>>();
+        let mut generic = plan.build(&mut generic_leaves).unwrap();
+        let generic_score = Arc::new(CompetitiveScore::default());
+        generic_score.raise(0.5);
+        let mut collector = TopKCollector::with_competitive_score(10, generic_score);
+        let mut current = generic.next().unwrap();
+        while current.is_some() {
+            if generic.matches().unwrap() {
+                collector.insert(ScoredRow {
+                    row_id: generic.document_key().unwrap(),
+                    score: generic.score().unwrap(),
+                });
+            }
+            current = generic.next().unwrap();
+        }
+        assert_eq!(
+            routed_rows,
+            collector.into_rows(),
+            "the batch profile must reproduce the generic walk row for row"
         );
     }
 
@@ -8850,10 +8996,9 @@ mod tests {
     }
     #[test]
     fn batch_flagged_multi_must_boxes_term_leaf_and_matches_wand_cursor() {
-        // P1b structural + differential sanity (the cheap half of the P1b
-        // hard gate): multi-MUST leaves flagged for the batch profile box as
-        // TermLeafScorers, and the resulting tree must agree bit-for-bit
-        // with the WandCursor-built generic tree.
+        // Structural + differential sanity: multi-MUST leaves flagged for the
+        // batch profile box as TermLeafScorers, and the resulting tree must
+        // agree bit-for-bit with the WandCursor-built generic tree.
         let n = 2000_u32;
         let mut docs = DocSet::default();
         for id in 0..n {
@@ -8884,7 +9029,7 @@ mod tests {
             "got {}",
             flagged_scorer.debug_type_name()
         );
-        // The capability contract (EXT R4) is checked at the host boundary:
+        // The capability contract is checked at the host boundary:
         // the flagged tree exposes two batch providers even though the direct
         // children are identity-boost ScaleScorer wrappers (they forward at
         // factor == 1.0 down to the TermLeafScorers).
@@ -8922,7 +9067,7 @@ mod tests {
 
     #[test]
     fn batch_flagged_floor_never_rises_shape_matches_generic() {
-        // R-O1 at unit scale: top-k=100 over only three matching docs — the
+        // Unit-scale check: top-k=100 over only three matching docs — the
         // heap never fills, collect_mapped stays on the per-document branch
         // the whole way, and the flagged (TermLeaf) build must still agree
         // with the generic WandCursor build.
@@ -8975,11 +9120,11 @@ mod tests {
     }
 
     #[test]
-    fn rg1_k1_sparse_disjoint_optionals_drive_from_the_sparse_side() {
-        // The R-G1 shape with realistic BM25 statistics (PLAN-V3 P2
-        // reproducer): K = 1 dense required (every document) plus two
-        // disjoint sparse optionals, top-1. Once a boosted optional hit
-        // lands in the heap, required_ub < floor fires tier 1 and the walk
+    fn k1_sparse_disjoint_optionals_drive_from_the_sparse_side() {
+        // The sparse-optional shape with realistic BM25 statistics:
+        // K = 1 dense required (every document) plus two disjoint sparse
+        // optionals, top-1. Once a boosted optional hit lands in the heap,
+        // `required_ub < floor` triggers the union promotion and the walk
         // drives from the optional-union side: routed work must stay
         // bounded while a full intersection scan would touch all 65,536
         // members, and the winner must be an optional-hit document.
@@ -9036,7 +9181,7 @@ mod tests {
         let routed_work = metrics.comparisons.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             routed_work < 1_000,
-            "tier 1 must drive from the sparse side; routed work {routed_work} \
+            "the union promotion must drive from the sparse side; routed work {routed_work} \
              suggests a full dense scan"
         );
 
@@ -9067,10 +9212,10 @@ mod tests {
 
     #[test]
     fn k2_multi_must_route_builds_batch_tree_and_matches_generic() {
-        // P3 wiring: a K >= 2 IU shape through the routing entry now builds
-        // the generic tree whose ReqOptScorer selects the multi batch
-        // profile. Results must agree bit-for-bit with the directly built
-        // generic (WandCursor) tree across the whole match set.
+        // A K >= 2 IU shape through the routing entry builds the generic tree
+        // whose ReqOptScorer selects the multi batch profile. Results must
+        // agree bit-for-bit with the directly built generic (WandCursor) tree
+        // across the whole match set.
         let n = 2000_u32;
         let mut docs = DocSet::default();
         for id in 0..n {
@@ -9099,8 +9244,15 @@ mod tests {
         // Routed entry (multi batch profile).
         let metrics = LocalMetricsCollector::default();
         let mut routed = TopKCollector::new(10);
+        let engagements_before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
         collect_partition_with_documents(&docs, leaves(), &routed_plan, &metrics, &mut routed, Ok)
             .unwrap();
+        let engagements =
+            super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) - engagements_before;
+        assert!(
+            engagements > 0,
+            "a K >= 2 non-skew IU shape must engage the batch profile"
+        );
         let routed_rows = routed.into_rows();
 
         // Directly built generic tree (WandCursor leaves), full walk.

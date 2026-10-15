@@ -130,12 +130,15 @@ pub trait MetricsCollector: Send + Sync {
     /// The goal is to provide some visibility into the compute cost of the search
     fn record_comparisons(&self, num_comparisons: usize);
 
-    /// Record block-batch work steps: candidates taken, merged or sought by
-    /// the IU batch profile.
+    /// Record block-batch work steps: candidates taken, scored,
+    /// key-resolved, folded or merged by the batch profile.
     ///
     /// Kept separate from [`Self::record_comparisons`] so that *routing* (did
     /// the batch own this partition?) is never inferred from a work counter
-    /// that the generic path also moves. Default: no-op.
+    /// that the generic path also moves. The production sink nevertheless
+    /// folds both into one exported counter, so the exported
+    /// `index_comparisons` is a work total rather than a routing signal.
+    /// Default: no-op.
     fn record_batch_steps(&self, _num_steps: usize) {}
 
     /// Record index cache hits observed while serving this query.
@@ -328,6 +331,7 @@ mod tests {
         parts: AtomicUsize,
         loads: AtomicUsize,
         comparisons: AtomicUsize,
+        batch_steps: AtomicUsize,
         hits: AtomicUsize,
         misses: AtomicUsize,
         batch_reads: AtomicUsize,
@@ -343,6 +347,9 @@ mod tests {
         }
         fn record_comparisons(&self, n: usize) {
             self.comparisons.fetch_add(n, Ordering::Relaxed);
+        }
+        fn record_batch_steps(&self, n: usize) {
+            self.batch_steps.fetch_add(n, Ordering::Relaxed);
         }
         fn record_index_cache_hits(&self, n: usize) {
             self.hits.fetch_add(n, Ordering::Relaxed);
@@ -367,6 +374,7 @@ mod tests {
         local.record_part_load();
         local.record_index_load();
         local.record_comparisons(5);
+        local.record_batch_steps(7);
         local.record_batch_read();
         local.record_batch_reads(2);
         local.record_single_page_read();
@@ -378,6 +386,7 @@ mod tests {
             parts: AtomicUsize::new(0),
             loads: AtomicUsize::new(0),
             comparisons: AtomicUsize::new(0),
+            batch_steps: AtomicUsize::new(0),
             hits: AtomicUsize::new(0),
             misses: AtomicUsize::new(0),
             batch_reads: AtomicUsize::new(0),
@@ -388,6 +397,7 @@ mod tests {
         assert_eq!(sink.parts.load(Ordering::Relaxed), 1);
         assert_eq!(sink.loads.load(Ordering::Relaxed), 1);
         assert_eq!(sink.comparisons.load(Ordering::Relaxed), 5);
+        assert_eq!(sink.batch_steps.load(Ordering::Relaxed), 7);
         assert_eq!(sink.hits.load(Ordering::Relaxed), 2);
         assert_eq!(sink.misses.load(Ordering::Relaxed), 3);
         assert_eq!(sink.batch_reads.load(Ordering::Relaxed), 3);

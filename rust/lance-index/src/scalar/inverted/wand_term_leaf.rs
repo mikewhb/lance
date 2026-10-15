@@ -33,7 +33,9 @@ pub struct TermLeafScorer<'a, D: WandDocuments> {
     /// (plain capacity; contents are fully rewritten per call).
     fold_scratch: Vec<u32>,
     /// Block-batch work steps taken by the batch profile (candidates taken,
-    /// merged, sought or scored). Reported through
+    /// scored, key-resolved, folded or merged — a bulk pass counts its
+    /// candidate slice, a merge adds one per live frequency, and the
+    /// per-candidate calls count one each). Reported through
     /// `MetricsCollector::record_batch_steps` so batch routing is never
     /// inferred from the generic comparison counter.
     batch_steps: Cell<usize>,
@@ -228,10 +230,10 @@ impl<D: WandDocuments> Drop for TermLeafScorer<'_, D> {
     }
 }
 
-/// Block-batch supply (PLAN-V3 §3.2): drives the inner posting directly,
-/// method-for-method identical to the iu_tight kernel's usage
-/// (`take_docs_one_block_upto` / `merge_optional_freqs` /
-/// `score(scorer, freq, scoring_num_tokens)`). After batch stepping the
+/// Block-batch supply: drives the inner posting directly through the same
+/// moves the batch state machines use (`take_docs_one_block_upto` /
+/// `merge_optional_freqs` / `score(scorer, freq, scoring_num_tokens)`).
+/// After batch stepping the
 /// leaf's derived caches (the `current` family) are all invalidated — the
 /// host state machine never reads them; resumption relies on pure-data
 /// breakpoints.
@@ -259,6 +261,7 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
         // with scorer state hoisted out. merge_optional_freqs zeroes every
         // entry itself, so a plain resize (no clear) suffices.
         debug_assert_eq!(docs.len(), sums.len());
+        self.batch_steps.set(self.batch_steps.get() + docs.len());
         self.fold_scratch.resize(docs.len(), 0);
         self.posting.merge_optional_freqs(docs, &mut self.fold_scratch);
         let scorer = self.scorer.as_ref();
@@ -294,9 +297,9 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
     }
 
     fn cost(&self) -> usize {
-        // Raw posting df (kernel convention; both the iu_tight cost and lead
-        // criteria use it, not TermLeafScorer::cost's visibility-truncated
-        // value).
+        // Raw posting df, matching what `PostingIterator::cost` returns and
+        // what the shape router reads — not the visibility-truncated value
+        // `TermLeafScorer::cost` returns for the same leaf.
         self.posting.cost()
     }
 
@@ -314,6 +317,7 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
         // to term_score, one dispatch per block.
         debug_assert_eq!(docs.len(), freqs.len());
         debug_assert_eq!(docs.len(), out.len());
+        self.batch_steps.set(self.batch_steps.get() + docs.len());
         let scorer = self.scorer.as_ref();
         for ((&doc, &freq), slot) in docs.iter().zip(freqs.iter()).zip(out.iter_mut()) {
             *slot = if freq != 0 {
@@ -326,6 +330,7 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
     }
 
     fn document_keys_batch(&self, docs: &[u64], out: &mut Vec<Option<u64>>) {
+        self.batch_steps.set(self.batch_steps.get() + docs.len());
         out.clear();
         out.reserve(docs.len());
         for &doc in docs {

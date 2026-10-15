@@ -3,10 +3,10 @@
 
 //! `ReqOptScorer`: required-plus-optional scoring for the IU shape.
 //!
-//! Extracted verbatim from `compound.rs` (PLAN-V3 P1a, zero behavior
-//! change). Declared as a child module of `compound` so it can reach the
-//! shared scorer-tree internals via `super::*` while keeping compound.rs
-//! small.
+//! Declared as a child module of `compound` so it can reach the shared
+//! scorer-tree internals via `super::*` while keeping compound.rs small. It
+//! also hosts the batch profile: the capability probe, the skew criterion
+//! that engages it, and the drain that drives its state machines.
 
 use super::super::wand::{IuBatchState, IuMultiBatchState};
 
@@ -59,9 +59,9 @@ pub(super) struct ReqOptScorer<'a> {
     /// clause alone, so the optional clause is mandatory for the rest of the
     /// scan and the query is an intersection.
     pub(super) optional_globally_required: bool,
-    /// Batch profile state (PLAN-V3 P2/P3). `Some` = a batch FSM owns this
-    /// scorer: pure-data breakpoints, providers re-acquired per drain call,
-    /// one-way until exhaustion (I-1/I-2 option (a)).
+    /// Batch profile state. `Some` = a batch FSM owns this scorer: pure-data
+    /// breakpoints, providers re-acquired per drain call, and the walk is
+    /// one-way until exhaustion.
     batch: Option<IuBatchEngagement>,
     /// Reused scratch for the batch drain's hit window. The batch yields on
     /// every produced hit (floor-freshness), so this vector is touched on
@@ -101,17 +101,16 @@ impl<'a> ReqOptScorer<'a> {
         }
     }
 
-    /// Capability probe + static skew criterion (tier 3 vs tier 2) on the
-    /// same raw-df source as the collect_partition guard (PLAN-V3 §1.3).
-    /// Returns the fresh batch state when the batch profile owns this shape.
+    /// Capability probe + the skew criterion, read from the same raw-df
+    /// source as the collect-time guard. Returns the fresh batch state when
+    /// the batch profile owns this shape.
     ///
-    /// Tier 1 (union promotion, `optional_globally_required`) outranks the
-    /// batch: a latched shape is already an intersection driven from the
-    /// sparse side, which is the R-G1 fix itself.
+    /// Union promotion (`optional_globally_required`) outranks the batch: a
+    /// latched shape is already an intersection driven from the sparse side,
+    /// which is what the skew criterion preserves.
     fn batch_engagement(&mut self) -> Option<IuBatchEngagement> {
         // Env gate: LANCE_FTS_IU_TIGHT=off must disable the batch profile
-        // entirely (the escape hatch the PR promises). Capability alone is
-        // not authorization.
+        // entirely. Capability alone is not authorization.
         if !iu_tight_enabled() {
             return None;
         }
@@ -120,10 +119,10 @@ impl<'a> ReqOptScorer<'a> {
             let optional_batch = self.optional.block_batch_children()?;
             let required_cost = required_batch.cost();
             let optional_cost: usize = optional_batch.iter().map(|p| p.cost()).sum();
-            // Tier 2 (mean formula, same as the collect_partition guard):
-            // sparse optionals against a dense required intersection yield
-            // to the generic per-document tree whose block-max skipping and
-            // union promotion own the shape.
+            // Sparse optionals against a dense required list yield to the
+            // generic per-document tree, whose block-max window skipping and
+            // union promotion own the shape. This is the same criterion the
+            // collect-time guard applies, read from the same raw-df source.
             // K = 1: the required side is a single provider.
             if super::optionals_are_sparse(1, optional_cost, required_cost) {
                 return None;
@@ -567,16 +566,15 @@ impl ComposableScorer for ReqOptScorer<'_> {
         true
     }
 
-    /// Batch profile (PLAN-V3 P2): when both sides are flat single-posting
-    /// providers and the static skew criterion does not yield, the drain is
-    /// driven by the IuBatchState FSM instead of the per-document walk.
+    /// When both sides are flat single-posting providers and the skew
+    /// criterion does not yield, the drain is driven by the batch FSM instead
+    /// of the per-document walk.
     ///
-    /// I-6: the entry runs the same decision hook as the default.
-    /// EXT R5: a non-positive floor keeps the collector's per-document
-    /// branch in charge, so the batch never engages there.
-    /// I-2 option (a): once the batch owns the scorer it runs to exhaustion;
-    /// a promotion latch recorded mid-run is terminal bookkeeping, not an
-    /// engine switch.
+    /// The entry runs the same decision hook as the default. A non-positive
+    /// floor keeps the collector's per-document branch in charge, so the
+    /// batch never engages there. Once the batch owns the scorer it runs to
+    /// exhaustion; a promotion latch recorded mid-run is terminal
+    /// bookkeeping, not an engine switch.
     fn collect_confirmed_window(
         &mut self,
         min_score: f32,
@@ -606,8 +604,8 @@ impl ComposableScorer for ReqOptScorer<'_> {
                 batch_hits,
                 ..
             } = self;
-            // I-2 option (a): a promotion latch recorded mid-run (the floor
-            // crossing the required upper bound while the batch is engaged)
+            // A promotion latch recorded mid-run (the floor crossing the
+            // required upper bound while the batch is engaged)
             // is terminal bookkeeping. The batch keeps full-scanning — sound
             // (nothing is dropped), just less pruning. The latch would only
             // re-route a scorer that has not engaged the batch yet.

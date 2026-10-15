@@ -25,7 +25,7 @@ use super::{
 /// Whether `partial + remaining` can no longer reach `floor`. Wraps the
 /// generic path's predicate so the widening and the inclusive floor semantics
 /// live in one audited place; a document scoring exactly at the floor still
-/// competes, which is the contract the IU kernels are tested against. Bounds
+/// competes, which is the contract the batch walks are tested against. Bounds
 /// are widened by `conservative_score_sum` so f32 rounding cannot shrink them
 /// below the true total and trigger premature IU termination: the consumer
 /// scores the same values by sequential `f32` accumulation, so with
@@ -49,11 +49,11 @@ fn live_upper_bound(dry: &[bool], upper_bound: impl Fn(usize) -> f32) -> f32 {
     conservative_score_sum((0..dry.len()).filter(|&index| !dry[index]).map(upper_bound))
 }
 
-/// Env gate for the IU fast paths, following the `LANCE_FTS_BULK_AND`
-/// convention: `auto` (default) and `on`/`1` are equivalent — both run both
-/// kernels — and `off`/`0` routes every IU-shaped Boolean back to the generic
-/// scorer tree. This is the A/B and rollout switch; it does not change
-/// results, only which engine computes them.
+/// Env gate for the batch profile, following the `LANCE_FTS_BULK_AND`
+/// convention: `auto` (default) and `on`/`1` both enable it, and `off`/`0`
+/// routes every IU-shaped Boolean back to the per-document scorer tree. This
+/// is the A/B and rollout switch; it does not change results, only which
+/// engine computes them.
 static IU_TIGHT_MODE: std::sync::LazyLock<BulkAndMode> =
     std::sync::LazyLock::new(|| match std::env::var("LANCE_FTS_IU_TIGHT") {
         Ok(value) => BulkAndMode::parse(&value).unwrap_or_else(|| {
@@ -197,24 +197,21 @@ mod tests {
     }
 }
 
-// ===== P0.5 prototype: K=1 pausable batch state machine (PLAN-V3 §2.3/§3.4) =====
+// ===== K=1 pausable batch state machine =====
 //
 // Pure-data breakpoints (borrow contract): this struct holds no borrows into
 // its children — providers (`BlockBatch`) are re-acquired by the host on
 // every collect_confirmed_window call; resumption always resumes from the
 // stored chunk/chunk-index breakpoint. Never use a forward posting seek as
-// recovery (the remaining chunk candidates would be silently skipped — the
-// kernel promoted() load-bearing seek comment at :418-431 is the mirror
-// image of this exact problem).
+// recovery: the remaining chunk candidates would be silently skipped.
 //
-// Floor semantics (I-4): each `next_batch` call's entry `floor` is the emit
+// Floor semantics: each `next_batch` call's entry `floor` is the emit
 // decision value for that segment, inclusive; the block-end dry-budget /
-// promotion decisions use the same value (I-7: floor refresh point = yield
-// boundary).
-/// Promoted sub-mode (I-8): drive the cheaper lead clause block-wise and
-/// seek every required clause per candidate (the kernel `promoted()` walk
-/// in provider form). Pure data — providers are re-acquired per call, and
-/// resumption always resumes from the stored lead chunk/index.
+// promotion decisions use the same value. The floor is only refreshed
+// between calls, so the yield boundary is the floor refresh point.
+/// Promoted sub-mode: drive the cheaper lead clause block-wise and seek every
+/// required clause per candidate. Pure data — providers are re-acquired per
+/// call, and resumption always resumes from the stored lead chunk/index.
 struct PromotedWalk {
     lead_index: usize,
     required: Vec<usize>,
@@ -251,7 +248,7 @@ impl PromotedWalk {
                     continue;
                 }
                 // Forward seeks only: every cursor sits at or past the start
-                // of its promoted region (I-1); a miss skips the candidate.
+                // of its promoted region; a miss skips the candidate.
                 let Some(must_freq) = must.seek_eq(doc) else {
                     continue;
                 };
@@ -346,8 +343,8 @@ pub(crate) struct IuBatchState {
     /// Whether at least one block has been taken (distinguishes the first
     /// call from a block-end check).
     chunk_started: bool,
-    /// Promoted sub-mode state; the MUST walk is dead once this is Some
-    /// (I-1: the engine is one-way, and the promoted walk owns everything).
+    /// Promoted sub-mode state; the MUST walk is dead once this is `Some`
+    /// (the walk is one-way, and the promoted walk owns everything).
     promoted: Option<PromotedWalk>,
     exhausted: bool,
 }
@@ -383,8 +380,8 @@ impl IuBatchState {
     /// Advances one segment: consumes the current chunk (resuming at the
     /// breakpoint) or takes the next block, delivering at most `max_hits`
     /// `(document_key, score)` pairs into `out` (score >= floor, inclusive;
-    /// I-4). Returns true = exhausted (I-7: every non-exhausted return
-    /// strictly advances the buffer offset).
+    /// a candidate tying the floor still competes). Returns true = exhausted;
+    /// every non-exhausted return strictly advances the buffer offset.
     ///
     /// `out` contract: the caller passes a fresh (empty) window per call;
     /// the walk yields as soon as this call produced a hit so the driver can
@@ -393,10 +390,10 @@ impl IuBatchState {
     /// cannot-compete against an obsolete floor).
     ///
     /// At a consumed block end: sync_after_batch (invalidate provider derived
-    /// caches) → dry-budget termination → promotion decision (I-8: only the
-    /// per-should necessity proof; a fired proof with a cheaper lead hands
-    /// the walk to the promoted sub-mode, I-2 option (a) — the MUST walk
-    /// never interleaves with it again).
+    /// caches) → dry-budget termination → promotion decision (the per-should
+    /// necessity proof; a fired proof with a cheaper lead hands the walk to
+    /// the promoted sub-mode — once engaged the batch runs to exhaustion and
+    /// the MUST walk never interleaves with it again).
     pub(crate) fn next_batch<'s>(
         &mut self,
         must: &'s mut dyn BlockBatch,
@@ -405,7 +402,7 @@ impl IuBatchState {
         out: &mut Vec<(u64, f32)>,
         max_hits: usize,
     ) -> bool {
-        debug_assert!(max_hits > 0, "max_hits=0 has a separate contract (I-7)");
+        debug_assert!(max_hits > 0, "max_hits must be positive");
         if self.exhausted {
             return true;
         }
@@ -448,11 +445,10 @@ impl IuBatchState {
             // floor only between drains (produced hits are inserted into the
             // collector after this call returns), so scanning on would make
             // the block-end decisions below re-check promotion and
-            // cannot-compete against a floor that is already stale — the
-            // kernel topology reads a live floor at every block end. Once
-            // this call produced a hit (the only way the driver's floor can
-            // rise) hand control back; the buffer strictly advanced, so I-7
-            // holds and the driver re-issues with the fresh floor.
+            // cannot-compete against a floor that is already stale. Once this
+            // call produced a hit (the only way the driver's floor can rise)
+            // hand control back; the buffer strictly advanced, so the driver
+            // re-issues with the fresh floor.
             if out.len() > out_start_len {
                 for provider in std::iter::once(&mut *must).chain(shoulds.iter_mut().map(|s| &mut **s)) {
                     provider.sync_after_batch();
@@ -560,11 +556,10 @@ impl IuBatchState {
     }
 }
 
-// ===== P0.5 harness: protocol path walkthrough (first takeover / pause and
-// resume / latch no-op / exhaustion). Drives IuBatchState with mock
-// providers to verify the borrow design (FSM = pure data, Send), incremental
-// vs one-shot equivalence, and soundness under a dynamic floor. The real
-// provider (TermLeafScorer) lands in P1a/P2.
+// ===== Protocol harness: path walkthrough (first takeover / pause and
+// resume / latch no-op / exhaustion). Drives IuBatchState with mock providers
+// to verify the borrow design (FSM = pure data, Send), incremental vs
+// one-shot equivalence, and soundness under a dynamic floor.
 
 #[cfg(test)]
 mod batch_proto_tests {
@@ -711,7 +706,7 @@ mod batch_proto_tests {
         }
     }
 
-    /// EXT R1 counterexample skeleton: MUST docs 1..=20 each freq 1;
+    /// Counterexample fixture: MUST docs 1..=20 each freq 1;
     /// SHOULD0 = {3,17} freq 10; SHOULD1 = {7} freq 10. Score = 1 + 10×hits.
     fn fixtures() -> (MockBatch, Vec<MockBatch>, MockDocs, Vec<(u64, f32)>) {
         let must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
@@ -768,7 +763,7 @@ mod batch_proto_tests {
         assert_eq!(
             out,
             vec![(3, 11.0), (7, 11.0), (17, 11.0)],
-            "EXT R1 counterexample shape: candidates tying (=) the floor must be kept (I-4)"
+            "candidates tying (=) the floor must be kept"
         );
     }
 
@@ -803,10 +798,10 @@ mod batch_proto_tests {
 
     #[test]
     fn batch_keeps_walking_when_floor_rises_past_must_ub() {
-        // ③→① precondition: after floor (11.0) crosses must_ub (1.0), the FSM
+        // Precondition: after floor (11.0) crosses must_ub (1.0), the FSM
         // performs no union→intersection pruning and keeps scanning MUST —
-        // docs hit by should0 (11.0, tying the floor) must be kept (dropping
-        // them is the EXT R1 recall loss).
+        // docs hit by should0 (11.0, tying the floor) must be kept, since
+        // dropping them would lose a result.
         let (mut must, mut shoulds, _docs, oracle) = fixtures();
         let mut state = IuBatchState::new(1.0, vec![10.0, 10.0]);
         let out = drain_all(&mut state, &mut must, &mut shoulds, 11.0, 100);
@@ -841,7 +836,7 @@ mod batch_proto_tests {
 
     #[test]
     fn batch_promoted_walk_drives_the_cheaper_sparse_lead() {
-        // I-8 promoted sub-mode: once MUST-only (1.0) cannot reach floor
+        // Promoted sub-mode: once MUST-only (1.0) cannot reach floor
         // (1.5) and the sparse SHOULD is individually necessary, the walk
         // drives the lead (cost 3 < MUST 20) and seeks MUST per candidate.
         // MUST-only docs never clear the floor, so only the lead hits come
@@ -944,7 +939,7 @@ mod batch_proto_tests {
 
     #[test]
     fn promoted_walk_adds_the_must_term_last() {
-        // d34358a2a regression (arithmetic isolated): the promoted walk must
+        // Regression (arithmetic isolated): the promoted walk must
         // accumulate optionals from zero and add MUST once. At 2^24 the two
         // associations differ by an ULP: optionals-first yields 2^24 + 2
         // (= floor, emitted); MUST-first rounds the 2^24 + 1 intermediate to
@@ -1022,7 +1017,7 @@ mod batch_proto_tests {
 
     #[test]
     fn batch_yields_for_a_fresh_floor_instead_of_scanning_the_tail() {
-        // 95f0ba312 regression: both sparse optionals hit only inside the first
+        // Regression: both sparse optionals hit only inside the first
         // MUST block, neither is individually necessary (so no promotion can
         // mask the effect), and the MUST upper bound is loose (10 >= the real
         // 1.0), so a frozen floor cannot prove the tail dead. The driver raises
@@ -1062,7 +1057,7 @@ mod batch_proto_tests {
 
     #[test]
     fn multi_bounds_its_scan_so_an_external_floor_rise_is_seen() {
-        // Shape B (delta review §4.3): a long sub-floor tail while the
+        // A long sub-floor tail while the
         // competitive floor rises *outside* this walk (the floor is shared
         // across partitions). The per-call candidate budget hands control
         // back at block granularity so the driver re-checks with the fresh
@@ -1138,7 +1133,8 @@ mod batch_proto_tests {
     }
 }
 
-// ===== P3 prototype: K>=2 pausable batch state machine (PLAN-V3 P3) =====
+// ===== K>=2 pausable batch state machine =====
+
 //
 // The multi walk in provider form: seek-to-max
 // alignment across the required providers, per-candidate optional probes,
@@ -1154,9 +1150,8 @@ pub(crate) struct IuMultiBatchState {
     optional_ub: f32,
     dry: Vec<bool>,
     /// N == 1 promotion latch: the lone optional has been promoted into the
-    /// required set. Stateful (unlike the kernel's vector surgery) because
-    /// the provider collections are re-acquired per drain call — the flag
-    /// must survive across calls.
+    /// required set. It has to be stateful because the provider collections
+    /// are re-acquired per drain call — the flag must survive across calls.
     promoted_optional: bool,
     /// Promoted optional's frequency at the aligned candidate.
     promoted_freq: u32,
@@ -1187,7 +1182,7 @@ impl IuMultiBatchState {
     /// at most `max_hits` `(document_key, score)` pairs into `out`. Returns
     /// true = exhausted.
     ///
-    /// Promotion (N == 1) mirrors the kernel: MUST-only documents are
+    /// Promotion (N == 1) mirrors the K = 1 walk: MUST-only documents are
     /// provably dead (`required_ub < floor` strictly), so the optional joins
     /// the required set — appended last, keeping the accumulation order.
     pub(crate) fn next_batch<'s>(
@@ -1199,7 +1194,7 @@ impl IuMultiBatchState {
         max_hits: usize,
     ) -> bool {
         debug_assert!(requireds.len() >= 2);
-        debug_assert!(max_hits > 0, "max_hits=0 has a separate contract (I-7)");
+        debug_assert!(max_hits > 0, "max_hits must be positive");
         if self.exhausted {
             return true;
         }
@@ -1326,9 +1321,8 @@ impl IuMultiBatchState {
             // bought a host round trip — provider re-acquisition, syncs and a
             // window copy — per candidate. Dropping them cannot lose a result
             // because the competitive floor only rises, so the driver's live
-            // floor is never below this call's snapshot. Equality is kept
-            // (I-4): a candidate tying the floor can still win the row-id
-            // tie-break.
+            // floor is never below this call's snapshot. Equality is kept: a
+            // candidate tying the floor can still win the row-id tie-break.
             let score = required_sum + optional_sum;
             scanned += 1;
             if score >= floor {
@@ -1342,9 +1336,11 @@ impl IuMultiBatchState {
             // only refreshes its competitive floor between drains, and the
             // block-end decisions above read this call's frozen floor. Once
             // this call produced a hit — the only way the floor can rise —
-            // hand control back with the cursor strictly advanced (I-7) so
-            // the next call re-checks promotion and cannot-compete against a
-            // fresh floor. max_hits stays honored as an upper bound.
+            // hand control back with the cursor strictly advanced, so the
+            // next call re-checks promotion and cannot-compete against a
+            // fresh floor. When no hit is produced the yield falls to
+            // `MULTI_CANDIDATE_BUDGET`, which bounds how much work a frozen
+            // floor can buy.
             if hits >= max_hits.min(1) || scanned >= MULTI_CANDIDATE_BUDGET {
                 for posting in requireds.iter_mut().chain(optionals.iter_mut()) {
                     posting.sync_after_batch();
