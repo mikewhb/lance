@@ -3,7 +3,7 @@
 
 mod should_maxscore;
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
@@ -2409,6 +2409,8 @@ impl<K: Copy + Ord> TopKCollector<K> {
         }
     }
 
+    /// Read by tests to pin the floor the batch walk sees.
+    #[cfg(test)]
     fn min_competitive_score(&self) -> f32 {
         self.competitive_score.get()
     }
@@ -4350,18 +4352,16 @@ where
     // PLAN-V3 P1b narrows the kernels to K >= 2: every K = 1 shape moves to
     // the generic tree, whose ReqOptScorer union promotion (see
     // `promote_optional_if_required`) is the R-G1 K = 1 fix, and whose
-    // K >= 2 batch profile lands in P2. `batch_flag` marks the shapes the
-    // batch profile owns so their leaves box as TermLeafScorers (the
-    // BlockBatch providers the profile consumes).
+    // K >= 2 batch profile lands in P2.
     // PLAN-V3 P3: the tight kernels no longer route at this level. Every
     // IU shape builds the generic tree; its ReqOptScorer selects the batch
-    // profile at drain time from the same skew criterion. `batch_flag`
-    // marks the shape so its leaves box as TermLeafScorers — the
-    // BlockBatch providers the batch profile consumes. A skewed shape
-    // (sparse optionals against a dense required intersection) keeps
-    // batch_flag false: the per-document generic walk with block-max
-    // skipping and union promotion owns it (the R-G1 fix).
-    let mut batch_flag = false;
+    // profile at drain time from the same skew criterion.
+    // `batch_leaf_indices` collects the shape's clauses so their leaves box
+    // as TermLeafScorers — the BlockBatch providers the batch profile
+    // consumes. A skewed shape (sparse optionals against a dense required
+    // intersection) leaves the collection empty: the per-document generic
+    // walk with block-max skipping and union promotion owns it (the R-G1
+    // fix).
     let mut batch_leaf_indices: Vec<usize> = Vec::new();
     if iu_tight_enabled()
         && let Some((must_indices, should_indices)) = iu_tight_clause_indices(plan)
@@ -4378,7 +4378,6 @@ where
         let sparse_optionals_vs_dense_required =
             optionals_are_sparse(must_indices.len(), optional_cost, required_cost);
         if !sparse_optionals_vs_dense_required {
-            batch_flag = true;
             batch_leaf_indices.extend(must_indices.iter().chain(should_indices.iter()).copied());
         }
     }
@@ -7937,8 +7936,6 @@ mod tests {
                 leaves
             };
             let leaf_node = |index| CompoundScorerPlan::Leaf { index, boost: 1.0 };
-            let must: Vec<usize> = (0..k).collect();
-            let optional: Vec<usize> = (k..k + 2).collect();
             let routed_plan = CompoundScorerPlan::Boolean {
                 must: (0..k).map(leaf_node).collect(),
                 should: (k..k + 2).map(leaf_node).collect(),
@@ -7956,7 +7953,7 @@ mod tests {
                 Ok,
             )
             .unwrap();
-            let tight_work = metrics
+            let _tight_work = metrics
                 .comparisons
                 .load(std::sync::atomic::Ordering::Relaxed);
             // Generic walk on the same shape (no skew guard: the plan is
@@ -8305,7 +8302,6 @@ mod tests {
 
     #[test]
     fn multi_never_emits_sub_floor_candidates_and_bounds_its_drains() {
-        use std::sync::atomic::Ordering;
         let mut docs = DocSet::default();
         for row in 0..40_u64 {
             docs.append(row, 1);
@@ -8377,7 +8373,6 @@ mod tests {
 
     #[test]
     fn multi_keeps_candidates_tying_the_floor() {
-        use std::sync::atomic::Ordering;
         let mut docs = DocSet::default();
         for row in 0..40_u64 {
             docs.append(row, 1);
@@ -8492,8 +8487,6 @@ mod tests {
         // the same non-skew 1+2 shape engages the profile with compressed
         // clauses and must be refused with Plain clauses. Asserted directly on
         // the entry counter, not inferred from work metrics.
-        use std::sync::atomic::Ordering;
-        let metrics = LocalMetricsCollector::default();
         let mut docs = DocSet::default();
         for i in 0..60_u64 {
             docs.append(i * 10, 1);
@@ -8596,7 +8589,6 @@ mod tests {
         // gate, so the profile must actually take over (asserted on the entry
         // counter) and account its own work (batch steps), independently of
         // the generic comparison counter.
-        use std::sync::atomic::Ordering;
         let k1_plan = CompoundScorerPlan::Boolean {
             must: vec![leaf_node(0)],
             should: vec![leaf_node(1)],
@@ -8917,7 +8909,7 @@ mod tests {
         let walk = |scorer: &mut dyn ComposableScorer| -> Vec<(u64, f32)> {
             let mut rows = Vec::new();
             let mut current = scorer.next().unwrap();
-            while let Some(id) = current {
+            while current.is_some() {
                 if scorer.matches().unwrap() {
                     rows.push((scorer.document_key().unwrap(), scorer.score().unwrap()));
                 }
@@ -8968,7 +8960,7 @@ mod tests {
         let walk = |scorer: &mut dyn ComposableScorer| -> Vec<(u64, f32)> {
             let mut rows = Vec::new();
             let mut current = scorer.next().unwrap();
-            while let Some(id) = current {
+            while current.is_some() {
                 if scorer.matches().unwrap() {
                     rows.push((scorer.document_key().unwrap(), scorer.score().unwrap()));
                 }
@@ -9058,7 +9050,7 @@ mod tests {
         let mut generic = routed_plan.build(&mut generic_leaves).unwrap();
         let mut collector = TopKCollector::new(1);
         let mut current = generic.next().unwrap();
-        while let Some(id) = current {
+        while current.is_some() {
             if generic.matches().unwrap() {
                 let score = generic.score().unwrap();
                 collector.insert(ScoredRow {
@@ -9120,7 +9112,7 @@ mod tests {
         let mut generic = routed_plan.build(&mut generic_leaves).unwrap();
         let mut collector = TopKCollector::new(10);
         let mut current = generic.next().unwrap();
-        while let Some(id) = current {
+        while current.is_some() {
             if generic.matches().unwrap() {
                 collector.insert(ScoredRow {
                     row_id: generic.document_key().unwrap(),

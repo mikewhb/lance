@@ -373,6 +373,9 @@ impl IuBatchState {
         }
     }
 
+    /// Test-only: the walk's terminal flag is otherwise observed through
+    /// `next_batch`'s return value.
+    #[cfg(test)]
     pub(crate) fn is_exhausted(&self) -> bool {
         self.exhausted
     }
@@ -759,7 +762,7 @@ mod batch_proto_tests {
 
     #[test]
     fn batch_first_takeover_delivers_hits_above_floor() {
-        let (mut must, mut shoulds, docs, _oracle) = fixtures();
+        let (mut must, mut shoulds, _docs, _oracle) = fixtures();
         let mut state = IuBatchState::new(1.0, vec![10.0, 10.0]);
         let out = drain_all(&mut state, &mut must, &mut shoulds, 11.0, 100);
         assert_eq!(
@@ -771,7 +774,7 @@ mod batch_proto_tests {
 
     #[test]
     fn batch_pause_resume_matches_one_shot() {
-        let (mut must, mut shoulds, docs, oracle) = fixtures();
+        let (mut must, mut shoulds, _docs, oracle) = fixtures();
         let mut state = IuBatchState::new(1.0, vec![10.0, 10.0]);
         let mut incremental = Vec::new();
         let floor = 11.0;
@@ -804,7 +807,7 @@ mod batch_proto_tests {
         // performs no union→intersection pruning and keeps scanning MUST —
         // docs hit by should0 (11.0, tying the floor) must be kept (dropping
         // them is the EXT R1 recall loss).
-        let (mut must, mut shoulds, docs, oracle) = fixtures();
+        let (mut must, mut shoulds, _docs, oracle) = fixtures();
         let mut state = IuBatchState::new(1.0, vec![10.0, 10.0]);
         let out = drain_all(&mut state, &mut must, &mut shoulds, 11.0, 100);
         assert!(state.is_exhausted(), "must exhaust after the full scan");
@@ -845,7 +848,7 @@ mod batch_proto_tests {
         // out.
         let mut must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
         let mut shoulds = vec![MockBatch::new(vec![(3, 1), (17, 1), (25, 1)], 1.0, 2)];
-        let docs = MockDocs {
+        let _docs = MockDocs {
             hidden: HashSet::new(),
         };
         let mut state = IuBatchState::new(1.0, vec![1.0]);
@@ -856,7 +859,6 @@ mod batch_proto_tests {
             "doc 25 misses MUST and is excluded by the intersection"
         );
         assert!(state.is_exhausted());
-        let _ = docs;
     }
 
     #[test]
@@ -928,7 +930,7 @@ mod batch_proto_tests {
         );
         must.hidden = (1..=199).collect();
         let mut shoulds = vec![MockBatch::new(vec![(200, 10)], 10.0, 32)];
-        let docs = MockDocs {
+        let _docs = MockDocs {
             hidden: (1..=199).collect(),
         };
         let mut state = IuBatchState::new(1.0, vec![10.0]);
@@ -1179,10 +1181,6 @@ impl IuMultiBatchState {
             candidate: 0,
             exhausted: false,
         }
-    }
-
-    pub(crate) fn is_exhausted(&self) -> bool {
-        self.exhausted
     }
 
     /// Advances one candidate (or a bounded run of candidates), delivering

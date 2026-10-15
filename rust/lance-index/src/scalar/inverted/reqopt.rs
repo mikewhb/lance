@@ -138,11 +138,11 @@ impl<'a> ReqOptScorer<'a> {
             )));
         }
         // K >= 2: the required side is a flat AND aggregate.
-        let mut requireds = self.required.block_batch_children()?;
+        let requireds = self.required.block_batch_children()?;
         if requireds.len() < 2 {
             return None;
         }
-        let mut optionals = self.optional.block_batch_children()?;
+        let optionals = self.optional.block_batch_children()?;
         let required_cost: usize = requireds.iter().map(|p| p.cost()).sum();
         let optional_cost: usize = optionals.iter().map(|p| p.cost()).sum();
         if super::optionals_are_sparse(requireds.len(), optional_cost, required_cost) {
@@ -603,7 +603,6 @@ impl ComposableScorer for ReqOptScorer<'_> {
                 exhausted,
                 current,
                 batch,
-                optional_globally_required,
                 batch_hits,
                 ..
             } = self;
