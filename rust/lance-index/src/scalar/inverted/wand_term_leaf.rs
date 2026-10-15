@@ -339,10 +339,6 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
             out.push(self.documents.document_key_for_doc_id(doc as u32));
         }
     }
-
-    fn sync_after_batch(&mut self) {
-        self.clear_current();
-    }
 }
 
 impl<D: WandDocuments + Sync> ComposableScorer for TermLeafScorer<'_, D> {

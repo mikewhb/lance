@@ -442,11 +442,6 @@ pub(super) type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
 /// - after `merge_optional_freqs` the cursor may park mid-block; resumption
 ///   reads the host state machine's pure-data breakpoint and must never use
 ///   a forward seek as recovery (that would skip the remaining chunk);
-/// - `sync_after_batch` is called by the host at batch pauses/block ends and
-///   invalidates every derived cache (TermLeafScorer = clear_current); the
-///   posting cursor itself is never moved by the host;
-/// - scoring must match the generic path in order and units (resolved via
-///   `documents.scoring_num_tokens`).
 pub(super) trait BlockBatch {
     /// Document-domain visibility probe shared by every provider of one
     /// partition (delegates to the implementor's documents context). The
@@ -522,9 +517,6 @@ pub(super) trait BlockBatch {
                 .map(|&doc| self.document_key_for_doc_id(doc as u32)),
         );
     }
-    /// Invalidates derived caches after batch stepping; resumption is the
-    /// host state machine's pure-data breakpoint's responsibility.
-    fn sync_after_batch(&mut self);
 }
 
 fn collect_confirmed_window_default<S: ComposableScorer + ?Sized>(

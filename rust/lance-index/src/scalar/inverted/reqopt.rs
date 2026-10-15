@@ -8,7 +8,7 @@
 //! also hosts the batch profile: the capability probe, the skew criterion
 //! that engages it, and the drain that drives its state machines.
 
-use super::super::wand::{IuBatchState, IuMultiBatchState};
+use super::super::wand::{run_multi_walk, run_single_walk};
 
 #[cfg(test)]
 std::thread_local! {
@@ -54,20 +54,21 @@ pub(super) struct ReqOptScorer<'a> {
     /// clause alone, so the optional clause is mandatory for the rest of the
     /// scan and the query is an intersection.
     pub(super) optional_globally_required: bool,
-    /// Batch profile state. `Some` = a batch FSM owns this scorer: pure-data
-    /// breakpoints, providers re-acquired per drain call, and the walk is
-    /// one-way until exhaustion.
-    batch: Option<IuBatchEngagement>,
 }
 
-/// Which batch engine owns the scorer. `Single` = K = 1 (one required
-/// provider, N optional probes); `Multi` = K >= 2 (seek-to-max alignment
-/// across required providers).
-enum IuBatchEngagement {
-    // The K = 1 state carries the per-block candidate tables, so it is boxed
-    // to keep the two variants within a sane size of each other.
-    Single(Box<IuBatchState>),
-    Multi(IuMultiBatchState),
+/// Which walk owns an eligible shape. `Single` = K = 1 (one required provider,
+/// N optional probes); `Multi` = K >= 2 (seek-to-max alignment across the
+/// required providers). Carries only the bounds the walk needs — the walk's own
+/// state lives inside its call.
+enum BatchShape {
+    Single {
+        must_ub: f32,
+        should_ubs: Vec<f32>,
+    },
+    Multi {
+        required_ubs: Vec<f32>,
+        optional_ubs: Vec<f32>,
+    },
 }
 
 impl<'a> ReqOptScorer<'a> {
@@ -88,7 +89,6 @@ impl<'a> ReqOptScorer<'a> {
             min_competitive_score: f32::NEG_INFINITY,
             shallow_bounds: None,
             optional_globally_required: false,
-            batch: None,
         }
     }
 
@@ -99,7 +99,7 @@ impl<'a> ReqOptScorer<'a> {
     /// Union promotion (`optional_globally_required`) outranks the batch: a
     /// latched shape is already an intersection driven from the sparse side,
     /// which is what the skew criterion preserves.
-    fn batch_engagement(&mut self) -> Option<IuBatchEngagement> {
+    fn batch_shape(&mut self) -> Option<BatchShape> {
         // Env gate: LANCE_FTS_IU_TIGHT=off must disable the batch profile
         // entirely. Capability alone is not authorization.
         if !iu_tight_enabled() {
@@ -123,9 +123,10 @@ impl<'a> ReqOptScorer<'a> {
                 .iter()
                 .map(|provider| provider.global_upper_bound())
                 .collect();
-            return Some(IuBatchEngagement::Single(Box::new(IuBatchState::new(
-                must_ub, should_ubs,
-            ))));
+            return Some(BatchShape::Single {
+                must_ub,
+                should_ubs,
+            });
         }
         // K >= 2: the required side is a flat AND aggregate.
         let requireds = self.required.block_batch_children()?;
@@ -140,10 +141,10 @@ impl<'a> ReqOptScorer<'a> {
         }
         let required_ubs: Vec<f32> = requireds.iter().map(|p| p.global_upper_bound()).collect();
         let optional_ubs: Vec<f32> = optionals.iter().map(|p| p.global_upper_bound()).collect();
-        Some(IuBatchEngagement::Multi(IuMultiBatchState::new(
-            &required_ubs,
-            &optional_ubs,
-        )))
+        Some(BatchShape::Multi {
+            required_ubs,
+            optional_ubs,
+        })
     }
 
     fn set_current(&mut self, current: Option<u64>) {
@@ -575,55 +576,64 @@ impl ComposableScorer for ReqOptScorer<'_> {
         if self.exhausted {
             return Ok(true);
         }
-        if self.batch.is_none()
-            && floor.get() > 0.0
-            && !self.optional_globally_required
-            && let Some(state) = self.batch_engagement()
-        {
-            #[cfg(test)]
-            BATCH_ENGAGEMENTS.with(|count| count.set(count.get() + 1));
-            self.batch = Some(state);
-        }
-        if self.batch.is_none() {
-            // Not a shape the batch owns: the caller keeps driving.
+        if floor.get() <= 0.0 || self.optional_globally_required {
+            // The collector keeps the per-document branch for a non-positive
+            // floor, and a latched union promotion already rides the sparse
+            // side: both decline here.
             return Ok(false);
         }
+        let Some(shape) = self.batch_shape() else {
+            // Not a shape a walk owns: the caller keeps driving.
+            return Ok(false);
+        };
+        #[cfg(test)]
+        BATCH_ENGAGEMENTS.with(|count| count.set(count.get() + 1));
         let Self {
             required,
             optional,
             exhausted,
             current,
-            batch,
             ..
         } = self;
-        let exhausted_now = match batch.as_mut() {
-            Some(IuBatchEngagement::Single(state)) => {
+        let exhausted_now = match shape {
+            BatchShape::Single {
+                must_ub,
+                should_ubs,
+            } => {
                 let Some(required_batch) = required.block_batch() else {
-                    return Err(Error::internal(
-                        "IU batch profile lost its required block provider",
-                    ));
+                    return Err(Error::internal("IU walk lost its required block provider"));
                 };
                 let Some(mut optional_batch) = optional.block_batch_children() else {
-                    return Err(Error::internal(
-                        "IU batch profile lost its optional block providers",
-                    ));
+                    return Err(Error::internal("IU walk lost its optional block providers"));
                 };
-                state.next_batch(required_batch, optional_batch.as_mut_slice(), floor, emit)?
+                run_single_walk(
+                    must_ub,
+                    &should_ubs,
+                    required_batch,
+                    optional_batch.as_mut_slice(),
+                    floor,
+                    emit,
+                )?
             }
-            Some(IuBatchEngagement::Multi(state)) => {
+            BatchShape::Multi {
+                required_ubs,
+                optional_ubs,
+            } => {
                 let Some(mut requireds) = required.block_batch_children() else {
-                    return Err(Error::internal(
-                        "IU batch profile lost its required block providers",
-                    ));
+                    return Err(Error::internal("IU walk lost its required block providers"));
                 };
                 let Some(mut optionals) = optional.block_batch_children() else {
-                    return Err(Error::internal(
-                        "IU batch profile lost its optional block providers",
-                    ));
+                    return Err(Error::internal("IU walk lost its optional block providers"));
                 };
-                state.next_batch(&mut requireds, &mut optionals, floor, emit)?
+                run_multi_walk(
+                    &required_ubs,
+                    &optional_ubs,
+                    &mut requireds,
+                    &mut optionals,
+                    floor,
+                    emit,
+                )?
             }
-            None => return Err(Error::internal("IU batch profile vanished while engaged")),
         };
         if exhausted_now {
             *exhausted = true;
