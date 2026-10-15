@@ -89,7 +89,7 @@ pub const IU_TIGHT_LEAD_COST_RATIO: usize = 3;
 /// scan of a sub-floor tail would ignore a floor that rose elsewhere. One
 /// block's worth of candidates matches the granularity the K = 1 walk already
 /// has through its block takes.
-pub(crate) const MULTI_CANDIDATE_BUDGET: usize = 128;
+pub const MULTI_CANDIDATE_BUDGET: usize = 128;
 
 pub fn iu_tight_lead_is_cheaper(must_cost: usize, lead_cost: usize) -> bool {
     lead_cost.saturating_mul(IU_TIGHT_LEAD_COST_RATIO) < must_cost
@@ -310,7 +310,7 @@ impl PromotedWalk {
     }
 }
 
-pub(crate) struct IuBatchState {
+pub struct IuBatchState {
     must_ub: f32,
     should_ubs: Vec<f32>,
     /// SHOULD cursor exhaustion flags (irreversible; once set, the cursor's
@@ -819,7 +819,7 @@ mod batch_proto_tests {
         let hidden: HashSet<u32> = HashSet::from([3, 17]);
         let mut must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
         must.hidden = hidden.clone();
-        let mut shoulds = vec![MockBatch::new(vec![(3, 10), (17, 10)], 10.0, 4)];
+        let mut shoulds = [MockBatch::new(vec![(3, 10), (17, 10)], 10.0, 4)];
         shoulds[0].hidden = hidden;
         let mut state = IuBatchState::new(1.0, vec![10.0]);
         let mut providers: Vec<&mut dyn BlockBatch> =
@@ -924,7 +924,7 @@ mod batch_proto_tests {
             32,
         );
         must.hidden = (1..=199).collect();
-        let mut shoulds = vec![MockBatch::new(vec![(200, 10)], 10.0, 32)];
+        let mut shoulds = [MockBatch::new(vec![(200, 10)], 10.0, 32)];
         let _docs = MockDocs {
             hidden: (1..=199).collect(),
         };
@@ -945,7 +945,7 @@ mod batch_proto_tests {
         // (= floor, emitted); MUST-first rounds the 2^24 + 1 intermediate to
         // 2^24, so the score stays below the floor and the hit is lost.
         let mut must = MockBatch::new(vec![(1, 16_777_216)], 16_777_216.0, 4);
-        let mut shoulds = vec![
+        let mut shoulds = [
             MockBatch::new(vec![(1, 1)], 1.0, 4),
             MockBatch::new(vec![(1, 1)], 1.0, 4),
         ];
@@ -1025,7 +1025,7 @@ mod batch_proto_tests {
         // freshness yield lets the walk terminate at the next call. Without it
         // the first call scans all 60 blocks.
         let mut must = MockBatch::new((1..=240).map(|d| (d, 1)).collect(), 10.0, 4);
-        let mut shoulds = vec![
+        let mut shoulds = [
             MockBatch::new(vec![(3, 10)], 10.0, 4),
             MockBatch::new(vec![(3, 10)], 10.0, 4),
         ];
@@ -1068,7 +1068,7 @@ mod batch_proto_tests {
         // it never contributes and never runs dry: the frozen floor cannot
         // prove the tail dead, while the externally raised floor can. Every
         // required candidate therefore scores 2.0, below the 2.5 floor.
-        let mut optionals = vec![MockBatch::new(vec![(10_000, 1)], 1.0, 4)];
+        let mut optionals = [MockBatch::new(vec![(10_000, 1)], 1.0, 4)];
         // Loose required bound (4.0 >= the real 2.0): the frozen 2.5 floor
         // can neither prove the tail dead nor trigger the N == 1 promotion.
         let mut state = IuMultiBatchState::new(&[2.0, 2.0], &[1.0]);
@@ -1100,7 +1100,7 @@ mod batch_proto_tests {
         let top = u32::MAX as u64;
         let mut must0 = MockBatch::new(vec![(top - 5, 1), (top, 1)], 1.0, 4);
         let mut must1 = MockBatch::new(vec![(top - 5, 1), (top, 1)], 1.0, 4);
-        let mut optionals = vec![MockBatch::new(vec![(top - 5, 4)], 4.0, 4)];
+        let mut optionals = [MockBatch::new(vec![(top - 5, 4)], 4.0, 4)];
         let mut state = super::IuMultiBatchState::new(&[1.0, 1.0], &[4.0]);
         let mut out = Vec::new();
         // The multi FSM yields on every produced hit (floor freshness), so
@@ -1141,7 +1141,7 @@ mod batch_proto_tests {
 // N == 1 promotion (the optional joins the required set — appended last so
 // the accumulation order is unchanged), and the live-budget termination.
 // Pure-data breakpoints; providers are re-acquired per drain call.
-pub(crate) struct IuMultiBatchState {
+pub struct IuMultiBatchState {
     /// Per required provider: does its cursor sit on the aligned candidate?
     aligned: Vec<bool>,
     /// Per required provider: the frequency at the aligned candidate.

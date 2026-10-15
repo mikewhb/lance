@@ -4273,10 +4273,8 @@ fn leaf_admission_set(plan: &CompoundScorerPlan, leaf_count: usize) -> Vec<bool>
                 }
             }
         }
-        CompoundScorerPlan::Leaf { index, .. } => {
-            if *index < leaf_count {
-                admits[*index] = true;
-            }
+        CompoundScorerPlan::Leaf { index, .. } if *index < leaf_count => {
+            admits[*index] = true;
         }
         _ => {}
     }
@@ -9232,11 +9230,11 @@ mod tests {
                 loaded_leaf(vec![compressed_unit_posting("a", (0..n).collect())], None),
                 loaded_leaf(vec![compressed_unit_posting(
                     "b",
-                    (0..n as u32).step_by(3).collect(),
+                    (0..n).step_by(3).collect(),
                 )], None),
                 loaded_leaf(vec![compressed_unit_posting(
                     "c",
-                    (0..n as u32).step_by(7).collect(),
+                    (0..n).step_by(7).collect(),
                 )], None),
             ]
         };

@@ -74,7 +74,9 @@ pub(super) struct ReqOptScorer<'a> {
 /// provider, N optional probes); `Multi` = K >= 2 (seek-to-max alignment
 /// across required providers).
 enum IuBatchEngagement {
-    Single(IuBatchState),
+    // The K = 1 state carries the per-block candidate tables, so it is boxed
+    // to keep the two variants within a sane size of each other.
+    Single(Box<IuBatchState>),
     Multi(IuMultiBatchState),
 }
 
@@ -132,9 +134,9 @@ impl<'a> ReqOptScorer<'a> {
                 .iter()
                 .map(|provider| provider.global_upper_bound())
                 .collect();
-            return Some(IuBatchEngagement::Single(IuBatchState::new(
+            return Some(IuBatchEngagement::Single(Box::new(IuBatchState::new(
                 must_ub, should_ubs,
-            )));
+            ))));
         }
         // K >= 2: the required side is a flat AND aggregate.
         let requireds = self.required.block_batch_children()?;
