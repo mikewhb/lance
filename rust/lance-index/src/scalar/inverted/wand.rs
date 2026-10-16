@@ -8287,6 +8287,16 @@ mod tests {
             mode_from_env_value("LANCE_FTS_TEST", Err(std::env::VarError::NotPresent)),
             BulkAndMode::Auto
         );
+        assert_eq!(
+            mode_from_env_value(
+                "LANCE_FTS_TEST",
+                Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                    "x"
+                )))
+            ),
+            BulkAndMode::Auto,
+            "a non-Unicode value falls back rather than panicking"
+        );
     }
 
     #[rstest]

@@ -444,8 +444,9 @@ pub(super) type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
 ///   seek as recovery (that would skip the remaining part of the block);
 /// - the capability entry (`ComposableScorer::block_batch` /
 ///   `block_batch_children`) is a **pure probe**: it must not mutate the
-///   posting or the documents. The engagement gate latches its first answer for
-///   the partition, so a probe with side effects would run at most once.
+///   posting or the documents. The engagement gate latches a *declined* answer
+///   for the partition (an engaged shape re-probes every window), so a probe
+///   with side effects would run an inconsistent number of times.
 pub(super) trait BlockBatch {
     /// Document-domain visibility probe shared by every provider of one
     /// partition (delegates to the implementor's documents context). The
@@ -8406,18 +8407,19 @@ mod tests {
         // for the same leaf. Pin both domains so a future consumer cannot mix
         // them silently.
         //
-        // m16 asked for a behavioural anchor (routing follows the raw domain and
-        // contradicts the truncated one). It is not constructible end-to-end:
-        // the router (`collect_partition_with_documents`) and the ReqOpt
-        // engagement gate (`ReqOptScorer::probe_batch_shape`) apply the *same*
-        // `optionals_are_sparse` criterion to the *same* raw costs, so a swap at
-        // either single point is masked by the other — a router that engaged on
-        // the truncated domain is still declined by the raw-domain gate, and a
-        // gate that engaged on the truncated domain is never reached because the
-        // raw-domain router already declined. Pinning the gate's cost source
-        // would instead need a gate-level unit test over a stub leaf whose raw
-        // (`BlockBatch::cost`) and truncated (`ComposableScorer::cost`) costs
-        // differ; that is a separate change from this value pin.
+        // m16 asked for a behavioural *results* anchor: routing follows the raw
+        // domain and contradicts the truncated one. It is not constructible:
+        // both engines return identical results, and the router and the
+        // engagement gate apply the same `optionals_are_sparse` criterion to the
+        // same raw costs, so at K>=2 a single-point domain swap is masked by the
+        // other (the router's `batch_leaf_indices` is the sole boxing path
+        // there). At K=1 `leaf_admission_set` admits the MUST/SHOULD leaves
+        // unconditionally, so the router's skew verdict is a no-op and the gate
+        // is the sole decider — a gate-side swap would change engagement
+        // (observable in `batch_steps`, not in results). Pinning that would need
+        // a gate-level unit test over a stub leaf whose raw (`BlockBatch::cost`)
+        // and truncated (`ComposableScorer::cost`) costs differ; that is a
+        // separate change from this value pin.
         let metrics = NoOpMetricsCollector;
         let mut dense = DocSet::default();
         for row in 0..64_u64 {

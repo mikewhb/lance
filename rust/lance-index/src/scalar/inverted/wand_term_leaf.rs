@@ -284,6 +284,15 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
     }
 
     fn seek_eq(&mut self, doc: u64) -> Option<u32> {
+        // Deliberately does NOT `clear_current()`, although it moves the posting
+        // cursor (`take`/`merge`/`fold`/`position_geq` all do). This runs once
+        // per required provider per candidate in the multi walk, and clearing
+        // would add five field writes to that hot path. The `current_doc` /
+        // `current_score` / `shallow` it leaves stale have no consumer on any
+        // path that calls `seek_eq`: the walk reads only `current_doc_id` (which
+        // delegates straight to the posting) and the returned frequency, and
+        // re-seeks per candidate. If `seek_eq` ever gains a caller that reads
+        // the current cache, clear it here like the other cursor-moving methods.
         self.batch_steps.set(self.batch_steps.get() + 1);
         if self.posting.doc().is_some_and(|info| info.doc_id() < doc) {
             self.posting.next(doc);
