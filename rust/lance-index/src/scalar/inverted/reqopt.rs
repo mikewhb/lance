@@ -54,6 +54,11 @@ pub(super) struct ReqOptScorer<'a> {
     /// clause alone, so the optional clause is mandatory for the rest of the
     /// scan and the query is an intersection.
     pub(super) optional_globally_required: bool,
+    /// Latch for a declined shape probe. The probe reads only static posting
+    /// costs, so a shape that declines (not IU, or skew) declines for the life
+    /// of this partition; remembering it stops the collector re-probing — and
+    /// re-allocating the child provider `Vec`s — on every window.
+    batch_shape_declined: bool,
 }
 
 /// Which walk owns an eligible shape. `Single` = K = 1 (one required provider,
@@ -89,6 +94,7 @@ impl<'a> ReqOptScorer<'a> {
             min_competitive_score: f32::NEG_INFINITY,
             shallow_bounds: None,
             optional_globally_required: false,
+            batch_shape_declined: false,
         }
     }
 
@@ -99,7 +105,22 @@ impl<'a> ReqOptScorer<'a> {
     /// Union promotion (`optional_globally_required`) outranks the batch: a
     /// latched shape is already an intersection driven from the sparse side,
     /// which is what the skew criterion preserves.
+    ///
+    /// The probe allocates the child provider `Vec`s, so its outcome is latched:
+    /// a declined shape never re-probes.
     fn batch_shape(&mut self) -> Option<BatchShape> {
+        if self.batch_shape_declined {
+            return None;
+        }
+        let shape = self.probe_batch_shape();
+        if shape.is_none() {
+            self.batch_shape_declined = true;
+        }
+        shape
+    }
+
+    /// Single-shot shape probe behind [`ReqOptScorer::batch_shape`].
+    fn probe_batch_shape(&mut self) -> Option<BatchShape> {
         // Env gate: LANCE_FTS_IU_TIGHT=off must disable the batch profile
         // entirely. Capability alone is not authorization.
         if !iu_tight_enabled() {

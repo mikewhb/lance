@@ -343,16 +343,21 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
 
 impl<D: WandDocuments + Sync> ComposableScorer for TermLeafScorer<'_, D> {
     fn block_batch(&mut self) -> Option<&mut dyn BlockBatch> {
-        // The capability contract above is a *compressed* single-posting leaf:
-        // batch steps address candidates as dense u32 doc-ids and resolve them
-        // through `document_key_for_doc_id` / `scoring_num_tokens`. Plain
-        // postings store row-ids in the legacy domain (a `DocInfo::Raw`
-        // doc-id is a row-id there), so handing one to an IU walk feeds
-        // row-ids into dense-index lookups — a wrong mapping or an
-        // out-of-bounds panic. Refuse here: this is the single capability
+        // The capability contract above is a *compressed, ungrouped*
+        // single-posting leaf: batch steps address candidates as dense u32
+        // doc-ids and resolve them through `document_key_for_doc_id` /
+        // `scoring_num_tokens`. Plain postings store row-ids in the legacy
+        // domain (a `DocInfo::Raw` doc-id is a row-id there), so handing one to
+        // an IU walk feeds row-ids into dense-index lookups — a wrong mapping
+        // or an out-of-bounds panic. Refuse here: this is the single capability
         // entry every batch consumer probes; the generic per-document walk
         // keeps using this leaf.
-        if self.posting.is_compressed() {
+        //
+        // The grouped check is unreachable through `box_leaf_scorer` today
+        // (`is_compound_term_leaf` already refuses grouped terms), but the
+        // entry states its own contract instead of relying on the construction
+        // site to keep it true.
+        if self.posting.is_compressed() && !self.posting.has_grouped_terms() {
             Some(self)
         } else {
             None

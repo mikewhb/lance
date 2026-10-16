@@ -699,33 +699,20 @@ mod batch_proto_tests {
 
     #[test]
     fn batch_promoted_walk_drives_the_cheaper_sparse_lead() {
-        // Promoted sub-mode: once MUST-only (1.0) cannot reach floor
-        // (1.5) and the sparse SHOULD is individually necessary, the walk
-        // drives the lead (cost 3 < MUST 20) and seeks MUST per candidate.
-        // MUST-only docs never clear the floor, so only the lead hits come
-        // out.
+        // Promoted sub-mode: once MUST-only (1.0) cannot reach floor (1.5) and
+        // the sparse SHOULD is individually necessary, the walk drives the lead
+        // (cost 3 < MUST 20) and seeks MUST per candidate. MUST-only docs never
+        // clear the floor, so only the lead hits come out. One call owns the
+        // loop and delivers every hit its lead walk produces (`run_all` asserts
+        // the drive runs to exhaustion); the promoted decision is terminal.
         let mut must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
         let mut shoulds = vec![MockBatch::new(vec![(3, 1), (17, 1), (25, 1)], 1.0, 2)];
-        let _docs = MockDocs {
-            hidden: HashSet::new(),
-        };
         let out = run_all(1.0, &vec![1.0], &mut must, &mut shoulds, 1.5);
         assert_eq!(
             out,
             vec![(3, 2.0), (17, 2.0)],
             "doc 25 misses MUST and is excluded by the intersection"
         );
-    }
-
-    #[test]
-    fn batch_promoted_walk_delivers_in_one_call() {
-        // The promoted sub-mode owns the loop too: one call delivers every hit
-        // its lead walk produces, and the promoted decision is terminal.
-        let mut must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
-        let mut shoulds = vec![MockBatch::new(vec![(3, 1), (17, 1), (25, 1)], 1.0, 2)];
-        let (exhausted, out) = run_once(1.0, &vec![1.0], &mut must, &mut shoulds, 1.5);
-        assert!(exhausted);
-        assert_eq!(out, vec![(3, 2.0), (17, 2.0)]);
     }
 
     #[test]
@@ -1175,15 +1162,12 @@ pub fn run_multi_walk<'s>(
             aligned.iter_mut().for_each(|aligned| *aligned = false);
             continue;
         };
-        // Only candidates that reach this call's floor enter the window
-        // the floor check below reads. Sub-floor candidates are pushed by
-        // neither: the driver re-checks every window entry against its
-        // live floor and would discard them anyway, so emitting them only
-        // bought a host round trip — provider re-acquisition, syncs and a
-        // window copy — per candidate. Dropping them cannot lose a result
-        // because the competitive floor only rises, so the driver's live
-        // floor is never below this call's snapshot. Equality is kept: a
-        // candidate tying the floor can still win the row-id tie-break.
+        // Only candidates that reach the live floor are emitted. Sub-floor
+        // candidates are dropped right here rather than handed on: the floor
+        // only rises, so a dropped candidate could never have competed, and
+        // passing it on would only buy a heap insert the collector rejects (the
+        // emit sink re-checks the same shared value anyway). Equality is kept —
+        // a candidate tying the floor can still win the row-id tie-break.
         let score = required_sum + optional_sum;
         if score >= current_floor && !emit(key, score)? {
             // The collector can take no more (heap overflow). This run is

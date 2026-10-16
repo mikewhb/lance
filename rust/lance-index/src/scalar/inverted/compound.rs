@@ -2561,6 +2561,12 @@ impl<K: Copy + Ord> TopKCollector<K> {
                 let floor = Arc::clone(&self.competitive_score);
                 let mut overflow = false;
                 let mut emit = |document_key: u64, score: f32| -> Result<bool> {
+                    // The walk only emits at or above the floor it last read, and
+                    // this is the second half of that contract: the floor can rise
+                    // between the walk's read and this call, so re-checking here is
+                    // what makes "a sub-floor candidate never enters the heap" true
+                    // rather than merely probable. (The window path below re-checks
+                    // for the same reason.)
                     if score >= floor.get() {
                         let status = self.insert(ScoredRow {
                             row_id: map_document(document_key)?,
@@ -4479,15 +4485,25 @@ where
 /// whole intersection loses to the generic path's block-max window skipping,
 /// so those shapes stay on the generic tree.
 ///
-/// Single source for the predicate: the shape router below, the drain-time
-/// engagement gate in `ReqOptScorer::batch_shape` and the unit tests all
-/// call this instead of re-deriving the inequality. The expression is kept
-/// verbatim (`k` multiplies with a plain `*`; only the `* 8` saturates) so the
-/// arithmetic and overflow behaviour do not drift.
+/// Single source for the predicate: the shape router below, the engagement
+/// gate in `ReqOptScorer::batch_shape` and the unit tests all call this
+/// instead of re-deriving the inequality. The expression is kept verbatim
+/// (`k` multiplies with a plain `*`; only the margin step saturates) so the
+/// arithmetic and overflow behaviour do not drift; `k * df * margin` stays far
+/// inside `usize` for any plan the router admits, since a cost is a posting
+/// count.
 #[inline]
 fn optionals_are_sparse(k_required: usize, optional_cost: usize, required_cost: usize) -> bool {
-    k_required * optional_cost.saturating_mul(8) < required_cost
+    k_required * optional_cost.saturating_mul(OPTIONAL_COST_MARGIN) < required_cost
 }
+
+/// The margin the skew criterion applies to the optional side.
+///
+/// This is a **heuristic multiple, not a measured constant** — the repository
+/// carries no provenance for the value, so changing it needs a fresh A/B on the
+/// shapes that route through the skew gate rather than a local judgement call.
+/// `optionals_are_sparse` is the single reader.
+const OPTIONAL_COST_MARGIN: usize = 8;
 
 /// IU clause indices for K >= 1 required clauses plus N >= 1 optional
 /// clauses, all identity-boost single-leaf children of one flat Boolean plan
@@ -8385,6 +8401,20 @@ mod tests {
         // criterion; `ComposableScorer::cost` is the visibility-truncated value
         // for the same leaf. Pin both domains so a future consumer cannot mix
         // them silently.
+        //
+        // m16 asked for a behavioural anchor (routing follows the raw domain and
+        // contradicts the truncated one). It is not constructible as specified:
+        // the router (`collect_partition_with_documents`) and the ReqOpt
+        // engagement gate (`ReqOptScorer::probe_batch_shape`) apply the *same*
+        // `optionals_are_sparse` criterion to the *same* raw costs, so a swap at
+        // either point is masked by the other (a router that engaged on the
+        // truncated domain still gets declined by the raw-domain gate, and a
+        // gate that then engaged on the truncated domain is never reached
+        // because the raw-domain router already declined). And the truncated
+        // domain is uniform per partition (`visible_cost_upper_bound` is a
+        // single value), so `8 * vc < vc` is never true and the truncated
+        // decision can never be "sparse". The value domains are therefore pinned
+        // directly, and a domain swap would have to change these values first.
         let metrics = NoOpMetricsCollector;
         let mut dense = DocSet::default();
         for row in 0..64_u64 {
@@ -8429,7 +8459,7 @@ mod tests {
     fn both_tie_modes_keep_equalities_and_break_by_row_id() {
         // Inclusive floor contract: when the k-th score is tied, row id decides.
         // Both tie modes must agree here - the IU walk keeps candidates tying
-        // the floor for the same reason (`multi_keeps_candidates_tying_the_floor`).
+        // the floor for the same reason (`multi_respects_the_inclusive_floor`).
         let modes: Vec<TieHandling> = vec![
             TieHandling::ResolveByKey,
             TieHandling::RetainScoreFloor { max_buffered: 8 },
@@ -8452,7 +8482,11 @@ mod tests {
     }
 
     #[test]
-    fn multi_never_emits_sub_floor_candidates() {
+    fn multi_respects_the_inclusive_floor() {
+        // Two edges of the inclusive floor share one fixture: a floor above the
+        // required-only score leaves a sub-floor tail that must not be emitted,
+        // and a floor equal to that score keeps the required-only documents that
+        // tie it. (The stale `..._and_bounds_its_drains` name went with the drain.)
         let mut docs = DocSet::default();
         for row in 0..40_u64 {
             docs.append(row, 1);
@@ -8548,64 +8582,10 @@ mod tests {
         // round trip" is structural rather than a drain count: the walk filters
         // on the live floor before it ever calls `emit`, and it never returns
         // control mid-walk.
-    }
 
-    #[test]
-    fn multi_keeps_candidates_tying_the_floor() {
-        let mut docs = DocSet::default();
-        for row in 0..40_u64 {
-            docs.append(row, 1);
-        }
-        let required_ids: Vec<u32> = (0..40).collect();
-        let optional_ids: Vec<u32> = (0..8).collect();
-        let plan = CompoundScorerPlan::Boolean {
-            must: vec![
-                CompoundScorerPlan::Leaf {
-                    index: 0,
-                    boost: 1.0,
-                },
-                CompoundScorerPlan::Leaf {
-                    index: 1,
-                    boost: 1.0,
-                },
-            ],
-            should: vec![
-                CompoundScorerPlan::Leaf {
-                    index: 2,
-                    boost: 1.0,
-                },
-                CompoundScorerPlan::Leaf {
-                    index: 3,
-                    boost: 1.0,
-                },
-            ],
-            must_not: Vec::new(),
-        };
-        let make_leaves = || {
-            vec![
-                loaded_leaf(
-                    vec![compressed_loose_ub_posting("m0", required_ids.clone(), 5.0)],
-                    None,
-                ),
-                loaded_leaf(
-                    vec![compressed_loose_ub_posting("m1", required_ids.clone(), 5.0)],
-                    None,
-                ),
-                loaded_leaf(
-                    vec![compressed_unit_posting("s0", optional_ids.clone())],
-                    None,
-                ),
-                loaded_leaf(
-                    vec![compressed_unit_posting("s1", optional_ids.clone())],
-                    None,
-                ),
-            ]
-        };
-
-        // Every required-only document shares one score; setting the floor to
-        // exactly that score makes them all tie the floor, so an exclusive
-        // comparison in the walk would silently drop them.
-        let oracle = multi_fixture_oracle(&docs, &required_ids, &optional_ids);
+        // Same fixture, floor exactly at the required-only score: every
+        // required-only document ties the floor and must be kept (an exclusive
+        // comparison in the walk would silently drop them).
         let required_only = oracle
             .iter()
             .filter(|(doc, _)| !optional_ids.contains(&(*doc as u32)))
@@ -8626,7 +8606,6 @@ mod tests {
             tying > 1,
             "the fixture must contain several candidates exactly at the floor"
         );
-
         let metrics = LocalMetricsCollector::default();
         let score = Arc::new(CompetitiveScore::default());
         score.raise(required_only);
