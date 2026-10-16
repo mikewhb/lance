@@ -429,24 +429,24 @@ pub(super) type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
 
 // ===== Block-batch supply capability =====
 
-/// Block-batch supply capability: the implementor holds a **single compressed
-/// posting** plus its scoring context, and exposes the posting's block-level
-/// moves (`take_docs_one_block_upto` / `merge_optional_freqs`) to the batch
-/// state machines.
+/// Block-batch supply capability: the implementor holds a **single compressed,
+/// ungrouped posting** plus its scoring context, and exposes the posting's
+/// block-level moves (`take_docs_one_block_upto` / `merge_optional_freqs`) to
+/// the IU walks.
 ///
 /// Implementation contract:
 /// - `take_docs_one_block_upto` copies one posting block after the cursor
 ///   (or up to `upto`) in ascending doc order, parking the cursor at the
 ///   block end; visibility is decided per candidate by the **host** (the
 ///   provider carries no visibility logic);
-/// - after `merge_optional_freqs` the cursor may park mid-block; resumption
-///   reads the host state machine's pure-data breakpoint and must never use
-///   a forward seek as recovery (that would skip the remaining chunk);
+/// - after `merge_optional_freqs` the cursor may park mid-block: the next call
+///   continues from the cursor itself, so a caller must never use a forward
+///   seek as recovery (that would skip the remaining part of the block);
 pub(super) trait BlockBatch {
     /// Document-domain visibility probe shared by every provider of one
     /// partition (delegates to the implementor's documents context). The
-    /// batch state machine calls this per candidate — providers carry the
-    /// erased documents context so the machine stays free of generics.
+    /// walk calls this per candidate — providers carry the erased documents
+    /// context so the walk stays free of generics.
     fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64>;
     /// Copies one posting block after the cursor (or up to `upto`), parking
     /// the cursor at the block end.
@@ -493,7 +493,7 @@ pub(super) trait BlockBatch {
     fn term_score(&self, doc: u64, freq: u32) -> f32;
     /// Batch form of [`BlockBatch::term_score`]: `out[i]` is the score of
     /// (`docs[i]`, `freqs[i]`); frequency-0 entries are written as 0.0 (the
-    /// same skip rule as the state machine's per-document loop). The default
+    /// same skip rule as the per-document scorer loop). The default
     /// delegates per entry; providers override to hoist scorer state out of
     /// the loop — one dispatch per block instead of per candidate, with
     /// bit-identical arithmetic.
@@ -4480,7 +4480,7 @@ where
 /// so those shapes stay on the generic tree.
 ///
 /// Single source for the predicate: the shape router below, the drain-time
-/// engagement gate in `ReqOptScorer::batch_engagement` and the unit tests all
+/// engagement gate in `ReqOptScorer::batch_shape` and the unit tests all
 /// call this instead of re-deriving the inequality. The expression is kept
 /// verbatim (`k` multiplies with a plain `*`; only the `* 8` saturates) so the
 /// arithmetic and overflow behaviour do not drift.
@@ -8064,7 +8064,7 @@ mod tests {
         // The counter only discriminates when the batch path is reachable at
         // all, which needs a positive competitive floor: with a non-positive
         // floor `collect_mapped` stays on the per-document branch and never
-        // probes `batch_engagement`, so a zero there would be vacuous.
+        // probes `batch_shape`, so a zero there would be vacuous.
         let n = 65_536_u64;
         let mut docs = DocSet::default();
         for id in 0..n {
@@ -8174,6 +8174,45 @@ mod tests {
             iu_tight_clauses_ready(&leaves, &must_indices, &should_indices),
             "a close-cost 1+1 shape must still reach the batch profile"
         );
+    }
+
+    #[test]
+    fn iu_tight_clauses_ready_rejects_bad_indices_and_shapes() {
+        // The admission gate is the single entry the IU walks rely on, so each
+        // of its rejection arms needs to be reachable in a test: an index
+        // outside the leaf array, and the shapes `is_compound_term_leaf`
+        // refuses (more than one posting, a phrase leaf). The non-compressed
+        // postings arm is covered by the plain-posting case elsewhere.
+        let single = || {
+            vec![loaded_leaf(
+                vec![compressed_unit_posting("a", (0..64).collect())],
+                None,
+            )]
+        };
+        // Positive control: without it a rejection assertion could pass simply
+        // because the fixture never matched in the first place.
+        assert!(iu_tight_clauses_ready(&single(), &[0], &[0]));
+
+        // (a) index outside the array, on either side.
+        assert!(!iu_tight_clauses_ready(&single(), &[1], &[0]));
+        assert!(!iu_tight_clauses_ready(&single(), &[0], &[1]));
+
+        // (b) more than one posting in the leaf.
+        let two_postings = vec![loaded_leaf(
+            vec![
+                compressed_unit_posting("a", (0..64).collect()),
+                compressed_unit_posting("b", (0..64).collect()),
+            ],
+            None,
+        )];
+        assert!(!iu_tight_clauses_ready(&two_postings, &[0], &[0]));
+
+        // (c) a phrase leaf carries positions this walk never confirms.
+        let phrase = vec![loaded_leaf(
+            vec![compressed_unit_posting("a", (0..64).collect())],
+            Some(1),
+        )];
+        assert!(!iu_tight_clauses_ready(&phrase, &[0], &[0]));
     }
 
     /// Scores every document of the K=2/N=2 fixture through the batch
@@ -8389,7 +8428,7 @@ mod tests {
     #[test]
     fn both_tie_modes_keep_equalities_and_break_by_row_id() {
         // Inclusive floor contract: when the k-th score is tied, row id decides.
-        // Both tie modes must agree here - the batch FSM keeps candidates tying
+        // Both tie modes must agree here - the IU walk keeps candidates tying
         // the floor for the same reason (`multi_keeps_candidates_tying_the_floor`).
         let modes: Vec<TieHandling> = vec![
             TieHandling::ResolveByKey,
@@ -8413,7 +8452,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_never_emits_sub_floor_candidates_and_bounds_its_drains() {
+    fn multi_never_emits_sub_floor_candidates() {
         let mut docs = DocSet::default();
         for row in 0..40_u64 {
             docs.append(row, 1);
@@ -8672,7 +8711,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_engagement_requires_the_compressed_domain() {
+    fn batch_shape_requires_the_compressed_domain() {
         // F1 guard with a positive floor (the batch only engages above zero):
         // the same non-skew 1+2 shape engages the profile with compressed
         // clauses and must be refused with Plain clauses. Asserted directly on
@@ -9259,7 +9298,6 @@ mod tests {
             generic.push(Some(box_leaf_scorer(leaf, &docs, &generic_metrics, false)));
         }
         let mut generic_scorer = plan.build(&mut generic).unwrap();
-        let _ = (&mut flagged_scorer, &mut generic_scorer);
         let walk = |scorer: &mut dyn ComposableScorer| -> Vec<(u64, f32)> {
             let mut rows = Vec::new();
             let mut current = scorer.next().unwrap();

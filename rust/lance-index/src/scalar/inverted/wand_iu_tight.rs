@@ -5,7 +5,7 @@
 //! clauses plus N optional ones (named after the Search Benchmark Game's
 //! query of that shape).
 //!
-//! The IU batch profile: a pure-data state machine that drives flat
+//! The IU batch profile: two walks that drive flat
 //! MUST/SHOULD shapes from the scorer tree's `BlockBatch` providers.
 //!
 //! [`run_single_walk`] owns the K = 1 walk (plus the promoted sub-mode) and
@@ -194,21 +194,15 @@ mod tests {
     }
 }
 
-// ===== K=1 pausable batch state machine =====
+// ===== The K = 1 and K >= 2 walks =====
 //
-// Pure-data breakpoints (borrow contract): this struct holds no borrows into
-// its children — providers (`BlockBatch`) are re-acquired by the host on
-// every collect_confirmed_window call; resumption always resumes from the
-// stored chunk/chunk-index breakpoint. Never use a forward posting seek as
-// recovery: the remaining chunk candidates would be silently skipped.
-//
-// Floor semantics: each `next_batch` call's entry `floor` is the emit
-// decision value for that segment, inclusive; the block-end dry-budget /
-// promotion decisions use the same value. The floor is only refreshed
-// between calls, so the yield boundary is the floor refresh point.
+// Floor semantics: both walks read the collector's shared floor live — at every
+// block end (K = 1) and at every candidate (K >= 2). A rise produced by an
+// emitted hit, or by another partition, is therefore honoured inside the same
+// call; there is no refresh boundary to yield for. `emit` returning false
+// (the collector's heap overflowed) ends the walk.
 /// Promoted sub-mode: drive the cheaper lead clause block-wise and seek every
-/// required clause per candidate. Pure data — providers are re-acquired per
-/// call, and resumption always resumes from the stored lead chunk/index.
+/// required clause per candidate.
 struct PromotedWalk {
     lead_index: usize,
     required: Vec<usize>,
@@ -300,10 +294,9 @@ impl PromotedWalk {
 /// block takes, every SHOULD folds its scores over the block's candidates, and
 /// each candidate at or above the live floor is handed to `emit`.
 ///
-/// The walk owns its loop for the whole shape, so every breakpoint the
-/// suspendable machine kept in a struct is a plain local here, and `floor` is
-/// the collector's own shared value: a rise produced by an emitted hit is
-/// honoured at the very next block end.
+/// The walk owns its loop for the whole shape, so all of its state is local to
+/// this call, and `floor` is the collector's own shared value: a rise produced
+/// by an emitted hit is honoured at the very next block end.
 pub fn run_single_walk<'s>(
     must_ub: f32,
     should_ubs: &[f32],
@@ -323,13 +316,6 @@ pub fn run_single_walk<'s>(
     let mut chunk_idx = 0usize;
     let mut last_doc = 0u64;
     let mut chunk_started = false;
-    let mut promoted: Option<PromotedWalk> = None;
-    if let Some(mut walk) = promoted.take() {
-        if walk.run(must, shoulds, floor, emit)? {
-            return Ok(true);
-        }
-        return Ok(false);
-    }
     loop {
         // 1) Emit the candidates of the block already in the state's
         // chunk. All per-candidate tables were batch-computed at block
@@ -383,12 +369,8 @@ pub fn run_single_walk<'s>(
                             .iter()
                             .min_by_key(|&&index| shoulds[index].cost())
                             .expect("checked non-empty");
-                        promoted = Some(PromotedWalk::new(
-                            lead,
-                            required.clone(),
-                            last_doc.saturating_add(1),
-                        ));
-                        let mut walk = promoted.take().expect("just set");
+                        let mut walk =
+                            PromotedWalk::new(lead, required.clone(), last_doc.saturating_add(1));
                         if walk.run(must, shoulds, floor, emit)? {
                             return Ok(true);
                         }
@@ -414,6 +396,10 @@ pub fn run_single_walk<'s>(
         must_scores.resize(candidates.len(), 0.0);
         must.term_scores_batch(&candidates, &chunk_freqs, &mut must_scores);
         must.document_keys_batch(&candidates, &mut keys);
+        // `should_sums` accumulates (`fold_optional_scores` adds into every
+        // hit slot and *leaves misses untouched*), so unlike `must_scores` it
+        // must be zeroed before each block: the resize above only grows the
+        // vector, it does not reset the slots the fold will revisit.
         should_sums.clear();
         should_sums.resize(chunk.len(), 0.0);
         for (index, should) in shoulds.iter_mut().enumerate() {
@@ -441,7 +427,10 @@ mod batch_proto_tests {
 
     use super::super::super::DocInfo;
     use super::super::{FlatDocuments, WandDocuments};
-    use super::{BlockBatch, CompetitiveScore, PromotedWalk, run_multi_walk, run_single_walk};
+    use super::{
+        BlockBatch, CompetitiveScore, PromotedWalk, conservative_score_sum, run_multi_walk,
+        run_single_walk,
+    };
 
     /// Minimal documents with configurable visibility / num_tokens.
     struct MockDocs {
@@ -495,14 +484,12 @@ mod batch_proto_tests {
     }
 
     /// Mock provider: in-memory posting (term_score = freq as f32), simulating
-    /// block decoding `block` docs at a time. The sync counter supports
-    /// contract assertions.
+    /// block decoding `block` docs at a time.
     struct MockBatch {
         docs: Vec<(u64, u32)>,
         pos: usize,
         ub: f32,
         block: usize,
-        syncs: usize,
         /// Block takes, so a test can bound the scanned work.
         takes: usize,
         /// Per-candidate seeks, so a test can bound the scanned candidates.
@@ -517,7 +504,6 @@ mod batch_proto_tests {
                 pos: 0,
                 ub,
                 block,
-                syncs: 0,
                 takes: 0,
                 seeks: 0,
                 hidden: HashSet::new(),
@@ -682,7 +668,7 @@ mod batch_proto_tests {
 
     #[test]
     fn batch_keeps_walking_when_floor_rises_past_must_ub() {
-        // Precondition: after floor (11.0) crosses must_ub (1.0), the FSM
+        // Precondition: after floor (11.0) crosses must_ub (1.0), the walk
         // performs no union→intersection pruning and keeps scanning MUST —
         // docs hit by should0 (11.0, tying the floor) must be kept, since
         // dropping them would lose a result.
@@ -819,11 +805,11 @@ mod batch_proto_tests {
     }
 
     #[test]
-    fn batch_promoted_resume_with_a_trailing_lead_matches_one_shot() {
+    fn batch_promoted_trailing_lead_is_deterministic() {
         // The promoted lead is not the first optional, two optionals are
-        // necessary, and the lead hits span blocks: incremental (max_hits = 1)
-        // and one-shot delivery must agree exactly, with the optionals still
-        // scored in query order on every resumed call.
+        // necessary, and the lead hits span blocks: two independent one-shot
+        // runs must agree exactly, with the optionals still scored in query
+        // order.
         let make = || {
             let must = MockBatch::new((1..=40).map(|d| (d, 1)).collect(), 1.0, 4);
             let shoulds = vec![
@@ -947,7 +933,7 @@ mod batch_proto_tests {
 
     #[test]
     fn batch_multi_seek_crosses_u32_domain_boundary() {
-        // The multi FSM aligns candidates near the u32 doc-id domain edge:
+        // The multi walk aligns candidates near the u32 doc-id domain edge:
         // a sparse required hit at u32::MAX must survive alignment and
         // deliver, and the walk must exhaust cleanly past the domain.
         let top = u32::MAX as u64;
@@ -977,6 +963,73 @@ mod batch_proto_tests {
     }
 
     #[test]
+    fn multi_n1_promotion_recomputes_the_bound_from_raw_clause_bounds() {
+        // Regression (M12): when the N == 1 promotion fires, the projected
+        // required bound must be recomputed from the *raw* per-clause bounds
+        // with `conservative_score_sum`, never by folding a raw f32 addend onto
+        // the already-widened bound.
+        //
+        // The two forms agree on ordinary values, so the fixture must sit where
+        // they cannot. Three clause bounds sum to 4500 in f64; with a factor
+        // above 1 at three values `conservative_score_sum` keeps an f32 just
+        // over 4500 (the next f32 is 4500.000488…), while a bare `+=` lands on
+        // exactly 4500. Put the floor at that next f32: the sound bound is below
+        // it (walk continues), the rounded-down one is below it too *but* the
+        // inclusive rule rejects strictly-below bounds — so the rounded bound
+        // (< floor) proves the rest dead and returns, while the sound bound
+        // (just ≥ … ) keeps scanning. Emission cannot tell the two apart (any
+        // candidate's score is bounded by the old bound, hence below the floor),
+        // so the walk's scanned work is the observable that separates them.
+        let next_above = |value: f32| f32::from_bits(value.to_bits() + 1);
+        let mut must0 = MockBatch::new(vec![(1, 1500), (2, 1500)], 1500.0, 4);
+        let mut must1 = MockBatch::new(vec![(1, 1500), (2, 1500)], 1500.0, 4);
+        let mut optionals = [MockBatch::new(vec![(1, 1500), (2, 1500)], 1500.0, 4)];
+        let floor = competitive_score_at(next_above(4500.0));
+        let mut out = Vec::new();
+        let exhausted = {
+            let mut requireds: Vec<&mut dyn BlockBatch> = vec![&mut must0, &mut must1];
+            let mut optionals_ref: Vec<&mut dyn BlockBatch> = vec![&mut optionals[0]];
+            run_multi_walk(
+                &[1500.0, 1500.0],
+                &[1500.0],
+                &mut requireds,
+                &mut optionals_ref,
+                &floor,
+                &mut |key, score| {
+                    out.push((key, score));
+                    Ok(true)
+                },
+            )
+            .expect("the multi walk must not fail")
+        };
+        assert!(exhausted);
+        assert!(
+            out.is_empty(),
+            "no candidate can reach a floor above the old bound"
+        );
+        // The promotion fires at the first aligned candidate (3000 < floor) and
+        // re-evaluates it; the sound bound does not prove the rest dead, so the
+        // walk keeps scanning (4 required seeks: candidates 0..3). The bare
+        // `+=` bound is strictly below the floor, cuts at the re-evaluation, and
+        // stops at 2.
+        assert!(
+            must0.seeks >= 4,
+            "a sound promoted bound must not cut the walk after the promotion (seeks {})",
+            must0.seeks
+        );
+        // Pin the arithmetic that makes the fixture discriminating (raw folds
+        // in f64 with a widening factor > 1; a bare `+=` rounds to exactly
+        // 4500), so the case cannot silently go vacuous.
+        let recomputed = conservative_score_sum([1500.0_f32, 1500.0, 1500.0].into_iter());
+        let folded = 3000.0_f32 + 1500.0;
+        assert!(
+            recomputed > folded && folded < next_above(4500.0) && recomputed >= next_above(4500.0),
+            "fixture must straddle a floor between a bare += and the recomputed bound: \
+             {recomputed} vs {folded}"
+        );
+    }
+
+    #[test]
     fn walk_bounds_are_plain_data() {
         // The walks take their bounds by value, so nothing about them needs the
         // old "pure data ⇒ Send" argument: there is no cross-call state left to
@@ -987,14 +1040,6 @@ mod batch_proto_tests {
     }
 }
 
-// ===== K>=2 pausable batch state machine =====
-
-//
-// The multi walk in provider form: seek-to-max
-// alignment across the required providers, per-candidate optional probes,
-// N == 1 promotion (the optional joins the required set — appended last so
-// the accumulation order is unchanged), and the live-budget termination.
-// Pure-data breakpoints; providers are re-acquired per drain call.
 /// Runs the K >= 2 IU walk to exhaustion: the required providers align by
 /// seek-to-max, the optionals are probed per candidate, and each candidate at
 /// or above the live floor is handed to `emit`.
@@ -1104,14 +1149,20 @@ pub fn run_multi_walk<'s>(
                 && optionals.len() == 1
                 && iu_cannot_compete(required_ub, 0.0, current_floor)
             {
-                // N == 1 promotion: MUST-only documents are provably
-                // dead. Pure state — the provider collections are
-                // re-acquired per drain call, so the flag (not vector
-                // surgery) carries the promotion across calls. The
-                // promoted clause stays in `optionals` at index 0 but
-                // participates as required from here on.
+                // N == 1 promotion: MUST-only documents are provably dead.
+                // The promoted clause stays in `optionals` at index 0 but
+                // participates as required from here on, so the projected
+                // required bound is recomputed from the original per-clause
+                // bounds — never by adding a raw f32 onto the already-widened
+                // `required_ub`, which could round down by an ULP and make the
+                // post-promotion pruning tighter than the proof that fired.
                 promoted_optional = true;
-                required_ub += optionals[0].global_upper_bound();
+                required_ub = conservative_score_sum(
+                    required_ubs
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(optionals[0].global_upper_bound())),
+                );
                 optional_ub = 0.0;
                 continue;
             }
@@ -1125,7 +1176,7 @@ pub fn run_multi_walk<'s>(
             continue;
         };
         // Only candidates that reach this call's floor enter the window
-        // and the freshness yield. Sub-floor candidates are pushed by
+        // the floor check below reads. Sub-floor candidates are pushed by
         // neither: the driver re-checks every window entry against its
         // live floor and would discard them anyway, so emitting them only
         // bought a host round trip — provider re-acquisition, syncs and a

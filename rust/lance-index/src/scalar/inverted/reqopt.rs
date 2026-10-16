@@ -6,7 +6,7 @@
 //! Declared as a child module of `compound` so it can reach the shared
 //! scorer-tree internals via `super::*` while keeping compound.rs small. It
 //! also hosts the batch profile: the capability probe, the skew criterion
-//! that engages it, and the drain that drives its state machines.
+//! that engages it, and the walks that drive them.
 
 use super::super::wand::{run_multi_walk, run_single_walk};
 
@@ -561,12 +561,13 @@ impl ComposableScorer for ReqOptScorer<'_> {
 
     /// Live-floor takeover: the batch walk runs to exhaustion inside this call
     /// and hands each hit straight to the collector, re-reading `floor` at
-    /// every block end. That removes the reason the drain had to yield — the
-    /// value the walk prunes with is never older than the heap it prunes for.
+    /// every block end. That removes the reason the old drain entry had to
+    /// yield — the value the walk prunes with is never older than the heap it
+    /// prunes for.
     ///
-    /// The engagement gate matches the drain override exactly, including the
+    /// The engagement gate is the one the old drain entry used, including the
     /// non-positive-floor carve-out (the collector keeps the per-document
-    /// branch there). Declining leaves the drain path in charge untouched.
+    /// branch there). Declining leaves the generic drain in charge untouched.
     fn collect_top_k(
         &mut self,
         floor: &CompetitiveScore,

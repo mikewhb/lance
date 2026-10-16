@@ -231,12 +231,12 @@ impl<D: WandDocuments> Drop for TermLeafScorer<'_, D> {
 }
 
 /// Block-batch supply: drives the inner posting directly through the same
-/// moves the batch state machines use (`take_docs_one_block_upto` /
+/// moves the IU walks use (`take_docs_one_block_upto` /
 /// `merge_optional_freqs` / `score(scorer, freq, scoring_num_tokens)`).
 /// After batch stepping the
 /// leaf's derived caches (the `current` family) are all invalidated — the
-/// host state machine never reads them; resumption relies on pure-data
-/// breakpoints.
+/// walk never reads them: it re-acquires the posting cursor it needs and never
+/// falls back to the cached per-document state.
 impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
     fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
         self.batch_steps.set(self.batch_steps.get() + 1);
@@ -347,7 +347,7 @@ impl<D: WandDocuments + Sync> ComposableScorer for TermLeafScorer<'_, D> {
         // batch steps address candidates as dense u32 doc-ids and resolve them
         // through `document_key_for_doc_id` / `scoring_num_tokens`. Plain
         // postings store row-ids in the legacy domain (a `DocInfo::Raw`
-        // doc-id is a row-id there), so handing one to the batch FSM feeds
+        // doc-id is a row-id there), so handing one to an IU walk feeds
         // row-ids into dense-index lookups — a wrong mapping or an
         // out-of-bounds panic. Refuse here: this is the single capability
         // entry every batch consumer probes; the generic per-document walk
