@@ -316,11 +316,19 @@ impl BulkAndMode {
     }
 }
 
-fn bulk_and_mode_from_env() -> BulkAndMode {
-    match std::env::var("LANCE_FTS_BULK_AND") {
+/// Map one rollout env var's raw value to a [`BulkAndMode`] with the shared
+/// fallback policy: an unset value is silently `Auto`, and an unknown or
+/// non-Unicode value warns and falls back to `Auto` (never silently disables).
+/// Shared by `LANCE_FTS_BULK_AND` and `LANCE_FTS_IU_TIGHT` so the two switches
+/// cannot drift.
+fn mode_from_env_value(
+    var: &str,
+    value: std::result::Result<String, std::env::VarError>,
+) -> BulkAndMode {
+    match value {
         Ok(value) => BulkAndMode::parse(&value).unwrap_or_else(|| {
             log::warn!(
-                "Invalid LANCE_FTS_BULK_AND value {value:?}; expected auto, on/1, or off/0; \
+                "Invalid {var} value {value:?}; expected auto, on/1, or off/0; \
                  falling back to auto"
             );
             BulkAndMode::Auto
@@ -328,12 +336,16 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
         Err(std::env::VarError::NotPresent) => BulkAndMode::Auto,
         Err(std::env::VarError::NotUnicode(value)) => {
             log::warn!(
-                "Invalid non-Unicode LANCE_FTS_BULK_AND value {value:?}; expected auto, on/1, \
-                 or off/0; falling back to auto"
+                "Invalid non-Unicode {var} value {value:?}; expected auto, on/1, or off/0; \
+                 falling back to auto"
             );
             BulkAndMode::Auto
         }
     }
+}
+
+fn bulk_and_mode_from_env() -> BulkAndMode {
+    mode_from_env_value("LANCE_FTS_BULK_AND", std::env::var("LANCE_FTS_BULK_AND"))
 }
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
@@ -8255,6 +8267,26 @@ mod tests {
     #[case::empty("", None)]
     fn test_bulk_and_mode_parse(#[case] value: &str, #[case] expected: Option<BulkAndMode>) {
         assert_eq!(BulkAndMode::parse(value), expected);
+    }
+
+    #[test]
+    fn mode_from_env_value_maps_and_falls_back() {
+        let ok = |value: &str| mode_from_env_value("LANCE_FTS_TEST", Ok(value.to_owned()));
+        assert_eq!(ok("off"), BulkAndMode::Off);
+        assert_eq!(ok("0"), BulkAndMode::Off);
+        assert_eq!(ok("on"), BulkAndMode::On);
+        assert_eq!(ok("1"), BulkAndMode::On);
+        assert_eq!(ok("auto"), BulkAndMode::Auto);
+        assert_eq!(ok("  off  "), BulkAndMode::Off, "parse trims");
+        assert_eq!(
+            ok("nonsense"),
+            BulkAndMode::Auto,
+            "an unknown value falls back, it must never silently disable"
+        );
+        assert_eq!(
+            mode_from_env_value("LANCE_FTS_TEST", Err(std::env::VarError::NotPresent)),
+            BulkAndMode::Auto
+        );
     }
 
     #[rstest]

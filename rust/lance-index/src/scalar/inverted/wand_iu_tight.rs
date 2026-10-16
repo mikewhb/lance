@@ -59,24 +59,9 @@ fn live_upper_bound(dry: &[bool], upper_bound: impl Fn(usize) -> f32) -> f32 {
 /// routes every IU-shaped Boolean back to the per-document scorer tree. This
 /// is the A/B and rollout switch; it does not change results, only which
 /// engine computes them.
-static IU_TIGHT_MODE: std::sync::LazyLock<BulkAndMode> =
-    std::sync::LazyLock::new(|| match std::env::var("LANCE_FTS_IU_TIGHT") {
-        Ok(value) => BulkAndMode::parse(&value).unwrap_or_else(|| {
-            log::warn!(
-                "Invalid LANCE_FTS_IU_TIGHT value {value:?}; expected auto, on/1, or off/0; \
-                 falling back to auto"
-            );
-            BulkAndMode::Auto
-        }),
-        Err(std::env::VarError::NotPresent) => BulkAndMode::Auto,
-        Err(std::env::VarError::NotUnicode(value)) => {
-            log::warn!(
-                "Invalid non-Unicode LANCE_FTS_IU_TIGHT value {value:?}; expected auto, on/1, \
-                 or off/0; falling back to auto"
-            );
-            BulkAndMode::Auto
-        }
-    });
+static IU_TIGHT_MODE: std::sync::LazyLock<BulkAndMode> = std::sync::LazyLock::new(|| {
+    super::mode_from_env_value("LANCE_FTS_IU_TIGHT", std::env::var("LANCE_FTS_IU_TIGHT"))
+});
 
 /// Whether the IU fast paths may run in this process.
 pub fn iu_tight_enabled() -> bool {
@@ -297,6 +282,13 @@ impl PromotedWalk {
 /// The walk owns its loop for the whole shape, so all of its state is local to
 /// this call, and `floor` is the collector's own shared value: a rise produced
 /// by an emitted hit is honoured at the very next block end.
+///
+/// Return value = "the candidate domain is exhausted": `true` when the
+/// providers run out, `false` when `emit` returned `false` (the collector's
+/// heap overflowed, so the caller retries the partition with resolved keys).
+/// `run_multi_walk` returns `true` on that same stall — a known asymmetry that
+/// is currently unobservable, since `ReqOptScorer::collect_top_k` is the only
+/// consumer and an overflow retries the partition regardless.
 pub fn run_single_walk<'s>(
     must_ub: f32,
     should_ubs: &[f32],
@@ -1035,6 +1027,11 @@ mod batch_proto_tests {
 /// the state lives in locals, and the floor is read per candidate, so a rise is
 /// honoured immediately. The N == 1 promotion latch is a local too — the walk
 /// cannot be re-entered, so it needs no cross-call representation.
+///
+/// Return value: like [`run_single_walk`] it is `true` when the required
+/// intersection is exhausted, but unlike it this walk returns `true` on an
+/// `emit` stall too (see the note on `run_single_walk`; the asymmetry is
+/// currently unobservable).
 pub fn run_multi_walk<'s>(
     required_ubs: &[f32],
     optional_ubs: &[f32],
