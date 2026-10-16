@@ -303,6 +303,12 @@ pub(super) trait ComposableScorer: Send {
     fn global_score_upper_bound(&self) -> Option<f32> {
         None
     }
+    /// Advisory lower bound on what can still reach the collector. An
+    /// implementation MAY treat it as a no-op when it has no way to skip with it
+    /// (`TermLeafScorer` never skips blocks, so its version only rejects NaN) —
+    /// callers must not rely on it for correctness, only for pruning. See the
+    /// leaf-swap note near `leaf_admission`: on the drain path the load-bearing
+    /// check is `score_bounds(up_to)`'s upper bound against `min_score`.
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()>;
 
     /// Conservative score upper bound for the current approximation without

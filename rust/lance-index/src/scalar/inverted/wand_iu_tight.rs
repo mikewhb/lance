@@ -119,7 +119,44 @@ pub fn iu_tight_required_shoulds(
 
 #[cfg(test)]
 mod tests {
-    use super::{iu_tight_lead_is_cheaper, iu_tight_required_shoulds};
+    use super::super::maxscore::exclusive_cannot_compete;
+    use super::super::outward_f32_upper_bound;
+    use super::{iu_cannot_compete, iu_tight_lead_is_cheaper, iu_tight_required_shoulds};
+
+    #[test]
+    fn iu_and_exclusive_predicates_agree_except_at_the_floor() {
+        // The IU walk and the generic WAND path share one kernel
+        // (`score_sum_cannot_compete`) but wrap it with opposite floor modes: IU
+        // keeps a document tying the floor (`Inclusive`), the generic path
+        // rejects it (`Exclusive`). Pin that relationship so the two predicates
+        // cannot silently drift — a drift would make the two engines disagree
+        // about a single candidate. Factor 1.0 is `score_sum_upper_bound_factor(2)`;
+        // `outward_f32_upper_bound` is the shared upper bound both compare on.
+        for &p in &[0.0_f32, 1.0, 2.5, 3000.0, 16_777_216.0] {
+            for &r in &[0.0_f32, 1.0, 3.0, 1500.0, 16_777_216.0] {
+                for &f in &[-1.0_f32, 0.0, 1.0, 3000.0, 3000.0005, 1.0e7] {
+                    let upper = outward_f32_upper_bound(f64::from(p) + f64::from(r));
+                    let iu = iu_cannot_compete(p, r, f);
+                    let ex = exclusive_cannot_compete(p, f64::from(r), f, 1.0);
+                    if f > 0.0 {
+                        assert!(
+                            iu || !ex || upper == f,
+                            "exclusive rejected a non-tie IU keeps: p={p} r={r} f={f}"
+                        );
+                        assert!(
+                            !iu || ex,
+                            "IU rejected where exclusive would not: p={p} r={r} f={f}"
+                        );
+                    } else {
+                        assert!(
+                            !iu && !ex,
+                            "a non-positive floor must reject nothing: p={p} r={r} f={f}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn required_shoulds_stays_on_must_while_must_alone_can_compete() {
