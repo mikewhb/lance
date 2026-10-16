@@ -970,16 +970,16 @@ mod batch_proto_tests {
         // the already-widened bound.
         //
         // The two forms agree on ordinary values, so the fixture must sit where
-        // they cannot. Three clause bounds sum to 4500 in f64; with a factor
-        // above 1 at three values `conservative_score_sum` keeps an f32 just
-        // over 4500 (the next f32 is 4500.000488…), while a bare `+=` lands on
-        // exactly 4500. Put the floor at that next f32: the sound bound is below
-        // it (walk continues), the rounded-down one is below it too *but* the
-        // inclusive rule rejects strictly-below bounds — so the rounded bound
-        // (< floor) proves the rest dead and returns, while the sound bound
-        // (just ≥ … ) keeps scanning. Emission cannot tell the two apart (any
-        // candidate's score is bounded by the old bound, hence below the floor),
-        // so the walk's scanned work is the observable that separates them.
+        // they cannot. Three clause bounds sum to 4500 in f64; the factor for
+        // three values pushes `conservative_score_sum` a few ULP above 4500 (to
+        // 4500.00244…), while a bare `+=` lands on exactly 4500. Put the floor
+        // at the next f32 above 4500 (4500.000488…): the rounded-down bound
+        // (4500) is strictly below it, and the inclusive rule rejects
+        // strictly-below bounds, so it proves the rest dead and returns; the
+        // sound bound sits above the floor, so it keeps scanning. Emission
+        // cannot tell the two apart (any candidate's score is bounded by the old
+        // bound, hence below the floor), so scanned work is the observable that
+        // separates them.
         let next_above = |value: f32| f32::from_bits(value.to_bits() + 1);
         let mut must0 = MockBatch::new(vec![(1, 1500), (2, 1500)], 1500.0, 4);
         let mut must1 = MockBatch::new(vec![(1, 1500), (2, 1500)], 1500.0, 4);
