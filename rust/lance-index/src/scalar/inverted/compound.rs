@@ -442,6 +442,10 @@ pub(super) type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
 /// - after `merge_optional_freqs` the cursor may park mid-block: the next call
 ///   continues from the cursor itself, so a caller must never use a forward
 ///   seek as recovery (that would skip the remaining part of the block);
+/// - the capability entry (`ComposableScorer::block_batch` /
+///   `block_batch_children`) is a **pure probe**: it must not mutate the
+///   posting or the documents. The engagement gate latches its first answer for
+///   the partition, so a probe with side effects would run at most once.
 pub(super) trait BlockBatch {
     /// Document-domain visibility probe shared by every provider of one
     /// partition (delegates to the implementor's documents context). The
@@ -8403,18 +8407,17 @@ mod tests {
         // them silently.
         //
         // m16 asked for a behavioural anchor (routing follows the raw domain and
-        // contradicts the truncated one). It is not constructible as specified:
+        // contradicts the truncated one). It is not constructible end-to-end:
         // the router (`collect_partition_with_documents`) and the ReqOpt
         // engagement gate (`ReqOptScorer::probe_batch_shape`) apply the *same*
         // `optionals_are_sparse` criterion to the *same* raw costs, so a swap at
-        // either point is masked by the other (a router that engaged on the
-        // truncated domain still gets declined by the raw-domain gate, and a
-        // gate that then engaged on the truncated domain is never reached
-        // because the raw-domain router already declined). And the truncated
-        // domain is uniform per partition (`visible_cost_upper_bound` is a
-        // single value), so `8 * vc < vc` is never true and the truncated
-        // decision can never be "sparse". The value domains are therefore pinned
-        // directly, and a domain swap would have to change these values first.
+        // either single point is masked by the other — a router that engaged on
+        // the truncated domain is still declined by the raw-domain gate, and a
+        // gate that engaged on the truncated domain is never reached because the
+        // raw-domain router already declined. Pinning the gate's cost source
+        // would instead need a gate-level unit test over a stub leaf whose raw
+        // (`BlockBatch::cost`) and truncated (`ComposableScorer::cost`) costs
+        // differ; that is a separate change from this value pin.
         let metrics = NoOpMetricsCollector;
         let mut dense = DocSet::default();
         for row in 0..64_u64 {
@@ -9040,6 +9043,34 @@ mod tests {
             multi_scorer.debug_type_name().contains("WandCursor"),
             "got {}",
             multi_scorer.debug_type_name()
+        );
+    }
+
+    #[test]
+    fn grouped_leaf_is_refused_at_the_batch_capability_entry() {
+        // B2-2 (m7): the batch capability contract is a *compressed, ungrouped*
+        // single posting. `box_leaf_scorer` would box a grouped leaf as a
+        // WandCursor (is_compound_term_leaf refuses grouped terms), so exercise
+        // the TermLeafScorer guard directly with a compressed + grouped posting.
+        let metrics = NoOpMetricsCollector;
+        let documents = DocSet::default();
+        let list = PostingList::Plain(PlainPostingList::new(
+            ScalarBuffer::from(vec![0_u64]),
+            ScalarBuffer::from(vec![1.0_f32]),
+            Some(1.0),
+            None,
+        ));
+        let grouped = compressed_unit_posting("g", vec![0, 1, 2])
+            .with_grouped_terms(Arc::from([GroupedTermScorer::new(1.0, &list)]));
+        assert!(
+            grouped.is_compressed() && grouped.has_grouped_terms(),
+            "the fixture must be compressed and carry grouped terms"
+        );
+        let scorer = Arc::new(MemBM25Scorer::new(1, 1, HashMap::new()));
+        let mut leaf = TermLeafScorer::new(grouped, &documents, scorer, &metrics);
+        assert!(
+            leaf.block_batch().is_none(),
+            "a compressed but grouped leaf must not expose the batch capability"
         );
     }
 
