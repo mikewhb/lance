@@ -96,11 +96,18 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
     fn record_metrics(&mut self) {
         if !self.metrics_recorded {
             self.metrics.record_comparisons(self.comparisons);
-            let batch_steps = self.batch_steps.get();
-            if batch_steps > 0 {
-                self.metrics.record_batch_steps(batch_steps);
-            }
             self.metrics_recorded = true;
+        }
+        // `batch_steps` is reported **incrementally**, outside the one-shot
+        // `metrics_recorded` latch: a per-document window can drain this leaf
+        // and latch the comparisons before the batch profile takes it over, and
+        // a one-shot flush would then lose every step the takeover adds. Taking
+        // the counter reports only the delta, so `batch_steps > 0` still means
+        // "a batch run happened" (the tests rely on that) and nothing is
+        // double-counted.
+        let batch_steps = self.batch_steps.replace(0);
+        if batch_steps > 0 {
+            self.metrics.record_batch_steps(batch_steps);
         }
     }
 
