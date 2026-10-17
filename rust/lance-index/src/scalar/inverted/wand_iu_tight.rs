@@ -24,7 +24,7 @@ use std::sync::LazyLock;
 use lance_core::Result;
 
 use super::super::compound::{BlockBatch, CompetitiveScore};
-use super::encoding::MAX_POSTING_BLOCK_SIZE;
+use super::super::encoding::MAX_POSTING_BLOCK_SIZE;
 use super::{
     BulkAndMode, CompetitiveFloorMode, TERMINATED_DOC_ID, conservative_score_sum,
     score_sum_cannot_compete, score_sum_upper_bound_factor,
