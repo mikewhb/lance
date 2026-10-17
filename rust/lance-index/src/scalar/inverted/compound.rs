@@ -342,6 +342,9 @@ pub(super) trait ComposableScorer: Send {
     /// at least `min_score` (inclusive). `max_hits` caps this window only; the
     /// scorer stays on the first document that did not fit so the next call
     /// can continue without re-emitting.
+    ///
+    /// `max_hits == 0` is the degenerate input: it reports `exhausted: true`
+    /// without moving the cursor (there is no window to drain).
     fn collect_confirmed_window(
         &mut self,
         min_score: f32,
@@ -362,8 +365,10 @@ pub(super) trait ComposableScorer: Send {
     /// stop driving this scorer. `Ok(false)` declines, and the caller's own
     /// loop stays in charge of the scorer.
     ///
-    /// Only the required/optional IU node overrides this today; everything
-    /// else declines, so the drain protocol below remains their only path.
+    /// `ReqOptScorer` (the required/optional IU node) overrides this to run a
+    /// walk; `BooleanScorer` overrides it only to forward to its single driver.
+    /// Everything else declines, so the drain protocol below remains their only
+    /// path.
     fn collect_top_k(
         &mut self,
         _floor: &CompetitiveScore,
@@ -372,10 +377,12 @@ pub(super) trait ComposableScorer: Send {
         Ok(false)
     }
 
-    /// Block-batch capability: implemented only by the "single compressed
-    /// posting leaf" form (`TermLeafScorer`). Defaults to `None`, so
-    /// nested / Max / boost≠1 / phrase / cross-column structures are rejected
-    /// and can never acquire it through recursive propagation.
+    /// Block-batch capability: implemented by the "single compressed posting
+    /// leaf" form (`TermLeafScorer`) and forwarded unchanged by identity-boost
+    /// wrappers (`ScaleScorer` with `factor == 1.0`, `BooleanScorer`'s single
+    /// driver). Defaults to `None`, so nested / Max / boost≠1 / phrase /
+    /// cross-column structures are rejected and can never acquire it through
+    /// recursive propagation.
     fn block_batch(&mut self) -> Option<&mut dyn BlockBatch> {
         None
     }
@@ -441,7 +448,7 @@ pub(super) type BoxScorer<'a> = Box<dyn ComposableScorer + 'a>;
 /// the IU walks.
 ///
 /// Implementation contract:
-/// - `take_docs_one_block_upto` copies one posting block after the cursor
+/// - `take_docs_one_block_upto` copies one posting block from the cursor (inclusive of the current document)
 ///   (or up to `upto`) in ascending doc order, parking the cursor at the
 ///   block end; visibility is decided per candidate by the **host** (the
 ///   provider carries no visibility logic);
@@ -459,7 +466,7 @@ pub(super) trait BlockBatch {
     /// walk calls this per candidate — providers carry the erased documents
     /// context so the walk stays free of generics.
     fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64>;
-    /// Copies one posting block after the cursor (or up to `upto`), parking
+    /// Copies one posting block from the cursor (inclusive of the current document) (or up to `upto`), parking
     /// the cursor at the block end.
     fn take_docs_one_block_upto(&mut self, upto: u64, out: &mut Vec<(u64, u32)>);
     /// Block-continuous merge: this posting's frequency at ascending `docs`
@@ -481,8 +488,19 @@ pub(super) trait BlockBatch {
         }
     }
     fn current_doc_id(&self) -> Option<u64>;
-    /// Forward-seek equivalent (promoted mode): position on `doc`, return
-    /// its frequency; None on a miss.
+    /// Forward-seek equivalent (promoted mode): position on `doc`, return its
+    /// frequency; `None` on a miss.
+    ///
+    /// Contract the IU walks rely on:
+    /// - `doc` is in the **dense u32 batch domain**, not a row id;
+    /// - on a hit the cursor sits on `doc`; on a **miss** it must sit on the
+    ///   first document `> doc` (or past the end), so a later ascending
+    ///   `seek_eq` never revisits a document this one skipped;
+    /// - this is a deliberately **narrow** contract: unlike the block moves it
+    ///   does not require the provider to invalidate its per-document caches.
+    ///   The walks re-derive every score from the returned frequency and never
+    ///   read `current_doc`/`current_score`/`shallow` between seeks, which is
+    ///   why `TermLeafScorer::seek_eq` may leave them untouched.
     fn seek_eq(&mut self, doc: u64) -> Option<u32>;
     /// Conservative list-wide score upper bound.
     ///
@@ -4326,11 +4344,14 @@ fn boolean_leaf_split(plan: &CompoundScorerPlan) -> Option<BooleanLeafSplit> {
 ///   skipping, and the optional children of a SHOULD-only union sit inside a
 ///   union machine — both measured slower with the swap.
 ///
-/// The remaining arms (MUST_NOT, Boost-positive, MultiMatch, nested shapes) are
-/// left on the WAND wrapper: TermLeafScorer never skips, and those arms are
-/// correctness-safe either way but have no measurement behind the swap. Note
-/// that a MUST_NOT Boolean still drives through `ReqOptScorer`; excluding it is
-/// deliberate conservatism, not a structural difference.
+/// The remaining arms (Boost-positive, MultiMatch, nested shapes) are left on
+/// the WAND wrapper: TermLeafScorer never skips, and those arms are
+/// correctness-safe either way but have no measurement behind the swap. A
+/// MUST_NOT Boolean is only **partly** excluded — its SHOULD leaves keep the
+/// wrapper, but its single MUST leaf is still admitted (`leaf_admission_set`
+/// admits the MUST leaf before the `has_must_not` test), so that arm is
+/// *unmeasured* rather than excluded. Note that a MUST_NOT Boolean still drives
+/// through `ReqOptScorer`.
 #[cfg(test)]
 fn leaf_admits_term_leaf(plan: &CompoundScorerPlan, index: usize) -> bool {
     leaf_admission_set(plan, index + 1)[index]
@@ -4351,6 +4372,10 @@ fn leaf_admission_set(plan: &CompoundScorerPlan, leaf_count: usize) -> Vec<bool>
             let Some(&(must_index, _)) = split.must_leaves.first() else {
                 return admits;
             };
+            // Index checks are load-bearing, not vacuous: the plan may carry an
+            // out-of-range leaf index (`reqopt_admits_one_must_and_its_shoulds`
+            // fabricates one on purpose), and the caller's `Leaf` match arm has
+            // the same guard. Do not turn these into `debug_assert!`.
             if must_index < leaf_count {
                 admits[must_index] = true;
             }

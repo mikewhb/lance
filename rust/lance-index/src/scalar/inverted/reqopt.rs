@@ -56,8 +56,10 @@ pub(super) struct ReqOptScorer<'a> {
     pub(super) optional_globally_required: bool,
     /// Latch for a declined shape probe. The probe reads only static posting
     /// costs, so a shape that declines (not IU, or skew) declines for the life
-    /// of this partition; remembering it stops the collector re-probing — and
-    /// re-allocating the child provider `Vec`s — on every window.
+    /// of this partition; remembering it stops the collector re-probing a
+    /// **declined** shape — and re-allocating the child provider `Vec`s — on
+    /// every window. An **engaged** shape is not latched: it re-probes (and
+    /// re-allocates) once per window.
     batch_shape_declined: bool,
 }
 
@@ -600,8 +602,8 @@ impl ComposableScorer for ReqOptScorer<'_> {
         }
         if floor.get() <= 0.0 || self.optional_globally_required {
             // The collector keeps the per-document branch for a non-positive
-            // floor, and a latched union promotion already rides the sparse
-            // side: both decline here.
+            // floor, and a latched intersection promotion already rides the
+            // sparse side: both decline here.
             return Ok(false);
         }
         let Some(shape) = self.batch_shape() else {

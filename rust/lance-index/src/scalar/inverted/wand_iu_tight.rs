@@ -28,15 +28,19 @@ use super::{
 };
 
 /// Whether `partial + remaining` can no longer reach `floor`. Wraps the
-/// generic path's predicate so the widening and the inclusive floor semantics
-/// live in one audited place; a document scoring exactly at the floor still
-/// competes, which is the contract the batch walks are tested against. Bounds
-/// are widened by `conservative_score_sum` so f32 rounding cannot shrink them
-/// below the true total and trigger premature IU termination: the consumer
-/// scores the same values by sequential `f32` accumulation, so with
-/// `n >= 3` clauses the accumulation order alone can exceed the f64 sum by
-/// `(n-1) * f32::EPSILON` relative error, and a bound that tight would drop a
-/// document tying the floor.
+/// generic path's predicate so the inclusive floor semantics live in one
+/// audited place; a document scoring exactly at the floor still competes,
+/// which is the contract the batch walks are tested against.
+///
+/// The **widening happens at the call sites**: every caller passes a
+/// `conservative_score_sum`-widened `remaining` (the sum of the still-live
+/// clause bounds), so this function itself only adds two operands and correctly
+/// uses `score_sum_upper_bound_factor(2)` (== 1.0). Adding a raw `f32` onto an
+/// already-widened bound is what would round down by an ULP; do not do that.
+/// The consumer scores the same values by sequential `f32` accumulation, so
+/// with `n >= 3` clauses the accumulation order alone can exceed the f64 sum by
+/// `(n-1) * f32::EPSILON` relative error — which is why the caller's
+/// `conservative_score_sum` matters, not this factor.
 fn iu_cannot_compete(partial: f32, remaining: f32, floor: f32) -> bool {
     score_sum_cannot_compete(
         partial,
@@ -385,6 +389,15 @@ pub fn run_single_walk<'s>(
                 if let Some(Some(required)) =
                     promotion_decision.as_ref().map(|(_, decision)| decision)
                 {
+                    // Defensive: `iu_tight_required_shoulds` returns
+                    // `Some(vec![])` only when `iu_cannot_compete(must_ub,
+                    // sum_shoulds, floor)` holds. The gate above uses
+                    // `live_upper_bound(&dry, ..)`, which is <= `sum_shoulds`
+                    // (it drops the dry clauses), and `iu_cannot_compete` is
+                    // monotone in `remaining` (a smaller sum is *more* likely to
+                    // be rejected) — so that gate fires first and this branch is
+                    // unreachable from this walk. Kept as a guard; the helper's
+                    // empty return is covered by its own unit tests.
                     if required.is_empty() {
                         return Ok(true);
                     }
