@@ -5,13 +5,13 @@
 //! clauses plus N optional ones (named after the Search Benchmark Game's
 //! query of that shape).
 //!
-//! The IU batch profile: two walks that drive flat
-//! MUST/SHOULD shapes from the scorer tree's `BlockBatch` providers.
+//! The IU batch profile: one block walk that drives flat MUST/SHOULD shapes
+//! from the scorer tree's `BlockBatch` providers.
 //!
-//! [`run_single_walk`] owns the K = 1 walk (plus the promoted sub-mode) and
-//! [`run_multi_walk`] the K >= 2 seek-to-max walk; both consume block-wise
-//! provider capabilities (`take_docs_one_block_upto`, `merge_optional_freqs`,
-//! `seek_eq`, batch scoring) instead of driving the per-document protocol.
+//! [`run_block_walk`] takes a [`RequiredSource`] — one provider for K = 1, a
+//! block intersection of several for K >= 2 — so the loop itself never learns
+//! how many required chains there are. [`run_single_walk`] and
+//! [`run_multi_walk`] are the two entry points that build the source.
 //!
 //! The walk owns its loop for the whole shape: hits are handed straight to the
 //! collector through `emit`, and the floor is re-read between blocks, so the
@@ -1200,6 +1200,19 @@ pub enum RequiredSource<'a> {
 }
 
 impl<'a> RequiredSource<'a> {
+    /// One dispatch per block for the whole key vector, the way the K = 1 walk
+    /// always did it (`document_keys_batch`); the per-document form is kept for
+    /// callers that only have one doc at a time.
+    fn document_keys_batch(&self, docs: &[u64], out: &mut Vec<Option<u64>>) {
+        match self {
+            Self::One { provider, .. } => provider
+                .as_ref()
+                .expect("required provider used after the promotion handoff")
+                .document_keys_batch(docs, out),
+            Self::Many(source) => source.children[0].document_keys_batch(docs, out),
+        }
+    }
+
     fn is_single(&self) -> bool {
         matches!(self, Self::One { .. })
     }
@@ -1211,7 +1224,9 @@ impl<'a> RequiredSource<'a> {
                     .as_mut()
                     .expect("required provider used after the promotion handoff");
                 provider.take_block(TERMINATED_DOC_ID, docs);
-                probe.blocks += 1;
+                if !docs.is_empty() {
+                    probe.blocks += 1;
+                }
                 !docs.is_empty()
             }
             Self::Many(source) => source.next_block(probe),
@@ -1317,12 +1332,7 @@ pub fn run_block_walk<'s>(
         docs_len = source.docs().len();
         probe.candidates += docs_len;
         keys.clear();
-        keys.extend(
-            source
-                .docs()
-                .iter()
-                .map(|&doc| source.document_key_for_doc_id(doc as u32)),
-        );
+        source.document_keys_batch(source.docs(), &mut keys);
         must_scores.clear();
         must_scores.resize(docs_len, 0.0);
         source.fold_required(&mut must_scores);
@@ -1365,6 +1375,13 @@ pub fn run_block_walk<'s>(
                     return Ok(stall);
                 }
             }
+        }
+        // The promoted clause cannot contribute again once it is exhausted,
+        // and the latch already proved MUST-only documents dead — the rest of
+        // the intersection can only be skipped. Bail out after this block so
+        // its hits are still emitted.
+        if promoted_optional && shoulds[0].current_doc_id().is_none() {
+            return Ok(true);
         }
         // Block end: read the floor once for the pruning decisions, so a hit
         // emitted in this block has already raised the value they prune with.
