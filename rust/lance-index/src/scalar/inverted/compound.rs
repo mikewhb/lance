@@ -490,45 +490,39 @@ pub(super) trait BlockBatch {
 
     // ----- block-protocol verbs -----
     //
-    // Three verbs the block protocol consumes, defined here as adapters over
-    // the per-document methods above. A provider whose block move already
-    // carries the frequencies should override the adapters (see
-    // `TermLeafScorer`); the defaults exist so a provider can join the
-    // protocol without owning a block cache.
+    // The block protocol consumes these three verbs. `take_block` and
+    // `fold_scores` are a pair: a take parks the provider's cursor past the
+    // block it just returned, and `merge_optional_freqs` only moves forward, so
+    // a fold that re-merged would score every document as a miss. Providers
+    // must therefore cache the block's frequencies in `take_block` and read
+    // them in `fold_scores`; there is no correct default for either.
 
-    /// The doc ids of the block [`BlockBatch::take_docs_one_block_upto`]
-    /// would return. Defaults to taking the pairs and dropping the
-    /// frequencies; providers on the hot path should override it and cache
-    /// them so a following [`BlockBatch::fold_scores`] does not re-read the
-    /// posting.
-    fn take_block(&mut self, upto: u64, out: &mut Vec<u64>) {
-        let mut pairs = Vec::new();
-        self.take_docs_one_block_upto(upto, &mut pairs);
-        out.clear();
-        out.extend(pairs.into_iter().map(|(doc, _)| doc));
-    }
+    /// The doc ids of the next block, ascending, **plus** that block's
+    /// frequencies in provider-owned scratch that [`BlockBatch::fold_scores`]
+    /// reads. Must not be interleaved with [`BlockBatch::fill_hits`] on the
+    /// same provider.
+    fn take_block(&mut self, upto: u64, out: &mut Vec<u64>);
 
-    /// Which of `docs` this provider hits (miss = `false`), in the same
-    /// block-continuous order as [`BlockBatch::merge_optional_freqs`].
+    /// Accumulate this provider's scores for the docs of the last
+    /// [`BlockBatch::take_block`] into `sums`, leaving a miss untouched.
+    /// Same arithmetic and order as [`BlockBatch::fold_optional_scores`].
+    fn fold_scores(&mut self, docs: &[u64], sums: &mut [f32]);
+
+    /// Intersect `hits` with this provider's answer for `docs` (miss = leave
+    /// `false`). `hits` starts all-true, so a sequence of providers composes
+    /// into an AND; an implementation must never write `true` over a `false`.
     ///
-    /// Like `merge_optional_freqs`, this may park the cursor mid-block; it is
-    /// for the "filter an externally produced block" direction, and must not
-    /// be interleaved with `take_block` on the same provider.
+    /// This is for the "filter an externally produced block" direction (the
+    /// promoted clause). It moves the cursor forward like
+    /// [`BlockBatch::merge_optional_freqs`], so a provider must not be used as
+    /// a source and a filter in the same block.
     fn fill_hits(&mut self, docs: &[u64], hits: &mut [bool]) {
         debug_assert_eq!(docs.len(), hits.len());
         let mut freqs = vec![0u32; docs.len()];
         self.merge_optional_freqs(docs, &mut freqs);
         for (hit, freq) in hits.iter_mut().zip(freqs) {
-            *hit = freq != 0;
+            *hit &= freq != 0;
         }
-    }
-
-    /// Accumulate this provider's scores for `docs` into `sums`, leaving a
-    /// miss untouched. Same arithmetic and ordering as
-    /// [`BlockBatch::fold_optional_scores`]; this is the protocol's name for
-    /// it, so callers read as take / filter / accumulate.
-    fn fold_scores(&mut self, docs: &[u64], sums: &mut [f32]) {
-        self.fold_optional_scores(docs, sums);
     }
 
     fn current_doc_id(&self) -> Option<u64>;
