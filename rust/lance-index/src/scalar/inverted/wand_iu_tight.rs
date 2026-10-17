@@ -527,8 +527,8 @@ mod batch_proto_tests {
     use std::collections::HashSet;
 
     use super::{
-        BlockBatch, CompetitiveScore, PromotedWalk, conservative_score_sum, run_multi_walk,
-        run_single_walk,
+        BlockBatch, CompetitiveScore, PromotedWalk, TERMINATED_DOC_ID, conservative_score_sum,
+        run_multi_walk, run_single_walk,
     };
 
     /// Mock provider: in-memory posting (term_score = freq as f32), simulating
@@ -1033,6 +1033,47 @@ mod batch_proto_tests {
             "fixture must straddle a floor between a bare += and the recomputed bound: \
              {recomputed} vs {folded}"
         );
+    }
+
+    /// The three block-protocol verbs are adapters over the per-document
+    /// methods: same docs, same hits, same accumulated values.
+    #[test]
+    fn block_verbs_match_their_per_document_equivalents() {
+        let docs: Vec<(u64, u32)> = vec![(1, 2), (5, 0), (9, 3), (12, 1)];
+
+        // take_block == take_docs_one_block_upto, ids only, same take count.
+        let mut pairs_src = MockBatch::new(docs.clone(), 9.0, 2);
+        let mut ids_src = MockBatch::new(docs.clone(), 9.0, 2);
+        let mut pairs = Vec::new();
+        pairs_src.take_docs_one_block_upto(TERMINATED_DOC_ID, &mut pairs);
+        let mut ids = Vec::new();
+        ids_src.take_block(TERMINATED_DOC_ID, &mut ids);
+        assert_eq!(
+            ids,
+            pairs.iter().map(|(doc, _)| *doc).collect::<Vec<_>>(),
+            "take_block must yield the same docs in the same order"
+        );
+        assert_eq!(pairs_src.takes, ids_src.takes, "one take either way");
+
+        // fold_scores == fold_optional_scores, misses leave the slot alone.
+        let probe: Vec<u64> = vec![1, 3, 5, 9];
+        let mut fold_src = MockBatch::new(docs.clone(), 9.0, 2);
+        let mut per_doc_src = MockBatch::new(docs.clone(), 9.0, 2);
+        let mut lhs = vec![0.5_f32; probe.len()];
+        let mut rhs = vec![0.5_f32; probe.len()];
+        fold_src.fold_optional_scores(&probe, &mut lhs);
+        per_doc_src.fold_scores(&probe, &mut rhs);
+        assert_eq!(lhs, rhs, "the fold verb must not change the arithmetic");
+        assert_eq!(lhs[1], 0.5, "a miss leaves the slot untouched");
+        assert_eq!(lhs[0], 2.5, "a hit adds the provider's score");
+
+        // fill_hits == freq != 0.
+        let mut hit_src = MockBatch::new(docs, 9.0, 2);
+        let mut hits = vec![true; probe.len()];
+        hit_src.fill_hits(&probe, &mut hits);
+        // Doc 5 is present but carries frequency 0, which the fold treats as a
+        // miss; the hit probe must agree with the fold, not with membership.
+        assert_eq!(hits, vec![true, false, false, true]);
     }
 }
 

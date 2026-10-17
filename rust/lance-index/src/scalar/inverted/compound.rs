@@ -487,6 +487,50 @@ pub(super) trait BlockBatch {
             }
         }
     }
+
+    // ----- block-protocol verbs -----
+    //
+    // Three verbs the block protocol consumes, defined here as adapters over
+    // the per-document methods above. A provider whose block move already
+    // carries the frequencies should override the adapters (see
+    // `TermLeafScorer`); the defaults exist so a provider can join the
+    // protocol without owning a block cache.
+
+    /// The doc ids of the block [`BlockBatch::take_docs_one_block_upto`]
+    /// would return. Defaults to taking the pairs and dropping the
+    /// frequencies; providers on the hot path should override it and cache
+    /// them so a following [`BlockBatch::fold_scores`] does not re-read the
+    /// posting.
+    fn take_block(&mut self, upto: u64, out: &mut Vec<u64>) {
+        let mut pairs = Vec::new();
+        self.take_docs_one_block_upto(upto, &mut pairs);
+        out.clear();
+        out.extend(pairs.into_iter().map(|(doc, _)| doc));
+    }
+
+    /// Which of `docs` this provider hits (miss = `false`), in the same
+    /// block-continuous order as [`BlockBatch::merge_optional_freqs`].
+    ///
+    /// Like `merge_optional_freqs`, this may park the cursor mid-block; it is
+    /// for the "filter an externally produced block" direction, and must not
+    /// be interleaved with `take_block` on the same provider.
+    fn fill_hits(&mut self, docs: &[u64], hits: &mut [bool]) {
+        debug_assert_eq!(docs.len(), hits.len());
+        let mut freqs = vec![0u32; docs.len()];
+        self.merge_optional_freqs(docs, &mut freqs);
+        for (hit, freq) in hits.iter_mut().zip(freqs) {
+            *hit = freq != 0;
+        }
+    }
+
+    /// Accumulate this provider's scores for `docs` into `sums`, leaving a
+    /// miss untouched. Same arithmetic and ordering as
+    /// [`BlockBatch::fold_optional_scores`]; this is the protocol's name for
+    /// it, so callers read as take / filter / accumulate.
+    fn fold_scores(&mut self, docs: &[u64], sums: &mut [f32]) {
+        self.fold_optional_scores(docs, sums);
+    }
+
     fn current_doc_id(&self) -> Option<u64>;
     /// Forward-seek equivalent (promoted mode): position on `doc`, return its
     /// frequency; `None` on a miss.
