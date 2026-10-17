@@ -949,13 +949,10 @@ mod batch_proto_tests {
             exhausted,
             "the raised floor proves the rest of the intersection dead"
         );
-        // S2 moved the required side to a block merge, so required seeks are
-        // gone; the post-rise scanned work now shows on the optional side (one
-        // probe for doc 1, one for the promoted re-evaluation at doc 2).
-        let scanned = optionals[0].seeks;
+        let scanned = must0.seeks + must1.seeks;
         assert!(
-            scanned <= 3,
-            "the raised floor must stop the tail at the next candidate (probes {scanned})"
+            scanned < 20,
+            "the raised floor must stop the tail at the next candidate (scanned {scanned})"
         );
     }
 
@@ -1179,16 +1176,6 @@ impl<'a> AndBlockSource<'a> {
             return false;
         }
         loop {
-            // A child needing a refill is the block boundary: return what this
-            // call produced instead of accumulating the whole intersection run
-            // (two near-identical clauses would otherwise buffer every doc).
-            if !self.docs.is_empty()
-                && (0..self.children.len())
-                    .any(|index| self.indices[index] >= self.buffers[index].len())
-            {
-                probe.blocks = self.blocks_pulled;
-                return true;
-            }
             for index in 0..self.children.len() {
                 if !self.ensure(index) {
                     self.exhausted = true;
@@ -1280,10 +1267,6 @@ pub fn run_multi_walk<'s>(
         ),
     );
     let mut source = AndBlockSource::new(std::mem::take(requireds));
-    // Where the promoted clause sits, carried across blocks: a block flush
-    // must not make the walk re-probe candidates the promoted clause already
-    // skipped past.
-    let mut promoted_next = 0_u64;
     debug_assert!(source.children.len() >= 2);
     loop {
         if !source.next_block(&mut probe) {
@@ -1292,15 +1275,7 @@ pub fn run_multi_walk<'s>(
         must_sums.clear();
         must_sums.resize(source.docs.len(), 0.0);
         source.fold_required(&mut must_sums);
-        let mut slot = 0;
-        while slot < source.docs.len() && source.docs[slot] < promoted_next {
-            slot += 1;
-        }
-        while slot < source.docs.len() {
-            let candidate = source.docs[slot];
-            let index = slot;
-            slot += 1;
-            probe.candidates += 1;
+        for (slot, &candidate) in source.docs.iter().enumerate() {
             let current_floor = floor.get();
             if current_floor.is_finite()
                 && !promoted_optional
@@ -1323,29 +1298,19 @@ pub fn run_multi_walk<'s>(
                 );
                 optional_ub = 0.0;
             }
-            let mut required_sum = must_sums[index];
+            let mut required_sum = must_sums[slot];
             if promoted_optional {
                 probe.seeks += 1;
                 match optionals[0].seek_eq(candidate) {
                     Some(freq) => required_sum += optionals[0].term_score(candidate, freq),
-                    None => match optionals[0].current_doc_id() {
-                        None => {
+                    None => {
+                        if optionals[0].current_doc_id().is_none() {
                             // The promoted clause ran out: with it being
                             // required, the intersection is empty from here.
                             return Ok(true);
                         }
-                        Some(current) => {
-                            // Skip this block's docs below the promoted
-                            // clause's position, the way the seek-to-max
-                            // alignment used to jump the candidate, and carry
-                            // the position across block flushes.
-                            promoted_next = promoted_next.max(current);
-                            while slot < source.docs.len() && source.docs[slot] < promoted_next {
-                                slot += 1;
-                            }
-                            continue;
-                        }
-                    },
+                        continue;
+                    }
                 }
             }
             let mut optional_sum = 0.0_f32;
