@@ -65,6 +65,8 @@ impl BlkProbe {
 }
 
 impl Drop for BlkProbe {
+    // The probe is the one place in this crate that writes to stderr on purpose.
+    #[allow(clippy::print_stderr)]
     fn drop(&mut self) {
         if *BLK_PROBE {
             eprintln!(
