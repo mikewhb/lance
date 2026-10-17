@@ -319,23 +319,13 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
     }
 
     fn seek_eq(&mut self, doc: u64) -> Option<u32> {
-        // Deliberately does NOT `clear_current()`, although it moves the posting
-        // cursor (`take`/`merge`/`fold`/`position_geq` all do). This runs once
-        // per required provider per candidate in the multi walk, and clearing
-        // would add five field writes to that hot path. The `current_doc` /
-        // `current_score` / `shallow` it leaves stale have no consumer on any
-        // path that calls `seek_eq`: the walk reads only `current_doc_id` (which
-        // delegates straight to the posting) and the returned frequency, and
-        // re-seeks per candidate. If `seek_eq` ever gains a caller that reads
-        // the current cache, clear it here like the other cursor-moving methods.
+        // Does not `clear_current()`, unlike `take` / `merge` / `fold` /
+        // `position_geq`. The multi walk calls this once per required provider
+        // per candidate and only reads `current_doc_id` plus the frequency
+        // `PostingIterator::seek_eq` returns. Clearing the five cached fields
+        // here would be dead writes on that path.
         self.batch_steps.set(self.batch_steps.get() + 1);
-        if self.posting.doc().is_some_and(|info| info.doc_id() < doc) {
-            self.posting.next(doc);
-        }
-        match self.posting.doc() {
-            Some(info) if info.doc_id() == doc => Some(info.frequency()),
-            _ => None,
-        }
+        self.posting.seek_eq(doc)
     }
 
     fn global_upper_bound(&self) -> f32 {
@@ -372,15 +362,6 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
             } else {
                 0.0
             };
-        }
-    }
-
-    fn document_keys_batch(&self, docs: &[u64], out: &mut Vec<Option<u64>>) {
-        self.batch_steps.set(self.batch_steps.get() + docs.len());
-        out.clear();
-        out.reserve(docs.len());
-        for &doc in docs {
-            out.push(self.documents.document_key_for_doc_id(doc as u32));
         }
     }
 }

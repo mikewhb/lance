@@ -5046,6 +5046,90 @@ mod tests {
             .collect()
     }
 
+    fn iu_boolean_plan(n_must: usize, n_should: usize) -> CompoundScorerPlan {
+        let leaf = |index| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        CompoundScorerPlan::Boolean {
+            must: (0..n_must).map(leaf).collect(),
+            should: (n_must..n_must + n_should).map(leaf).collect(),
+            must_not: Vec::new(),
+        }
+    }
+
+    struct RoutedCollect {
+        rows: Vec<ScoredRow>,
+        engagements: usize,
+        batch_steps: usize,
+    }
+
+    /// One `collect_partition_with_documents` through the routing entry.
+    /// `floor: None` leaves the collector's floor at its default.
+    fn collect_routed(
+        docs: &DocSet,
+        leaves: Vec<LoadedLeaf>,
+        plan: &CompoundScorerPlan,
+        limit: usize,
+        floor: Option<f32>,
+    ) -> RoutedCollect {
+        let metrics = LocalMetricsCollector::default();
+        let score = Arc::new(CompetitiveScore::default());
+        if let Some(floor) = floor {
+            score.raise(floor);
+        }
+        let mut collector = TopKCollector::with_competitive_score(limit, score);
+        let before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
+        collect_partition_with_documents(docs, leaves, plan, &metrics, &mut collector, Ok).unwrap();
+        RoutedCollect {
+            rows: collector.into_rows(),
+            engagements: super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) - before,
+            batch_steps: metrics.batch_steps(),
+        }
+    }
+
+    /// The same plan built with `admits_term_leaf = false` (WandCursor leaves)
+    /// and drained with `next` / `score` into a top-k collector.
+    fn generic_top_k(
+        docs: &DocSet,
+        leaves: Vec<LoadedLeaf>,
+        plan: &CompoundScorerPlan,
+        limit: usize,
+        floor: Option<f32>,
+    ) -> Vec<ScoredRow> {
+        let metrics = NoOpMetricsCollector;
+        let mut boxed = leaves
+            .into_iter()
+            .map(|leaf| Some(box_leaf_scorer(leaf, docs, &metrics, false)))
+            .collect::<Vec<_>>();
+        let mut scorer = plan.build(&mut boxed).unwrap();
+        let score = Arc::new(CompetitiveScore::default());
+        if let Some(floor) = floor {
+            score.raise(floor);
+        }
+        let mut collector = TopKCollector::with_competitive_score(limit, score);
+        let mut current = scorer.next().unwrap();
+        while current.is_some() {
+            if scorer.matches().unwrap() {
+                collector.insert(ScoredRow {
+                    row_id: scorer.document_key().unwrap(),
+                    score: scorer.score().unwrap(),
+                });
+            }
+            current = scorer.next().unwrap();
+        }
+        collector.into_rows()
+    }
+
+    fn walk_all(scorer: &mut dyn ComposableScorer) -> Vec<(u64, f32)> {
+        let mut rows = Vec::new();
+        let mut current = scorer.next().unwrap();
+        while current.is_some() {
+            if scorer.matches().unwrap() {
+                rows.push((scorer.document_key().unwrap(), scorer.score().unwrap()));
+            }
+            current = scorer.next().unwrap();
+        }
+        rows
+    }
+
     fn materialized(values: &[(u64, f32)]) -> Box<dyn ComposableScorer> {
         Box::new(MaterializedScorer::try_new(rows(values)).unwrap())
     }
@@ -8555,29 +8639,7 @@ mod tests {
         }
         let required_ids: Vec<u32> = (0..40).collect();
         let optional_ids: Vec<u32> = (0..8).collect();
-        let plan = CompoundScorerPlan::Boolean {
-            must: vec![
-                CompoundScorerPlan::Leaf {
-                    index: 0,
-                    boost: 1.0,
-                },
-                CompoundScorerPlan::Leaf {
-                    index: 1,
-                    boost: 1.0,
-                },
-            ],
-            should: vec![
-                CompoundScorerPlan::Leaf {
-                    index: 2,
-                    boost: 1.0,
-                },
-                CompoundScorerPlan::Leaf {
-                    index: 3,
-                    boost: 1.0,
-                },
-            ],
-            must_not: Vec::new(),
-        };
+        let plan = iu_boolean_plan(2, 2);
         let make_leaves = || {
             vec![
                 loaded_leaf(
@@ -8617,26 +8679,17 @@ mod tests {
             "the fixture must leave a sub-floor tail"
         );
 
-        let metrics = LocalMetricsCollector::default();
-        let score = Arc::new(CompetitiveScore::default());
-        score.raise(floor);
-        let mut collector = TopKCollector::with_competitive_score(40, score);
-        let engagements_before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
-        collect_partition_with_documents(&docs, make_leaves(), &plan, &metrics, &mut collector, Ok)
-            .unwrap();
-        let engagements =
-            super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) - engagements_before;
-
+        let routed = collect_routed(&docs, make_leaves(), &plan, 40, Some(floor));
         assert!(
-            engagements > 0,
+            routed.engagements > 0,
             "the K=2/N=2 non-skew shape must engage the batch profile"
         );
         assert!(
-            metrics.batch_steps() > 0,
+            routed.batch_steps > 0,
             "the batch profile must account its work"
         );
         assert_eq!(
-            collector.into_rows(),
+            routed.rows,
             rows(&expected),
             "the routed run must return exactly the oracle's above-floor rows"
         );
@@ -8668,19 +8721,13 @@ mod tests {
             tying > 1,
             "the fixture must contain several candidates exactly at the floor"
         );
-        let metrics = LocalMetricsCollector::default();
-        let score = Arc::new(CompetitiveScore::default());
-        score.raise(required_only);
-        let mut collector = TopKCollector::with_competitive_score(40, score);
-        let engagements_before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
-        collect_partition_with_documents(&docs, make_leaves(), &plan, &metrics, &mut collector, Ok)
-            .unwrap();
+        let routed = collect_routed(&docs, make_leaves(), &plan, 40, Some(required_only));
         assert!(
-            super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) > engagements_before,
+            routed.engagements > 0,
             "the fixture must route through the batch profile"
         );
         assert_eq!(
-            collector.into_rows(),
+            routed.rows,
             rows(&expected),
             "candidates tying the floor must be kept (inclusive comparison)"
         );
@@ -8880,107 +8927,40 @@ mod tests {
         for doc_id in 0..50_u64 {
             docs.append(doc_id, 1);
         }
-        let leaf_node = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
-
-        // K=1: a dense MUST against a close-cost SHOULD clears the skew
-        // gate, so the profile must actually take over (asserted on the entry
-        // counter) and account its own work (batch steps), independently of
-        // the generic comparison counter.
-        let k1_plan = CompoundScorerPlan::Boolean {
-            must: vec![leaf_node(0)],
-            should: vec![leaf_node(1)],
-            must_not: Vec::new(),
+        let posting = |token: &str, ids: Vec<u32>| {
+            loaded_leaf(vec![compressed_unit_posting(token, ids)], None)
         };
-        let should_close_cost = || {
-            loaded_leaf(
-                vec![compressed_unit_posting("should", (0..8).collect())],
-                None,
-            )
-        };
-        let k1_leaves = vec![
-            loaded_leaf(
-                vec![compressed_unit_posting("must", (0..50).collect())],
-                None,
+        // K=1 close-cost, then K>=2. Each must take over and account batch
+        // steps; the generic comparison counter does not see this work.
+        let cases = [
+            (
+                iu_boolean_plan(1, 1),
+                vec![
+                    posting("must", (0..50).collect()),
+                    posting("should", (0..8).collect()),
+                ],
+                "K=1 non-skew IU shape must engage the batch profile",
             ),
-            should_close_cost(),
-        ];
-        let (k1_must, k1_should) = iu_tight_clause_indices(&k1_plan).expect("1+1 shape");
-        assert!(iu_tight_clauses_ready(&k1_leaves, &k1_must, &k1_should));
-
-        let metrics = LocalMetricsCollector::default();
-        let score = Arc::new(CompetitiveScore::default());
-        score.raise(0.5);
-        let mut collector = TopKCollector::with_competitive_score(10, score);
-        let before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
-        let status = collect_partition_with_documents(
-            &docs,
-            k1_leaves,
-            &k1_plan,
-            &metrics,
-            &mut collector,
-            Ok,
-        )
-        .unwrap();
-        assert_eq!(status, CollectionStatus::Complete);
-        assert!(
-            super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) > before,
-            "K=1 non-skew IU shape must engage the batch profile"
-        );
-        assert!(
-            metrics.batch_steps() > 0,
-            "the batch profile must account its own work steps"
-        );
-
-        // K>=2: two dense MUSTs plus a sparse SHOULD take the multi walk.
-        let k2_plan = CompoundScorerPlan::Boolean {
-            must: vec![leaf_node(0), leaf_node(1)],
-            should: vec![leaf_node(2)],
-            must_not: Vec::new(),
-        };
-        let k2_leaves = vec![
-            loaded_leaf(
-                vec![compressed_unit_posting("must_a", (0..50).collect())],
-                None,
-            ),
-            loaded_leaf(
-                vec![compressed_unit_posting(
-                    "must_b",
-                    (0..50).step_by(2).collect(),
-                )],
-                None,
-            ),
-            loaded_leaf(
-                vec![compressed_unit_posting("should", (0..8).collect())],
-                None,
+            (
+                iu_boolean_plan(2, 1),
+                vec![
+                    posting("must_a", (0..50).collect()),
+                    posting("must_b", (0..50).step_by(2).collect()),
+                    posting("should", (0..8).collect()),
+                ],
+                "K>=2 non-skew IU shape must engage the batch profile",
             ),
         ];
-        let (k2_must, k2_should) = iu_tight_clause_indices(&k2_plan).expect("2+1 shape");
-        assert_eq!(k2_must.len(), 2);
-        assert!(iu_tight_clauses_ready(&k2_leaves, &k2_must, &k2_should));
-
-        let metrics = LocalMetricsCollector::default();
-        let score = Arc::new(CompetitiveScore::default());
-        score.raise(0.5);
-        let mut collector = TopKCollector::with_competitive_score(10, score);
-        let before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
-        let status = collect_partition_with_documents(
-            &docs,
-            k2_leaves,
-            &k2_plan,
-            &metrics,
-            &mut collector,
-            Ok,
-        )
-        .unwrap();
-        assert_eq!(status, CollectionStatus::Complete);
-        assert!(
-            super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) > before,
-            "K>=2 non-skew IU shape must engage the batch profile"
-        );
-        assert!(
-            metrics.batch_steps() > 0,
-            "the multi batch profile must account its own work steps"
-        );
+        for (plan, leaves, message) in cases {
+            let (must, should) = iu_tight_clause_indices(&plan).expect("IU shape");
+            assert!(iu_tight_clauses_ready(&leaves, &must, &should));
+            let routed = collect_routed(&docs, leaves, &plan, 10, Some(0.5));
+            assert!(routed.engagements > 0, "{message}");
+            assert!(
+                routed.batch_steps > 0,
+                "the batch profile must account its own work steps"
+            );
+        }
     }
 
     #[test]
@@ -8992,12 +8972,7 @@ mod tests {
         for id in 0..50_u64 {
             docs.append(id, 1);
         }
-        let leaf_node = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
-        let plan = CompoundScorerPlan::Boolean {
-            must: vec![leaf_node(0)],
-            should: vec![leaf_node(1)],
-            must_not: Vec::new(),
-        };
+        let plan = iu_boolean_plan(1, 1);
         let leaves = || {
             vec![
                 loaded_leaf(
@@ -9010,52 +8985,22 @@ mod tests {
                 ),
             ]
         };
-
-        // Routed entry (batch profile).
-        let metrics = LocalMetricsCollector::default();
-        let score = Arc::new(CompetitiveScore::default());
-        score.raise(0.5);
-        let mut routed = TopKCollector::with_competitive_score(10, score);
-        let engagements_before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
-        collect_partition_with_documents(&docs, leaves(), &plan, &metrics, &mut routed, Ok)
-            .unwrap();
+        let routed = collect_routed(&docs, leaves(), &plan, 10, Some(0.5));
         assert!(
-            super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) > engagements_before,
+            routed.engagements > 0,
             "a K=1 non-skew IU shape must engage the batch profile"
         );
-        // The bulk passes (scores / keys / fold) each account their candidate
-        // slice, so the total must exceed the 50 taken MUST candidates that
-        // the block take alone would report.
+        // Bulk passes (scores / keys / fold) each account their candidate
+        // slice, so the total must exceed the 50 MUST docs a block take
+        // alone would report.
         assert!(
-            metrics.batch_steps() > 50,
+            routed.batch_steps > 50,
             "the batch bulk passes must account their candidate slices, got {}",
-            metrics.batch_steps()
+            routed.batch_steps
         );
-        let routed_rows = routed.into_rows();
-
-        // Directly built generic tree, same starting floor, full walk.
-        let generic_metrics = NoOpMetricsCollector;
-        let mut generic_leaves = leaves()
-            .into_iter()
-            .map(|leaf| Some(box_leaf_scorer(leaf, &docs, &generic_metrics, false)))
-            .collect::<Vec<_>>();
-        let mut generic = plan.build(&mut generic_leaves).unwrap();
-        let generic_score = Arc::new(CompetitiveScore::default());
-        generic_score.raise(0.5);
-        let mut collector = TopKCollector::with_competitive_score(10, generic_score);
-        let mut current = generic.next().unwrap();
-        while current.is_some() {
-            if generic.matches().unwrap() {
-                collector.insert(ScoredRow {
-                    row_id: generic.document_key().unwrap(),
-                    score: generic.score().unwrap(),
-                });
-            }
-            current = generic.next().unwrap();
-        }
         assert_eq!(
-            routed_rows,
-            collector.into_rows(),
+            routed.rows,
+            generic_top_k(&docs, leaves(), &plan, 10, Some(0.5)),
             "the batch profile must reproduce the generic walk row for row"
         );
     }
@@ -9316,19 +9261,10 @@ mod tests {
             .map(|leaf| Some(box_leaf_scorer(leaf, &docs, &generic_metrics, false)))
             .collect::<Vec<_>>();
         let mut generic_scorer = plan.build(&mut generic).unwrap();
-
-        let walk = |scorer: &mut dyn ComposableScorer| -> Vec<(u64, f32)> {
-            let mut rows = Vec::new();
-            let mut current = scorer.next().unwrap();
-            while current.is_some() {
-                if scorer.matches().unwrap() {
-                    rows.push((scorer.document_key().unwrap(), scorer.score().unwrap()));
-                }
-                current = scorer.next().unwrap();
-            }
-            rows
-        };
-        assert_eq!(walk(flagged_scorer.as_mut()), walk(generic_scorer.as_mut()));
+        assert_eq!(
+            walk_all(flagged_scorer.as_mut()),
+            walk_all(generic_scorer.as_mut())
+        );
     }
 
     #[test]
@@ -9367,19 +9303,8 @@ mod tests {
             generic.push(Some(box_leaf_scorer(leaf, &docs, &generic_metrics, false)));
         }
         let mut generic_scorer = plan.build(&mut generic).unwrap();
-        let walk = |scorer: &mut dyn ComposableScorer| -> Vec<(u64, f32)> {
-            let mut rows = Vec::new();
-            let mut current = scorer.next().unwrap();
-            while current.is_some() {
-                if scorer.matches().unwrap() {
-                    rows.push((scorer.document_key().unwrap(), scorer.score().unwrap()));
-                }
-                current = scorer.next().unwrap();
-            }
-            rows
-        };
-        let flagged_rows = walk(flagged_scorer.as_mut());
-        let generic_rows = walk(generic_scorer.as_mut());
+        let flagged_rows = walk_all(flagged_scorer.as_mut());
+        let generic_rows = walk_all(generic_scorer.as_mut());
         assert_eq!(flagged_rows.len(), 3, "exactly the b hits survive the AND");
         assert_eq!(flagged_rows, generic_rows);
     }
@@ -9452,27 +9377,7 @@ mod tests {
              suggests a full dense scan"
         );
 
-        // Differential: the directly built generic tree must agree on the
-        // winner and its score.
-        let generic_metrics = NoOpMetricsCollector;
-        let mut generic_leaves = leaves()
-            .into_iter()
-            .map(|leaf| Some(box_leaf_scorer(leaf, &docs, &generic_metrics, false)))
-            .collect::<Vec<_>>();
-        let mut generic = routed_plan.build(&mut generic_leaves).unwrap();
-        let mut collector = TopKCollector::new(1);
-        let mut current = generic.next().unwrap();
-        while current.is_some() {
-            if generic.matches().unwrap() {
-                let score = generic.score().unwrap();
-                collector.insert(ScoredRow {
-                    row_id: generic.document_key().unwrap(),
-                    score,
-                });
-            }
-            current = generic.next().unwrap();
-        }
-        let generic_rows = collector.into_rows();
+        let generic_rows = generic_top_k(&docs, leaves(), &routed_plan, 1, None);
         assert_eq!(rows[0].row_id, generic_rows[0].row_id);
         assert_eq!(rows[0].score, generic_rows[0].score);
     }
@@ -9488,12 +9393,7 @@ mod tests {
         for id in 0..n {
             docs.append(id.into(), 1);
         }
-        let leaf_node = |index| CompoundScorerPlan::Leaf { index, boost: 1.0 };
-        let routed_plan = CompoundScorerPlan::Boolean {
-            must: vec![leaf_node(0), leaf_node(1)],
-            should: vec![leaf_node(2)],
-            must_not: Vec::new(),
-        };
+        let routed_plan = iu_boolean_plan(2, 1);
         let leaves = || {
             vec![
                 loaded_leaf(vec![compressed_unit_posting("a", (0..n).collect())], None),
@@ -9507,42 +9407,14 @@ mod tests {
                 ),
             ]
         };
-
-        // Routed entry (multi batch profile).
-        let metrics = LocalMetricsCollector::default();
-        let mut routed = TopKCollector::new(10);
-        let engagements_before = super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get);
-        collect_partition_with_documents(&docs, leaves(), &routed_plan, &metrics, &mut routed, Ok)
-            .unwrap();
-        let engagements =
-            super::reqopt::BATCH_ENGAGEMENTS.with(std::cell::Cell::get) - engagements_before;
+        let routed = collect_routed(&docs, leaves(), &routed_plan, 10, None);
         assert!(
-            engagements > 0,
+            routed.engagements > 0,
             "a K >= 2 non-skew IU shape must engage the batch profile"
         );
-        let routed_rows = routed.into_rows();
-
-        // Directly built generic tree (WandCursor leaves), full walk.
-        let generic_metrics = NoOpMetricsCollector;
-        let mut generic_leaves = leaves()
-            .into_iter()
-            .map(|leaf| Some(box_leaf_scorer(leaf, &docs, &generic_metrics, false)))
-            .collect::<Vec<_>>();
-        let mut generic = routed_plan.build(&mut generic_leaves).unwrap();
-        let mut collector = TopKCollector::new(10);
-        let mut current = generic.next().unwrap();
-        while current.is_some() {
-            if generic.matches().unwrap() {
-                collector.insert(ScoredRow {
-                    row_id: generic.document_key().unwrap(),
-                    score: generic.score().unwrap(),
-                });
-            }
-            current = generic.next().unwrap();
-        }
-        let generic_rows = collector.into_rows();
-
-        assert_eq!(routed_rows.len(), generic_rows.len());
-        assert_eq!(routed_rows, generic_rows);
+        assert_eq!(
+            routed.rows,
+            generic_top_k(&docs, leaves(), &routed_plan, 10, None)
+        );
     }
 }

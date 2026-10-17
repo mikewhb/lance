@@ -1392,6 +1392,22 @@ impl PostingIterator {
         }
     }
 
+    /// Forward-seek to `doc` in the dense doc-id domain.
+    ///
+    /// On a hit the cursor sits on `doc` and the frequency is returned. On a
+    /// miss it sits on the first document strictly after `doc`, or past the
+    /// end. Same park as [`PostingIterator::next`]; callers that must not
+    /// revive a cursor past `u32::MAX` rely on that seek being terminal.
+    pub(super) fn seek_eq(&mut self, doc: u64) -> Option<u32> {
+        if self.doc().is_some_and(|info| info.doc_id() < doc) {
+            self.next(doc);
+        }
+        match self.doc() {
+            Some(info) if info.doc_id() == doc => Some(info.frequency()),
+            _ => None,
+        }
+    }
+
     // move to the next doc id that is greater than or equal to least_id
     fn next(&mut self, least_id: u64) {
         match self.list {

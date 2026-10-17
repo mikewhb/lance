@@ -78,6 +78,13 @@ enum BatchShape {
     },
 }
 
+enum RequiredLeap {
+    Hit,
+    Exhausted,
+    /// The next search target. The caller drops the cached shallow window.
+    Restart(u64),
+}
+
 impl<'a> ReqOptScorer<'a> {
     pub(super) fn new(required: BoxScorer<'a>, optional: BoxScorer<'a>) -> Self {
         debug_assert!(required.scores_non_negative());
@@ -223,24 +230,54 @@ impl<'a> ReqOptScorer<'a> {
         }
     }
 
-    /// Leapfrog driven by the required (MUST) list.
-    fn intersect_from_required(&mut self, target: u64) -> Result<Option<u64>> {
+    /// Leapfrog driven by the required (MUST) list. `up_to == u64::MAX` never
+    /// restarts: running off either list exhausts. A finite `up_to` is the
+    /// shallow window inside [`ReqOptScorer::position`]; leaving that window
+    /// restarts the outer search instead of ending the scan.
+    fn leapfrog_from_required(&mut self, target: u64, up_to: u64) -> Result<RequiredLeap> {
         let Some(mut required_doc) = self.required.advance(target)? else {
-            return Ok(self.exhaust());
+            return Ok(RequiredLeap::Exhausted);
         };
+        if required_doc > up_to {
+            return Ok(RequiredLeap::Restart(required_doc));
+        }
         loop {
             self.set_current(Some(required_doc));
             self.set_optional_required(true);
             let Some(optional_doc) = self.ensure_optional_at_or_after(required_doc)? else {
-                return Ok(self.exhaust());
+                return Ok(if up_to == u64::MAX {
+                    RequiredLeap::Exhausted
+                } else {
+                    RequiredLeap::Restart(up_to + 1)
+                });
             };
+            if optional_doc > up_to {
+                return Ok(if up_to == u64::MAX {
+                    RequiredLeap::Exhausted
+                } else {
+                    RequiredLeap::Restart(up_to + 1)
+                });
+            }
             if optional_doc == required_doc {
-                return Ok(self.current);
+                return Ok(RequiredLeap::Hit);
             }
             let Some(next_required) = self.required.advance(optional_doc)? else {
-                return Ok(self.exhaust());
+                return Ok(RequiredLeap::Exhausted);
             };
+            if next_required > up_to {
+                return Ok(RequiredLeap::Restart(next_required));
+            }
             required_doc = next_required;
+        }
+    }
+
+    /// Leapfrog driven by the required (MUST) list, with no shallow-range cap.
+    fn intersect_from_required(&mut self, target: u64) -> Result<Option<u64>> {
+        match self.leapfrog_from_required(target, u64::MAX)? {
+            RequiredLeap::Hit => Ok(self.current),
+            RequiredLeap::Exhausted => Ok(self.exhaust()),
+            // `u64::MAX` cannot be exceeded, so a restart is not produced.
+            RequiredLeap::Restart(_) => Ok(self.exhaust()),
         }
     }
 
@@ -354,50 +391,16 @@ impl<'a> ReqOptScorer<'a> {
 
                 if bounds.required.upper < self.min_competitive_score {
                     // The optional contribution is necessary throughout this
-                    // cached shallow range. Intersect approximations until
-                    // both sides agree or the range is exhausted.
-                    let Some(mut required_doc) = self.required.advance(target)? else {
-                        return Ok(self.exhaust());
-                    };
-                    if required_doc > bounds.up_to {
-                        target = required_doc;
-                        self.shallow_bounds = None;
-                        continue;
-                    }
-                    self.set_current(Some(required_doc));
-                    self.set_optional_required(true);
-                    loop {
-                        self.set_current(Some(required_doc));
-                        self.set_optional_required(true);
-                        let Some(optional_doc) = self.ensure_optional_at_or_after(required_doc)?
-                        else {
-                            if bounds.up_to == u64::MAX {
-                                return Ok(self.exhaust());
-                            }
-                            target = bounds.up_to + 1;
-                            self.shallow_bounds = None;
-                            continue 'search;
-                        };
-                        if optional_doc > bounds.up_to {
-                            if bounds.up_to == u64::MAX {
-                                return Ok(self.exhaust());
-                            }
-                            target = bounds.up_to + 1;
+                    // cached shallow range. Intersect until both sides agree
+                    // or the range is exhausted.
+                    match self.leapfrog_from_required(target, bounds.up_to)? {
+                        RequiredLeap::Hit => return Ok(self.current),
+                        RequiredLeap::Exhausted => return Ok(self.exhaust()),
+                        RequiredLeap::Restart(next) => {
+                            target = next;
                             self.shallow_bounds = None;
                             continue 'search;
                         }
-                        if optional_doc == required_doc {
-                            return Ok(self.current);
-                        }
-                        let Some(next_required) = self.required.advance(optional_doc)? else {
-                            return Ok(self.exhaust());
-                        };
-                        if next_required > bounds.up_to {
-                            target = next_required;
-                            self.shallow_bounds = None;
-                            continue 'search;
-                        }
-                        required_doc = next_required;
                     }
                 }
             }

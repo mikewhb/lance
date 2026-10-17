@@ -388,19 +388,8 @@ pub fn run_single_walk<'s>(
                 }
                 if let Some(Some(required)) =
                     promotion_decision.as_ref().map(|(_, decision)| decision)
+                    && !required.is_empty()
                 {
-                    // Defensive: `iu_tight_required_shoulds` returns
-                    // `Some(vec![])` only when `iu_cannot_compete(must_ub,
-                    // sum_shoulds, floor)` holds. The gate above uses
-                    // `live_upper_bound(&dry, ..)`, which is <= `sum_shoulds`
-                    // (it drops the dry clauses), and `iu_cannot_compete` is
-                    // monotone in `remaining` (a smaller sum is *more* likely to
-                    // be rejected) — so that gate fires first and this branch is
-                    // unreachable from this walk. Kept as a guard; the helper's
-                    // empty return is covered by its own unit tests.
-                    if required.is_empty() {
-                        return Ok(true);
-                    }
                     let lead_cost = required
                         .iter()
                         .map(|&index| shoulds[index].cost())
@@ -467,63 +456,10 @@ pub fn run_single_walk<'s>(
 mod batch_proto_tests {
     use std::collections::HashSet;
 
-    use super::super::super::DocInfo;
-    use super::super::{FlatDocuments, WandDocuments};
     use super::{
         BlockBatch, CompetitiveScore, PromotedWalk, conservative_score_sum, run_multi_walk,
         run_single_walk,
     };
-
-    /// Minimal documents with configurable visibility / num_tokens.
-    struct MockDocs {
-        hidden: HashSet<u32>,
-    }
-
-    impl MockDocs {
-        fn key(&self, doc_id: u32) -> Option<u64> {
-            (!self.hidden.contains(&doc_id)).then_some(doc_id as u64)
-        }
-    }
-
-    impl WandDocuments for MockDocs {
-        type Candidate = u64;
-
-        fn len(&self) -> usize {
-            1000
-        }
-
-        fn scoring_norms(&self) -> Option<&[u8]> {
-            None
-        }
-
-        fn scoring_num_tokens(&self, _doc_id: u32) -> u32 {
-            1
-        }
-
-        fn doc_length(&self, _doc: &DocInfo) -> u32 {
-            1
-        }
-
-        fn document_key(&self, doc: &DocInfo) -> Option<u64> {
-            self.key(doc.doc_id() as u32)
-        }
-
-        fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
-            self.key(doc_id)
-        }
-
-        fn candidate_from_key(&self, key: u64) -> u64 {
-            key
-        }
-
-        fn flat_documents(&self) -> Option<FlatDocuments<'_>> {
-            None
-        }
-
-        fn flat_doc_length(&self, _doc_id: u64, _key: u64, _compressed: bool) -> u32 {
-            1
-        }
-    }
 
     /// Mock provider: in-memory posting (term_score = freq as f32), simulating
     /// block decoding `block` docs at a time.
@@ -606,13 +542,10 @@ mod batch_proto_tests {
 
     /// Counterexample fixture: MUST docs 1..=20 each freq 1;
     /// SHOULD0 = {3,17} freq 10; SHOULD1 = {7} freq 10. Score = 1 + 10×hits.
-    fn fixtures() -> (MockBatch, Vec<MockBatch>, MockDocs, Vec<(u64, f32)>) {
+    fn fixtures() -> (MockBatch, Vec<MockBatch>, Vec<(u64, f32)>) {
         let must = MockBatch::new((1..=20).map(|d| (d, 1)).collect(), 1.0, 4);
         let should0 = MockBatch::new(vec![(3, 10), (17, 10)], 10.0, 4);
         let should1 = MockBatch::new(vec![(7, 10)], 10.0, 4);
-        let docs = MockDocs {
-            hidden: HashSet::new(),
-        };
         // Enumeration oracle (all visible): doc d scores 1 + 10×(SHOULD hits).
         let oracle: Vec<(u64, f32)> = (1..=20)
             .map(|d| {
@@ -623,7 +556,7 @@ mod batch_proto_tests {
                 (d as u64, 1.0 + 10.0 * s)
             })
             .collect();
-        (must, vec![should0, should1], docs, oracle)
+        (must, vec![should0, should1], oracle)
     }
 
     /// A shared floor raised to `value`, mirroring what the collector exposes.
@@ -678,19 +611,12 @@ mod batch_proto_tests {
     }
 
     #[test]
-    fn batch_first_takeover_delivers_hits_above_floor() {
-        let (mut must, mut shoulds, _docs, _oracle) = fixtures();
-        let out = run_all(1.0, &vec![10.0, 10.0], &mut must, &mut shoulds, 11.0);
-        assert_eq!(
-            out,
-            vec![(3, 11.0), (7, 11.0), (17, 11.0)],
-            "candidates tying (=) the floor must be kept"
-        );
-    }
-
-    #[test]
     fn batch_one_call_delivers_every_above_floor_hit_once_in_order() {
-        let (mut must, mut shoulds, _docs, oracle) = fixtures();
+        // Floor 11 ties the SHOULD hits (score 11) and sits above must_ub (1).
+        // Keeping those ties is the inclusive-floor pin; delivering each once,
+        // in order, is the one-call contract. A walk that stopped when the
+        // floor passed must_ub would drop them.
+        let (mut must, mut shoulds, oracle) = fixtures();
         let floor = 11.0;
         let out = run_all(1.0, &vec![10.0, 10.0], &mut must, &mut shoulds, floor);
         let expected: Vec<(u64, f32)> = oracle
@@ -700,28 +626,12 @@ mod batch_proto_tests {
             .collect();
         assert_eq!(
             out, expected,
-            "one call must deliver every above-floor hit exactly once"
+            "one call must deliver every above-floor hit exactly once, including ties"
         );
         assert!(
             out.windows(2).all(|pair| pair[0].0 < pair[1].0),
             "delivery stays in ascending doc order"
         );
-    }
-
-    #[test]
-    fn batch_keeps_walking_when_floor_rises_past_must_ub() {
-        // Precondition: after floor (11.0) crosses must_ub (1.0), the walk
-        // performs no union→intersection pruning and keeps scanning MUST —
-        // docs hit by should0 (11.0, tying the floor) must be kept, since
-        // dropping them would lose a result.
-        let (mut must, mut shoulds, _docs, oracle) = fixtures();
-        let out = run_all(1.0, &vec![10.0, 10.0], &mut must, &mut shoulds, 11.0);
-        let expected: Vec<(u64, f32)> = oracle
-            .iter()
-            .copied()
-            .filter(|(_, score)| *score >= 11.0)
-            .collect();
-        assert_eq!(out, expected);
     }
 
     #[test]
@@ -786,9 +696,6 @@ mod batch_proto_tests {
         let mut must = MockBatch::new((1..=200).map(|d| (d, 1)).collect(), 1.0, 32);
         must.hidden = (1..=199).collect();
         let mut shoulds = [MockBatch::new(vec![(200, 10)], 10.0, 32)];
-        let _docs = MockDocs {
-            hidden: (1..=199).collect(),
-        };
         let (exhausted, out) = run_once(1.0, &vec![10.0], &mut must, &mut shoulds, 5.0);
         assert!(exhausted);
         assert_eq!(out, vec![(200, 11.0)], "the far visible hit must survive");
@@ -1056,16 +963,6 @@ mod batch_proto_tests {
             "fixture must straddle a floor between a bare += and the recomputed bound: \
              {recomputed} vs {folded}"
         );
-    }
-
-    #[test]
-    fn walk_bounds_are_plain_data() {
-        // The walks take their bounds by value, so nothing about them needs the
-        // old "pure data ⇒ Send" argument: there is no cross-call state left to
-        // send. This asserts the shape stayed that way.
-        let bounds: (f32, Vec<f32>) = (1.0, vec![1.0]);
-        fn assert_send<T: Send>(_: &T) {}
-        assert_send(&bounds);
     }
 }
 
