@@ -1166,6 +1166,17 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
             if doc > up_to {
                 return Ok(WindowCollect { exhausted: false });
             }
+            // Same two-phase contract the default drain enforces: a non-finite
+            // or negative `match_cost` means the provider is inconsistent, and
+            // silently reading it as "no confirmation needed" would skip the
+            // phrase check. Validate before consulting it.
+            if let Some(match_cost) = self.match_cost()
+                && (!match_cost.is_finite() || match_cost < 0.0)
+            {
+                return Err(Error::internal(format!(
+                    "FTS scorer reported invalid two-phase match cost: {match_cost}"
+                )));
+            }
             let score = checked_score(self.current_score()?, "window drain emit")?;
             // Inclusive collector floor. wand_factor only raises the skip
             // threshold inside next(); it must not tighten this emit test.
@@ -2590,6 +2601,11 @@ impl<K: Copy + Ord> TopKCollector<K> {
                 let floor = Arc::clone(&self.competitive_score);
                 let mut overflow = false;
                 let mut emit = |document_key: u64, score: f32| -> Result<bool> {
+                    // The batch walks sum their clause scores directly, so this
+                    // is their equivalent of the generic path's `checked_score`:
+                    // a non-finite sum is a scorer bug, not a candidate to drop
+                    // silently (the `score >= floor` test below would drop it).
+                    let score = checked_score(score, "IU batch walk emit")?;
                     // The walk only emits at or above the floor it last read, and
                     // this is the second half of that contract: the floor can rise
                     // between the walk's read and this call, so re-checking here is
@@ -4498,7 +4514,16 @@ where
     // One plan scan for the whole admission decision: the per-leaf predicate
     // re-derives the plan's leaf split every time, which is O(L^2) over a
     // plan that never changes.
-    let term_leaf_admits = leaf_admission_set(plan, leaves.len());
+    // The leaf swap belongs to the same opt-in capability as the batch walks:
+    // gating it on `iu_tight_enabled()` makes `off` a clean A/B baseline (every
+    // leaf boxes as a `WandCursor`, matching the pre-change leaf topology).
+    // It cannot make `off` byte-for-byte the old *code* — the collector itself
+    // was rewritten — only the same leaf topology.
+    let term_leaf_admits = if iu_tight_enabled() {
+        leaf_admission_set(plan, leaves.len())
+    } else {
+        vec![false; leaves.len()]
+    };
     let mut leaf_scorers = leaves
         .into_iter()
         .enumerate()
