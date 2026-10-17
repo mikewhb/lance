@@ -389,6 +389,7 @@ impl PromotedWalk {
 /// `run_multi_walk` returns `true` on that same stall — a known asymmetry that
 /// is currently unobservable, since `ReqOptScorer::collect_top_k` is the only
 /// consumer and an overflow retries the partition regardless.
+/// K = 1 entry: one required provider, folded per block.
 pub fn run_single_walk<'s>(
     must_ub: f32,
     should_ubs: &[f32],
@@ -397,130 +398,23 @@ pub fn run_single_walk<'s>(
     floor: &CompetitiveScore,
     emit: &mut dyn FnMut(u64, f32) -> Result<bool>,
 ) -> Result<bool> {
-    let mut dry = vec![false; should_ubs.len()];
-    let mut promotion_decision: Option<(f32, Option<Vec<usize>>)> = None;
-    let mut chunk: Vec<(u64, u32)> = Vec::new();
-    let mut candidates: Vec<u64> = Vec::new();
-    let mut should_sums: Vec<f32> = Vec::new();
-    let mut chunk_freqs: Vec<u32> = Vec::new();
-    let mut must_scores: Vec<f32> = Vec::new();
-    let mut keys: Vec<Option<u64>> = Vec::new();
-    let mut chunk_idx = 0usize;
-    let mut last_doc = 0u64;
-    let mut chunk_started = false;
-    let mut probe = BlkProbe::new(
-        "single",
-        est_block_count(
-            std::iter::once(must.cost()).chain(shoulds.iter().map(|should| should.cost())),
-        ),
-    );
-    loop {
-        // 1) Emit the candidates of the block already in the state's
-        // chunk. All per-candidate tables were batch-computed at block
-        // take — this loop does no provider dispatch at all.
-        while chunk_idx < chunk.len() {
-            let idx = chunk_idx;
-            let (doc, _freq) = chunk[idx];
-            chunk_idx += 1;
-            last_doc = doc;
-            let Some(key) = keys[idx] else {
-                continue;
-            };
-            let score = must_scores[idx] + should_sums[idx];
-            if score >= floor.get() {
-                probe.emits += 1;
-                if !emit(key, score)? {
-                    return Ok(false);
-                }
-            }
-        }
-        // 2) Block fully consumed: block-end checks (only after really
-        // consuming a block). The floor is read here, at the block
-        // boundary, so a hit emitted earlier in this call has already
-        // raised the value these gates prune with.
-        if chunk_started {
-            let floor_now = floor.get();
-            if floor_now.is_finite() {
-                let live_optional_ub = live_upper_bound(&dry, |index| should_ubs[index]);
-                if iu_cannot_compete(must_ub, live_optional_ub, floor_now) {
-                    return Ok(true);
-                }
-                if promotion_decision
-                    .as_ref()
-                    .is_none_or(|(decided_floor, _)| *decided_floor != floor_now)
-                {
-                    promotion_decision = Some((
-                        floor_now,
-                        iu_tight_required_shoulds(must_ub, should_ubs, floor_now),
-                    ));
-                }
-                if let Some(Some(required)) =
-                    promotion_decision.as_ref().map(|(_, decision)| decision)
-                    && !required.is_empty()
-                {
-                    let lead_cost = required
-                        .iter()
-                        .map(|&index| shoulds[index].cost())
-                        .min()
-                        .unwrap_or(usize::MAX);
-                    if iu_tight_lead_is_cheaper(must.cost(), lead_cost) {
-                        let lead = *required
-                            .iter()
-                            .min_by_key(|&&index| shoulds[index].cost())
-                            .expect("checked non-empty");
-                        let mut walk =
-                            PromotedWalk::new(lead, required.clone(), last_doc.saturating_add(1));
-                        if walk.run(must, shoulds, floor, emit)? {
-                            return Ok(true);
-                        }
-                        return Ok(false);
-                    }
-                }
-            }
-        }
-        // 3) Take the next block and rebuild the merge state. All
-        // per-candidate provider exits (must scores, visibility keys,
-        // per-SHOULD scoring) collapse to one dispatch per block.
-        must.take_docs_one_block_upto(TERMINATED_DOC_ID, &mut chunk);
-        if chunk.is_empty() {
-            return Ok(true);
-        }
-        probe.blocks += 1;
-        probe.candidates += chunk.len();
-        candidates.clear();
-        candidates.extend(chunk.iter().map(|(doc, _)| *doc));
-        chunk_freqs.clear();
-        chunk_freqs.extend(chunk.iter().map(|(_, f)| *f));
-        // must_scores carries no independent zero semantics — every
-        // entry is rewritten by term_scores_batch below — so a plain
-        // resize (no clear) avoids a per-block memset.
-        must_scores.resize(candidates.len(), 0.0);
-        must.term_scores_batch(&candidates, &chunk_freqs, &mut must_scores);
-        must.document_keys_batch(&candidates, &mut keys);
-        // `should_sums` accumulates (`fold_optional_scores` adds into every
-        // hit slot and *leaves misses untouched*), so unlike `must_scores` it
-        // must be zeroed before each block: the resize above only grows the
-        // vector, it does not reset the slots the fold will revisit.
-        should_sums.clear();
-        should_sums.resize(chunk.len(), 0.0);
-        for (index, should) in shoulds.iter_mut().enumerate() {
-            // One fused dispatch per SHOULD: merge + score + accumulate
-            // in the provider, in the same accumulation order as the
-            // separated passes.
-            should.fold_optional_scores(&candidates, &mut should_sums);
-            if should.current_doc_id().is_none() {
-                dry[index] = true;
-            }
-        }
-        chunk_idx = 0;
-        chunk_started = true;
-    }
+    let must_cost = must.cost();
+    let mut source = RequiredSource::One {
+        provider: Some(must),
+        docs: Vec::new(),
+    };
+    run_block_walk(
+        must_ub,
+        &[],
+        must_cost,
+        should_ubs,
+        &mut source,
+        shoulds,
+        floor,
+        emit,
+    )
 }
 
-// ===== Walk harness: path walkthrough (takeover / promotion latch /
-// exhaustion). Drives the walks with mock providers to verify deliver-once
-// ordering, visibility, the promotion sub-mode, and soundness under a floor
-// that rises mid-walk.
 
 #[cfg(test)]
 mod batch_proto_tests {
@@ -544,6 +438,8 @@ mod batch_proto_tests {
         seeks: usize,
         /// Frequencies of the block last returned by `take_block`.
         block_freqs: Vec<u32>,
+        /// Block merges, so a test can see the per-block work.
+        merges: usize,
         hidden: HashSet<u32>,
     }
 
@@ -557,6 +453,7 @@ mod batch_proto_tests {
                 takes: 0,
                 seeks: 0,
                 block_freqs: Vec::new(),
+                merges: 0,
                 hidden: HashSet::new(),
             }
         }
@@ -576,6 +473,7 @@ mod batch_proto_tests {
         }
 
         fn merge_optional_freqs(&mut self, docs: &[u64], out_freqs: &mut [u32]) {
+            self.merges += 1;
             out_freqs.fill(0);
             for (index, &doc) in docs.iter().enumerate() {
                 if let Ok(hit) = self.docs.binary_search_by_key(&doc, |&(d, _)| d) {
@@ -949,13 +847,12 @@ mod batch_proto_tests {
             exhausted,
             "the raised floor proves the rest of the intersection dead"
         );
-        // S2 moved the required side to a block merge, so required seeks are
-        // gone; the post-rise scanned work now shows on the optional side (one
-        // probe for doc 1, one for the promoted re-evaluation at doc 2).
-        let scanned = optionals[0].seeks;
+        // S3 folds the optionals per block, so the scanned work shows as
+        // merges: the raised floor must stop the walk after the first block.
+        let scanned = optionals[0].merges;
         assert!(
-            scanned <= 3,
-            "the raised floor must stop the tail at the next candidate (probes {scanned})"
+            scanned <= 2,
+            "the raised floor must stop the tail at the first block end (merges {scanned})"
         );
     }
 
@@ -1009,9 +906,12 @@ mod batch_proto_tests {
         // bound, hence below the floor), so scanned work is the observable that
         // separates them.
         let next_above = |value: f32| f32::from_bits(value.to_bits() + 1);
-        let mut must0 = MockBatch::new(vec![(1, 1500), (2, 1500)], 1500.0, 4);
-        let mut must1 = MockBatch::new(vec![(1, 1500), (2, 1500)], 1500.0, 4);
-        let mut optionals = [MockBatch::new(vec![(1, 1500), (2, 1500)], 1500.0, 4)];
+        // One doc per block: the promotion decision is taken at a block end, so
+        // the fixture needs two blocks for a sound bound to be distinguishable
+        // from a rounded-down one (which stops after the first).
+        let mut must0 = MockBatch::new(vec![(1, 1500), (2, 1500)], 1500.0, 1);
+        let mut must1 = MockBatch::new(vec![(1, 1500), (2, 1500)], 1500.0, 1);
+        let mut optionals = [MockBatch::new(vec![(1, 1500), (2, 1500)], 1500.0, 1)];
         let floor = competitive_score_at(next_above(4500.0));
         let mut out = Vec::new();
         let exhausted = {
@@ -1035,20 +935,14 @@ mod batch_proto_tests {
             out.is_empty(),
             "no candidate can reach a floor above the old bound"
         );
-        // The promotion fires at the first candidate (3000 < floor) and
-        // re-evaluates it; the sound bound does not prove the rest dead, so the
-        // walk keeps scanning: the promoted clause is probed at both candidates
-        // (2 seeks). The bare `+=` bound is strictly below the floor, cuts at
-        // the re-evaluation, and stops after the first probe.
-        //
-        // The observable moved from `must0.seeks` to the promoted clause's
-        // seeks when S2 replaced the per-candidate required alignment with a
-        // block merge: the required providers are no longer seeked per
-        // candidate, so scanned work is now visible on the optional side.
+        // The promotion fires at the first block end (3000 < floor); the sound
+        // bound does not prove the rest dead, so the walk scans the second
+        // block too (2 merges). The bare `+=` bound is strictly below the
+        // floor, cuts at that same block end, and stops after the first.
         assert!(
-            optionals[0].seeks >= 2,
-            "a sound promoted bound must not cut the walk after the promotion (seeks {})",
-            optionals[0].seeks
+            optionals[0].merges >= 2,
+            "a sound promoted bound must not cut the walk after the promotion (merges {})",
+            optionals[0].merges
         );
         // Pin the arithmetic that makes the fixture discriminating (raw folds
         // in f64 with a widening factor > 1; a bare `+=` rounds to exactly
@@ -1224,6 +1118,10 @@ impl<'a> AndBlockSource<'a> {
         }
     }
 
+    fn docs(&self) -> &[u64] {
+        &self.docs
+    }
+
     /// Sum of the required clauses at each doc, in children order (the order
     /// `RequiredConjunctionScorer::score` uses).
     fn fold_required(&mut self, sums: &mut [f32]) {
@@ -1257,6 +1155,244 @@ impl<'a> AndBlockSource<'a> {
 /// intersection is exhausted, but unlike it this walk returns `true` on an
 /// `emit` stall too (see the note on `run_single_walk`; the asymmetry is
 /// currently unobservable).
+/// The required side of the block walk: one provider (K = 1) or a block-level
+/// intersection of several (K >= 2). The walk below never learns which.
+pub enum RequiredSource<'a> {
+    One {
+        provider: Option<&'a mut dyn BlockBatch>,
+        docs: Vec<u64>,
+    },
+    Many(AndBlockSource<'a>),
+}
+
+impl<'a> RequiredSource<'a> {
+    fn is_single(&self) -> bool {
+        matches!(self, Self::One { .. })
+    }
+
+    fn next_block(&mut self, probe: &mut BlkProbe) -> bool {
+        match self {
+            Self::One { provider, docs } => {
+                let provider = provider
+                    .as_mut()
+                    .expect("required provider used after the promotion handoff");
+                provider.take_block(TERMINATED_DOC_ID, docs);
+                probe.blocks += 1;
+                !docs.is_empty()
+            }
+            Self::Many(source) => source.next_block(probe),
+        }
+    }
+
+    fn docs(&self) -> &[u64] {
+        match self {
+            Self::One { docs, .. } => docs,
+            Self::Many(source) => source.docs(),
+        }
+    }
+
+    fn fold_required(&mut self, sums: &mut [f32]) {
+        match self {
+            Self::One { provider, docs } => {
+                let provider = provider
+                    .as_mut()
+                    .expect("required provider used after the promotion handoff");
+                provider.fold_scores(docs, sums);
+            }
+            Self::Many(source) => source.fold_required(sums),
+        }
+    }
+
+    fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+        match self {
+            Self::One { provider, .. } => provider
+                .as_ref()
+                .expect("required provider used after the promotion handoff")
+                .document_key_for_doc_id(doc_id),
+            Self::Many(source) => source.document_key_for_doc_id(doc_id),
+        }
+    }
+
+    fn cost(&self) -> usize {
+        match self {
+            Self::One { provider, .. } => provider
+                .as_ref()
+                .expect("required provider used after the promotion handoff")
+                .cost(),
+            Self::Many(source) => source.children.iter().map(|child| child.cost()).sum(),
+        }
+    }
+
+    fn take_single(&mut self) -> Option<&'a mut dyn BlockBatch> {
+        match self {
+            Self::One { provider, .. } => provider.take(),
+            Self::Many(_) => None,
+        }
+    }
+}
+
+/// One block walk for both shapes: the required side supplies a block of docs
+/// (a posting block for K = 1, an intersection block for K >= 2), the SHOULD
+/// clauses are folded over it, and each doc at or above the live floor is
+/// handed to `emit` with `required + optional` — the two sums are kept in
+/// separate accumulators because the generic path adds the MUST total to the
+/// optional total, not the other way round.
+///
+/// Per block: one dispatch to the source, one fold per SHOULD. Per doc: a floor
+/// read, a key lookup and the emit. At the block end the floor is read again
+/// for `iu_cannot_compete`, `dry` shrinking and the promotion decision, exactly
+/// as the K = 1 walk always did; the K >= 2 shape's N == 1 latch is that same
+/// decision, one step coarser (per block instead of per candidate — it only
+/// prunes, the per-doc floor test still decides what is emitted).
+///
+/// Stall return: `false` for the single shape and `true` for the multi shape,
+/// matching the two walks this replaces (their callers disagree on what the
+/// bool means on a stall; unifying that is a separate, observable change).
+pub fn run_block_walk<'s>(
+    must_ub: f32,
+    required_ubs: &[f32],
+    must_cost: usize,
+    optional_ubs: &[f32],
+    source: &mut RequiredSource<'s>,
+    shoulds: &'s mut [&'s mut dyn BlockBatch],
+    floor: &CompetitiveScore,
+    emit: &mut dyn FnMut(u64, f32) -> Result<bool>,
+) -> Result<bool> {
+    let single = source.is_single();
+    let stall = !single;
+    let mut must_ub = must_ub;
+    let mut dry = vec![false; optional_ubs.len()];
+    let mut promotion_decision: Option<(f32, Option<Vec<usize>>)> = None;
+    let mut promoted_optional = false;
+    let mut docs_len = 0usize;
+    let mut must_scores: Vec<f32> = Vec::new();
+    let mut should_sums: Vec<f32> = Vec::new();
+    let mut promoted_sums: Vec<f32> = Vec::new();
+    let mut keys: Vec<Option<u64>> = Vec::new();
+    let mut last_doc = 0u64;
+    let mut probe = BlkProbe::new(
+        if single { "single" } else { "multi" },
+        est_block_count(
+            std::iter::once(source.cost()).chain(shoulds.iter().map(|should| should.cost())),
+        ),
+    );
+    loop {
+        if !source.next_block(&mut probe) {
+            return Ok(true);
+        }
+        docs_len = source.docs().len();
+        probe.candidates += docs_len;
+        keys.clear();
+        keys.extend(
+            source
+                .docs()
+                .iter()
+                .map(|&doc| source.document_key_for_doc_id(doc as u32)),
+        );
+        must_scores.clear();
+        must_scores.resize(docs_len, 0.0);
+        source.fold_required(&mut must_scores);
+        // K >= 2, N == 1: once the latch fires the single optional is required,
+        // so it is folded into the required total (children first, promoted
+        // last — the order the old required sum used).
+        promoted_sums.clear();
+        if promoted_optional {
+            promoted_sums.resize(docs_len, 0.0);
+            shoulds[0].fold_optional_scores(source.docs(), &mut promoted_sums);
+        }
+        should_sums.clear();
+        should_sums.resize(docs_len, 0.0);
+        for (index, should) in shoulds.iter_mut().enumerate() {
+            if promoted_optional && index == 0 {
+                continue;
+            }
+            should.fold_optional_scores(source.docs(), &mut should_sums);
+            if should.current_doc_id().is_none() {
+                dry[index] = true;
+            }
+        }
+        for index in 0..docs_len {
+            let doc = source.docs()[index];
+            last_doc = doc;
+            if promoted_optional {
+                // A zero fold is the same miss rule the fold itself uses.
+                if promoted_sums[index] == 0.0 {
+                    continue;
+                }
+                must_scores[index] += promoted_sums[index];
+            }
+            let Some(key) = keys[index] else {
+                continue;
+            };
+            let score = must_scores[index] + should_sums[index];
+            if score >= floor.get() {
+                probe.emits += 1;
+                if !emit(key, score)? {
+                    return Ok(stall);
+                }
+            }
+        }
+        // Block end: read the floor once for the pruning decisions, so a hit
+        // emitted in this block has already raised the value they prune with.
+        let floor_now = floor.get();
+        if !floor_now.is_finite() {
+            continue;
+        }
+        let live_optional_ub = live_upper_bound(&dry, |index| optional_ubs[index]);
+        if iu_cannot_compete(must_ub, live_optional_ub, floor_now) {
+            return Ok(true);
+        }
+        if single {
+            if promotion_decision
+                .as_ref()
+                .is_none_or(|(decided_floor, _)| *decided_floor != floor_now)
+            {
+                promotion_decision = Some((
+                    floor_now,
+                    iu_tight_required_shoulds(must_ub, optional_ubs, floor_now),
+                ));
+            }
+            if let Some(Some(required)) =
+                promotion_decision.as_ref().map(|(_, decision)| decision)
+                && !required.is_empty()
+            {
+                let lead_cost = required
+                    .iter()
+                    .map(|&index| shoulds[index].cost())
+                    .min()
+                    .unwrap_or(usize::MAX);
+                if iu_tight_lead_is_cheaper(must_cost, lead_cost) {
+                    let lead = *required
+                        .iter()
+                        .min_by_key(|&&index| shoulds[index].cost())
+                        .expect("checked non-empty");
+                    let must = source
+                        .take_single()
+                        .expect("a single-shape promotion needs its provider");
+                    let mut walk =
+                        PromotedWalk::new(lead, required.clone(), last_doc.saturating_add(1));
+                    return Ok(walk.run(must, shoulds, floor, emit)?);
+                }
+            }
+        } else if optional_ubs.len() == 1
+            && !promoted_optional
+            && iu_cannot_compete(must_ub, 0.0, floor_now)
+        {
+            // N == 1 promotion: MUST-only documents are provably dead. The
+            // projected bound is recomputed from the raw per-clause bounds —
+            // never by folding a raw f32 onto the already-widened one.
+            promoted_optional = true;
+            must_ub = conservative_score_sum(
+                required_ubs
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(shoulds[0].global_upper_bound())),
+            );
+        }
+    }
+}
+
+/// K >= 2 entry: the required providers intersect block by block.
 pub fn run_multi_walk<'s>(
     required_ubs: &[f32],
     optional_ubs: &[f32],
@@ -1265,134 +1401,16 @@ pub fn run_multi_walk<'s>(
     floor: &CompetitiveScore,
     emit: &mut dyn FnMut(u64, f32) -> Result<bool>,
 ) -> Result<bool> {
-    let mut required_ub = conservative_score_sum(required_ubs.iter().copied());
-    let mut optional_ub = conservative_score_sum(optional_ubs.iter().copied());
-    let mut dry = vec![false; optional_ubs.len()];
-    let mut promoted_optional = false;
-    let mut must_sums: Vec<f32> = Vec::new();
-    let mut probe = BlkProbe::new(
-        "multi",
-        est_block_count(
-            requireds
-                .iter()
-                .map(|posting| posting.cost())
-                .chain(optionals.iter().map(|posting| posting.cost())),
-        ),
-    );
-    let mut source = AndBlockSource::new(std::mem::take(requireds));
-    // Where the promoted clause sits, carried across blocks: a block flush
-    // must not make the walk re-probe candidates the promoted clause already
-    // skipped past.
-    let mut promoted_next = 0_u64;
-    debug_assert!(source.children.len() >= 2);
-    loop {
-        if !source.next_block(&mut probe) {
-            return Ok(true);
-        }
-        must_sums.clear();
-        must_sums.resize(source.docs.len(), 0.0);
-        source.fold_required(&mut must_sums);
-        let mut slot = 0;
-        while slot < source.docs.len() && source.docs[slot] < promoted_next {
-            slot += 1;
-        }
-        while slot < source.docs.len() {
-            let candidate = source.docs[slot];
-            let index = slot;
-            slot += 1;
-            probe.candidates += 1;
-            let current_floor = floor.get();
-            if current_floor.is_finite()
-                && !promoted_optional
-                && optionals.len() == 1
-                && iu_cannot_compete(required_ub, 0.0, current_floor)
-            {
-                // N == 1 promotion: MUST-only documents are provably dead.
-                // The promoted clause stays in `optionals` at index 0 but
-                // participates as required from here on, so the projected
-                // required bound is recomputed from the original per-clause
-                // bounds — never by adding a raw f32 onto the already-widened
-                // `required_ub`, which could round down by an ULP and make the
-                // post-promotion pruning tighter than the proof that fired.
-                promoted_optional = true;
-                required_ub = conservative_score_sum(
-                    required_ubs
-                        .iter()
-                        .copied()
-                        .chain(std::iter::once(optionals[0].global_upper_bound())),
-                );
-                optional_ub = 0.0;
-            }
-            let mut required_sum = must_sums[index];
-            if promoted_optional {
-                probe.seeks += 1;
-                match optionals[0].seek_eq(candidate) {
-                    Some(freq) => required_sum += optionals[0].term_score(candidate, freq),
-                    None => match optionals[0].current_doc_id() {
-                        None => {
-                            // The promoted clause ran out: with it being
-                            // required, the intersection is empty from here.
-                            return Ok(true);
-                        }
-                        Some(current) => {
-                            // Skip this block's docs below the promoted
-                            // clause's position, the way the seek-to-max
-                            // alignment used to jump the candidate, and carry
-                            // the position across block flushes.
-                            promoted_next = promoted_next.max(current);
-                            while slot < source.docs.len() && source.docs[slot] < promoted_next {
-                                slot += 1;
-                            }
-                            continue;
-                        }
-                    },
-                }
-            }
-            let mut optional_sum = 0.0_f32;
-            let mut newly_dry = false;
-            for (index, posting) in optionals.iter_mut().enumerate() {
-                if promoted_optional && index == 0 {
-                    // Promoted: its frequency is already in `required_sum`
-                    // and its hit is enforced above.
-                    continue;
-                }
-                probe.seeks += 1;
-                if let Some(freq) = posting.seek_eq(candidate) {
-                    optional_sum += posting.term_score(candidate, freq);
-                } else if posting.current_doc_id().is_none() && !dry[index] {
-                    dry[index] = true;
-                    newly_dry = true;
-                }
-            }
-            if newly_dry {
-                optional_ub = live_upper_bound(&dry, |index| optionals[index].global_upper_bound());
-            }
-            if current_floor.is_finite()
-                && iu_cannot_compete(required_ub, optional_ub, current_floor)
-            {
-                return Ok(true);
-            }
-            let Some(key) = source.document_key_for_doc_id(candidate as u32) else {
-                continue;
-            };
-            // Only candidates that reach the live floor are emitted. Sub-floor
-            // candidates are dropped right here rather than handed on: the
-            // floor only rises, so a dropped candidate could never have
-            // competed, and passing it on would only buy a heap insert the
-            // collector rejects (the emit sink re-checks the same shared value
-            // anyway). Equality is kept — a candidate tying the floor can still
-            // win the row-id tie-break.
-            let score = required_sum + optional_sum;
-            if score >= current_floor {
-                probe.emits += 1;
-                if !emit(key, score)? {
-                    // The collector can take no more (heap overflow). This run
-                    // is over: the caller retries the partition with resolved
-                    // keys.
-                    return Ok(true);
-                }
-            }
-        }
-        probe.blocks = source.blocks_pulled;
-    }
+    let must_ub = conservative_score_sum(required_ubs.iter().copied());
+    let mut source = RequiredSource::Many(AndBlockSource::new(std::mem::take(requireds)));
+    run_block_walk(
+        must_ub,
+        required_ubs,
+        0,
+        optional_ubs,
+        &mut source,
+        optionals.as_mut_slice(),
+        floor,
+        emit,
+    )
 }
