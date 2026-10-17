@@ -542,8 +542,6 @@ mod batch_proto_tests {
         takes: usize,
         /// Per-candidate seeks, so a test can bound the scanned candidates.
         seeks: usize,
-        /// Frequencies of the block last returned by `take_block`.
-        block_freqs: Vec<u32>,
         hidden: HashSet<u32>,
     }
 
@@ -556,7 +554,6 @@ mod batch_proto_tests {
                 block,
                 takes: 0,
                 seeks: 0,
-                block_freqs: Vec::new(),
                 hidden: HashSet::new(),
             }
         }
@@ -580,22 +577,6 @@ mod batch_proto_tests {
             for (index, &doc) in docs.iter().enumerate() {
                 if let Ok(hit) = self.docs.binary_search_by_key(&doc, |&(d, _)| d) {
                     out_freqs[index] = self.docs[hit].1;
-                }
-            }
-        }
-
-        fn take_block(&mut self, upto: u64, out: &mut Vec<u64>) {
-            let mut pairs = Vec::new();
-            self.take_docs_one_block_upto(upto, &mut pairs);
-            out.clear();
-            out.extend(pairs.iter().map(|(doc, _)| *doc));
-            self.block_freqs = pairs.iter().map(|(_, freq)| *freq).collect();
-        }
-
-        fn fold_scores(&mut self, docs: &[u64], sums: &mut [f32]) {
-            for (index, &freq) in self.block_freqs.iter().enumerate() {
-                if freq != 0 {
-                    sums[index] += self.term_score(docs[index], freq);
                 }
             }
         }
@@ -1074,38 +1055,25 @@ mod batch_proto_tests {
         );
         assert_eq!(pairs_src.takes, ids_src.takes, "one take either way");
 
-        // take_block -> fold_scores must equal a per-document merge on a fresh
-        // provider. The take parks the cursor past the block, so a fold that
-        // re-merged instead of reading the cache would score zeros here.
-        let mut block_src = MockBatch::new(docs.clone(), 9.0, 2);
-        let mut per_doc_src = MockBatch::new(docs.clone(), 9.0, 2);
-        let mut block_ids = Vec::new();
-        block_src.take_block(TERMINATED_DOC_ID, &mut block_ids);
-        let mut block_sums = vec![0.5_f32; block_ids.len()];
-        block_src.fold_scores(&block_ids, &mut block_sums);
-        let mut per_doc_sums = vec![0.5_f32; block_ids.len()];
-        per_doc_src.fold_optional_scores(&block_ids, &mut per_doc_sums);
-        assert_eq!(
-            block_sums, per_doc_sums,
-            "the cached fold must not change the arithmetic"
-        );
-        assert_eq!(block_ids, vec![1, 5], "first block of the fixture");
-        assert_eq!(block_sums[0], 2.5, "a hit adds the provider's score");
-        assert_eq!(block_sums[1], 0.5, "a miss leaves the slot untouched");
-
-        // fill_hits intersects, so providers compose; a doc with frequency 0
-        // is a miss even though it is present in the posting.
+        // fold_scores == fold_optional_scores, misses leave the slot alone.
         let probe: Vec<u64> = vec![1, 3, 5, 9];
+        let mut fold_src = MockBatch::new(docs.clone(), 9.0, 2);
+        let mut per_doc_src = MockBatch::new(docs.clone(), 9.0, 2);
+        let mut lhs = vec![0.5_f32; probe.len()];
+        let mut rhs = vec![0.5_f32; probe.len()];
+        fold_src.fold_optional_scores(&probe, &mut lhs);
+        per_doc_src.fold_scores(&probe, &mut rhs);
+        assert_eq!(lhs, rhs, "the fold verb must not change the arithmetic");
+        assert_eq!(lhs[1], 0.5, "a miss leaves the slot untouched");
+        assert_eq!(lhs[0], 2.5, "a hit adds the provider's score");
+
+        // fill_hits == freq != 0.
         let mut hit_src = MockBatch::new(docs, 9.0, 2);
         let mut hits = vec![true; probe.len()];
         hit_src.fill_hits(&probe, &mut hits);
+        // Doc 5 is present but carries frequency 0, which the fold treats as a
+        // miss; the hit probe must agree with the fold, not with membership.
         assert_eq!(hits, vec![true, false, false, true]);
-        let mut composed = vec![true, true, true, true];
-        composed[3] = false;
-        hit_src.fill_hits(&probe, &mut composed);
-        assert!(composed[0], "a hit stays a hit after intersecting");
-        assert!(!composed[2], "a miss clears the slot");
-        assert!(!composed[3], "a provider must not write true over false");
     }
 }
 

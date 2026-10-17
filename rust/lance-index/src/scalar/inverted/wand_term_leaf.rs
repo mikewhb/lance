@@ -32,13 +32,6 @@ pub struct TermLeafScorer<'a, D: WandDocuments> {
     /// Reused frequency scratch for the fused fold_optional_scores pass
     /// (plain capacity; contents are fully rewritten per call).
     fold_scratch: Vec<u32>,
-    /// Frequencies of the block last returned by `take_block`, aligned with the
-    /// caller's doc ids. `fold_scores` reads these instead of re-merging: the
-    /// take parks the cursor past the block and the merge only moves forward,
-    /// so a re-merge would score every document as a miss.
-    block_freqs: Vec<u32>,
-    /// Reused pair scratch for `take_block`.
-    block_pairs: Vec<(u64, u32)>,
     /// Block-batch work steps taken by the batch profile (candidates taken,
     /// scored, key-resolved, folded or merged — a bulk pass counts its
     /// candidate slice, a merge adds one per live frequency, and the
@@ -76,8 +69,6 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
             scorer,
             cost,
             fold_scratch: Vec::new(),
-            block_freqs: Vec::new(),
-            block_pairs: Vec::new(),
             batch_steps: Cell::new(0),
             global_score_upper_bound: OnceCell::new(),
             current_doc: None,
@@ -321,38 +312,6 @@ impl<D: WandDocuments> BlockBatch for TermLeafScorer<'_, D> {
             }
         }
         self.clear_current();
-    }
-
-    fn take_block(&mut self, upto: u64, out: &mut Vec<u64>) {
-        // Move the scratch out so the take can borrow `self` mutably.
-        let mut pairs = std::mem::take(&mut self.block_pairs);
-        pairs.clear();
-        self.take_docs_one_block_upto(upto, &mut pairs);
-        out.clear();
-        out.extend(pairs.iter().map(|(doc, _)| *doc));
-        self.block_freqs.clear();
-        self.block_freqs.extend(pairs.iter().map(|(_, freq)| *freq));
-        self.block_pairs = pairs;
-    }
-
-    fn fold_scores(&mut self, docs: &[u64], sums: &mut [f32]) {
-        debug_assert_eq!(docs.len(), sums.len());
-        debug_assert_eq!(
-            docs.len(),
-            self.block_freqs.len(),
-            "fold_scores must follow the take_block it scores"
-        );
-        self.batch_steps.set(self.batch_steps.get() + docs.len());
-        let scorer = self.scorer.as_ref();
-        for (i, &freq) in self.block_freqs.iter().enumerate() {
-            if freq != 0 {
-                sums[i] += self.posting.score(
-                    scorer,
-                    freq,
-                    self.documents.scoring_num_tokens(docs[i] as u32),
-                );
-            }
-        }
     }
 
     fn current_doc_id(&self) -> Option<u64> {
