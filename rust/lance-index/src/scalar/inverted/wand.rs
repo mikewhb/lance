@@ -31,7 +31,7 @@ mod maxscore;
 #[path = "wand_term_leaf.rs"]
 mod term_leaf;
 
-pub(super) use iu_tight::{iu_tight_enabled, run_multi_walk, run_single_walk};
+pub(super) use iu_tight::{iu_tight_enabled, run_single_walk};
 pub(super) use term_leaf::TermLeafScorer;
 
 use super::{

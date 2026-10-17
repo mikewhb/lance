@@ -8,7 +8,7 @@
 //! also hosts the batch profile: the capability probe, the skew criterion
 //! that engages it, and the walks that drive them.
 
-use super::super::wand::{run_multi_walk, run_single_walk};
+use super::super::wand::run_single_walk;
 
 #[cfg(test)]
 std::thread_local! {
@@ -68,14 +68,7 @@ pub(super) struct ReqOptScorer<'a> {
 /// required providers). Carries only the bounds the walk needs — the walk's own
 /// state lives inside its call.
 enum BatchShape {
-    Single {
-        must_ub: f32,
-        should_ubs: Vec<f32>,
-    },
-    Multi {
-        required_ubs: Vec<f32>,
-        optional_ubs: Vec<f32>,
-    },
+    Single { must_ub: f32, should_ubs: Vec<f32> },
 }
 
 enum RequiredLeap {
@@ -158,23 +151,10 @@ impl<'a> ReqOptScorer<'a> {
                 should_ubs,
             });
         }
-        // K >= 2: the required side is a flat AND aggregate.
-        let requireds = self.required.block_batch_children()?;
-        if requireds.len() < 2 {
-            return None;
-        }
-        let optionals = self.optional.block_batch_children()?;
-        let required_cost: usize = requireds.iter().map(|p| p.cost()).sum();
-        let optional_cost: usize = optionals.iter().map(|p| p.cost()).sum();
-        if super::optionals_are_sparse(requireds.len(), optional_cost, required_cost) {
-            return None;
-        }
-        let required_ubs: Vec<f32> = requireds.iter().map(|p| p.global_upper_bound()).collect();
-        let optional_ubs: Vec<f32> = optionals.iter().map(|p| p.global_upper_bound()).collect();
-        Some(BatchShape::Multi {
-            required_ubs,
-            optional_ubs,
-        })
+        // K >= 2 stays on the per-document tree. The benchmark has no such
+        // query, and the batch engine it needed is the bulk of the walk module;
+        // the tree's block-max window skipping covers the shape instead.
+        None
     }
 
     fn set_current(&mut self, current: Option<u64>) {
@@ -638,25 +618,6 @@ impl ComposableScorer for ReqOptScorer<'_> {
                     &should_ubs,
                     required_batch,
                     optional_batch.as_mut_slice(),
-                    floor,
-                    emit,
-                )?
-            }
-            BatchShape::Multi {
-                required_ubs,
-                optional_ubs,
-            } => {
-                let Some(mut requireds) = required.block_batch_children() else {
-                    return Err(Error::internal("IU walk lost its required block providers"));
-                };
-                let Some(mut optionals) = optional.block_batch_children() else {
-                    return Err(Error::internal("IU walk lost its optional block providers"));
-                };
-                run_multi_walk(
-                    &required_ubs,
-                    &optional_ubs,
-                    &mut requireds,
-                    &mut optionals,
                     floor,
                     emit,
                 )?
