@@ -1128,6 +1128,9 @@ mod batch_proto_tests {
 /// forbids recovering a provider from a mid-block merge with a forward seek:
 /// [`AndBlockSource::fold_required`] must not touch the cursors again.
 struct AndBlockSource<'a> {
+    /// Cheapest child: its blocks drive the merge, and every other child seeks
+    /// to their start instead of walking there block by block.
+    driver: usize,
     children: Vec<&'a mut dyn BlockBatch>,
     buffers: Vec<Vec<(u64, u32)>>,
     indices: Vec<usize>,
@@ -1140,7 +1143,13 @@ struct AndBlockSource<'a> {
 impl<'a> AndBlockSource<'a> {
     fn new(children: Vec<&'a mut dyn BlockBatch>) -> Self {
         let count = children.len();
+        // `cost()` is the raw df; the rarest provider has the fewest blocks to
+        // walk, and the others jump to it.
+        let driver = (0..count)
+            .min_by_key(|&index| children[index].cost())
+            .unwrap_or(0);
         Self {
+            driver,
             children,
             buffers: (0..count).map(|_| Vec::new()).collect(),
             indices: vec![0; count],
@@ -1151,12 +1160,38 @@ impl<'a> AndBlockSource<'a> {
         }
     }
 
+    /// The driver's next unconsumed doc: where every other child should seek
+    /// to when it has to refill.
+    fn drive_start(&mut self) -> Option<u64> {
+        if !self.ensure(self.driver) {
+            return None;
+        }
+        let index = self.indices[self.driver];
+        Some(self.buffers[self.driver][index].0)
+    }
+
     /// Refill `index`'s buffer when its cursor is past the end. `false` when
     /// that provider is exhausted.
     fn ensure(&mut self, index: usize) -> bool {
         while self.indices[index] >= self.buffers[index].len() {
             self.buffers[index].clear();
             self.indices[index] = 0;
+            if index != self.driver {
+                // Jump, do not walk: `next(least_id)` locates the target block
+                // from the block first-doc slab and decompresses only that
+                // one, while `take_docs_one_block_upto` advances a block at a
+                // time (and decodes the next block to park on it). Without
+                // this a wide clause is decompressed end to end just to catch
+                // up with a rare one.
+                let target = self.drive_start();
+                if let Some(target) = target
+                    && self.children[index]
+                        .current_doc_id()
+                        .is_none_or(|current| current < target)
+                {
+                    self.children[index].seek_eq(target);
+                }
+            }
             self.children[index]
                 .take_docs_one_block_upto(TERMINATED_DOC_ID, &mut self.buffers[index]);
             self.blocks_pulled += 1;
