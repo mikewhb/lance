@@ -1032,20 +1032,15 @@ mod batch_proto_tests {
             out.is_empty(),
             "no candidate can reach a floor above the old bound"
         );
-        // The promotion fires at the first candidate (3000 < floor) and
+        // The promotion fires at the first aligned candidate (3000 < floor) and
         // re-evaluates it; the sound bound does not prove the rest dead, so the
-        // walk keeps scanning: the promoted clause is probed at both candidates
-        // (2 seeks). The bare `+=` bound is strictly below the floor, cuts at
-        // the re-evaluation, and stops after the first probe.
-        //
-        // The observable moved from `must0.seeks` to the promoted clause's
-        // seeks when S2 replaced the per-candidate required alignment with a
-        // block merge: the required providers are no longer seeked per
-        // candidate, so scanned work is now visible on the optional side.
+        // walk keeps scanning (4 required seeks: candidates 0..3). The bare
+        // `+=` bound is strictly below the floor, cuts at the re-evaluation, and
+        // stops at 2.
         assert!(
-            optionals[0].seeks >= 2,
+            must0.seeks >= 4,
             "a sound promoted bound must not cut the walk after the promotion (seeks {})",
-            optionals[0].seeks
+            must0.seeks
         );
         // Pin the arithmetic that makes the fixture discriminating (raw folds
         // in f64 with a widening factor > 1; a bare `+=` rounds to exactly
@@ -1114,131 +1109,14 @@ mod batch_proto_tests {
     }
 }
 
-/// Block-level intersection over the K >= 2 required providers.
+/// Runs the K >= 2 IU walk to exhaustion: the required providers align by
+/// seek-to-max, the optionals are probed per candidate, and each candidate at
+/// or above the live floor is handed to `emit`.
 ///
-/// Each provider is asked for a block; the source keeps one buffer per child
-/// and advances a local index instead of calling `seek_eq` per candidate, so a
-/// dyn dispatch happens once per block (up to `MAX_POSTING_BLOCK_SIZE` docs)
-/// rather than once per candidate per child.
-///
-/// The per-child frequencies of the emitted docs are cached because the trait
-/// forbids recovering a provider from a mid-block merge with a forward seek:
-/// [`AndBlockSource::fold_required`] must not touch the cursors again.
-struct AndBlockSource<'a> {
-    children: Vec<&'a mut dyn BlockBatch>,
-    buffers: Vec<Vec<(u64, u32)>>,
-    indices: Vec<usize>,
-    freqs: Vec<Vec<u32>>,
-    docs: Vec<u64>,
-    blocks_pulled: usize,
-    exhausted: bool,
-}
-
-impl<'a> AndBlockSource<'a> {
-    fn new(children: Vec<&'a mut dyn BlockBatch>) -> Self {
-        let count = children.len();
-        Self {
-            children,
-            buffers: (0..count).map(|_| Vec::new()).collect(),
-            indices: vec![0; count],
-            freqs: (0..count).map(|_| Vec::new()).collect(),
-            docs: Vec::new(),
-            blocks_pulled: 0,
-            exhausted: false,
-        }
-    }
-
-    /// Refill `index`'s buffer when its cursor is past the end. `false` when
-    /// that provider is exhausted.
-    fn ensure(&mut self, index: usize) -> bool {
-        while self.indices[index] >= self.buffers[index].len() {
-            self.buffers[index].clear();
-            self.indices[index] = 0;
-            self.children[index]
-                .take_docs_one_block_upto(TERMINATED_DOC_ID, &mut self.buffers[index]);
-            self.blocks_pulled += 1;
-            if self.buffers[index].is_empty() {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Next ascending run of docs every child contains. `false` when the
-    /// intersection is exhausted (a partial run is returned as `true` first).
-    fn next_block(&mut self, probe: &mut BlkProbe) -> bool {
-        self.docs.clear();
-        for freqs in self.freqs.iter_mut() {
-            freqs.clear();
-        }
-        probe.blocks = self.blocks_pulled;
-        if self.exhausted {
-            return false;
-        }
-        loop {
-            for index in 0..self.children.len() {
-                if !self.ensure(index) {
-                    self.exhausted = true;
-                    probe.blocks = self.blocks_pulled;
-                    return !self.docs.is_empty();
-                }
-            }
-            let mut candidate = 0_u64;
-            for index in 0..self.children.len() {
-                candidate = candidate.max(self.buffers[index][self.indices[index]].0);
-            }
-            let mut aligned = true;
-            for index in 0..self.children.len() {
-                while self.indices[index] < self.buffers[index].len()
-                    && self.buffers[index][self.indices[index]].0 < candidate
-                {
-                    self.indices[index] += 1;
-                }
-                if self.indices[index] >= self.buffers[index].len()
-                    || self.buffers[index][self.indices[index]].0 != candidate
-                {
-                    aligned = false;
-                }
-            }
-            if !aligned {
-                continue;
-            }
-            self.docs.push(candidate);
-            for index in 0..self.children.len() {
-                self.freqs[index].push(self.buffers[index][self.indices[index]].1);
-                self.indices[index] += 1;
-            }
-        }
-    }
-
-    /// Sum of the required clauses at each doc, in children order (the order
-    /// `RequiredConjunctionScorer::score` uses).
-    fn fold_required(&mut self, sums: &mut [f32]) {
-        debug_assert_eq!(self.docs.len(), sums.len());
-        for index in 0..self.children.len() {
-            for (slot, &doc) in self.docs.iter().enumerate() {
-                let freq = self.freqs[index][slot];
-                if freq != 0 {
-                    sums[slot] += self.children[index].term_score(doc, freq);
-                }
-            }
-        }
-    }
-
-    fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
-        self.children[0].document_key_for_doc_id(doc_id)
-    }
-}
-
-/// Runs the K >= 2 IU walk to exhaustion: the required providers are merged
-/// block by block, the optionals are probed per candidate, and each candidate
-/// at or above the live floor is handed to `emit`.
-///
-/// The candidate stream is the same ascending intersection the seek-to-max
-/// alignment produced; only its production changed (a per-child block buffer
-/// advanced by index, instead of a `seek_eq` round per candidate). Scoring,
-/// the promotion latch, `dry` shrinking and the floor reads stay where they
-/// were, so results are unchanged.
+/// Same shape as [`run_single_walk`]: the loop lives here for the whole call,
+/// the state lives in locals, and the floor is read per candidate, so a rise is
+/// honoured immediately. The N == 1 promotion latch is a local too — the walk
+/// cannot be re-entered, so it needs no cross-call representation.
 ///
 /// Return value: like [`run_single_walk`] it is `true` when the required
 /// intersection is exhausted, but unlike it this walk returns `true` on an
@@ -1252,11 +1130,14 @@ pub fn run_multi_walk<'s>(
     floor: &CompetitiveScore,
     emit: &mut dyn FnMut(u64, f32) -> Result<bool>,
 ) -> Result<bool> {
+    let mut aligned = vec![false; required_ubs.len()];
+    let mut freqs = vec![0u32; required_ubs.len()];
     let mut required_ub = conservative_score_sum(required_ubs.iter().copied());
     let mut optional_ub = conservative_score_sum(optional_ubs.iter().copied());
     let mut dry = vec![false; optional_ubs.len()];
     let mut promoted_optional = false;
-    let mut must_sums: Vec<f32> = Vec::new();
+    let mut promoted_freq = 0u32;
+    let mut candidate = u64::MIN;
     let mut probe = BlkProbe::new(
         "multi",
         est_block_count(
@@ -1266,19 +1147,92 @@ pub fn run_multi_walk<'s>(
                 .chain(optionals.iter().map(|posting| posting.cost())),
         ),
     );
-    let mut source = AndBlockSource::new(std::mem::take(requireds));
-    debug_assert!(source.children.len() >= 2);
+    debug_assert!(requireds.len() >= 2);
     loop {
-        if !source.next_block(&mut probe) {
-            return Ok(true);
+        // Seek-to-max alignment across the required providers — plus
+        // the promoted optional once it joined the required set.
+        let mut max_doc = candidate;
+        if promoted_optional {
+            let optional = &mut optionals[0];
+            // Always re-seek: a promoted clause is required from here on,
+            // and the cursor only ever moves forward with the candidate.
+            probe.seeks += 1;
+            match optional.seek_eq(candidate) {
+                Some(freq) => {
+                    promoted_freq = freq;
+                }
+                None => match optional.current_doc_id() {
+                    // The promoted optional ran out: with it being
+                    // required, the intersection is empty from here.
+                    None => {
+                        return Ok(true);
+                    }
+                    Some(cur) => max_doc = max_doc.max(cur),
+                },
+            }
         }
-        must_sums.clear();
-        must_sums.resize(source.docs.len(), 0.0);
-        source.fold_required(&mut must_sums);
-        for (slot, &candidate) in source.docs.iter().enumerate() {
-            let current_floor = floor.get();
-            if current_floor.is_finite()
-                && !promoted_optional
+        for (index, posting) in requireds.iter_mut().enumerate() {
+            if !aligned[index] {
+                probe.seeks += 1;
+                match posting.seek_eq(candidate) {
+                    Some(freq) => {
+                        freqs[index] = freq;
+                        aligned[index] = true;
+                    }
+                    None => {
+                        let Some(cur) = posting.current_doc_id() else {
+                            // A required list ran out: the intersection
+                            // is empty from here on.
+                            return Ok(true);
+                        };
+                        max_doc = max_doc.max(cur);
+                    }
+                }
+            }
+            max_doc = max_doc.max(posting.current_doc_id().unwrap_or(u64::MAX));
+        }
+        if max_doc > candidate {
+            candidate = max_doc;
+            aligned.iter_mut().for_each(|aligned| *aligned = false);
+            continue;
+        }
+
+        probe.candidates += 1;
+        let mut required_sum = 0.0_f32;
+        for (index, posting) in requireds.iter().enumerate() {
+            let Some(freq) = (aligned[index]).then(|| freqs[index]) else {
+                return Ok(true);
+            };
+            required_sum += posting.term_score(candidate, freq);
+        }
+        if promoted_optional {
+            // The promoted clause's contribution: after the N == 1
+            // promotion it is a required clause — its aligned frequency
+            // feeds required_sum exactly like the others.
+            required_sum += optionals[0].term_score(candidate, promoted_freq);
+        }
+        let mut optional_sum = 0.0_f32;
+        let mut newly_dry = false;
+        for (index, posting) in optionals.iter_mut().enumerate() {
+            if promoted_optional && index == 0 {
+                // Promoted: its frequency is already in required_sum and
+                // its hit is enforced by the alignment above.
+                continue;
+            }
+            probe.seeks += 1;
+            if let Some(freq) = posting.seek_eq(candidate) {
+                optional_sum += posting.term_score(candidate, freq);
+            } else if posting.current_doc_id().is_none() && !dry[index] {
+                dry[index] = true;
+                newly_dry = true;
+            }
+        }
+        if newly_dry {
+            optional_ub = live_upper_bound(&dry, |index| optionals[index].global_upper_bound());
+        }
+        let current_floor = floor.get();
+        if current_floor.is_finite() {
+            if !promoted_optional
                 && optionals.len() == 1
                 && iu_cannot_compete(required_ub, 0.0, current_floor)
             {
@@ -1297,67 +1251,33 @@ pub fn run_multi_walk<'s>(
                         .chain(std::iter::once(optionals[0].global_upper_bound())),
                 );
                 optional_ub = 0.0;
+                continue;
             }
-            let mut required_sum = must_sums[slot];
-            if promoted_optional {
-                probe.seeks += 1;
-                match optionals[0].seek_eq(candidate) {
-                    Some(freq) => required_sum += optionals[0].term_score(candidate, freq),
-                    None => {
-                        if optionals[0].current_doc_id().is_none() {
-                            // The promoted clause ran out: with it being
-                            // required, the intersection is empty from here.
-                            return Ok(true);
-                        }
-                        continue;
-                    }
-                }
-            }
-            let mut optional_sum = 0.0_f32;
-            let mut newly_dry = false;
-            for (index, posting) in optionals.iter_mut().enumerate() {
-                if promoted_optional && index == 0 {
-                    // Promoted: its frequency is already in `required_sum`
-                    // and its hit is enforced above.
-                    continue;
-                }
-                probe.seeks += 1;
-                if let Some(freq) = posting.seek_eq(candidate) {
-                    optional_sum += posting.term_score(candidate, freq);
-                } else if posting.current_doc_id().is_none() && !dry[index] {
-                    dry[index] = true;
-                    newly_dry = true;
-                }
-            }
-            if newly_dry {
-                optional_ub = live_upper_bound(&dry, |index| optionals[index].global_upper_bound());
-            }
-            if current_floor.is_finite()
-                && iu_cannot_compete(required_ub, optional_ub, current_floor)
-            {
+            if iu_cannot_compete(required_ub, optional_ub, current_floor) {
                 return Ok(true);
             }
-            let Some(key) = source.document_key_for_doc_id(candidate as u32) else {
-                continue;
-            };
-            // Only candidates that reach the live floor are emitted. Sub-floor
-            // candidates are dropped right here rather than handed on: the
-            // floor only rises, so a dropped candidate could never have
-            // competed, and passing it on would only buy a heap insert the
-            // collector rejects (the emit sink re-checks the same shared value
-            // anyway). Equality is kept — a candidate tying the floor can still
-            // win the row-id tie-break.
-            let score = required_sum + optional_sum;
-            if score >= current_floor {
-                probe.emits += 1;
-                if !emit(key, score)? {
-                    // The collector can take no more (heap overflow). This run
-                    // is over: the caller retries the partition with resolved
-                    // keys.
-                    return Ok(true);
-                }
+        }
+        let Some(key) = requireds[0].document_key_for_doc_id(candidate as u32) else {
+            candidate += 1;
+            aligned.iter_mut().for_each(|aligned| *aligned = false);
+            continue;
+        };
+        // Only candidates that reach the live floor are emitted. Sub-floor
+        // candidates are dropped right here rather than handed on: the floor
+        // only rises, so a dropped candidate could never have competed, and
+        // passing it on would only buy a heap insert the collector rejects (the
+        // emit sink re-checks the same shared value anyway). Equality is kept —
+        // a candidate tying the floor can still win the row-id tie-break.
+        let score = required_sum + optional_sum;
+        if score >= current_floor {
+            probe.emits += 1;
+            if !emit(key, score)? {
+                // The collector can take no more (heap overflow). This run is
+                // over: the caller retries the partition with resolved keys.
+                return Ok(true);
             }
         }
-        probe.blocks = source.blocks_pulled;
+        candidate += 1;
+        aligned.iter_mut().for_each(|aligned| *aligned = false);
     }
 }
