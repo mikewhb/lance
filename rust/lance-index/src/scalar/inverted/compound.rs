@@ -4339,11 +4339,12 @@ fn boolean_leaf_split(plan: &CompoundScorerPlan) -> Option<BooleanLeafSplit> {
 }
 
 /// Whether a leaf may step its single posting directly instead of paying the
-/// WAND wrapper. TermLeafScorer consults no competitive floor —
-/// `set_min_competitive_score` is a no-op and it never skips — so the swap
-/// also gives up the wrapper's block-max skipping. Where that skipping earns
-/// nothing the wrapper is pure overhead; where it earns, the leaf keeps its
-/// cursor.
+/// WAND wrapper. `TermLeafScorer` now honours a floor with a **block-granular**
+/// skip (`set_min_competitive_score` records it; `position_geq` jumps a block
+/// whose max cannot reach it), so the bare-Leaf drain keeps block-max skipping
+/// instead of giving it up. The WAND wrapper is still finer-grained — it skips
+/// within a block, threshold-steered — so where that extra skipping earns, the
+/// leaf keeps its cursor.
 ///
 /// The ReqOpt scorer holds its floor itself and never forwards it to either
 /// side (`ReqOptScorer::set_min_competitive_score`); it prunes by consulting

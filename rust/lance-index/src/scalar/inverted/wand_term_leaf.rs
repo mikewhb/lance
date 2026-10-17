@@ -44,6 +44,11 @@ pub struct TermLeafScorer<'a, D: WandDocuments> {
     current_document_key: Option<u64>,
     current_score: f32,
     score_ready: bool,
+    /// The collector floor last handed to `set_min_competitive_score`, kept so
+    /// `position_geq` can skip a whole block whose best possible score cannot
+    /// reach it. `NEG_INFINITY` = no floor (the IU walks, which re-seek every
+    /// candidate, never set one).
+    min_competitive_score: f32,
     shallow: Option<(u64, u64, f32)>,
     comparisons: usize,
     metrics_recorded: bool,
@@ -70,6 +75,7 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
             current_document_key: None,
             current_score: 0.0,
             score_ready: false,
+            min_competitive_score: f32::NEG_INFINITY,
             shallow: None,
             comparisons: 0,
             metrics_recorded: false,
@@ -120,6 +126,22 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
                 return Ok(None);
             };
             self.comparisons += 1;
+            // Block-granular floor skip: a block whose best possible score
+            // cannot reach the floor holds no emittable hit, so jump past it
+            // instead of decoding it document by document. `window_max_score`
+            // is an upper bound over the whole block, so this can only skip
+            // documents the caller would drop anyway. The IU walks never set a
+            // floor (they re-seek every candidate), so this is inert for them.
+            if self.min_competitive_score.is_finite() {
+                let block_max = self.posting.window_max_score(None, self.scorer.as_ref());
+                if block_max < self.min_competitive_score {
+                    let end = self.posting.block_end_doc();
+                    if end >= doc.doc_id() {
+                        target = end.saturating_add(1);
+                        continue;
+                    }
+                }
+            }
             let Some(document_key) = self.documents.document_key(&doc) else {
                 target = doc.doc_id().saturating_add(1);
                 continue;
@@ -217,6 +239,12 @@ impl<'a, D: WandDocuments> TermLeafScorer<'a, D> {
             return Err(Error::invalid_input(
                 "minimum competitive FTS score cannot be NaN",
             ));
+        }
+        // Keep the floor monotone, like the shared `CompetitiveScore`: only a
+        // rise can enable more skipping, and a lower floor must never resurrect
+        // a block already skipped past.
+        if min_score > self.min_competitive_score {
+            self.min_competitive_score = min_score;
         }
         Ok(())
     }

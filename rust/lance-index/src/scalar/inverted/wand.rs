@@ -13071,7 +13071,7 @@ mod tests {
     }
 
     #[test]
-    fn term_leaf_ignores_competitive_floor_on_advance() {
+    fn term_leaf_skips_a_block_below_the_competitive_floor() {
         let (docs, posting) = term_leaf_posting(vec![0, 5], true);
         let scorer = Arc::new(MemBM25Scorer::new(
             docs.len() as u64,
@@ -13080,7 +13080,26 @@ mod tests {
         ));
         let metrics = NoOpMetricsCollector;
         let mut leaf = TermLeafScorer::new(posting, &docs, scorer, &metrics);
+        // A floor no score can reach makes the whole block unemittable, so the
+        // leaf jumps past it instead of decoding it document by document. (It
+        // used to be a no-op; the bare-Leaf drain is the consumer that needs
+        // the skip, because it is the only path that forwards its floor.)
         leaf.set_min_competitive_score(f32::MAX).unwrap();
+        assert_eq!(leaf.next().unwrap(), None);
+    }
+
+    #[test]
+    fn term_leaf_keeps_a_block_that_can_reach_the_competitive_floor() {
+        let (docs, posting) = term_leaf_posting(vec![0, 5], true);
+        let scorer = Arc::new(MemBM25Scorer::new(
+            docs.len() as u64,
+            docs.len(),
+            Default::default(),
+        ));
+        let metrics = NoOpMetricsCollector;
+        let mut leaf = TermLeafScorer::new(posting, &docs, scorer, &metrics);
+        // A zero floor cannot skip anything: both documents still come through.
+        leaf.set_min_competitive_score(0.0).unwrap();
         assert_eq!(leaf.next().unwrap(), Some(0));
         assert_eq!(leaf.next().unwrap(), Some(5));
     }
