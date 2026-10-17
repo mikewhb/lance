@@ -19,13 +19,70 @@
 //! Nothing has to be handed back mid-walk, and batch engagement stays one-way
 //! per scorer.
 
+use std::sync::LazyLock;
+
 use lance_core::Result;
 
 use super::super::compound::{BlockBatch, CompetitiveScore};
+use super::encoding::MAX_POSTING_BLOCK_SIZE;
 use super::{
     BulkAndMode, CompetitiveFloorMode, TERMINATED_DOC_ID, conservative_score_sum,
     score_sum_cannot_compete, score_sum_upper_bound_factor,
 };
+
+// ===== S0 block probe (zero behavior, env-gated) =====
+//
+// Counts what the batch walks actually do, so the block-merge decision rests on
+// data instead of intuition. `LANCE_FTS_BLK_PROBE=1` prints one line per walk
+// call; with the variable unset the counters are still maintained (a handful of
+// integer adds per block) but nothing is printed.
+//
+// `blocks` = block takes the walk really performed.
+// `est_blocks` = blocks a block-merge intersection would have to decompress:
+// `sum(ceil(cost / MAX_POSTING_BLOCK_SIZE))` over every provider, using the raw
+// df the trait exposes. If `seeks` is far below `est_blocks`, a merge would
+// touch more blocks than the per-candidate seeks it replaces.
+struct BlkProbe {
+    shape: &'static str,
+    blocks: usize,
+    est_blocks: usize,
+    candidates: usize,
+    seeks: usize,
+    emits: usize,
+}
+
+impl BlkProbe {
+    fn new(shape: &'static str, est_blocks: usize) -> Self {
+        Self {
+            shape,
+            blocks: 0,
+            est_blocks,
+            candidates: 0,
+            seeks: 0,
+            emits: 0,
+        }
+    }
+}
+
+impl Drop for BlkProbe {
+    fn drop(&mut self) {
+        if *BLK_PROBE {
+            eprintln!(
+                "[blkprobe] shape={} blocks={} est_blocks={} candidates={} seeks={} emits={}",
+                self.shape, self.blocks, self.est_blocks, self.candidates, self.seeks, self.emits
+            );
+        }
+    }
+}
+
+static BLK_PROBE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("LANCE_FTS_BLK_PROBE").is_ok_and(|value| value.trim() == "1"));
+
+fn est_block_count(costs: impl Iterator<Item = usize>) -> usize {
+    costs
+        .map(|cost| cost.div_ceil(MAX_POSTING_BLOCK_SIZE))
+        .sum()
+}
 
 /// Whether `partial + remaining` can no longer reach `floor`. Wraps the
 /// generic path's predicate so the inclusive floor semantics live in one
@@ -349,6 +406,12 @@ pub fn run_single_walk<'s>(
     let mut chunk_idx = 0usize;
     let mut last_doc = 0u64;
     let mut chunk_started = false;
+    let mut probe = BlkProbe::new(
+        "single",
+        est_block_count(
+            std::iter::once(must.cost()).chain(shoulds.iter().map(|should| should.cost())),
+        ),
+    );
     loop {
         // 1) Emit the candidates of the block already in the state's
         // chunk. All per-candidate tables were batch-computed at block
@@ -362,8 +425,11 @@ pub fn run_single_walk<'s>(
                 continue;
             };
             let score = must_scores[idx] + should_sums[idx];
-            if score >= floor.get() && !emit(key, score)? {
-                return Ok(false);
+            if score >= floor.get() {
+                probe.emits += 1;
+                if !emit(key, score)? {
+                    return Ok(false);
+                }
             }
         }
         // 2) Block fully consumed: block-end checks (only after really
@@ -417,6 +483,8 @@ pub fn run_single_walk<'s>(
         if chunk.is_empty() {
             return Ok(true);
         }
+        probe.blocks += 1;
+        probe.candidates += chunk.len();
         candidates.clear();
         candidates.extend(chunk.iter().map(|(doc, _)| *doc));
         chunk_freqs.clear();
@@ -995,6 +1063,15 @@ pub fn run_multi_walk<'s>(
     let mut promoted_optional = false;
     let mut promoted_freq = 0u32;
     let mut candidate = u64::MIN;
+    let mut probe = BlkProbe::new(
+        "multi",
+        est_block_count(
+            requireds
+                .iter()
+                .map(|posting| posting.cost())
+                .chain(optionals.iter().map(|posting| posting.cost())),
+        ),
+    );
     debug_assert!(requireds.len() >= 2);
     loop {
         // Seek-to-max alignment across the required providers — plus
@@ -1004,6 +1081,7 @@ pub fn run_multi_walk<'s>(
             let optional = &mut optionals[0];
             // Always re-seek: a promoted clause is required from here on,
             // and the cursor only ever moves forward with the candidate.
+            probe.seeks += 1;
             match optional.seek_eq(candidate) {
                 Some(freq) => {
                     promoted_freq = freq;
@@ -1020,6 +1098,7 @@ pub fn run_multi_walk<'s>(
         }
         for (index, posting) in requireds.iter_mut().enumerate() {
             if !aligned[index] {
+                probe.seeks += 1;
                 match posting.seek_eq(candidate) {
                     Some(freq) => {
                         freqs[index] = freq;
@@ -1043,6 +1122,7 @@ pub fn run_multi_walk<'s>(
             continue;
         }
 
+        probe.candidates += 1;
         let mut required_sum = 0.0_f32;
         for (index, posting) in requireds.iter().enumerate() {
             let Some(freq) = (aligned[index]).then(|| freqs[index]) else {
@@ -1064,6 +1144,7 @@ pub fn run_multi_walk<'s>(
                 // its hit is enforced by the alignment above.
                 continue;
             }
+            probe.seeks += 1;
             if let Some(freq) = posting.seek_eq(candidate) {
                 optional_sum += posting.term_score(candidate, freq);
             } else if posting.current_doc_id().is_none() && !dry[index] {
@@ -1113,10 +1194,13 @@ pub fn run_multi_walk<'s>(
         // emit sink re-checks the same shared value anyway). Equality is kept —
         // a candidate tying the floor can still win the row-id tie-break.
         let score = required_sum + optional_sum;
-        if score >= current_floor && !emit(key, score)? {
-            // The collector can take no more (heap overflow). This run is
-            // over: the caller retries the partition with resolved keys.
-            return Ok(true);
+        if score >= current_floor {
+            probe.emits += 1;
+            if !emit(key, score)? {
+                // The collector can take no more (heap overflow). This run is
+                // over: the caller retries the partition with resolved keys.
+                return Ok(true);
+            }
         }
         candidate += 1;
         aligned.iter_mut().for_each(|aligned| *aligned = false);
