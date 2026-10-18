@@ -9,6 +9,8 @@ use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
+use smallvec::SmallVec;
+
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, Result};
@@ -4376,8 +4378,8 @@ fn leaf_admits_term_leaf(plan: &CompoundScorerPlan, index: usize) -> bool {
 
 /// The same admission decision for every leaf of one plan, computed with a
 /// single leaf-split derivation. Shapes the swap does not cover stay false.
-fn leaf_admission_set(plan: &CompoundScorerPlan, leaf_count: usize) -> Vec<bool> {
-    let mut admits = vec![false; leaf_count];
+fn leaf_admission_set(plan: &CompoundScorerPlan, leaf_count: usize) -> SmallVec<[bool; 8]> {
+    let mut admits = SmallVec::from_elem(false, leaf_count);
     match plan {
         CompoundScorerPlan::Boolean { .. } => {
             let Some(split) = boolean_leaf_split(plan) else {
@@ -4489,7 +4491,7 @@ where
     // skewed shape leaves the collection empty, so the per-document walk with
     // block-max skipping and union promotion (see
     // `promote_optional_if_required`) owns it.
-    let mut batch_leaf_indices: Vec<usize> = Vec::new();
+    let mut batch_leaf_indices: SmallVec<[usize; 8]> = SmallVec::new();
     if iu_tight_enabled()
         && let Some((must_indices, should_indices)) = iu_tight_clause_indices(plan)
         && iu_tight_clauses_ready(&leaves, &must_indices, &should_indices)
@@ -4508,10 +4510,6 @@ where
             batch_leaf_indices.extend(must_indices.iter().chain(should_indices.iter()).copied());
         }
     }
-    let mut batch_leaf_set = vec![false; leaves.len()];
-    for &index in &batch_leaf_indices {
-        batch_leaf_set[index] = true;
-    }
     // One plan scan for the whole admission decision: the per-leaf predicate
     // re-derives the plan's leaf split every time, which is O(L^2) over a
     // plan that never changes.
@@ -4523,13 +4521,13 @@ where
     let term_leaf_admits = if iu_tight_enabled() {
         leaf_admission_set(plan, leaves.len())
     } else {
-        vec![false; leaves.len()]
+        SmallVec::from_elem(false, leaves.len())
     };
     let mut leaf_scorers = leaves
         .into_iter()
         .enumerate()
         .map(|(index, leaf)| {
-            let admits = batch_leaf_set[index] || term_leaf_admits[index];
+            let admits = batch_leaf_indices.contains(&index) || term_leaf_admits[index];
             Some(box_leaf_scorer(leaf, documents, metrics, admits))
         })
         .collect::<Vec<_>>();
