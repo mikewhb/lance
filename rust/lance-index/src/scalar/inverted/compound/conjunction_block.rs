@@ -241,14 +241,19 @@ impl<'a> ConjunctionProducer<'a> {
         }
         let up_to = self.lead_buf.up_to.min(window_end);
         debug_assert_eq!(self.lead_buf.docs.len(), self.lead_buf.keys.len());
-        // Capping the lead budget makes the lead block end at `window_end`, so
-        // this truncation is a no-op for a child that honours its own window
-        // bound. It exists only to keep a child that produces past `up_to` from
-        // being evaluated: that would move the clause cursors beyond `up_to`
-        // and lose those documents on the next call.
+        // Capping the lead budget makes the lead block end at `window_end`.
+        // A child that produces past `up_to` would move the clause cursors
+        // beyond those documents and lose them, so reject that contract
+        // violation instead of evaluating a partial block.
         let mut docs = self.lead_buf.docs.clone();
-        docs.truncate(docs.partition_point(|&doc| doc <= up_to));
-        debug_assert_eq!(docs.len(), self.lead_buf.docs.len());
+        let kept = docs.partition_point(|&doc| doc <= up_to);
+        if kept != docs.len() {
+            return Err(Error::internal(format!(
+                "block conjunction lead produced {} documents past window end {up_to}",
+                docs.len() - kept
+            )));
+        }
+        docs.truncate(kept);
         let mut scores = vec![0.0_f32; docs.len()];
         let mut matched = vec![true; docs.len()];
         let mut eval = EvalOut::default();
