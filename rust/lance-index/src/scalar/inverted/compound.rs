@@ -820,6 +820,22 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
     fn scores_non_negative(&self) -> bool {
         true
     }
+
+    fn as_eval(&mut self) -> Option<&mut dyn BatchEvaluator> {
+        if self.is_block_source() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
+    fn as_block(&mut self) -> Option<&mut dyn BlockScorer> {
+        if self.is_block_source() {
+            Some(self)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2384,6 +2400,25 @@ impl ComposableScorer for ScaleScorer<'_> {
 
     fn scores_non_negative(&self) -> bool {
         self.child.scores_non_negative()
+    }
+
+    fn as_eval(&mut self) -> Option<&mut dyn BatchEvaluator> {
+        // A factor of one leaves every child score untouched, so the child's
+        // batch results are this node's results. Any other factor would need
+        // this node to scale each entry.
+        if self.factor == 1.0 {
+            self.child.as_eval()
+        } else {
+            None
+        }
+    }
+
+    fn as_block(&mut self) -> Option<&mut dyn BlockScorer> {
+        if self.factor == 1.0 {
+            self.child.as_block()
+        } else {
+            None
+        }
     }
 }
 
@@ -7053,4 +7088,98 @@ mod tests {
             );
         }
     }
+}
+use crate::scalar::inverted::block::{BlockBuf, BlockStatus, Capacities, EvalOut, Window};
+
+/// Minimal child that advertises both block capabilities, so the scaling
+/// forwarder can be observed without building a posting source.
+struct BlockCapableChild;
+
+impl BatchEvaluator for BlockCapableChild {
+    fn eval_at(&mut self, docs: &[u64], out: &mut EvalOut) -> Result<()> {
+        out.clear(docs.len());
+        Ok(())
+    }
+}
+
+impl BlockScorer for BlockCapableChild {
+    fn caps(&self) -> Capacities {
+        Capacities::NONE
+    }
+
+    fn seek(&mut self, _target: u64) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    fn next_block(
+        &mut self,
+        _target: u64,
+        _budget: usize,
+        _out: &mut BlockBuf,
+    ) -> Result<BlockStatus> {
+        Ok(BlockStatus::Exhausted)
+    }
+
+    fn block_end_at(&mut self, target: u64) -> Result<u64> {
+        Ok(target)
+    }
+
+    fn upper_bound(&mut self, _window: &Window) -> Result<ScoreBounds> {
+        Ok(ScoreBounds::ZERO)
+    }
+}
+
+impl ComposableScorer for BlockCapableChild {
+    fn doc(&self) -> Option<u64> {
+        None
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    fn advance(&mut self, _target: u64) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    fn cost(&self) -> usize {
+        1
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        Ok(0.0)
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        Ok(target)
+    }
+
+    fn score_bounds(&mut self, _up_to: u64) -> Result<ScoreBounds> {
+        Ok(ScoreBounds::ZERO)
+    }
+
+    fn set_min_competitive_score(&mut self, _min_score: f32) -> Result<()> {
+        Ok(())
+    }
+
+    fn as_eval(&mut self) -> Option<&mut dyn BatchEvaluator> {
+        Some(self)
+    }
+
+    fn as_block(&mut self) -> Option<&mut dyn BlockScorer> {
+        Some(self)
+    }
+}
+
+#[test]
+fn scale_scorer_forwards_block_capability_only_at_unit_factor() {
+    // A unit factor leaves every child score untouched, so the child's
+    // block results are this node's results.
+    let mut identity = ScaleScorer::try_new(Box::new(BlockCapableChild), 1.0).unwrap();
+    assert!(identity.as_block().is_some());
+    assert!(identity.as_eval().is_some());
+
+    let mut scaled = ScaleScorer::try_new(Box::new(BlockCapableChild), 0.5).unwrap();
+    assert!(scaled.as_block().is_none());
+    assert!(scaled.as_eval().is_none());
 }

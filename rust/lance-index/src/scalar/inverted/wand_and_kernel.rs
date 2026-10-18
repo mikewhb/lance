@@ -14,10 +14,19 @@
 //! window, decides whether a positive floor exists, and does all scoring.
 //! The only floor-derived input is a caller-owned frequency LUT.
 
+use arrow_array::Array;
+use lance_core::Result;
+use smallvec::SmallVec;
+
+use super::super::block::{BlockBuf, BlockStatus, Window};
+use super::super::compound::ScoreBounds;
 use super::super::scorer::{Scorer, bm25_doc_weight_with_norm};
 #[cfg(target_arch = "x86_64")]
 use super::find_next_geq_avx2;
-use super::{FREQ_LUT_BUCKETS, PostingIterator, find_next_geq, find_next_geq_scalar, intersection};
+use super::{
+    FREQ_LUT_BUCKETS, PostingIterator, PostingList, TERMINATED_DOC_ID, WandDocuments,
+    conservative_score_sum, find_next_geq, find_next_geq_scalar, intersection,
+};
 
 /// Per-window view of one clause's current block. Raw pointers into the
 /// clause's `CompressedState`; valid for the whole window because the block
@@ -458,5 +467,417 @@ pub(super) fn merge_window(
         (_, _, true) => unsafe {
             merge_window_n(wins, freq_cannot_beat, cursor_scratch, docs_out, offs_out)
         },
+    }
+}
+
+/// Inclusive end of the posting block that holds `target`: the document just
+/// before the next block's first document, never below `target`. The last
+/// block reports [`TERMINATED_DOC_ID`].
+pub(super) fn posting_block_up_to(posting: &PostingIterator, target: u64) -> u64 {
+    posting
+        .next_block_first_doc()
+        .map(|doc| doc.saturating_sub(1))
+        .unwrap_or(TERMINATED_DOC_ID)
+        .max(target)
+}
+
+/// Outcome of [`open_window`].
+pub(super) struct OpenWindow {
+    /// Inclusive end of the opened window; [`TERMINATED_DOC_ID`] when a
+    /// clause's block is its last one.
+    pub(super) up_to: u64,
+    /// Some clause holds no document inside `[target, up_to]`, so the window
+    /// cannot contain a conjunction match and only its end is meaningful.
+    pub(super) skipped: bool,
+    /// First document at or after `target` that a skipped window could not
+    /// reach. The next window starts here when it lies beyond `up_to`.
+    pub(super) jump_to: u64,
+    /// A clause has no block left at or after `target`: the conjunction has no
+    /// further matches.
+    pub(super) exhausted: bool,
+}
+
+/// Position every clause's block cursor at the block that can hold `target`,
+/// end the window at the nearest next-block boundary, and slice each clause's
+/// block to `[target, up_to]`.
+///
+/// `win_cap` truncates the window for callers that must not emit more than a
+/// fixed number of documents; the conjunction terminal passes
+/// `u64::MAX`. `slice_prev` caches, per clause, the block that was sliced last
+/// and the exclusive end of that slice, so contiguous windows resume with a
+/// compare instead of a partition point.
+///
+/// All postings must be compressed. `posting.block_idx` is left on the block
+/// the window uses; callers that need block maxima read them after this call.
+///
+/// One document block per clause stays decompressed while the returned
+/// `wins` slices are live: the block cursor does not move inside a window, and
+/// position decoding writes to separate fields of the same state.
+pub(super) fn open_window(
+    postings: &mut [Box<PostingIterator>],
+    target: u64,
+    win_cap: u64,
+    wins: &mut SmallVec<[WindowList; 8]>,
+    slice_prev: &mut [(usize, usize)],
+) -> OpenWindow {
+    debug_assert!(target <= u32::MAX as u64);
+    debug_assert_eq!(slice_prev.len(), postings.len());
+    let target32 = target as u32;
+
+    let mut win_end = TERMINATED_DOC_ID;
+    for posting in postings.iter_mut() {
+        let PostingList::Compressed(ref list) = posting.list else {
+            unreachable!("window opening requires compressed postings");
+        };
+        let block_idx = posting.block_idx_for_doc(list, posting.block_idx, target32);
+        let block_up_to = if block_idx + 1 < list.blocks.len() {
+            u64::from(list.block_least_doc_id(block_idx + 1)).saturating_sub(1)
+        } else {
+            TERMINATED_DOC_ID
+        };
+        posting.block_idx = block_idx;
+        win_end = win_end.min(block_up_to.max(target));
+    }
+    let win_end = win_end.min(win_cap);
+    let win_end32 = u32::try_from(win_end).unwrap_or(u32::MAX);
+
+    wins.clear();
+    for (index, posting) in postings.iter().enumerate() {
+        let PostingList::Compressed(ref list) = posting.list else {
+            unreachable!("window opening requires compressed postings");
+        };
+        let block_idx = posting.block_idx;
+        // SAFETY: the pointer belongs to this posting's own `UnsafeCell`
+        // state. The window does not move the cursor, so the decompressed
+        // block stays valid until the caller finishes with `wins`.
+        let state = unsafe { &mut *posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
+        let doc_ids = state.doc_ids.as_slice();
+        let len = doc_ids.len();
+        // Everything before the previous slice's end of this block is below the
+        // current target, so resume from there.
+        let (prev_block, prev_hi) = slice_prev[index];
+        let start = if prev_block == block_idx {
+            prev_hi.min(len)
+        } else {
+            0
+        };
+        let lo = if start < len && doc_ids[start] >= target32 {
+            start
+        } else {
+            start + doc_ids[start..].partition_point(|&doc| doc < target32)
+        };
+        let hi = if win_end32 == u32::MAX || len == 0 || doc_ids[len - 1] <= win_end32 {
+            len
+        } else {
+            lo + doc_ids[lo..].partition_point(|&doc| doc <= win_end32)
+        };
+        slice_prev[index] = (block_idx, hi);
+        if lo == hi {
+            // No document of this clause in the window: the whole window has no
+            // conjunction match. If this was the clause's last block and it is
+            // fully behind the target, the clause is exhausted.
+            let (jump_to, exhausted) = if lo < len {
+                (u64::from(doc_ids[lo]), false)
+            } else if block_idx + 1 < list.blocks.len() {
+                (u64::from(list.block_least_doc_id(block_idx + 1)), false)
+            } else {
+                (0, true)
+            };
+            return OpenWindow {
+                up_to: win_end,
+                skipped: true,
+                jump_to,
+                exhausted,
+            };
+        }
+        wins.push(WindowList {
+            docs: state.doc_ids.as_ptr(),
+            freqs: std::ptr::null(),
+            pos: lo,
+            end: hi,
+            block_start: block_idx << list.block_shift(),
+        });
+    }
+
+    OpenWindow {
+        up_to: win_end,
+        skipped: false,
+        jump_to: 0,
+        exhausted: false,
+    }
+}
+
+/// First document of the window that follows one ending at `up_to`, or
+/// `u64::MAX` when there is no later window.
+pub(super) fn next_window_start(up_to: u64, jump_to: u64) -> u64 {
+    if up_to == TERMINATED_DOC_ID {
+        return u64::MAX;
+    }
+    (up_to + 1).max(jump_to)
+}
+
+/// Buffers one [`AndMergeKernel`] reuses across windows.
+///
+/// Only `slice_prev` survives a call, and only as a resume hint: windows are
+/// contiguous, so the next slice of a block starts where the previous one
+/// ended. Everything else is cleared before use, which keeps a window's cost
+/// to the intersection work itself.
+pub(super) struct AndWindowScratch {
+    slice_prev: SmallVec<[(usize, usize); 8]>,
+    docs: Vec<u32>,
+    offs: Vec<u8>,
+    cursor_scratch: Vec<usize>,
+    intersection_scratch: Vec<u32>,
+    anchors: SmallVec<[usize; 8]>,
+}
+
+impl AndWindowScratch {
+    pub(super) fn new(num_lists: usize) -> Self {
+        Self {
+            slice_prev: std::iter::repeat_n((usize::MAX, 0), num_lists).collect(),
+            docs: Vec::with_capacity(super::super::encoding::MAX_POSTING_BLOCK_SIZE),
+            offs: Vec::with_capacity(super::super::encoding::MAX_POSTING_BLOCK_SIZE * num_lists),
+            cursor_scratch: Vec::with_capacity(num_lists),
+            intersection_scratch: Vec::new(),
+            anchors: SmallVec::new(),
+        }
+    }
+}
+
+/// Conjunction block source over a flat posting list.
+///
+/// The kernel owns no state that outlives one call: [`open_window`] gives it
+/// one decompressed block per clause, [`merge_window`] intersects them, and
+/// [`window_bm25_score`] totals each match in query order. Scores are the same
+/// f32 additions the per-document cursor performs, so a leaf that serves both
+/// faces reports identical numbers.
+///
+/// The kernel never prunes. A competitive floor belongs to the caller, which
+/// keeps the bound and the emitted documents independent of iteration order.
+pub(super) struct AndMergeKernel<'a, 's, S: Scorer + ?Sized, D: WandDocuments> {
+    postings: &'a mut [Box<PostingIterator>],
+    /// Clause indices in query order: ascending `(position, token_id)`.
+    score_order: &'a [usize],
+    documents: &'a D,
+    scorer: &'a S,
+    scratch: &'s mut AndWindowScratch,
+}
+
+impl<'a, 's, S: Scorer, D: WandDocuments> AndMergeKernel<'a, 's, S, D> {
+    pub(super) fn new(
+        postings: &'a mut [Box<PostingIterator>],
+        score_order: &'a [usize],
+        documents: &'a D,
+        scorer: &'a S,
+        scratch: &'s mut AndWindowScratch,
+    ) -> Self {
+        Self {
+            postings,
+            score_order,
+            documents,
+            scorer,
+            scratch,
+        }
+    }
+
+    /// Position every clause on the first common document at or after
+    /// `target`, or report that no such document exists.
+    pub(super) fn seek(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.postings.is_empty() {
+            return Ok(None);
+        }
+        let mut current = target;
+        loop {
+            for posting in self.postings.iter_mut() {
+                if posting.doc().is_none_or(|doc| doc.doc_id() < current) {
+                    posting.next(current);
+                }
+            }
+            let mut max_doc = 0;
+            let mut aligned = true;
+            for posting in self.postings.iter() {
+                let Some(doc) = posting.doc() else {
+                    return Ok(None);
+                };
+                let doc_id = doc.doc_id();
+                max_doc = max_doc.max(doc_id);
+                aligned &= doc_id == current;
+            }
+            if aligned {
+                return Ok(Some(current));
+            }
+            // Every clause is at or beyond `current` and at least one is past
+            // it, so the leapfrog target strictly increases.
+            current = max_doc;
+        }
+    }
+
+    /// Inclusive end of the block holding `target`, for the tightest clause.
+    /// Restores the block anchors it touches.
+    pub(super) fn block_end_at(&mut self, target: u64) -> Result<u64> {
+        self.save_block_anchors();
+        let mut up_to = TERMINATED_DOC_ID;
+        for posting in self.postings.iter_mut() {
+            posting.shallow_next(target);
+            up_to = up_to.min(posting_block_up_to(posting, target));
+        }
+        self.restore_block_anchors();
+        Ok(up_to)
+    }
+
+    /// Conservative bound for `window`: the sum of every clause's block maxima
+    /// over the window. Restores the block anchors it touches.
+    pub(super) fn upper_bound(&mut self, window: &Window) -> Result<ScoreBounds> {
+        self.save_block_anchors();
+        for posting in self.postings.iter_mut() {
+            posting.shallow_next(window.start);
+        }
+        let upper = conservative_score_sum(self.postings.iter().map(|posting| {
+            posting
+                .block_max_score_up_to_with_stats(window.up_to, self.scorer)
+                .score
+        }));
+        self.restore_block_anchors();
+        ScoreBounds::try_new(0.0, upper)
+    }
+
+    /// Produce the next block of conjunction matches at or after `target`.
+    pub(super) fn next_block(
+        &mut self,
+        target: u64,
+        budget: usize,
+        out: &mut BlockBuf,
+    ) -> Result<BlockStatus> {
+        if budget == 0 {
+            return Err(lance_core::Error::invalid_input(
+                "FTS block request budget must be at least 1",
+            ));
+        }
+        if self.postings.is_empty() {
+            return Ok(BlockStatus::Exhausted);
+        }
+        let num_lists = self.postings.len();
+        let mut start = target;
+        // The window itself lives for one call: its slices are raw pointers
+        // into per-posting state, so keeping them in the reusable scratch
+        // would leave stale addresses in a structure that outlives the window.
+        let mut wins = SmallVec::<[WindowList; 8]>::new();
+        loop {
+            if start > u32::MAX as u64 {
+                return Ok(BlockStatus::Exhausted);
+            }
+            // The budget caps one produced block, so it is measured from the
+            // window about to be opened; a window always ends at or after
+            // `start` and the next one starts beyond that end, which bounds the
+            // loop even when windows are skipped.
+            let win_cap = start.saturating_add(budget as u64 - 1);
+            let open = open_window(
+                self.postings,
+                start,
+                win_cap,
+                &mut wins,
+                self.scratch.slice_prev.as_mut_slice(),
+            );
+            if open.exhausted {
+                return Ok(BlockStatus::Exhausted);
+            }
+            if open.skipped {
+                start = next_window_start(open.up_to, open.jump_to);
+                continue;
+            }
+            let up_to = open.up_to;
+            // The bound must be read while every cursor still sits in the
+            // window's own block, which the intersection below leaves behind.
+            let upper = self.upper_bound(&Window { start, up_to })?;
+
+            let scratch = &mut *self.scratch;
+            scratch.docs.clear();
+            scratch.offs.clear();
+            let freq_cannot_beat = [false; FREQ_LUT_BUCKETS];
+            #[cfg(target_arch = "x86_64")]
+            let use_avx2 = *super::HAS_AVX2;
+            #[cfg(not(target_arch = "x86_64"))]
+            let use_avx2 = false;
+            // Block mode does not tune the intersection arm: without a floor
+            // every arm produces the same document list.
+            merge_window(
+                &wins,
+                num_lists,
+                use_avx2,
+                false,
+                false,
+                &freq_cannot_beat,
+                &mut scratch.docs,
+                &mut scratch.offs,
+                &mut scratch.cursor_scratch,
+                &mut scratch.intersection_scratch,
+            );
+            if scratch.docs.is_empty() {
+                if up_to == TERMINATED_DOC_ID {
+                    return Ok(BlockStatus::Exhausted);
+                }
+                start = up_to + 1;
+                continue;
+            }
+            for (window, posting) in wins.iter_mut().zip(self.postings.iter()) {
+                let PostingList::Compressed(ref list) = posting.list else {
+                    unreachable!("window opening requires compressed postings");
+                };
+                let state =
+                    unsafe { &mut *posting.ensure_compressed_block_ptr(list, posting.block_idx) };
+                window.freqs = state.freqs.as_ptr();
+            }
+
+            out.clear();
+            for (index, &doc) in scratch.docs.iter().enumerate() {
+                // A filtered-out document contributes neither a candidate nor a
+                // key, so the emitted block holds visible documents only.
+                let Some(key) = self.documents.document_key_for_doc_id(doc) else {
+                    continue;
+                };
+                let doc_length = self.documents.scoring_num_tokens(doc);
+                let offs = &scratch.offs[index * num_lists..(index + 1) * num_lists];
+                let score = window_bm25_score(
+                    self.postings,
+                    &wins,
+                    offs,
+                    self.score_order,
+                    self.scorer,
+                    None,
+                    doc_length,
+                );
+                out.docs.push(u64::from(doc));
+                out.scores.push(score);
+                out.keys.push(key);
+                out.matched.push(true);
+                for clause in 0..num_lists {
+                    out.freqs
+                        .push(unsafe { *wins[clause].freqs.add(offs[clause] as usize) });
+                }
+            }
+
+            out.start = start;
+            out.up_to = up_to;
+            out.clause_count = num_lists;
+            out.upper = upper;
+            return Ok(if out.docs.is_empty() {
+                BlockStatus::Empty { up_to }
+            } else {
+                BlockStatus::Data
+            });
+        }
+    }
+
+    fn save_block_anchors(&mut self) {
+        self.scratch.anchors.clear();
+        self.scratch
+            .anchors
+            .extend(self.postings.iter().map(|posting| posting.block_idx));
+    }
+
+    fn restore_block_anchors(&mut self) {
+        for (posting, &block_idx) in self.postings.iter_mut().zip(self.scratch.anchors.iter()) {
+            posting.block_idx = block_idx;
+        }
     }
 }

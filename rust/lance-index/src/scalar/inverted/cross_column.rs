@@ -973,7 +973,7 @@ fn collect_local_generator_candidates(
                 .iter()
                 .map(PostingIterator::fork_from_start)
                 .collect::<Vec<_>>();
-            let mut local_scorer = WandCursor::new(
+            let mut local_scorer = WandCursor::new_without_blocks(
                 leaf.operator,
                 leaf.postings,
                 &documents,
@@ -1080,7 +1080,7 @@ fn score_generator_candidates(
             };
             let expected_matches = leaf.candidate_docs.len();
             let mut actual_matches = 0_u64;
-            let mut local_scorer = WandCursor::new(
+            let mut local_scorer = WandCursor::new_without_blocks(
                 leaf.operator,
                 leaf.postings,
                 &documents,
@@ -1216,7 +1216,7 @@ fn score_cross_column_sources(
             else {
                 continue;
             };
-            let local_scorer: BoxScorer<'_> = Box::new(WandCursor::new(
+            let local_scorer: BoxScorer<'_> = Box::new(WandCursor::new_without_blocks(
                 leaf.operator,
                 leaf.postings,
                 &wand_documents[source_ordinal],

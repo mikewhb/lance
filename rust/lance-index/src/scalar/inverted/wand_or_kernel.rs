@@ -57,62 +57,39 @@ pub(super) fn fill_window<'a, S, D, I>(
 
 /// Reusable OR window kernel over a flat posting list.
 ///
-/// This is the C1b/C1c kernel: it never touches the terminal heap, threshold,
-/// or essential-clause policy. The caller owns the posting ownership and the
-/// candidate block.
-#[allow(dead_code)]
-pub(super) struct OrUnionKernel<'a, S: Scorer + ?Sized, D: WandDocuments> {
-    postings: Vec<Box<PostingIterator>>,
-    score_order: Vec<usize>,
+/// This is the block-source kernel: it never touches the terminal heap,
+/// threshold, or essential-clause policy. The caller owns the postings and the
+/// accumulator, so a leaf keeps both across windows instead of rebuilding
+/// them.
+pub(super) struct OrUnionKernel<'a, 's, S: Scorer + ?Sized, D: WandDocuments> {
+    postings: &'a mut [Box<PostingIterator>],
+    /// Clause indices in query order: ascending `(position, token_id)`.
+    score_order: &'a [usize],
     documents: &'a D,
     scorer: &'a S,
+    acc: &'s mut WindowAccumulator,
 }
 
-#[allow(dead_code)]
-impl<'a, S: Scorer + ?Sized, D: WandDocuments> OrUnionKernel<'a, S, D> {
+impl<'a, 's, S: Scorer + ?Sized, D: WandDocuments> OrUnionKernel<'a, 's, S, D> {
     pub(super) fn new(
-        postings: Vec<Box<PostingIterator>>,
-        score_order: Vec<usize>,
+        postings: &'a mut [Box<PostingIterator>],
+        score_order: &'a [usize],
         documents: &'a D,
         scorer: &'a S,
+        acc: &'s mut WindowAccumulator,
     ) -> Self {
         Self {
             postings,
             score_order,
             documents,
             scorer,
-        }
-    }
-
-    pub(super) fn caps(&self) -> crate::scalar::inverted::block::Capacities {
-        use crate::scalar::inverted::PostingList;
-        use crate::scalar::inverted::block::Capacities;
-        let compressed = self.postings.iter().all(|posting| posting.is_compressed());
-        let grouped = self
-            .postings
-            .iter()
-            .any(|posting| posting.has_grouped_terms());
-        let block_size = self
-            .postings
-            .first()
-            .and_then(|posting| match &posting.list {
-                PostingList::Compressed(list) => Some(list.block_size),
-                PostingList::Plain(_) => None,
-            })
-            .unwrap_or(0);
-        Capacities {
-            compressed,
-            grouped,
-            phrase: false,
-            scores_non_negative: true,
-            block_size,
-            window_bounds: compressed && matches!(block_size, 128 | 256),
+            acc,
         }
     }
 
     pub(super) fn seek(&mut self, target: u64) -> Result<Option<u64>> {
         let mut first: Option<u64> = None;
-        for posting in &mut self.postings {
+        for posting in self.postings.iter_mut() {
             if posting.doc().is_none_or(|doc| doc.doc_id() < target) {
                 posting.next(target);
             }
@@ -126,9 +103,9 @@ impl<'a, S: Scorer + ?Sized, D: WandDocuments> OrUnionKernel<'a, S, D> {
 
     pub(super) fn block_end_at(&mut self, target: u64) -> Result<u64> {
         let mut up_to = u64::MAX;
-        for posting in &mut self.postings {
+        for posting in self.postings.iter_mut() {
             posting.shallow_next(target);
-            up_to = up_to.min(posting.block_end_doc());
+            up_to = up_to.min(super::and_kernel::posting_block_up_to(posting, target));
         }
         Ok(up_to)
     }
@@ -152,19 +129,27 @@ impl<'a, S: Scorer + ?Sized, D: WandDocuments> OrUnionKernel<'a, S, D> {
         budget: usize,
         out: &mut crate::scalar::inverted::block::BlockBuf,
     ) -> Result<crate::scalar::inverted::block::BlockStatus> {
-        use crate::scalar::inverted::block::BlockStatus;
+        use crate::scalar::inverted::block::{BlockStatus, Window};
         if budget == 0 {
             return Err(lance_core::Error::invalid_input(
-                "UBE block budget must be at least 1",
+                "FTS block request budget must be at least 1",
             ));
         }
+        if self.postings.is_empty() {
+            return Ok(BlockStatus::Exhausted);
+        }
+        // The accumulator has one slot per document of a fixed-length window,
+        // so a wider budget cannot be honoured.
+        let window_len = budget.min(MAXSCORE_INNER_WINDOW);
+        // A block end is never below the target, so the window is non-empty.
         let up_to = self
             .block_end_at(target)?
-            .min(target.saturating_add(budget as u64 - 1));
-        if up_to < target {
-            return Ok(BlockStatus::Empty { up_to: target });
-        }
-        let mut acc = WindowAccumulator::new(self.postings.len());
+            .min(target.saturating_add(window_len as u64 - 1));
+        // The bound must be read before the scan below leaves the window.
+        let upper = self.upper_bound(&Window {
+            start: target,
+            up_to,
+        })?;
         fill_window(
             self.postings
                 .iter_mut()
@@ -175,39 +160,43 @@ impl<'a, S: Scorer + ?Sized, D: WandDocuments> OrUnionKernel<'a, S, D> {
             self.documents,
             self.scorer,
             None,
-            &mut acc,
+            self.acc,
         );
         out.clear();
         out.start = target;
         out.up_to = up_to;
         out.clause_count = self.postings.len();
         for slot in 0..=(up_to - target) as usize {
-            if acc.words[slot >> 6] & (1u64 << (slot & 63)) == 0 {
+            if self.acc.words[slot >> 6] & (1u64 << (slot & 63)) == 0 {
                 continue;
             }
             let doc = target + slot as u64;
             let Some(key) = self.documents.document_key_for_doc_id(doc as u32) else {
-                acc.clear_slot(slot);
+                self.acc.clear_slot(slot);
                 continue;
             };
             out.docs.push(doc);
-            out.scores.push(acc.scores[slot]);
+            out.scores.push(self.acc.scores[slot]);
             out.keys.push(key);
             out.matched.push(true);
             for clause in 0..self.postings.len() {
-                out.freqs.push(acc.clause_freq(clause, slot));
+                out.freqs.push(self.acc.clause_freq(clause, slot));
             }
-            acc.clear_slot(slot);
+            self.acc.clear_slot(slot);
         }
-        acc.words.fill(0);
-        out.upper = self.upper_bound(&crate::scalar::inverted::block::Window {
-            start: target,
-            up_to,
-        })?;
-        if out.docs.is_empty() {
+        self.acc.words.fill(0);
+        out.upper = upper;
+        if !out.docs.is_empty() {
+            return Ok(BlockStatus::Data);
+        }
+        // The scan left every clause on its first document beyond the window.
+        // With none left, no later window can hold a document, and the block
+        // boundary alone cannot say so: the last block reports no next-block
+        // start, so its end is the caller's budget rather than the list end.
+        if self.postings.iter().any(|posting| posting.doc().is_some()) {
             Ok(BlockStatus::Empty { up_to })
         } else {
-            Ok(BlockStatus::Data)
+            Ok(BlockStatus::Exhausted)
         }
     }
 
@@ -218,9 +207,10 @@ impl<'a, S: Scorer + ?Sized, D: WandDocuments> OrUnionKernel<'a, S, D> {
     ) -> Result<()> {
         out.clear(docs.len());
         for (index, &doc) in docs.iter().enumerate() {
+            let doc_length = self.documents.scoring_num_tokens(doc as u32);
             let mut total = 0.0_f32;
             let mut matched = false;
-            for &clause in &self.score_order {
+            for &clause in self.score_order {
                 let posting = &mut self.postings[clause];
                 if posting.doc().is_none_or(|current| current.doc_id() < doc) {
                     posting.next(doc);
@@ -232,7 +222,6 @@ impl<'a, S: Scorer + ?Sized, D: WandDocuments> OrUnionKernel<'a, S, D> {
                     continue;
                 }
                 matched = true;
-                let doc_length = self.documents.scoring_num_tokens(doc as u32);
                 total += posting.score(self.scorer, current.frequency(), doc_length);
             }
             out.scores[index] = total;

@@ -42,6 +42,16 @@ impl Capacities {
         block_size: 0,
         window_bounds: false,
     };
+
+    /// Whether a leaf with these capabilities can serve block execution.
+    ///
+    /// Compressed short-block postings are the only source of a true window
+    /// bound. Grouped expansions score their terms one by one and a phrase
+    /// leaf decides membership from positions, so neither can answer a
+    /// document from posting blocks alone.
+    pub(super) fn supports_block(&self) -> bool {
+        self.compressed && !self.grouped && !self.phrase && self.window_bounds
+    }
 }
 
 /// Inclusive document range used by block kernels.
