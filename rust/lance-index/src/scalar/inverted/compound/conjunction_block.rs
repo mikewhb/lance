@@ -21,12 +21,18 @@ struct BlockState {
     /// on the per-document face instead of a scan of the whole block.
     current_index: Option<usize>,
     current: Option<u64>,
+    /// Whether `next_block` has produced anything for this state. Reading
+    /// `block.up_to == 0` as the same signal would confuse "not produced yet"
+    /// with a legitimate window that ends at document 0.
+    produced: bool,
     exhausted: bool,
 }
 
 impl BlockState {
     fn refill(&mut self, producer: &mut dyn BlockScorer, target: u64) -> Result<bool> {
-        match producer.next_block(target, 4096, &mut self.block)? {
+        let status = producer.next_block(target, 4096, &mut self.block)?;
+        self.produced = true;
+        match status {
             BlockStatus::Data => {
                 self.cursor = 0;
                 self.exhausted = false;
@@ -54,10 +60,10 @@ impl BlockState {
             if self.exhausted {
                 return Ok(None);
             }
-            let target = if self.block.up_to == 0 {
-                0
-            } else {
+            let target = if self.produced {
                 self.block.up_to.saturating_add(1)
+            } else {
+                0
             };
             if !self.refill(producer, target)? && self.exhausted {
                 return Ok(None);
@@ -86,12 +92,12 @@ impl BlockState {
             self.exhausted = true;
             return Ok(None);
         }
-        // `up_to == 0` means no block has been produced yet, so `target` is
-        // still the first document this state may return.
-        let next = if self.block.up_to == 0 {
-            target
-        } else {
+        // Before the first produced block, `target` is still the first
+        // document this state may return.
+        let next = if self.produced {
             target.max(self.block.up_to.saturating_add(1))
+        } else {
+            target
         };
         if !self.refill(producer, next)? && self.exhausted {
             return Ok(None);
@@ -124,7 +130,6 @@ impl BlockState {
 struct ConjunctionProducer<'a> {
     children: Vec<BoxScorer<'a>>,
     cost_order: Vec<usize>,
-    score_order: Vec<usize>,
     lead_buf: BlockBuf,
 }
 
@@ -137,7 +142,6 @@ impl<'a> ConjunctionProducer<'a> {
         cost_order.sort_unstable_by_key(|&index| (children[index].cost(), index));
         Ok(Self {
             children,
-            score_order: (0..cost_order.len()).collect(),
             cost_order,
             lead_buf: BlockBuf::default(),
         })
@@ -248,7 +252,7 @@ impl<'a> ConjunctionProducer<'a> {
         let mut scores = vec![0.0_f32; docs.len()];
         let mut matched = vec![true; docs.len()];
         let mut eval = EvalOut::default();
-        for &index in &self.score_order {
+        for index in 0..self.children.len() {
             if index == lead {
                 // Producing the lead block can leave the lead cursor on the
                 // first document after the window (the OR kernel scans the
@@ -297,7 +301,7 @@ impl BatchEvaluator for ConjunctionProducer<'_> {
         out.clear(docs.len());
         out.matched.fill(true);
         let mut eval = EvalOut::default();
-        for &index in &self.score_order {
+        for index in 0..self.children.len() {
             self.children[index]
                 .as_eval()
                 .ok_or_else(|| Error::internal("conjunction child has no batch evaluator"))?
