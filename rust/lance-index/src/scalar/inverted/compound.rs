@@ -708,6 +708,14 @@ impl CompoundScorerPlan {
     }
 
     pub(super) fn build<'a>(&self, leaves: &mut [Option<BoxScorer<'a>>]) -> Result<BoxScorer<'a>> {
+        self.build_with_block(leaves, false)
+    }
+
+    pub(super) fn build_with_block<'a>(
+        &self,
+        leaves: &mut [Option<BoxScorer<'a>>],
+        block_exec: bool,
+    ) -> Result<BoxScorer<'a>> {
         match self {
             Self::Leaf { index, boost } => {
                 let leaf = leaves
@@ -725,14 +733,14 @@ impl CompoundScorerPlan {
                 negative,
                 negative_boost,
             } => Ok(Box::new(BoostScorer::try_new(
-                positive.build(leaves)?,
-                negative.build(leaves)?,
+                positive.build_with_block(leaves, block_exec)?,
+                negative.build_with_block(leaves, block_exec)?,
                 *negative_boost,
             )?)),
             Self::MultiMatch(children) => Ok(Box::new(DisjunctionScorer::try_new(
                 children
                     .iter()
-                    .map(|child| child.build(leaves))
+                    .map(|child| child.build_with_block(leaves, block_exec))
                     .collect::<Result<Vec<_>>>()?,
                 DisjunctionScore::Max,
             )?)),
@@ -740,18 +748,19 @@ impl CompoundScorerPlan {
                 should,
                 must,
                 must_not,
-            } => Ok(Box::new(BooleanScorer::try_new(
+            } => Ok(Box::new(BooleanScorer::try_new_with_block(
                 should
                     .iter()
-                    .map(|child| child.build(leaves))
+                    .map(|child| child.build_with_block(leaves, block_exec))
                     .collect::<Result<Vec<_>>>()?,
                 must.iter()
-                    .map(|child| child.build(leaves))
+                    .map(|child| child.build_with_block(leaves, block_exec))
                     .collect::<Result<Vec<_>>>()?,
                 must_not
                     .iter()
-                    .map(|child| child.build(leaves))
+                    .map(|child| child.build_with_block(leaves, block_exec))
                     .collect::<Result<Vec<_>>>()?,
+                block_exec,
             )?)),
         }
     }
@@ -3465,13 +3474,25 @@ pub(super) struct BooleanScorer<'a> {
     confirmed: bool,
     optional_matches: bool,
     defer_confirmation: bool,
+    #[allow(dead_code)]
+    block_exec: bool,
 }
 
 impl<'a> BooleanScorer<'a> {
+    #[allow(dead_code)]
     pub(super) fn try_new(
         should: Vec<BoxScorer<'a>>,
         must: Vec<BoxScorer<'a>>,
         must_not: Vec<BoxScorer<'a>>,
+    ) -> Result<Self> {
+        Self::try_new_with_block(should, must, must_not, false)
+    }
+
+    pub(super) fn try_new_with_block(
+        should: Vec<BoxScorer<'a>>,
+        must: Vec<BoxScorer<'a>>,
+        must_not: Vec<BoxScorer<'a>>,
+        block_exec: bool,
     ) -> Result<Self> {
         let (driver, optional) = if must.is_empty() {
             if should.is_empty() {
@@ -3540,6 +3561,7 @@ impl<'a> BooleanScorer<'a> {
             confirmed: false,
             optional_matches: false,
             defer_confirmation: scores_non_negative && has_doc_local_confirmation,
+            block_exec,
         })
     }
 
@@ -4070,6 +4092,7 @@ where
     D: WandDocuments + Sync,
     K: Copy + Ord,
 {
+    let block_exec = leaves.first().is_some_and(|leaf| leaf.params.block_exec);
     let mut leaf_scorers = leaves
         .into_iter()
         .map(|leaf| {
@@ -4088,7 +4111,7 @@ where
             Some(scorer)
         })
         .collect::<Vec<_>>();
-    let mut scorer = plan.build(&mut leaf_scorers)?;
+    let mut scorer = plan.build_with_block(&mut leaf_scorers, block_exec)?;
     if leaf_scorers.iter().any(Option::is_some) {
         return Err(Error::internal(
             "compound FTS scorer did not consume every prepared leaf",
@@ -6017,6 +6040,7 @@ mod tests {
             confirmed: false,
             optional_matches: false,
             defer_confirmation: false,
+            block_exec: false,
         };
         let eager_results = TopKCollector::new(1).collect(&mut eager).unwrap();
 
