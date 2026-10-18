@@ -2131,7 +2131,7 @@ struct MaxScoreClause {
 }
 
 /// Per-window score/frequency accumulator for the bulk MAXSCORE path. Slot i
-/// covers doc id `window_min + i`; `freqs` is laid out clause-major so accept
+/// covers doc id `window_min + i`; `freqs` is laid out doc-major so accept
 /// paths can recover (term, freq) pairs of the essential clauses.
 pub(super) struct WindowAccumulator {
     scores: Vec<f32>,

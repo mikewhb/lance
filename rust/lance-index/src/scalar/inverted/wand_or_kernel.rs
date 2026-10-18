@@ -19,7 +19,7 @@
 //! from window to window.
 
 use super::super::scorer::Scorer;
-use super::{PostingIterator, WandDocuments, WindowAccumulator};
+use super::{MAXSCORE_INNER_WINDOW, PostingIterator, WandDocuments, WindowAccumulator};
 
 /// Accumulate one window of a disjunction leaf.
 ///
@@ -44,6 +44,8 @@ pub(super) fn fill_window<'a, S, D, I>(
     D: WandDocuments,
     I: IntoIterator<Item = (usize, &'a mut PostingIterator)>,
 {
+    debug_assert!(window_min <= up_to);
+    debug_assert!((up_to - window_min) < MAXSCORE_INNER_WINDOW as u64);
     for (clause_idx, posting) in postings {
         posting.collect_window_scores(
             window_min, up_to, clause_idx, documents, scorer, norm_k, acc,
