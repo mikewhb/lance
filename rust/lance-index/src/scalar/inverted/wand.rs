@@ -6208,6 +6208,17 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         params: &FtsSearchParams,
         metrics: &'a dyn MetricsCollector,
     ) -> Self {
+        Self::new_without_blocks(operator, postings, documents, scorer, params, metrics)
+    }
+
+    pub(super) fn new_with_blocks(
+        operator: Operator,
+        postings: Vec<PostingIterator>,
+        documents: &'a D,
+        scorer: Arc<MemBM25Scorer>,
+        params: &FtsSearchParams,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Self {
         Self::build(
             operator,
             postings,
@@ -14711,7 +14722,9 @@ mod tests {
     // ---- Block source (multi-clause leaf block execution) ----
 
     use crate::scalar::inverted::block::{BlockBuf, BlockScorer, BlockStatus, EvalOut};
-    use crate::scalar::inverted::compound::ComposableScorer;
+    use crate::scalar::inverted::compound::{
+        BooleanScorer, BoxScorer, CompetitiveScore, ComposableScorer, TopKCollector as RowCollector,
+    };
 
     const BLOCK_TEST_DOCS: u32 = 300;
 
@@ -14845,7 +14858,7 @@ mod tests {
         params: &'a FtsSearchParams,
         metrics: &'a NoOpMetricsCollector,
     ) -> WandCursor<'a, DocSet> {
-        WandCursor::new(
+        WandCursor::new_with_blocks(
             operator,
             postings
                 .iter()
@@ -14889,7 +14902,10 @@ mod tests {
         let lengths = block_test_lengths();
         let docs = block_test_documents(&lengths);
         let postings = block_test_postings(&lengths, block_size, impacts);
-        let classic_params = FtsSearchParams::default();
+        let classic_params = FtsSearchParams {
+            block_exec: false,
+            ..FtsSearchParams::default()
+        };
         let block_params = block_test_params();
         let metrics = NoOpMetricsCollector;
 
@@ -15074,7 +15090,7 @@ mod tests {
         let block_params = block_test_params();
         let metrics = NoOpMetricsCollector;
 
-        let mut block = WandCursor::new(
+        let mut block = WandCursor::new_with_blocks(
             Operator::And,
             vec![
                 posting("even", 0, even.clone()),
@@ -15092,7 +15108,7 @@ mod tests {
             "no document holds both clauses"
         );
 
-        let mut block = WandCursor::new(
+        let mut block = WandCursor::new_with_blocks(
             Operator::And,
             vec![posting("even", 0, even), posting("odd", 1, odd)],
             &docs,
@@ -15128,7 +15144,7 @@ mod tests {
             &classic_params,
             &metrics,
         );
-        let mut block = WandCursor::new(
+        let mut block = WandCursor::new_with_blocks(
             Operator::Or,
             single,
             &docs,
@@ -15281,7 +15297,10 @@ mod tests {
         let postings = block_test_postings(&lengths, 128, true);
         let metrics = NoOpMetricsCollector;
         let params = if blocker == "flag_off" {
-            FtsSearchParams::default()
+            FtsSearchParams {
+                block_exec: false,
+                ..FtsSearchParams::default()
+            }
         } else {
             block_test_params()
         };
@@ -15302,5 +15321,116 @@ mod tests {
         assert!(cursor.as_block().is_none());
         assert!(cursor.as_eval().is_none());
         assert!(cursor.next().unwrap().is_some());
+    }
+
+    /// One leaf of a compound scorer, built either flat or block-capable.
+    #[cfg_attr(coverage, coverage(off))]
+    fn block_boolean_leaf<'a>(
+        block: bool,
+        clauses: &[usize],
+        postings: &[PostingIterator],
+        docs: &'a DocSet,
+        scorer: Arc<MemBM25Scorer>,
+        params: &'a FtsSearchParams,
+        metrics: &'a NoOpMetricsCollector,
+    ) -> BoxScorer<'a> {
+        let operator = if clauses.len() == 1 {
+            Operator::And
+        } else {
+            Operator::Or
+        };
+        let postings = clauses
+            .iter()
+            .map(|&clause| postings[clause].fork_from_start())
+            .collect::<Vec<_>>();
+        if block {
+            Box::new(WandCursor::new_with_blocks(
+                operator, postings, docs, scorer, params, metrics,
+            ))
+        } else {
+            Box::new(WandCursor::new(
+                operator, postings, docs, scorer, params, metrics,
+            ))
+        }
+    }
+
+    /// Run the same MUST/SHOULD tree over flat or block leaves and report
+    /// `(doc, score bits)` for the top results.
+    #[cfg_attr(coverage, coverage(off))]
+    fn block_boolean_rows(block: bool, multi: bool, limit: usize) -> Vec<(u64, u32)> {
+        block_boolean_rows_with_should(block, multi, limit, true)
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    fn block_boolean_rows_with_should(
+        block: bool,
+        multi: bool,
+        limit: usize,
+        with_should: bool,
+    ) -> Vec<(u64, u32)> {
+        let lengths = block_test_lengths();
+        let docs = block_test_documents(&lengths);
+        let postings = block_test_postings(&lengths, 128, true);
+        let metrics = NoOpMetricsCollector;
+        let params = FtsSearchParams {
+            block_exec: block,
+            ..FtsSearchParams::default()
+        };
+        let leaf_scorer = block_test_scorer();
+        let leaf = |clauses: &[usize]| {
+            block_boolean_leaf(
+                block,
+                clauses,
+                &postings,
+                &docs,
+                leaf_scorer.clone(),
+                &params,
+                &metrics,
+            )
+        };
+        let must = if multi {
+            vec![leaf(&[0, 2]), leaf(&[1])]
+        } else {
+            vec![leaf(&[0]), leaf(&[1])]
+        };
+        let should = if with_should {
+            vec![leaf(&[2])]
+        } else {
+            Vec::new()
+        };
+        let mut scorer =
+            BooleanScorer::try_new_with_block(should, must, Vec::new(), block).unwrap();
+        RowCollector::with_competitive_score(limit, Arc::new(CompetitiveScore::default()))
+            .collect(&mut scorer)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.row_id, row.score.to_bits()))
+            .collect()
+    }
+
+    #[rstest]
+    #[case::single_posting_must(false)]
+    #[case::multi_posting_must(true)]
+    fn boolean_block_required_matches_flat_bits(#[case] multi: bool) {
+        // A full heap installs a score floor, so the required-plus-optional
+        // driver exercises its bounds and temporary-optional paths.
+        for limit in [300, 64, 7, 1] {
+            let flat = block_boolean_rows(false, multi, limit);
+            let block = block_boolean_rows(true, multi, limit);
+            assert!(!flat.is_empty(), "limit={limit}");
+            assert_eq!(block, flat, "limit={limit}");
+        }
+    }
+
+    #[test]
+    fn block_conjunction_without_optional_matches_flat_bits() {
+        for multi in [false, true] {
+            for limit in [300, 64, 7, 1] {
+                let flat = block_boolean_rows_with_should(false, multi, limit, false);
+                let block = block_boolean_rows_with_should(true, multi, limit, false);
+                assert!(!flat.is_empty(), "limit={limit}");
+                assert_eq!(block, flat, "multi={multi} limit={limit}");
+            }
+        }
     }
 }

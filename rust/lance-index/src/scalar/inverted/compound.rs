@@ -4110,14 +4110,25 @@ where
             let scorer: BoxScorer<'_> = if leaf.postings.is_empty() {
                 Box::new(EmptyScorer)
             } else {
-                Box::new(WandCursor::new(
-                    leaf.operator,
-                    leaf.postings,
-                    documents,
-                    leaf.scorer,
-                    leaf.params.as_ref(),
-                    metrics,
-                ))
+                Box::new(if leaf.params.block_exec {
+                    WandCursor::new_with_blocks(
+                        leaf.operator,
+                        leaf.postings,
+                        documents,
+                        leaf.scorer,
+                        leaf.params.as_ref(),
+                        metrics,
+                    )
+                } else {
+                    WandCursor::new(
+                        leaf.operator,
+                        leaf.postings,
+                        documents,
+                        leaf.scorer,
+                        leaf.params.as_ref(),
+                        metrics,
+                    )
+                })
             };
             Some(scorer)
         })
