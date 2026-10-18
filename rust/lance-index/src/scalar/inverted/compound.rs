@@ -4496,18 +4496,27 @@ where
         && let Some((must_indices, should_indices)) = iu_tight_clause_indices(plan)
         && iu_tight_clauses_ready(&leaves, &must_indices, &should_indices)
     {
-        let required_cost: usize = must_indices
-            .iter()
-            .map(|&index| leaves[index].postings[0].cost())
-            .sum();
-        let optional_cost: usize = should_indices
-            .iter()
-            .map(|&index| leaves[index].postings[0].cost())
-            .sum();
-        let sparse_optionals_vs_dense_required =
-            optionals_are_sparse(must_indices.len(), optional_cost, required_cost);
-        if !sparse_optionals_vs_dense_required {
+        // The sparse-optional gate only decides whether the K = 1 batch walk
+        // can outrun the generic tree. K >= 2 has no batch walk at all, so the
+        // gate must not keep its single-posting leaves on the WAND wrapper:
+        // TermLeaf is a drop-in child there and skips the per-leaf heap.
+        if must_indices.len() > 1 {
             batch_leaf_indices.extend(must_indices.iter().chain(should_indices.iter()).copied());
+        } else {
+            let required_cost: usize = must_indices
+                .iter()
+                .map(|&index| leaves[index].postings[0].cost())
+                .sum();
+            let optional_cost: usize = should_indices
+                .iter()
+                .map(|&index| leaves[index].postings[0].cost())
+                .sum();
+            let sparse_optionals_vs_dense_required =
+                optionals_are_sparse(must_indices.len(), optional_cost, required_cost);
+            if !sparse_optionals_vs_dense_required {
+                batch_leaf_indices
+                    .extend(must_indices.iter().chain(should_indices.iter()).copied());
+            }
         }
     }
     // One plan scan for the whole admission decision: the per-leaf predicate
