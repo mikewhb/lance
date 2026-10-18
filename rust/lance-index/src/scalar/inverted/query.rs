@@ -52,12 +52,12 @@ pub(crate) fn fuzzy_term_options<'a>(
     }
 }
 
-fn is_true(value: &bool) -> bool {
-    *value
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_block_exec() -> bool {
-    true
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,9 +80,10 @@ pub struct FtsSearchParams {
     pub phrase_slop: Option<u32>,
     /// The number of beginning characters being unchanged for fuzzy matching.
     pub prefix_length: u32,
-    /// Enables the block-execution path for compound FTS. Enabled by default;
-    /// the flag remains so a query can fall back to the per-document path.
-    #[serde(default = "default_block_exec", skip_serializing_if = "is_true")]
+    /// Enables the block-execution path for compound FTS. Opt-in: the C4
+    /// performance gate showed slower per-query medians on K=1 shapes, so the
+    /// per-document path stays the default.
+    #[serde(default = "default_block_exec", skip_serializing_if = "is_false")]
     pub block_exec: bool,
 }
 
@@ -95,7 +96,7 @@ impl FtsSearchParams {
             max_expansions: 50,
             phrase_slop: None,
             prefix_length: 0,
-            block_exec: true,
+            block_exec: false,
         }
     }
 
@@ -1931,17 +1932,17 @@ mod tests {
             "prefix_length": 0
         });
         let params: FtsSearchParams = serde_json::from_value(value).unwrap();
-        assert!(params.block_exec);
+        assert!(!params.block_exec);
 
-        // The default is omitted, while an explicit opt-out survives a
+        // The default is omitted, while an explicit opt-in survives a
         // round-trip.
         let default = serde_json::to_value(FtsSearchParams::new()).unwrap();
         assert!(default.get("block_exec").is_none());
-        let mut opt_out = FtsSearchParams::new();
-        opt_out.block_exec = false;
-        let encoded = serde_json::to_value(&opt_out).unwrap();
-        assert_eq!(encoded["block_exec"], serde_json::json!(false));
+        let mut opt_in = FtsSearchParams::new();
+        opt_in.block_exec = true;
+        let encoded = serde_json::to_value(&opt_in).unwrap();
+        assert_eq!(encoded["block_exec"], serde_json::json!(true));
         let decoded: FtsSearchParams = serde_json::from_value(encoded).unwrap();
-        assert!(!decoded.block_exec);
+        assert!(decoded.block_exec);
     }
 }
