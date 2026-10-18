@@ -17,6 +17,9 @@ use super::{BoxScorer, ComposableScorer, ScoreBounds};
 struct BlockState {
     block: BlockBuf,
     cursor: usize,
+    /// Index in `block.docs` of `current`; the position lookup below is O(1)
+    /// on the per-document face instead of a scan of the whole block.
+    current_index: Option<usize>,
     current: Option<u64>,
     exhausted: bool,
 }
@@ -44,10 +47,9 @@ impl BlockState {
     fn next(&mut self, producer: &mut dyn BlockScorer) -> Result<Option<u64>> {
         loop {
             if self.cursor < self.block.docs.len() {
-                let doc = self.block.docs[self.cursor];
-                self.current = Some(doc);
-                self.cursor += 1;
-                return Ok(Some(doc));
+                let index = self.cursor;
+                self.take(index);
+                return Ok(self.current);
             }
             if self.exhausted {
                 return Ok(None);
@@ -76,10 +78,9 @@ impl BlockState {
             self.cursor += 1;
         }
         if self.cursor < self.block.docs.len() {
-            let doc = self.block.docs[self.cursor];
-            self.current = Some(doc);
-            self.cursor += 1;
-            return Ok(Some(doc));
+            let index = self.cursor;
+            self.take(index);
+            return Ok(self.current);
         }
         if self.block.up_to == u64::MAX {
             self.exhausted = true;
@@ -98,22 +99,25 @@ impl BlockState {
         self.next(producer)
     }
 
+    fn take(&mut self, index: usize) {
+        self.cursor = index + 1;
+        self.current_index = Some(index);
+        self.current = Some(self.block.docs[index]);
+    }
+
+    fn positioned_index(&self) -> Option<usize> {
+        let index = self.current_index?;
+        (self.block.docs.get(index) == Some(&self.current?)).then_some(index)
+    }
+
     fn current_score(&self) -> Option<f32> {
-        let doc = self.current?;
-        self.block
-            .docs
-            .iter()
-            .position(|&d| d == doc)
-            .map(|i| self.block.scores[i])
+        self.positioned_index()
+            .and_then(|index| self.block.scores.get(index).copied())
     }
 
     fn current_key(&self) -> Option<u64> {
-        let doc = self.current?;
-        self.block
-            .docs
-            .iter()
-            .position(|&d| d == doc)
-            .map(|i| self.block.keys[i])
+        self.positioned_index()
+            .and_then(|index| self.block.keys.get(index).copied())
     }
 }
 

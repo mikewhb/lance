@@ -3476,8 +3476,6 @@ pub(super) struct BooleanScorer<'a> {
     confirmed: bool,
     optional_matches: bool,
     defer_confirmation: bool,
-    #[allow(dead_code)]
-    block_exec: bool,
 }
 
 impl<'a> BooleanScorer<'a> {
@@ -3572,7 +3570,6 @@ impl<'a> BooleanScorer<'a> {
             confirmed: false,
             optional_matches: false,
             defer_confirmation: scores_non_negative && has_doc_local_confirmation,
-            block_exec,
         })
     }
 
@@ -6071,7 +6068,6 @@ mod tests {
             confirmed: false,
             optional_matches: false,
             defer_confirmation: false,
-            block_exec: false,
         };
         let eager_results = TopKCollector::new(1).collect(&mut eager).unwrap();
 
