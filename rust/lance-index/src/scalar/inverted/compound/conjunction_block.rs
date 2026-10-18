@@ -238,6 +238,17 @@ impl<'a> ConjunctionProducer<'a> {
         let mut matched = vec![true; docs.len()];
         let mut eval = EvalOut::default();
         for &index in &self.score_order {
+            if index == lead {
+                // Producing the lead block can leave the lead cursor on the
+                // first document after the window (the OR kernel scans the
+                // window), so evaluating the lead again would report no match.
+                // The produced block already carries the lead's exact score.
+                debug_assert!(self.lead_buf.scores.len() >= docs.len());
+                for (score, lead_score) in scores.iter_mut().zip(&self.lead_buf.scores) {
+                    *score += *lead_score;
+                }
+                continue;
+            }
             self.children[index]
                 .as_eval()
                 .ok_or_else(|| Error::internal("conjunction child has no batch evaluator"))?
