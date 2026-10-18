@@ -121,6 +121,10 @@ impl<'a, D: WandDocuments> BlockPostingSet<'a, D> {
             .collect::<Vec<_>>();
         if operator == Operator::And {
             postings.sort_unstable_by_key(|posting| posting.cost());
+        } else {
+            // The OR window kernel accumulates in array order. Keep the array
+            // in query order so it matches `score_order` and `eval_at`.
+            postings.sort_unstable_by_key(|posting| (posting.position, posting.token_id));
         }
         let num_terms = postings.len();
         let mut score_order = (0..num_terms).collect::<Vec<_>>();
@@ -264,7 +268,9 @@ impl<D: WandDocuments> BatchEvaluator for BlockPostingSet<'_, D> {
                     out.scores[index] = total;
                     out.matched[index] = matched;
                 }
-                out.exhausted = self.postings.iter().all(|posting| posting.doc().is_none());
+                // A conjunction is exhausted as soon as any required clause
+                // has no further document.
+                out.exhausted = self.postings.iter().any(|posting| posting.doc().is_none());
                 Ok(())
             }
         }
