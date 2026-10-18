@@ -1911,4 +1911,18 @@ mod tests {
         assert!(debug.contains("title"), "unexpected Debug output: {debug}");
         assert!(debug.contains("2.5"), "unexpected Debug output: {debug}");
     }
+
+    #[test]
+    fn old_params_json_without_block_exec_deserializes() {
+        let value = serde_json::json!({
+            "limit": 10,
+            "wand_factor": 1.0,
+            "fuzziness": 0,
+            "max_expansions": 50,
+            "phrase_slop": null,
+            "prefix_length": 0
+        });
+        let params: FtsSearchParams = serde_json::from_value(value).unwrap();
+        assert!(!params.block_exec);
+    }
 }

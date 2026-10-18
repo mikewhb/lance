@@ -6,18 +6,18 @@
 //! These types are inert in C0. They describe the contract that the leaf
 //! block source, the AND/OR window kernels, and the compound nodes will use.
 
+#![allow(dead_code)]
+
 use lance_core::Result;
 
 use super::compound::ScoreBounds;
-use super::wand::PostingIterator;
 
 /// Capabilities of one leaf (or one aggregated node) for block execution.
+///
+/// Availability is authoritative through `ComposableScorer::as_block` /
+/// `as_eval`; this struct only describes the leaf's properties.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Capacities {
-    /// The node can produce candidate blocks.
-    pub block_producer: bool,
-    /// The node can evaluate an externally supplied candidate batch.
-    pub batch_eval: bool,
     /// All postings are compressed.
     pub compressed: bool,
     /// At least one posting has grouped terms; block scoring is not valid.
@@ -35,8 +35,6 @@ pub(super) struct Capacities {
 
 impl Capacities {
     pub(super) const NONE: Self = Self {
-        block_producer: false,
-        batch_eval: false,
         compressed: false,
         grouped: false,
         phrase: false,
@@ -63,6 +61,9 @@ pub(super) struct BlockBuf {
     pub scores: Vec<f32>,
     pub keys: Vec<u64>,
     pub matched: Vec<bool>,
+    /// Document-major frequencies: `docs.len() * clause_count` entries.
+    pub freqs: Vec<u32>,
+    pub clause_count: usize,
 }
 
 impl Default for BlockBuf {
@@ -75,6 +76,8 @@ impl Default for BlockBuf {
             scores: Vec::new(),
             keys: Vec::new(),
             matched: Vec::new(),
+            freqs: Vec::new(),
+            clause_count: 0,
         }
     }
 }
@@ -88,6 +91,8 @@ impl BlockBuf {
         self.scores.clear();
         self.keys.clear();
         self.matched.clear();
+        self.freqs.clear();
+        self.clause_count = 0;
     }
 }
 
@@ -100,6 +105,10 @@ pub(super) enum BlockStatus {
 }
 
 /// Evaluation result for a supplied candidate batch.
+///
+/// `scores.len() == matched.len() == docs.len()`. `exhausted` means the
+/// subtree cannot produce any further candidates; it is not "this batch is
+/// empty".
 #[derive(Debug)]
 pub(super) struct EvalOut {
     pub scores: Vec<f32>,
@@ -114,6 +123,16 @@ impl Default for EvalOut {
             matched: Vec::new(),
             exhausted: false,
         }
+    }
+}
+
+impl EvalOut {
+    pub(super) fn clear(&mut self, len: usize) {
+        self.scores.clear();
+        self.scores.resize(len, 0.0);
+        self.matched.clear();
+        self.matched.resize(len, false);
+        self.exhausted = false;
     }
 }
 
@@ -135,7 +154,9 @@ pub(super) trait BlockScorer: BatchEvaluator {
     fn caps(&self) -> Capacities;
 
     /// Metadata-only positioning. Returns the first document at or after
-    /// `target`, or `None` when exhausted. Must not score or check visibility.
+    /// `target`, or `None` when no such document exists. `None` is not a
+    /// terminal state: the node may still be reusable for a different target.
+    /// Must not score or check visibility.
     fn seek(&mut self, target: u64) -> Result<Option<u64>>;
 
     /// Produce the next block at or after `target`.
@@ -149,16 +170,8 @@ pub(super) trait BlockScorer: BatchEvaluator {
     fn upper_bound(&mut self, window: &Window) -> Result<ScoreBounds>;
 }
 
-/// Flat posting view used by block kernels.
-///
-/// The classic `Wand` keeps postings in heap/lead/tail form. Block execution
-/// uses a stable flat list plus explicit score/cost orders.
-pub(super) struct BlockPostingSet {
-    pub postings: Vec<Box<PostingIterator>>,
-    pub score_order: Vec<usize>,
-    pub cost_order: Vec<usize>,
-    pub weights: Vec<f32>,
-}
+#[allow(dead_code)]
+fn assert_block_scorer_object_safe(_: &dyn BlockScorer) {}
 
 #[cfg(test)]
 mod tests {
@@ -167,9 +180,8 @@ mod tests {
     #[test]
     fn none_capabilities_are_inert() {
         let caps = Capacities::NONE;
-        assert!(!caps.block_producer);
-        assert!(!caps.batch_eval);
         assert!(!caps.window_bounds);
+        assert!(!caps.compressed);
     }
 
     #[test]
@@ -178,7 +190,20 @@ mod tests {
         assert!(buf.docs.is_empty());
         assert_eq!(buf.upper, ScoreBounds::ZERO);
         buf.docs.push(1);
+        buf.freqs.push(1);
+        buf.clause_count = 1;
         buf.clear();
         assert!(buf.docs.is_empty());
+        assert!(buf.freqs.is_empty());
+        assert_eq!(buf.clause_count, 0);
+    }
+
+    #[test]
+    fn eval_out_clear_matches_len() {
+        let mut out = EvalOut::default();
+        out.clear(3);
+        assert_eq!(out.scores.len(), 3);
+        assert_eq!(out.matched.len(), 3);
+        assert!(!out.exhausted);
     }
 }

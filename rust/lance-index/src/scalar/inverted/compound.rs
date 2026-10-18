@@ -98,7 +98,7 @@ impl ScoreBounds {
         self.lower
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn upper(self) -> f32 {
         self.upper
     }
@@ -141,14 +141,14 @@ impl ScoreBounds {
         }
     }
 
-    fn include_zero(self) -> Self {
+    pub(super) fn include_zero(self) -> Self {
         Self {
             lower: self.lower.min(0.0),
             upper: self.upper.max(0.0),
         }
     }
 
-    fn add(self, other: Self) -> Self {
+    pub(super) fn add(self, other: Self) -> Self {
         if !self.lower.is_finite()
             || !self.upper.is_finite()
             || !other.lower.is_finite()
@@ -303,19 +303,16 @@ pub(super) trait ComposableScorer: Send {
     /// Batch-scoring capability. `None` keeps this node on the per-document
     /// path. A node that returns `Some` must also return `Some` from
     /// [`Self::as_block`] when it can produce blocks.
+    #[allow(dead_code)]
     fn as_eval(&mut self) -> Option<&mut dyn BatchEvaluator> {
         None
     }
 
     /// Block-producing capability. `None` means this node must be consumed
     /// per document. There is intentionally no single-document fallback.
+    #[allow(dead_code)]
     fn as_block(&mut self) -> Option<&mut dyn BlockScorer> {
         None
-    }
-
-    /// Whether this scorer requires position confirmation for membership.
-    fn phrase(&self) -> bool {
-        false
     }
 }
 
