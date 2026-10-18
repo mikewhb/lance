@@ -64,6 +64,11 @@ impl BlockState {
     }
 
     fn advance(&mut self, producer: &mut dyn BlockScorer, target: u64) -> Result<Option<u64>> {
+        if let Some(current) = self.current
+            && current >= target
+        {
+            return Ok(Some(current));
+        }
         if self.exhausted {
             return Ok(None);
         }
@@ -214,23 +219,14 @@ impl<'a> ConjunctionProducer<'a> {
             BlockStatus::Data => {}
         }
         let up_to = self.lead_buf.up_to.min(window_end);
-        // The lead block may extend past the intersection window, which ends
-        // where any other clause leaves its compressed block. Documents past
-        // `up_to` belong to a later produced block: evaluating them here would
-        // move the clause cursors beyond `up_to` and skip them on the next
-        // call.
-        let lead_len = self.lead_buf.docs.len().min(self.lead_buf.keys.len());
-        let mut indices = Vec::with_capacity(lead_len);
-        for index in 0..lead_len {
-            let doc = self.lead_buf.docs[index];
-            if (d..=up_to).contains(&doc) {
-                indices.push(index);
-            }
-        }
-        let docs = indices
-            .iter()
-            .map(|&index| self.lead_buf.docs[index])
-            .collect::<Vec<_>>();
+        debug_assert_eq!(self.lead_buf.docs.len(), self.lead_buf.keys.len());
+        // Capping the lead budget makes the lead block end at `window_end`, so
+        // this truncation normally keeps every document. It still guards the
+        // case where a child produces past the window: evaluating those
+        // documents would move the clause cursors beyond `up_to` and skip them
+        // on the next call.
+        let mut docs = self.lead_buf.docs.clone();
+        docs.truncate(docs.partition_point(|&doc| doc <= up_to));
         let mut scores = vec![0.0_f32; docs.len()];
         let mut matched = vec![true; docs.len()];
         let mut eval = EvalOut::default();
@@ -247,12 +243,14 @@ impl<'a> ConjunctionProducer<'a> {
         out.clear();
         out.start = d;
         out.up_to = up_to;
-        out.clause_count = self.children.len();
-        for (i, &lead_index) in indices.iter().enumerate() {
+        // Composite blocks do not expose per-clause frequencies; `freqs` stays
+        // empty and `clause_count` stays zero so the two cannot disagree.
+        out.clause_count = 0;
+        for i in 0..docs.len() {
             if matched[i] {
                 out.docs.push(docs[i]);
                 out.scores.push(scores[i]);
-                out.keys.push(self.lead_buf.keys[lead_index]);
+                out.keys.push(self.lead_buf.keys[i]);
                 out.matched.push(true);
             }
         }
@@ -268,6 +266,7 @@ impl<'a> ConjunctionProducer<'a> {
 impl BatchEvaluator for ConjunctionProducer<'_> {
     fn eval_at(&mut self, docs: &[u64], out: &mut EvalOut) -> Result<()> {
         out.clear(docs.len());
+        out.matched.fill(true);
         let mut eval = EvalOut::default();
         for &index in &self.score_order {
             self.children[index]
@@ -276,18 +275,9 @@ impl BatchEvaluator for ConjunctionProducer<'_> {
                 .eval_at(docs, &mut eval)?;
             for i in 0..docs.len() {
                 out.scores[i] += eval.scores[i];
-                out.matched[i] = if i == 0 {
-                    eval.matched[i]
-                } else {
-                    out.matched[i] && eval.matched[i]
-                };
+                out.matched[i] &= eval.matched[i];
             }
         }
-        out.exhausted = self.children.iter_mut().any(|child| {
-            child
-                .as_block()
-                .is_some_and(|block| block.seek(u64::MAX).ok().flatten().is_none())
-        });
         Ok(())
     }
 }

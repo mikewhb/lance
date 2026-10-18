@@ -3631,6 +3631,15 @@ impl<'a> BooleanScorer<'a> {
     }
 }
 
+impl<'a> BooleanScorer<'a> {
+    /// Test-only access to the driver, so tests can pin the driver's own
+    /// iterator contract instead of the wrapper's guards.
+    #[cfg(test)]
+    pub(super) fn driver_mut(&mut self) -> &mut dyn ComposableScorer {
+        self.driver.as_mut()
+    }
+}
+
 impl ComposableScorer for BooleanScorer<'_> {
     fn doc(&self) -> Option<u64> {
         self.current

@@ -15343,15 +15343,17 @@ mod tests {
             .iter()
             .map(|&clause| postings[clause].fork_from_start())
             .collect::<Vec<_>>();
-        if block {
-            Box::new(WandCursor::new_with_blocks(
-                operator, postings, docs, scorer, params, metrics,
-            ))
+        let leaf = if block {
+            WandCursor::new_with_blocks(operator, postings, docs, scorer, params, metrics)
         } else {
-            Box::new(WandCursor::new(
-                operator, postings, docs, scorer, params, metrics,
-            ))
-        }
+            WandCursor::new(operator, postings, docs, scorer, params, metrics)
+        };
+        assert_eq!(
+            leaf.is_block_source(),
+            block,
+            "leaf did not take the requested path"
+        );
+        Box::new(leaf)
     }
 
     /// Run the same MUST/SHOULD tree over flat or block leaves and report
@@ -15420,6 +15422,38 @@ mod tests {
             assert!(!flat.is_empty(), "limit={limit}");
             assert_eq!(block, flat, "limit={limit}");
         }
+    }
+
+    #[test]
+    fn block_conjunction_advance_is_idempotent() {
+        // Required-plus-optional re-advances the required side at the document
+        // it already sits on after a shallow-bound miss. Advancing must not
+        // consume that document.
+        let lengths = block_test_lengths();
+        let docs = block_test_documents(&lengths);
+        let postings = block_test_postings(&lengths, 128, true);
+        let metrics = NoOpMetricsCollector;
+        let params = block_test_params();
+        let leaf = |clauses: &[usize]| {
+            block_boolean_leaf(
+                true,
+                clauses,
+                &postings,
+                &docs,
+                block_test_scorer(),
+                &params,
+                &metrics,
+            )
+        };
+        let must = vec![leaf(&[0]), leaf(&[1])];
+        let mut scorer =
+            BooleanScorer::try_new_with_block(Vec::new(), must, Vec::new(), true).unwrap();
+
+        let first = scorer.advance(0).unwrap().unwrap();
+        assert_eq!(scorer.driver_mut().advance(first).unwrap(), Some(first));
+        let second = scorer.next().unwrap().unwrap();
+        assert!(second > first);
+        assert_eq!(scorer.driver_mut().advance(second).unwrap(), Some(second));
     }
 
     #[test]
