@@ -85,7 +85,13 @@ impl BlockState {
             self.exhausted = true;
             return Ok(None);
         }
-        let next = target.max(self.block.up_to.saturating_add(1));
+        // `up_to == 0` means no block has been produced yet, so `target` is
+        // still the first document this state may return.
+        let next = if self.block.up_to == 0 {
+            target
+        } else {
+            target.max(self.block.up_to.saturating_add(1))
+        };
         if !self.refill(producer, next)? && self.exhausted {
             return Ok(None);
         }

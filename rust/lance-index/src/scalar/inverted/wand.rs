@@ -15404,6 +15404,40 @@ mod tests {
     }
 
     #[cfg_attr(coverage, coverage(off))]
+    fn block_boolean_rows_single_required(block: bool, limit: usize) -> Vec<(u64, u32)> {
+        let lengths = block_test_lengths();
+        let docs = block_test_documents(&lengths);
+        let postings = block_test_postings(&lengths, 128, true);
+        let metrics = NoOpMetricsCollector;
+        let params = FtsSearchParams {
+            block_exec: block,
+            ..FtsSearchParams::default()
+        };
+        let leaf_scorer = block_test_scorer();
+        let leaf = |clauses: &[usize]| {
+            block_boolean_leaf(
+                block,
+                clauses,
+                &postings,
+                &docs,
+                leaf_scorer.clone(),
+                &params,
+                &metrics,
+            )
+        };
+        let must = vec![leaf(&[0])];
+        let should = vec![leaf(&[2])];
+        let mut scorer =
+            BooleanScorer::try_new_with_block(should, must, Vec::new(), block).unwrap();
+        RowCollector::with_competitive_score(limit, Arc::new(CompetitiveScore::default()))
+            .collect(&mut scorer)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.row_id, row.score.to_bits()))
+            .collect()
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
     fn block_boolean_rows_with_should(
         block: bool,
         multi: bool,
@@ -15448,6 +15482,16 @@ mod tests {
             .into_iter()
             .map(|row| (row.row_id, row.score.to_bits()))
             .collect()
+    }
+
+    #[test]
+    fn boolean_block_single_required_matches_flat_bits() {
+        for limit in [300, 64, 7, 1] {
+            let flat = block_boolean_rows_single_required(false, limit);
+            let block = block_boolean_rows_single_required(true, limit);
+            assert!(!flat.is_empty(), "limit={limit}");
+            assert_eq!(block, flat, "limit={limit}");
+        }
     }
 
     #[rstest]
