@@ -194,18 +194,43 @@ impl<'a> ConjunctionProducer<'a> {
         let Some(d) = self.seek(target)? else {
             return Ok(BlockStatus::Exhausted);
         };
+        // The intersection window ends where any clause leaves its compressed
+        // block. Cap the lead's budget at that end: a lead block reaching past
+        // it would advance the lead's internal slice cursor beyond documents
+        // the conjunction still has to emit on the next call.
+        let window_end = self.block_end_at(d)?;
+        let window_len = window_end
+            .saturating_sub(d)
+            .saturating_add(1)
+            .min(usize::MAX as u64) as usize;
         let lead = self.cost_order[0];
         let status = self.children[lead]
             .as_block()
             .ok_or_else(|| Error::internal("conjunction child is not a block producer"))?
-            .next_block(d, budget, &mut self.lead_buf)?;
+            .next_block(d, budget.min(window_len), &mut self.lead_buf)?;
         match status {
             BlockStatus::Exhausted => return Ok(BlockStatus::Exhausted),
             BlockStatus::Empty { .. } => return Ok(status),
             BlockStatus::Data => {}
         }
-        let up_to = self.lead_buf.up_to.min(self.block_end_at(d)?);
-        let docs = self.lead_buf.docs.clone();
+        let up_to = self.lead_buf.up_to.min(window_end);
+        // The lead block may extend past the intersection window, which ends
+        // where any other clause leaves its compressed block. Documents past
+        // `up_to` belong to a later produced block: evaluating them here would
+        // move the clause cursors beyond `up_to` and skip them on the next
+        // call.
+        let lead_len = self.lead_buf.docs.len().min(self.lead_buf.keys.len());
+        let mut indices = Vec::with_capacity(lead_len);
+        for index in 0..lead_len {
+            let doc = self.lead_buf.docs[index];
+            if (d..=up_to).contains(&doc) {
+                indices.push(index);
+            }
+        }
+        let docs = indices
+            .iter()
+            .map(|&index| self.lead_buf.docs[index])
+            .collect::<Vec<_>>();
         let mut scores = vec![0.0_f32; docs.len()];
         let mut matched = vec![true; docs.len()];
         let mut eval = EvalOut::default();
@@ -222,12 +247,12 @@ impl<'a> ConjunctionProducer<'a> {
         out.clear();
         out.start = d;
         out.up_to = up_to;
-        out.keys = self.lead_buf.keys.clone();
         out.clause_count = self.children.len();
-        for i in 0..docs.len() {
+        for (i, &lead_index) in indices.iter().enumerate() {
             if matched[i] {
                 out.docs.push(docs[i]);
                 out.scores.push(scores[i]);
+                out.keys.push(self.lead_buf.keys[lead_index]);
                 out.matched.push(true);
             }
         }
