@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod conjunction_block;
 mod should_maxscore;
 
 use std::cell::RefCell;
@@ -38,6 +39,7 @@ use super::{
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
 
+use self::conjunction_block::BlockConjunctionScorer;
 use self::should_maxscore::ShouldMaxScoreScorer;
 
 const DEFAULT_BLOCK_SIZE: usize = 128;
@@ -3494,6 +3496,7 @@ impl<'a> BooleanScorer<'a> {
         must_not: Vec<BoxScorer<'a>>,
         block_exec: bool,
     ) -> Result<Self> {
+        let mut must = must;
         let (driver, optional) = if must.is_empty() {
             if should.is_empty() {
                 return Err(Error::invalid_input(
@@ -3516,7 +3519,15 @@ impl<'a> BooleanScorer<'a> {
                         as BoxScorer<'a>,
                 )
             };
-            let required = Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>;
+            let required: BoxScorer<'a> = if block_exec
+                && must
+                    .iter_mut()
+                    .all(|child| child.as_block().is_some() && child.as_eval().is_some())
+            {
+                Box::new(BlockConjunctionScorer::try_new(must)?)
+            } else {
+                Box::new(RequiredConjunctionScorer::try_new(must)?)
+            };
             let driver = if required.scores_non_negative()
                 && optional
                     .as_ref()
