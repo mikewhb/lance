@@ -29,6 +29,7 @@ mod maxscore;
 
 use super::{
     CompressedPositionStorage,
+    block::Capacities,
     documents::{DocId, DocLengths, DocVisibility},
     impact::{IMPACT_LEVEL1_BLOCKS, ImpactScoreCache, ImpactSkipData},
     index::{PositionStreamCodec, dequantize_doc_length},
@@ -2204,6 +2205,15 @@ pub(super) trait WandDocuments {
     fn candidate_from_key(&self, key: u64) -> Self::Candidate;
     fn flat_documents(&self) -> Option<FlatDocuments<'_>>;
     fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32;
+
+    /// Block-execution capabilities of this document source.
+    ///
+    /// The default is inert. The modern single-column document source can
+    /// opt in once the block path is enabled; cross-column and legacy
+    /// sources keep the default.
+    fn block_capabilities(&self) -> Capacities {
+        Capacities::NONE
+    }
 }
 
 pub(super) trait ModernVisibility {

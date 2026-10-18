@@ -72,6 +72,10 @@ pub struct FtsSearchParams {
     pub phrase_slop: Option<u32>,
     /// The number of beginning characters being unchanged for fuzzy matching.
     pub prefix_length: u32,
+    /// Enables the block-execution path for compound FTS. Defaults to false
+    /// so existing queries keep the per-document behavior.
+    #[serde(default)]
+    pub block_exec: bool,
 }
 
 impl FtsSearchParams {
@@ -83,6 +87,7 @@ impl FtsSearchParams {
             max_expansions: 50,
             phrase_slop: None,
             prefix_length: 0,
+            block_exec: false,
         }
     }
 

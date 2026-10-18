@@ -17,6 +17,7 @@ use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 
 use super::{
     InvertedIndex, PreparedBm25Query,
+    block::{BatchEvaluator, BlockScorer},
     document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer},
     documents::{
         CachedRowAddressOrder, DocId, DocLengths, DocVisibility, OrderedRowAddressProjection,
@@ -296,6 +297,24 @@ pub(super) trait ComposableScorer: Send {
     }
 
     fn scores_non_negative(&self) -> bool {
+        false
+    }
+
+    /// Batch-scoring capability. `None` keeps this node on the per-document
+    /// path. A node that returns `Some` must also return `Some` from
+    /// [`Self::as_block`] when it can produce blocks.
+    fn as_eval(&mut self) -> Option<&mut dyn BatchEvaluator> {
+        None
+    }
+
+    /// Block-producing capability. `None` means this node must be consumed
+    /// per document. There is intentionally no single-document fallback.
+    fn as_block(&mut self) -> Option<&mut dyn BlockScorer> {
+        None
+    }
+
+    /// Whether this scorer requires position confirmation for membership.
+    fn phrase(&self) -> bool {
         false
     }
 }
