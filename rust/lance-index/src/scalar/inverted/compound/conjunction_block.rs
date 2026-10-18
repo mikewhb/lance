@@ -214,6 +214,13 @@ impl<'a> ConjunctionProducer<'a> {
             .saturating_sub(d)
             .saturating_add(1)
             .min(usize::MAX as u64) as usize;
+        // Read the bound while every child still sits in the window's block:
+        // producing the lead block and evaluating the other children move the
+        // cursors past it, and a later bound would describe a different block.
+        let upper = self.upper_bound(&Window {
+            start: d,
+            up_to: window_end,
+        })?;
         let lead = self.cost_order[0];
         let status = self.children[lead]
             .as_block()
@@ -272,7 +279,7 @@ impl<'a> ConjunctionProducer<'a> {
                 out.matched.push(true);
             }
         }
-        out.upper = self.upper_bound(&Window { start: d, up_to })?;
+        out.upper = upper;
         if out.docs.is_empty() {
             Ok(BlockStatus::Empty { up_to })
         } else {
