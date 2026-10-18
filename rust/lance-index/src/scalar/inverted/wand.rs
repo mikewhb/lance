@@ -28,6 +28,8 @@ mod and_kernel;
 mod intersection;
 #[path = "wand_maxscore.rs"]
 mod maxscore;
+#[path = "wand_or_kernel.rs"]
+mod or_kernel;
 
 use self::and_kernel::{WindowList, window_bm25_score};
 use super::{
@@ -2131,7 +2133,7 @@ struct MaxScoreClause {
 /// Per-window score/frequency accumulator for the bulk MAXSCORE path. Slot i
 /// covers doc id `window_min + i`; `freqs` is laid out clause-major so accept
 /// paths can recover (term, freq) pairs of the essential clauses.
-struct WindowAccumulator {
+pub(super) struct WindowAccumulator {
     scores: Vec<f32>,
     freqs: Vec<u32>,
     words: Vec<u64>,
@@ -3752,17 +3754,22 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let inner_max =
                     window_max.min(inner_min.saturating_add(MAXSCORE_INNER_WINDOW as u64 - 1));
 
-                for (clause_idx, clause) in clauses.iter_mut().enumerate().skip(first_essential) {
-                    clause.posting.collect_window_scores(
-                        inner_min,
-                        inner_max,
-                        clause_idx,
-                        self.documents,
-                        &self.scorer,
-                        norm_k_ref,
-                        &mut acc,
-                    );
-                }
+                // Clause indices stay global: the accumulator's frequency
+                // lanes are indexed by a clause's position in `clauses`, which
+                // the drain loop below reads back with `clause_freq`.
+                or_kernel::fill_window(
+                    clauses
+                        .iter_mut()
+                        .enumerate()
+                        .skip(first_essential)
+                        .map(|(clause_idx, clause)| (clause_idx, clause.posting.as_mut())),
+                    inner_min,
+                    inner_max,
+                    self.documents,
+                    &self.scorer,
+                    norm_k_ref,
+                    &mut acc,
+                );
 
                 // Drain candidates in doc order, completing them with the
                 // non-essential clauses ordered by descending bound.
@@ -3857,10 +3864,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             let doc_length = doc_length_cell
                                 .unwrap_or_else(|| self.documents.scoring_num_tokens(doc as u32));
                             let score = if !needs_canonical_rescore {
-                                // `collect_window_scores` visited every
-                                // essential clause in query order, so the
-                                // accumulator already contains the canonical
-                                // f32 fold. Avoid rescoring exhaustive hits.
+                                // The window kernel folded the essential
+                                // clauses in query order, so the accumulator
+                                // already holds the canonical f32 total. Avoid
+                                // rescoring exhaustive hits.
                                 score
                             } else {
                                 for (i, clause) in clauses.iter().enumerate().skip(first_essential)
