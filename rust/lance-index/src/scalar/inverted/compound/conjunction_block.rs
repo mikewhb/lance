@@ -64,13 +64,13 @@ impl BlockState {
     }
 
     fn advance(&mut self, producer: &mut dyn BlockScorer, target: u64) -> Result<Option<u64>> {
+        if self.exhausted {
+            return Ok(None);
+        }
         if let Some(current) = self.current
             && current >= target
         {
             return Ok(Some(current));
-        }
-        if self.exhausted {
-            return Ok(None);
         }
         while self.cursor < self.block.docs.len() && self.block.docs[self.cursor] < target {
             self.cursor += 1;
@@ -221,12 +221,13 @@ impl<'a> ConjunctionProducer<'a> {
         let up_to = self.lead_buf.up_to.min(window_end);
         debug_assert_eq!(self.lead_buf.docs.len(), self.lead_buf.keys.len());
         // Capping the lead budget makes the lead block end at `window_end`, so
-        // this truncation normally keeps every document. It still guards the
-        // case where a child produces past the window: evaluating those
-        // documents would move the clause cursors beyond `up_to` and skip them
-        // on the next call.
+        // this truncation is a no-op for a child that honours its own window
+        // bound. It exists only to keep a child that produces past `up_to` from
+        // being evaluated: that would move the clause cursors beyond `up_to`
+        // and lose those documents on the next call.
         let mut docs = self.lead_buf.docs.clone();
         docs.truncate(docs.partition_point(|&doc| doc <= up_to));
+        debug_assert_eq!(docs.len(), self.lead_buf.docs.len());
         let mut scores = vec![0.0_f32; docs.len()];
         let mut matched = vec![true; docs.len()];
         let mut eval = EvalOut::default();
