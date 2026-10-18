@@ -109,21 +109,11 @@ pub(super) enum BlockStatus {
 /// `scores.len() == matched.len() == docs.len()`. `exhausted` means the
 /// subtree cannot produce any further candidates; it is not "this batch is
 /// empty".
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct EvalOut {
     pub scores: Vec<f32>,
     pub matched: Vec<bool>,
     pub exhausted: bool,
-}
-
-impl Default for EvalOut {
-    fn default() -> Self {
-        Self {
-            scores: Vec::new(),
-            matched: Vec::new(),
-            exhausted: false,
-        }
-    }
 }
 
 impl EvalOut {

@@ -52,6 +52,10 @@ pub(crate) fn fuzzy_term_options<'a>(
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FtsSearchParams {
     /// Controls result completeness for each recursively planned FTS node.
@@ -74,7 +78,7 @@ pub struct FtsSearchParams {
     pub prefix_length: u32,
     /// Enables the block-execution path for compound FTS. Defaults to false
     /// so existing queries keep the per-document behavior.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub block_exec: bool,
 }
 
