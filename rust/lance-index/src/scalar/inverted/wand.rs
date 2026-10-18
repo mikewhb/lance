@@ -6177,6 +6177,17 @@ enum CursorSource<'a, D: WandDocuments> {
 /// Unlike [`Wand::search`], this cursor does not own a top-k heap. It exposes
 /// exact candidates and conservative block bounds to the compound collector,
 /// which owns the only competitive score for the whole scorer tree.
+/// Counters that prove a unit test actually entered the block face, and let a
+/// test state the window/candidate cost of a walk.
+#[cfg(test)]
+#[derive(Default)]
+struct BlockProbes {
+    seeks: usize,
+    blocks: usize,
+    empty_blocks: usize,
+    candidates: usize,
+}
+
 pub(super) struct WandCursor<'a, D: WandDocuments> {
     source: CursorSource<'a, D>,
     /// What the postings allow, computed before they were moved into `source`.
@@ -6197,6 +6208,8 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     comparisons: usize,
     metrics_recorded: bool,
     metrics: &'a dyn MetricsCollector,
+    #[cfg(test)]
+    block_probes: BlockProbes,
 }
 
 impl<'a, D: WandDocuments> WandCursor<'a, D> {
@@ -6301,12 +6314,26 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             comparisons: 0,
             metrics_recorded: false,
             metrics,
+            #[cfg(test)]
+            block_probes: BlockProbes::default(),
         }
     }
 
     /// Whether this leaf owns a block-capable posting source.
     pub(super) fn is_block_source(&self) -> bool {
         matches!(self.source, CursorSource::Block(_))
+    }
+
+    /// `(seeks, produced blocks, empty blocks, candidates)` observed on the
+    /// block face. Test-only: it proves activation, not production telemetry.
+    #[cfg(test)]
+    pub(super) fn block_probes(&self) -> (usize, usize, usize, usize) {
+        (
+            self.block_probes.seeks,
+            self.block_probes.blocks,
+            self.block_probes.empty_blocks,
+            self.block_probes.candidates,
+        )
     }
 
     fn block(&mut self) -> Option<&mut block_source::BlockPostingSet<'a, D>> {
@@ -6580,6 +6607,10 @@ impl<D: WandDocuments> BlockScorer for WandCursor<'_, D> {
     }
 
     fn seek(&mut self, target: u64) -> Result<Option<u64>> {
+        #[cfg(test)]
+        {
+            self.block_probes.seeks += 1;
+        }
         self.clear_current();
         let Some(set) = self.block() else {
             return Err(Error::internal(
@@ -6608,6 +6639,15 @@ impl<D: WandDocuments> BlockScorer for WandCursor<'_, D> {
             return Err(Error::internal("block request for a per-document FTS leaf"));
         };
         let status = BlockScorer::next_block(set, target, budget, out)?;
+        #[cfg(test)]
+        {
+            self.block_probes.blocks += 1;
+            match status {
+                BlockStatus::Data => self.block_probes.candidates += out.docs.len(),
+                BlockStatus::Empty { .. } => self.block_probes.empty_blocks += 1,
+                BlockStatus::Exhausted => {}
+            }
+        }
         let next_target = match status {
             BlockStatus::Data | BlockStatus::Empty { .. } => out
                 .up_to
@@ -15422,6 +15462,28 @@ mod tests {
             assert!(!flat.is_empty(), "limit={limit}");
             assert_eq!(block, flat, "limit={limit}");
         }
+    }
+
+    #[test]
+    fn block_source_counts_windows_and_candidates() {
+        let lengths = block_test_lengths();
+        let docs = block_test_documents(&lengths);
+        let postings = block_test_postings(&lengths, 128, true);
+        let metrics = NoOpMetricsCollector;
+        let params = block_test_params();
+        let mut cursor = block_test_cursor(&postings, Operator::Or, &docs, &params, &metrics);
+        assert_eq!(cursor.block_probes(), (0, 0, 0, 0));
+
+        BlockScorer::seek(&mut cursor, 0).unwrap();
+        let mut block = BlockBuf::default();
+        BlockScorer::next_block(&mut cursor, 0, 4096, &mut block).unwrap();
+
+        let (seeks, blocks, empty, candidates) = cursor.block_probes();
+        assert_eq!(seeks, 1);
+        assert_eq!(blocks, 1);
+        assert_eq!(empty, 0);
+        assert_eq!(candidates, block.docs.len());
+        assert!(candidates > 0);
     }
 
     #[test]
