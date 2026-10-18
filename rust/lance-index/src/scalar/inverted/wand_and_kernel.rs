@@ -9,9 +9,10 @@
 //! block-local offsets the caller needs to reach the matching frequencies.
 //!
 //! Everything here is a pure function over immutable window slices. The
-//! kernels never advance a posting cursor, never read or update the top-k
-//! floor, and never touch phrase or terminal state: the caller materializes
-//! the window, decides whether a positive floor exists, and does all scoring.
+//! kernels never advance a posting cursor, never read or update `threshold`,
+//! and never touch phrase or terminal state: the caller materializes the
+//! window, decides whether a positive floor exists, and does all scoring.
+//! The only floor-derived input is a caller-owned frequency LUT.
 
 use super::super::scorer::{Scorer, bm25_doc_weight_with_norm};
 #[cfg(target_arch = "x86_64")]
@@ -412,6 +413,7 @@ fn merge_window_docs_pairwise(
 /// conjunctions; it only applies without a floor, where no frequency pruning
 /// happens.
 #[allow(clippy::too_many_arguments)]
+#[inline]
 pub(super) fn merge_window(
     wins: &[WindowList],
     num_lists: usize,
@@ -424,6 +426,9 @@ pub(super) fn merge_window(
     cursor_scratch: &mut Vec<usize>,
     intersection_scratch: &mut Vec<u32>,
 ) {
+    debug_assert_eq!(num_lists, wins.len());
+    // The pruning kernels inspect `wins[0]`; the caller must put the clause
+    // that produced `freq_cannot_beat` first.
     match (num_lists, use_avx2, window_started_with_floor) {
         (1, _, _) => merge_window_1(wins, docs_out, offs_out),
         #[cfg(target_arch = "x86_64")]
