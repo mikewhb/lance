@@ -110,6 +110,10 @@ impl<'a, 's, S: Scorer + ?Sized, D: WandDocuments> OrUnionKernel<'a, 's, S, D> {
         Ok(up_to)
     }
 
+    /// Requires `block_end_at(target)` immediately before this call: the bound
+    /// reads each posting's anchor block (`block_idx`), and this method does
+    /// not position the anchor itself. Pairing the two is what keeps the bound
+    /// on the window's block.
     pub(super) fn upper_bound(
         &mut self,
         window: &crate::scalar::inverted::block::Window,

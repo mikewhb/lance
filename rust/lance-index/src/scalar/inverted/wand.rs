@@ -6186,6 +6186,7 @@ struct BlockProbes {
     blocks: usize,
     empty_blocks: usize,
     candidates: usize,
+    bounds_computed: usize,
 }
 
 pub(super) struct WandCursor<'a, D: WandDocuments> {
@@ -6205,6 +6206,12 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     current_score: f32,
     confirmation: Option<bool>,
     shallow: Option<(u64, u64, f32)>,
+    /// Per-block `(start, up_to, upper)` for the block face. Independent of
+    /// `shallow`: `shallow` is the current `[target, up_to]` contract and is
+    /// cleared on every per-document move, while this survives within a block
+    /// so repeated `advance_shallow` calls do not redo `block_end_at` +
+    /// `upper_bound`. Cleared by the block-face mutators only.
+    block_window: Option<(u64, u64, f32)>,
     comparisons: usize,
     metrics_recorded: bool,
     metrics: &'a dyn MetricsCollector,
@@ -6311,6 +6318,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             current_score: 0.0,
             confirmation: None,
             shallow: None,
+            block_window: None,
             comparisons: 0,
             metrics_recorded: false,
             metrics,
@@ -6322,6 +6330,18 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     /// Whether this leaf owns a block-capable posting source.
     pub(super) fn is_block_source(&self) -> bool {
         matches!(self.source, CursorSource::Block(_))
+    }
+
+    /// Drop the cached block window. Only the block-face entry points move the
+    /// clause cursors; per-document moves stay inside the cached block.
+    fn clear_block_face(&mut self) {
+        self.block_window = None;
+    }
+
+    /// Number of `block_end_at` + `upper_bound` pairs computed. Test-only.
+    #[cfg(test)]
+    pub(super) fn block_bounds_computed(&self) -> usize {
+        self.block_probes.bounds_computed
     }
 
     /// `(seeks, produced blocks, empty blocks, candidates)` observed on the
@@ -6535,6 +6555,14 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         let (up_to, upper) = match &mut self.source {
             CursorSource::Flat(wand) => wand.compound_shallow_bound(target),
             CursorSource::Block(set) => {
+                if let Some((start, up_to, upper)) = self.block_window
+                    && start <= target
+                    && target <= up_to
+                {
+                    debug_assert!(target >= start);
+                    self.shallow = Some((target, up_to, upper));
+                    return Ok(up_to);
+                }
                 let up_to = BlockScorer::block_end_at(set, target)?;
                 let bound = BlockScorer::upper_bound(
                     set,
@@ -6543,6 +6571,11 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                         up_to,
                     },
                 )?;
+                #[cfg(test)]
+                {
+                    self.block_probes.bounds_computed += 1;
+                }
+                self.block_window = Some((target, up_to, bound.upper()));
                 (up_to, bound.upper())
             }
         };
@@ -6592,6 +6625,7 @@ impl<D: WandDocuments> Drop for WandCursor<'_, D> {
 
 impl<D: WandDocuments> BatchEvaluator for WandCursor<'_, D> {
     fn eval_at(&mut self, docs: &[u64], out: &mut EvalOut) -> Result<()> {
+        self.clear_block_face();
         let Some(set) = self.block() else {
             return Err(Error::internal(
                 "block evaluation requested from a per-document FTS leaf",
@@ -6612,6 +6646,7 @@ impl<D: WandDocuments> BlockScorer for WandCursor<'_, D> {
             self.block_probes.seeks += 1;
         }
         self.clear_current();
+        self.clear_block_face();
         let Some(set) = self.block() else {
             return Err(Error::internal(
                 "block seek requested from a per-document FTS leaf",
@@ -6635,6 +6670,7 @@ impl<D: WandDocuments> BlockScorer for WandCursor<'_, D> {
         out: &mut BlockBuf,
     ) -> Result<BlockStatus> {
         self.clear_current();
+        self.clear_block_face();
         let Some(set) = self.block() else {
             return Err(Error::internal("block request for a per-document FTS leaf"));
         };
@@ -15650,6 +15686,80 @@ mod tests {
             assert!(!flat.is_empty(), "limit={limit}");
             assert_eq!(block, flat, "limit={limit}");
         }
+    }
+
+    #[test]
+    fn block_window_reuses_and_matches_recompute() {
+        let lengths = block_test_lengths();
+        let docs = block_test_documents(&lengths);
+        let postings = block_test_postings(&lengths, 128, true);
+        let metrics = NoOpMetricsCollector;
+        let params = block_test_params();
+        let mut cursor = block_test_cursor(&postings, Operator::Or, &docs, &params, &metrics);
+
+        let up_to = cursor.advance_shallow(0).unwrap();
+        let upper = cursor.score_upper_bound(up_to).unwrap();
+        assert_eq!(cursor.block_bounds_computed(), 1);
+
+        // Same block, same start: the cached window is reused.
+        assert_eq!(cursor.advance_shallow(0).unwrap(), up_to);
+        assert_eq!(cursor.block_bounds_computed(), 1);
+
+        // A block-face seek invalidates; the recomputed bound must match the
+        // cached one bit for bit.
+        BlockScorer::seek(&mut cursor, 0).unwrap();
+        assert_eq!(cursor.advance_shallow(0).unwrap(), up_to);
+        assert_eq!(cursor.block_bounds_computed(), 2);
+        assert_eq!(
+            cursor.score_upper_bound(up_to).unwrap().to_bits(),
+            upper.to_bits()
+        );
+
+        // Past the cached window: recompute.
+        cursor.advance_shallow(up_to + 1).unwrap();
+        assert_eq!(cursor.block_bounds_computed(), 3);
+    }
+
+    #[test]
+    fn block_window_invalidated_by_seek_and_eval_at() {
+        let lengths = block_test_lengths();
+        let docs = block_test_documents(&lengths);
+        let postings = block_test_postings(&lengths, 128, true);
+        let metrics = NoOpMetricsCollector;
+        let params = block_test_params();
+        let mut cursor = block_test_cursor(&postings, Operator::Or, &docs, &params, &metrics);
+
+        cursor.advance_shallow(0).unwrap();
+        assert_eq!(cursor.block_bounds_computed(), 1);
+
+        BlockScorer::seek(&mut cursor, 0).unwrap();
+        cursor.advance_shallow(0).unwrap();
+        assert_eq!(cursor.block_bounds_computed(), 2);
+
+        let mut out = EvalOut::default();
+        BatchEvaluator::eval_at(&mut cursor, &[0], &mut out).unwrap();
+        cursor.advance_shallow(0).unwrap();
+        assert_eq!(cursor.block_bounds_computed(), 3);
+    }
+
+    #[test]
+    fn next_clears_shallow_but_block_window_hits() {
+        let lengths = block_test_lengths();
+        let docs = block_test_documents(&lengths);
+        let postings = block_test_postings(&lengths, 128, true);
+        let metrics = NoOpMetricsCollector;
+        let params = block_test_params();
+        let mut cursor = block_test_cursor(&postings, Operator::Or, &docs, &params, &metrics);
+
+        let up_to = cursor.advance_shallow(0).unwrap();
+        let upper = cursor.score_upper_bound(up_to).unwrap();
+        let doc = cursor.next().unwrap().unwrap();
+        assert_eq!(cursor.advance_shallow(doc).unwrap(), up_to);
+        assert_eq!(cursor.block_bounds_computed(), 1);
+        assert_eq!(
+            cursor.score_upper_bound(up_to).unwrap().to_bits(),
+            upper.to_bits()
+        );
     }
 
     #[test]
