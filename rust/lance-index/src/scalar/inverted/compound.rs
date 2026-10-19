@@ -3626,6 +3626,11 @@ impl<'a> ReqOptScorer<'a> {
                 return Err(Error::internal("IU promoted lead is out of range"));
             }
 
+            // `merge_optional_freqs` leaves a required-driven block parked on
+            // the first optional document after the block's last document, so
+            // the promoted lead always resumes strictly past the documents the
+            // walk already scored. A block source that ever left the cursor on
+            // a match would re-emit that document here.
             self.chunk.clear();
             optionals[index].take_docs_one_block_upto(TERMINATED_DOC_ID, &mut self.chunk);
             if self.chunk.is_empty() {
@@ -8226,4 +8231,88 @@ fn iu_block_face_declines_when_the_optionals_are_sparse() {
     assert_eq!(per_document, block);
     assert_eq!(block_stats.engagements, 0);
     assert!(block_stats.perdoc_calls > 0);
+}
+
+#[cfg(test)]
+#[rstest::rstest]
+#[case::one_optional(1)]
+#[case::two_optionals(2)]
+#[case::three_optionals(3)]
+fn iu_block_face_matches_per_document_with_several_optionals(#[case] optionals: usize) {
+    let num_docs = 300_u64;
+    let documents = TestDocuments {
+        len: num_docs as usize,
+    };
+    let scorer = iu_scorer(num_docs);
+    let params = Arc::new(FtsSearchParams::new());
+    let all: Vec<u64> = (0..num_docs).collect();
+    let leaves = || {
+        let mut leaves = vec![LoadedLeaf {
+            postings: vec![iu_posting(&all, 1.0)],
+            params: params.clone(),
+            operator: Operator::Or,
+            scorer: scorer.clone(),
+        }];
+        for step in 1..=optionals {
+            let docs: Vec<u64> = (0..num_docs).step_by(step + 1).collect();
+            leaves.push(LoadedLeaf {
+                postings: vec![iu_posting(&docs, 2.0)],
+                params: params.clone(),
+                operator: Operator::Or,
+                scorer: scorer.clone(),
+            });
+        }
+        leaves
+    };
+    let plan = iu_plan(1, optionals);
+
+    let (per_document, per_document_stats) = iu_run(&documents, leaves, &plan, 10, false);
+    let (block, block_stats) = iu_run(&documents, leaves, &plan, 10, true);
+
+    assert_eq!(per_document, block, "optionals={optionals}");
+    assert_eq!(per_document_stats.engagements, 0, "optionals={optionals}");
+    assert!(block_stats.engagements > 0, "optionals={optionals}");
+    assert_eq!(block_stats.perdoc_calls, 0, "optionals={optionals}");
+}
+
+#[test]
+fn iu_block_face_never_re_emits_a_document_after_promotion() {
+    // The optional covers every document, so its cursor sits exactly on each
+    // required block boundary when promotion happens. The lead must continue
+    // strictly after the documents the required side already scored.
+    let num_docs = 300_u64;
+    let documents = TestDocuments {
+        len: num_docs as usize,
+    };
+    let scorer = iu_scorer(num_docs);
+    let params = Arc::new(FtsSearchParams::new());
+    let all: Vec<u64> = (0..num_docs).collect();
+    let leaves = || {
+        vec![
+            LoadedLeaf {
+                postings: vec![iu_posting(&all, 1.0)],
+                params: params.clone(),
+                operator: Operator::Or,
+                scorer: scorer.clone(),
+            },
+            LoadedLeaf {
+                postings: vec![iu_posting(&all, 100.0)],
+                params: params.clone(),
+                operator: Operator::Or,
+                scorer: scorer.clone(),
+            },
+        ]
+    };
+    let plan = iu_plan(1, 1);
+
+    let (per_document, _) = iu_run(&documents, leaves, &plan, 10, false);
+    let (block, block_stats) = iu_run(&documents, leaves, &plan, 10, true);
+
+    assert!(block_stats.promotions > 0);
+    assert_eq!(per_document, block);
+    let mut rows = block.iter().map(|row| row.row_id).collect::<Vec<_>>();
+    let total = rows.len();
+    rows.sort_unstable();
+    rows.dedup();
+    assert_eq!(rows.len(), total, "the block walk emitted a duplicate row");
 }
