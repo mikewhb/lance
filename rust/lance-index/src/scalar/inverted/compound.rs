@@ -3476,6 +3476,8 @@ pub(super) struct BooleanScorer<'a> {
     confirmed: bool,
     optional_matches: bool,
     defer_confirmation: bool,
+    #[cfg(test)]
+    required_unwrapped: bool,
 }
 
 impl<'a> BooleanScorer<'a> {
@@ -3495,6 +3497,8 @@ impl<'a> BooleanScorer<'a> {
         block_exec: bool,
     ) -> Result<Self> {
         let mut must = must;
+        #[cfg(test)]
+        let mut required_unwrapped = false;
         let (driver, optional) = if must.is_empty() {
             if should.is_empty() {
                 return Err(Error::invalid_input(
@@ -3517,7 +3521,22 @@ impl<'a> BooleanScorer<'a> {
                         as BoxScorer<'a>,
                 )
             };
-            let required: BoxScorer<'a> = if block_exec
+            // A one-child conjunction is the child. Unwrapping lets the
+            // leaf's per-document block face serve the required side
+            // directly, without the producer's eager window scoring. Only
+            // block-capable children qualify: a flat single MUST keeps the
+            // classic RequiredConjunctionScorer.
+            let single_block_child = block_exec
+                && must.len() == 1
+                && must[0].as_block().is_some()
+                && must[0].as_eval().is_some();
+            #[cfg(test)]
+            {
+                required_unwrapped = single_block_child;
+            }
+            let required: BoxScorer<'a> = if single_block_child {
+                must.pop().expect("one required child")
+            } else if block_exec
                 && must
                     .iter_mut()
                     .all(|child| child.as_block().is_some() && child.as_eval().is_some())
@@ -3570,6 +3589,8 @@ impl<'a> BooleanScorer<'a> {
             confirmed: false,
             optional_matches: false,
             defer_confirmation: scores_non_negative && has_doc_local_confirmation,
+            #[cfg(test)]
+            required_unwrapped,
         })
     }
 
@@ -3634,6 +3655,13 @@ impl<'a> BooleanScorer<'a> {
     #[cfg(test)]
     pub(super) fn driver_mut(&mut self) -> &mut dyn ComposableScorer {
         self.driver.as_mut()
+    }
+
+    /// Test-only: whether a single block-capable MUST child was used directly
+    /// instead of the one-child block conjunction.
+    #[cfg(test)]
+    pub(super) fn required_is_leaf(&self) -> bool {
+        self.required_unwrapped
     }
 }
 
@@ -6068,6 +6096,8 @@ mod tests {
             confirmed: false,
             optional_matches: false,
             defer_confirmation: false,
+            #[cfg(test)]
+            required_unwrapped: false,
         };
         let eager_results = TopKCollector::new(1).collect(&mut eager).unwrap();
 
@@ -7138,6 +7168,42 @@ mod tests {
                 rows(&[(0, large_score), (1, large_score), (2, large_score)])
             );
         }
+    }
+
+    #[test]
+    fn single_must_block_child_unwraps_required() {
+        let scorer = BooleanScorer::try_new_with_block(
+            Vec::new(),
+            vec![Box::new(BlockCapableChild)],
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        assert!(scorer.required_is_leaf());
+    }
+
+    #[test]
+    fn single_must_flat_child_keeps_required_conjunction() {
+        let scorer = BooleanScorer::try_new_with_block(
+            Vec::new(),
+            vec![materialized(&[(0, 1.0)])],
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        assert!(!scorer.required_is_leaf());
+    }
+
+    #[test]
+    fn single_must_without_block_exec_keeps_required_conjunction() {
+        let scorer = BooleanScorer::try_new_with_block(
+            Vec::new(),
+            vec![Box::new(BlockCapableChild)],
+            Vec::new(),
+            false,
+        )
+        .unwrap();
+        assert!(!scorer.required_is_leaf());
     }
 }
 use crate::scalar::inverted::block::{BlockBuf, BlockStatus, Capacities, EvalOut, Window};

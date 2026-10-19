@@ -15429,6 +15429,7 @@ mod tests {
         let should = vec![leaf(&[2])];
         let mut scorer =
             BooleanScorer::try_new_with_block(should, must, Vec::new(), block).unwrap();
+        assert_eq!(scorer.required_is_leaf(), block);
         RowCollector::with_competitive_score(limit, Arc::new(CompetitiveScore::default()))
             .collect(&mut scorer)
             .unwrap()
@@ -15576,12 +15577,55 @@ mod tests {
         let should = vec![leaf(&[1])];
         let mut scorer =
             BooleanScorer::try_new_with_block(should, must, Vec::new(), block).unwrap();
+        assert_eq!(scorer.required_is_leaf(), block);
         RowCollector::with_competitive_score(limit, Arc::new(CompetitiveScore::default()))
             .collect(&mut scorer)
             .unwrap()
             .into_iter()
             .map(|row| (row.row_id, row.score.to_bits()))
             .collect()
+    }
+
+    #[cfg_attr(coverage, coverage(off))]
+    fn block_boolean_rows_single_must_no_optional(block: bool, limit: usize) -> Vec<(u64, u32)> {
+        let lengths = block_test_lengths();
+        let docs = block_test_documents(&lengths);
+        let postings = block_test_postings(&lengths, 128, true);
+        let metrics = NoOpMetricsCollector;
+        let params = FtsSearchParams {
+            block_exec: block,
+            ..FtsSearchParams::default()
+        };
+        let leaf = block_boolean_leaf(
+            block,
+            &[0],
+            &postings,
+            &docs,
+            block_test_scorer(),
+            &params,
+            &metrics,
+        );
+        let mut scorer =
+            BooleanScorer::try_new_with_block(Vec::new(), vec![leaf], Vec::new(), block).unwrap();
+        assert_eq!(scorer.required_is_leaf(), block);
+        RowCollector::with_competitive_score(limit, Arc::new(CompetitiveScore::default()))
+            .collect(&mut scorer)
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.row_id, row.score.to_bits()))
+            .collect()
+    }
+
+    #[test]
+    fn boolean_block_single_must_without_optional_matches_flat_bits() {
+        // The 943 corpus has no `+term` Boolean nodes, so the must=1 /
+        // should=0 shape needs its own parity check.
+        for limit in [300, 10, 1] {
+            let flat = block_boolean_rows_single_must_no_optional(false, limit);
+            let block = block_boolean_rows_single_must_no_optional(true, limit);
+            assert!(!flat.is_empty(), "limit={limit}");
+            assert_eq!(block, flat, "limit={limit}");
+        }
     }
 
     #[test]
