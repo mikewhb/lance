@@ -26,7 +26,7 @@ use lance_core::Result;
 use super::super::block::{
     BatchEvaluator, BlockBuf, BlockScorer, BlockStatus, Capacities, EvalOut, Window,
 };
-use super::super::compound::ScoreBounds;
+use super::super::compound::{BlockBatch, ScoreBounds};
 use super::super::query::Operator;
 use super::super::scorer::MemBM25Scorer;
 use super::and_kernel::{AndMergeKernel, AndWindowScratch};
@@ -59,6 +59,9 @@ pub(super) struct BlockPostingSet<'a, D: WandDocuments> {
     acc: WindowAccumulator,
     and_scratch: AndWindowScratch,
     eval: EvalOut,
+    /// Reused frequency scratch for the fused optional fold. Contents are
+    /// fully rewritten by `merge_optional_freqs` per call.
+    fold_freqs: Vec<u32>,
 }
 
 /// Capabilities of `postings`, computed before they are moved into a block
@@ -142,6 +145,7 @@ impl<'a, D: WandDocuments> BlockPostingSet<'a, D> {
             acc: WindowAccumulator::new(num_terms),
             and_scratch: AndWindowScratch::new(num_terms),
             eval: EvalOut::default(),
+            fold_freqs: Vec::new(),
         }
     }
 
@@ -329,5 +333,84 @@ impl<D: WandDocuments> BlockScorer for BlockPostingSet<'_, D> {
             Operator::Or => self.or_kernel().upper_bound(window),
             Operator::And => self.and_kernel().upper_bound(window),
         }
+    }
+}
+
+impl<D: WandDocuments> BlockBatch for BlockPostingSet<'_, D> {
+    fn take_docs_one_block_upto(&mut self, upto: u64, out: &mut Vec<(u64, u32)>) {
+        debug_assert_eq!(self.postings.len(), 1, "batch view requires N == 1");
+        self.postings[0].take_docs_one_block_upto(upto, out);
+    }
+
+    fn term_scores_batch(&self, docs: &[u64], freqs: &[u32], out: &mut [f32]) {
+        debug_assert_eq!(docs.len(), freqs.len());
+        debug_assert_eq!(docs.len(), out.len());
+        let posting = &self.postings[0];
+        for i in 0..docs.len() {
+            let freq = freqs[i];
+            out[i] = if freq == 0 {
+                0.0
+            } else {
+                posting.score(
+                    &self.scorer,
+                    freq,
+                    self.documents.scoring_num_tokens(docs[i] as u32),
+                )
+            };
+        }
+    }
+
+    fn document_keys_batch(&self, docs: &[u64], out: &mut Vec<Option<u64>>) {
+        out.clear();
+        out.extend(
+            docs.iter()
+                .map(|&doc| self.documents.document_key_for_doc_id(doc as u32)),
+        );
+    }
+
+    fn fold_optional_scores(&mut self, docs: &[u64], sums: &mut [f32]) {
+        debug_assert_eq!(docs.len(), sums.len());
+        self.fold_freqs.clear();
+        self.fold_freqs.resize(docs.len(), 0);
+        self.postings[0].merge_optional_freqs(docs, &mut self.fold_freqs);
+        for i in 0..docs.len() {
+            let freq = self.fold_freqs[i];
+            if freq != 0 {
+                sums[i] += self.postings[0].score(
+                    &self.scorer,
+                    freq,
+                    self.documents.scoring_num_tokens(docs[i] as u32),
+                );
+            }
+        }
+    }
+
+    fn seek_eq(&mut self, doc: u64) -> Option<u32> {
+        self.postings[0].next(doc);
+        match self.postings[0].doc() {
+            Some(current) if current.doc_id() == doc => Some(current.frequency()),
+            _ => None,
+        }
+    }
+
+    fn term_score(&self, doc: u64, freq: u32) -> f32 {
+        self.postings[0].score(
+            &self.scorer,
+            freq,
+            self.documents.scoring_num_tokens(doc as u32),
+        )
+    }
+
+    fn current_doc_id(&self) -> Option<u64> {
+        self.postings[0].current_doc_id()
+    }
+
+    fn global_upper_bound(&self) -> Option<f32> {
+        let upper = self.postings[0].global_upper_bound(&self.scorer);
+        upper.is_finite().then_some(upper)
+    }
+
+    fn cost(&self) -> usize {
+        self.postings[0].cost()
     }
 }

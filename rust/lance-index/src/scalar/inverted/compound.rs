@@ -4,10 +4,15 @@
 mod conjunction_block;
 mod should_maxscore;
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
+use std::sync::LazyLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
 use futures::{StreamExt, TryStreamExt, stream};
@@ -18,7 +23,7 @@ use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
 
 use super::{
     InvertedIndex, PreparedBm25Query,
-    block::{BatchEvaluator, BlockScorer},
+    block::{BatchEvaluator, BlockBuf, BlockScorer, BlockStatus},
     document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer},
     documents::{
         CachedRowAddressOrder, DocId, DocLengths, DocVisibility, OrderedRowAddressProjection,
@@ -33,8 +38,9 @@ use super::{
     scorer::MemBM25Scorer,
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
-        FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        WandCursor, WandDocuments, score_sum_upper_bound_factor,
+        CompetitiveFloorMode, FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments,
+        ModernWandDocuments, PostingIterator, TERMINATED_DOC_ID, WandCursor, WandDocuments,
+        conservative_score_sum, score_sum_cannot_compete, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -251,6 +257,34 @@ fn checked_score(score: f32, context: &str) -> Result<f32> {
     }
 }
 
+/// Narrow batch view over a single-posting leaf.
+///
+/// These are deliberately *leaf* operations: one term's posting answers for a
+/// caller-supplied block of documents. They are used by `ReqOptScorer`'s block
+/// face; the same `BlockPostingSet` still owns the posting cursor.
+pub(super) trait BlockBatch {
+    fn take_docs_one_block_upto(&mut self, upto: u64, out: &mut Vec<(u64, u32)>);
+    fn term_scores_batch(&self, docs: &[u64], freqs: &[u32], out: &mut [f32]);
+    fn document_keys_batch(&self, docs: &[u64], out: &mut Vec<Option<u64>>);
+    fn fold_optional_scores(&mut self, docs: &[u64], sums: &mut [f32]);
+    fn seek_eq(&mut self, doc: u64) -> Option<u32>;
+    fn term_score(&self, doc: u64, freq: u32) -> f32;
+    fn current_doc_id(&self) -> Option<u64>;
+    fn global_upper_bound(&self) -> Option<f32>;
+    fn cost(&self) -> usize;
+}
+
+/// Driver-facing block face for a root `ReqOptScorer`.
+///
+/// This is intentionally narrower than `BlockScorer`: the driver only needs
+/// `next_block` and a way to publish the latest competitive floor. P3's
+/// `Node::next_block` is the long-term replacement.
+pub(super) trait BlockProducer {
+    fn next_block(&mut self, target: u64, budget: usize, out: &mut BlockBuf)
+    -> Result<BlockStatus>;
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()>;
+}
+
 /// Internal document-at-a-time scorer protocol for compound FTS.
 ///
 /// Implementations iterate matching partition-local document ids in ascending
@@ -314,6 +348,22 @@ pub(super) trait ComposableScorer: Send {
     /// per document. There is intentionally no single-document fallback.
     #[allow(dead_code)]
     fn as_block(&mut self) -> Option<&mut dyn BlockScorer> {
+        None
+    }
+
+    /// Batch view of a single-posting leaf, used by `ReqOptScorer`'s block
+    /// face. `None` keeps this node on the per-document path.
+    fn block_batch(&mut self) -> Option<&mut dyn BlockBatch> {
+        None
+    }
+
+    /// Batch views of all children, used when this node is a SHOULD side.
+    fn block_batch_children(&mut self) -> Option<Vec<&mut dyn BlockBatch>> {
+        None
+    }
+
+    /// Root block face. Only nodes that own a complete IU walk return `Some`.
+    fn as_block_producer(&mut self) -> Option<&mut dyn BlockProducer> {
         None
     }
 }
@@ -846,6 +896,10 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
         } else {
             None
         }
+    }
+
+    fn block_batch(&mut self) -> Option<&mut dyn BlockBatch> {
+        self.block_batch_view()
     }
 }
 
@@ -2027,6 +2081,11 @@ impl<K: Copy + Ord> TopKCollector<K> {
         }
     }
 
+    /// Clone the collector's shared floor for a block walk.
+    pub(super) fn competitive_score(&self) -> Arc<CompetitiveScore> {
+        Arc::clone(&self.competitive_score)
+    }
+
     fn insert(&mut self, row: ScoredRow<K>) -> CollectionStatus {
         if self.limit == 0 {
             return CollectionStatus::Complete;
@@ -2431,6 +2490,14 @@ impl ComposableScorer for ScaleScorer<'_> {
             None
         }
     }
+
+    fn block_batch(&mut self) -> Option<&mut dyn BlockBatch> {
+        if self.factor == 1.0 {
+            self.child.block_batch()
+        } else {
+            None
+        }
+    }
 }
 
 /// Union scorer used for Boolean SHOULD sums and MultiMatch DisMax.
@@ -2680,6 +2747,17 @@ impl ComposableScorer for DisjunctionScorer<'_> {
         self.children
             .iter()
             .all(|child| child.scores_non_negative())
+    }
+
+    fn block_batch_children(&mut self) -> Option<Vec<&mut dyn BlockBatch>> {
+        if !matches!(self.mode, DisjunctionScore::Sum) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(self.children.len());
+        for child in &mut self.children {
+            out.push(child.block_batch()?);
+        }
+        Some(out)
     }
 }
 
@@ -3115,6 +3193,32 @@ struct ReqOptScorer<'a> {
     confirmed: bool,
     min_competitive_score: f32,
     shallow_bounds: Option<ReqOptBounds>,
+
+    // Block-face scratch and state. Only used while `next_block` is active.
+    chunk: Vec<(u64, u32)>,
+    candidates: Vec<u64>,
+    chunk_freqs: Vec<u32>,
+    must_scores: Vec<f32>,
+    should_sums: Vec<f32>,
+    keys: Vec<Option<u64>>,
+    dry: Vec<bool>,
+    dry_next: Vec<bool>,
+    must_ub: f32,
+    should_ubs: Vec<f32>,
+    lead: Lead,
+    promoted: bool,
+    promotions: usize,
+    blocks: usize,
+    candidates_seen: usize,
+    emitted: usize,
+    floor_rejected: usize,
+    visibility_rejected: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lead {
+    Must,
+    Should(usize),
 }
 
 impl<'a> ReqOptScorer<'a> {
@@ -3134,6 +3238,24 @@ impl<'a> ReqOptScorer<'a> {
             confirmed: false,
             min_competitive_score: f32::NEG_INFINITY,
             shallow_bounds: None,
+            chunk: Vec::new(),
+            candidates: Vec::new(),
+            chunk_freqs: Vec::new(),
+            must_scores: Vec::new(),
+            should_sums: Vec::new(),
+            keys: Vec::new(),
+            dry: Vec::new(),
+            dry_next: Vec::new(),
+            must_ub: f32::NEG_INFINITY,
+            should_ubs: Vec::new(),
+            lead: Lead::Must,
+            promoted: false,
+            promotions: 0,
+            blocks: 0,
+            candidates_seen: 0,
+            emitted: 0,
+            floor_rejected: 0,
+            visibility_rejected: 0,
         }
     }
 
@@ -3311,6 +3433,304 @@ impl<'a> ReqOptScorer<'a> {
     }
 }
 
+static IU_BLOCK_MODE: LazyLock<bool> =
+    LazyLock::new(|| matches!(std::env::var("LANCE_UBE_IU").as_deref(), Ok("1") | Ok("on")));
+
+#[cfg(test)]
+thread_local! {
+    static IU_BLOCK_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+static IU_BLOCK_ENGAGEMENTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static IU_BLOCK_PROMOTIONS: AtomicUsize = AtomicUsize::new(0);
+
+fn iu_block_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = IU_BLOCK_OVERRIDE.with(Cell::get) {
+        return enabled;
+    }
+    *IU_BLOCK_MODE
+}
+
+#[cfg(test)]
+fn set_iu_block_for_test(enabled: Option<bool>) {
+    IU_BLOCK_OVERRIDE.with(|cell| cell.set(enabled));
+}
+
+/// The skew gate: when every required list dwarfs the optional union, the
+/// generic path's block-max window skipping beats scoring the whole
+/// intersection. The margin is a heuristic, not a measured constant.
+const OPTIONAL_COST_MARGIN: usize = 8;
+
+fn optionals_are_sparse(k_required: usize, optional_cost: usize, required_cost: usize) -> bool {
+    k_required * optional_cost.saturating_mul(OPTIONAL_COST_MARGIN) < required_cost
+}
+
+fn iu_cannot_compete(must_ub: f32, optional_ub: f32, floor: f32) -> bool {
+    score_sum_cannot_compete(
+        must_ub,
+        f64::from(optional_ub),
+        floor,
+        score_sum_upper_bound_factor(2),
+        CompetitiveFloorMode::Inclusive,
+    )
+}
+
+fn live_upper_bound(dry: &[bool], ubs: &[f32]) -> f32 {
+    conservative_score_sum(
+        ubs.iter()
+            .enumerate()
+            .filter(|(index, _)| !dry[*index])
+            .map(|(_, upper)| *upper),
+    )
+}
+
+impl<'a> BlockProducer for ReqOptScorer<'a> {
+    fn next_block(
+        &mut self,
+        _target: u64,
+        budget: usize,
+        out: &mut BlockBuf,
+    ) -> Result<BlockStatus> {
+        if self.exhausted {
+            return Ok(BlockStatus::Exhausted);
+        }
+        assert!(budget > 0, "IU block walk requires a positive budget");
+        self.blocks += 1;
+        match self.lead {
+            Lead::Must => self.next_block_must(out),
+            Lead::Should(index) => self.next_block_should(index, out),
+        }
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        ComposableScorer::set_min_competitive_score(self, min_score)
+    }
+}
+
+impl<'a> ReqOptScorer<'a> {
+    fn next_block_must(&mut self, out: &mut BlockBuf) -> Result<BlockStatus> {
+        {
+            let (required, optional) = (&mut self.required, &mut self.optional);
+            let Some(required_batch) = required.block_batch() else {
+                return Err(Error::internal("IU block walk lost its required batch"));
+            };
+            let Some(mut optionals) = optional.block_batch_children() else {
+                return Err(Error::internal("IU block walk lost its optional batches"));
+            };
+
+            self.chunk.clear();
+            required_batch.take_docs_one_block_upto(TERMINATED_DOC_ID, &mut self.chunk);
+            if self.chunk.is_empty() {
+                self.exhausted = true;
+                return Ok(BlockStatus::Exhausted);
+            }
+
+            self.candidates.clear();
+            self.chunk_freqs.clear();
+            for &(doc, freq) in &self.chunk {
+                self.candidates.push(doc);
+                self.chunk_freqs.push(freq);
+            }
+
+            self.must_scores.clear();
+            self.must_scores.resize(self.candidates.len(), 0.0);
+            required_batch.term_scores_batch(
+                &self.candidates,
+                &self.chunk_freqs,
+                &mut self.must_scores,
+            );
+
+            self.keys.clear();
+            required_batch.document_keys_batch(&self.candidates, &mut self.keys);
+
+            self.should_sums.clear();
+            self.should_sums.resize(self.candidates.len(), 0.0);
+            self.dry_next.clear();
+            self.dry_next.extend_from_slice(&self.dry);
+            for (index, optional) in optionals.iter_mut().enumerate() {
+                optional.fold_optional_scores(&self.candidates, &mut self.should_sums);
+                if optional.current_doc_id().is_none() {
+                    self.dry_next[index] = true;
+                }
+            }
+        }
+
+        self.emit_block(out)?;
+        std::mem::swap(&mut self.dry, &mut self.dry_next);
+
+        if self.min_competitive_score.is_finite() {
+            let live = live_upper_bound(&self.dry, &self.should_ubs);
+            if iu_cannot_compete(self.must_ub, live, self.min_competitive_score) {
+                self.exhausted = true;
+            }
+        }
+        if !self.exhausted {
+            self.maybe_promote();
+        }
+
+        if out.docs.is_empty() {
+            Ok(BlockStatus::Empty { up_to: out.up_to })
+        } else {
+            Ok(BlockStatus::Data)
+        }
+    }
+
+    fn next_block_should(&mut self, index: usize, out: &mut BlockBuf) -> Result<BlockStatus> {
+        {
+            let (required, optional) = (&mut self.required, &mut self.optional);
+            let Some(required_batch) = required.block_batch() else {
+                return Err(Error::internal("IU promoted walk lost its required batch"));
+            };
+            let Some(mut optionals) = optional.block_batch_children() else {
+                return Err(Error::internal(
+                    "IU promoted walk lost its optional batches",
+                ));
+            };
+            if index >= optionals.len() {
+                return Err(Error::internal("IU promoted lead is out of range"));
+            }
+
+            self.chunk.clear();
+            optionals[index].take_docs_one_block_upto(TERMINATED_DOC_ID, &mut self.chunk);
+            if self.chunk.is_empty() {
+                self.exhausted = true;
+                return Ok(BlockStatus::Exhausted);
+            }
+
+            self.candidates.clear();
+            self.chunk_freqs.clear();
+            for &(doc, freq) in &self.chunk {
+                self.candidates.push(doc);
+                self.chunk_freqs.push(freq);
+            }
+
+            self.keys.clear();
+            optionals[index].document_keys_batch(&self.candidates, &mut self.keys);
+
+            out.clear();
+            out.start = self.candidates[0];
+            out.up_to = *self.candidates.last().expect("non-empty promoted chunk");
+            let floor = self.min_competitive_score;
+
+            for i in 0..self.candidates.len() {
+                self.candidates_seen += 1;
+                let Some(key) = self.keys[i] else {
+                    self.visibility_rejected += 1;
+                    continue;
+                };
+                let doc = self.candidates[i];
+                let Some(must_freq) = required_batch.seek_eq(doc) else {
+                    continue;
+                };
+                let lead_freq = self.chunk_freqs[i];
+                let mut should_sum = 0.0_f32;
+                for (j, optional) in optionals.iter_mut().enumerate() {
+                    let freq = if j == index {
+                        Some(lead_freq)
+                    } else {
+                        optional.seek_eq(doc)
+                    };
+                    if let Some(freq) = freq {
+                        should_sum += optional.term_score(doc, freq);
+                    }
+                }
+                let must_score = required_batch.term_score(doc, must_freq);
+                let score = checked_score(must_score + should_sum, "IU promoted walk")?;
+                if score < floor {
+                    self.floor_rejected += 1;
+                    continue;
+                }
+                out.docs.push(doc);
+                out.scores.push(score);
+                out.keys.push(key);
+                out.matched.push(true);
+                self.emitted += 1;
+            }
+
+            self.dry_next.clear();
+            self.dry_next.extend_from_slice(&self.dry);
+            for (i, optional) in optionals.iter_mut().enumerate() {
+                if optional.current_doc_id().is_none() {
+                    self.dry_next[i] = true;
+                }
+            }
+            out.upper = ScoreBounds::UNBOUNDED;
+        }
+
+        std::mem::swap(&mut self.dry, &mut self.dry_next);
+        if self.min_competitive_score.is_finite() {
+            let live = live_upper_bound(&self.dry, &self.should_ubs);
+            if iu_cannot_compete(self.must_ub, live, self.min_competitive_score) {
+                self.exhausted = true;
+            }
+        }
+
+        if out.docs.is_empty() {
+            Ok(BlockStatus::Empty { up_to: out.up_to })
+        } else {
+            Ok(BlockStatus::Data)
+        }
+    }
+
+    fn emit_block(&mut self, out: &mut BlockBuf) -> Result<()> {
+        out.clear();
+        out.start = self.candidates[0];
+        out.up_to = *self.candidates.last().expect("non-empty chunk");
+        let floor = self.min_competitive_score;
+        for i in 0..self.candidates.len() {
+            self.candidates_seen += 1;
+            let Some(key) = self.keys[i] else {
+                self.visibility_rejected += 1;
+                continue;
+            };
+            let score = checked_score(self.must_scores[i] + self.should_sums[i], "IU block walk")?;
+            if score < floor {
+                self.floor_rejected += 1;
+                continue;
+            }
+            out.docs.push(self.candidates[i]);
+            out.scores.push(score);
+            out.keys.push(key);
+            out.matched.push(true);
+            self.emitted += 1;
+        }
+        out.upper = ScoreBounds::UNBOUNDED;
+        Ok(())
+    }
+
+    fn maybe_promote(&mut self) {
+        if self.promoted || !self.min_competitive_score.is_finite() {
+            return;
+        }
+        if self.min_competitive_score <= self.must_ub {
+            return;
+        }
+        for index in 0..self.should_ubs.len() {
+            if self.dry[index] {
+                continue;
+            }
+            let others = conservative_score_sum(
+                self.should_ubs
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != index && !self.dry[*other])
+                    .map(|(_, upper)| *upper),
+            );
+            if iu_cannot_compete(self.must_ub, others, self.min_competitive_score) {
+                self.lead = Lead::Should(index);
+                self.promoted = true;
+                self.promotions += 1;
+                #[cfg(test)]
+                IU_BLOCK_PROMOTIONS.fetch_add(1, AtomicOrdering::Relaxed);
+                return;
+            }
+        }
+    }
+}
+
 impl ComposableScorer for ReqOptScorer<'_> {
     fn doc(&self) -> Option<u64> {
         self.current
@@ -3464,6 +3884,47 @@ impl ComposableScorer for ReqOptScorer<'_> {
     fn scores_non_negative(&self) -> bool {
         true
     }
+
+    fn as_block_producer(&mut self) -> Option<&mut dyn BlockProducer> {
+        if !iu_block_enabled() || self.exhausted {
+            return None;
+        }
+        // Entering the block face after any per-document positioning would
+        // re-emit the current document (take_docs includes the cursor's doc).
+        if self.current.is_some() || self.optional_initialized {
+            debug_assert!(false, "block face entered after per-document positioning");
+            return None;
+        }
+        if !(self.required.scores_non_negative() && self.optional.scores_non_negative()) {
+            return None;
+        }
+
+        let (must_ub, should_ubs) = {
+            let required_batch = self.required.block_batch()?;
+            let optionals = self.optional.block_batch_children()?;
+            let required_cost = required_batch.cost();
+            let optional_cost: usize = optionals.iter().map(|optional| optional.cost()).sum();
+            if optionals_are_sparse(1, optional_cost, required_cost) {
+                return None;
+            }
+            let must_ub = required_batch.global_upper_bound()?;
+            let mut should_ubs = Vec::with_capacity(optionals.len());
+            for optional in &optionals {
+                should_ubs.push(optional.global_upper_bound()?);
+            }
+            (must_ub, should_ubs)
+        };
+
+        self.must_ub = must_ub;
+        self.should_ubs = should_ubs;
+        self.dry = vec![false; self.should_ubs.len()];
+        self.dry_next = vec![false; self.should_ubs.len()];
+        self.lead = Lead::Must;
+        self.promoted = false;
+        #[cfg(test)]
+        IU_BLOCK_ENGAGEMENTS.fetch_add(1, AtomicOrdering::Relaxed);
+        Some(self)
+    }
 }
 
 /// Boolean scorer preserving the current membership and score semantics.
@@ -3476,6 +3937,8 @@ pub(super) struct BooleanScorer<'a> {
     confirmed: bool,
     optional_matches: bool,
     defer_confirmation: bool,
+    /// True only for a flat Boolean with both MUST and SHOULD children.
+    flat_reqopt: bool,
     #[cfg(test)]
     required_unwrapped: bool,
 }
@@ -3496,6 +3959,7 @@ impl<'a> BooleanScorer<'a> {
         must_not: Vec<BoxScorer<'a>>,
         block_exec: bool,
     ) -> Result<Self> {
+        let flat_reqopt = !must.is_empty() && !should.is_empty();
         let mut must = must;
         #[cfg(test)]
         let mut required_unwrapped = false;
@@ -3589,6 +4053,7 @@ impl<'a> BooleanScorer<'a> {
             confirmed: false,
             optional_matches: false,
             defer_confirmation: scores_non_negative && has_doc_local_confirmation,
+            flat_reqopt,
             #[cfg(test)]
             required_unwrapped,
         })
@@ -3827,6 +4292,13 @@ impl ComposableScorer for BooleanScorer<'_> {
                 .optional
                 .as_ref()
                 .is_none_or(|optional| optional.scores_non_negative())
+    }
+
+    fn as_block_producer(&mut self) -> Option<&mut dyn BlockProducer> {
+        if !self.flat_reqopt || self.optional.is_some() || self.prohibited.is_some() {
+            return None;
+        }
+        self.driver.as_block_producer()
     }
 }
 
@@ -4125,6 +4597,56 @@ struct CollectedPartitions {
     boundary: Option<PartitionCollectionBoundary>,
 }
 
+fn collect_blocks<D, K>(
+    root: &mut dyn BlockProducer,
+    collector: &mut TopKCollector<K>,
+    map_document: &mut impl FnMut(u64) -> Result<K>,
+) -> Result<CollectionStatus>
+where
+    D: WandDocuments + Sync,
+    K: Copy + Ord,
+{
+    if collector.limit == 0 {
+        return Ok(CollectionStatus::Complete);
+    }
+    let floor = collector.competitive_score();
+    let mut target = 0_u64;
+    let mut buf = BlockBuf::default();
+    loop {
+        root.set_min_competitive_score(floor.get())?;
+        match root.next_block(target, 4096, &mut buf)? {
+            BlockStatus::Data => {
+                for index in 0..buf.docs.len() {
+                    let score = buf.scores[index];
+                    if score >= floor.get() {
+                        let row = map_document(buf.keys[index])?;
+                        let status = collector.insert(ScoredRow { row_id: row, score });
+                        if status == CollectionStatus::ScoreFloorOverflow {
+                            return Ok(status);
+                        }
+                    }
+                }
+                match next_target(buf.up_to) {
+                    Some(next) => target = next,
+                    None => break,
+                }
+            }
+            BlockStatus::Empty { up_to } => match next_target(up_to) {
+                Some(next) => target = next,
+                None => break,
+            },
+            BlockStatus::Exhausted => break,
+        }
+    }
+    Ok(CollectionStatus::Complete)
+}
+
+fn next_target(up_to: u64) -> Option<u64> {
+    up_to
+        .checked_add(1)
+        .filter(|target| *target <= u32::MAX as u64)
+}
+
 fn collect_partition_with_documents<D, K>(
     documents: &D,
     leaves: Vec<LoadedLeaf>,
@@ -4173,7 +4695,11 @@ where
             "compound FTS scorer did not consume every prepared leaf",
         ));
     }
-    collector.collect_mapped(scorer.as_mut(), &mut map_document)
+    if let Some(producer) = scorer.as_block_producer() {
+        collect_blocks::<D, K>(producer, collector, &mut map_document)
+    } else {
+        collector.collect_mapped(scorer.as_mut(), &mut map_document)
+    }
 }
 
 fn collect_loaded_partitions(
@@ -6096,6 +6622,7 @@ mod tests {
             confirmed: false,
             optional_matches: false,
             defer_confirmation: false,
+            flat_reqopt: false,
             #[cfg(test)]
             required_unwrapped: false,
         };
@@ -7206,7 +7733,7 @@ mod tests {
         assert!(!scorer.required_is_leaf());
     }
 }
-use crate::scalar::inverted::block::{BlockBuf, BlockStatus, Capacities, EvalOut, Window};
+use crate::scalar::inverted::block::{Capacities, EvalOut, Window};
 
 /// Minimal child that advertises both block capabilities, so the scaling
 /// forwarder can be observed without building a posting source.
@@ -7299,4 +7826,271 @@ fn scale_scorer_forwards_block_capability_only_at_unit_factor() {
     let mut scaled = ScaleScorer::try_new(Box::new(BlockCapableChild), 0.5).unwrap();
     assert!(scaled.as_block().is_none());
     assert!(scaled.as_eval().is_none());
+}
+
+#[cfg(test)]
+struct TestDocuments {
+    len: usize,
+}
+
+#[cfg(test)]
+impl WandDocuments for TestDocuments {
+    type Candidate = u64;
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn scoring_norms(&self) -> Option<&[u8]> {
+        None
+    }
+
+    fn scoring_num_tokens(&self, _doc_id: u32) -> u32 {
+        1
+    }
+
+    fn doc_length(&self, _doc: &super::DocInfo) -> u32 {
+        1
+    }
+
+    fn document_key(&self, doc: &super::DocInfo) -> Option<u64> {
+        if doc.doc_id() == 5 {
+            None
+        } else {
+            Some(doc.doc_id())
+        }
+    }
+
+    fn document_key_for_doc_id(&self, doc_id: u32) -> Option<u64> {
+        if doc_id == 5 {
+            None
+        } else {
+            Some(u64::from(doc_id))
+        }
+    }
+
+    fn dense_doc_ids(&self) -> bool {
+        true
+    }
+
+    fn candidate_from_key(&self, key: u64) -> Self::Candidate {
+        key
+    }
+
+    fn flat_documents(&self) -> Option<super::wand::FlatDocuments<'_>> {
+        None
+    }
+
+    fn flat_doc_length(&self, _doc_id: u64, _document_key: u64, _compressed: bool) -> u32 {
+        1
+    }
+}
+
+#[test]
+fn iu_block_face_matches_per_document() {
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::inverted::encoding::compress_posting_list;
+    use crate::scalar::inverted::{
+        CompressedPostingList, LEGACY_BLOCK_SIZE, PostingList, PostingTailCodec,
+    };
+    use std::collections::HashMap;
+
+    fn posting(doc_ids: &[u64]) -> PostingIterator {
+        let doc_ids = doc_ids
+            .iter()
+            .map(|&doc_id| u32::try_from(doc_id).unwrap())
+            .collect::<Vec<_>>();
+        let frequencies = vec![1_u32; doc_ids.len()];
+        let blocks = compress_posting_list(
+            doc_ids.len(),
+            doc_ids.iter(),
+            frequencies.iter(),
+            vec![1.0; doc_ids.len()].into_iter(),
+        )
+        .unwrap();
+        PostingIterator::new(
+            "term".to_owned(),
+            0,
+            0,
+            PostingList::Compressed(CompressedPostingList::new(
+                blocks,
+                1.0,
+                doc_ids.len() as u32,
+                PostingTailCodec::VarintDelta,
+                LEGACY_BLOCK_SIZE,
+                None,
+                None,
+            )),
+            doc_ids.len(),
+        )
+    }
+
+    let num_docs = 300_u64;
+    let documents = TestDocuments {
+        len: num_docs as usize,
+    };
+    let scorer = Arc::new(MemBM25Scorer::new(
+        num_docs,
+        num_docs as usize,
+        HashMap::from([
+            ("m".to_owned(), num_docs as usize),
+            ("o".to_owned(), (num_docs / 2) as usize),
+        ]),
+    ));
+    let params = Arc::new(FtsSearchParams::new());
+    let leaves = || {
+        vec![
+            LoadedLeaf {
+                postings: vec![posting(&(0..num_docs).collect::<Vec<_>>())],
+                params: params.clone(),
+                operator: Operator::Or,
+                scorer: scorer.clone(),
+            },
+            LoadedLeaf {
+                postings: vec![posting(&(0..num_docs).step_by(2).collect::<Vec<_>>())],
+                params: params.clone(),
+                operator: Operator::Or,
+                scorer: scorer.clone(),
+            },
+        ]
+    };
+    let plan = CompoundScorerPlan::Boolean {
+        must: vec![CompoundScorerPlan::Leaf {
+            index: 0,
+            boost: 1.0,
+        }],
+        should: vec![CompoundScorerPlan::Leaf {
+            index: 1,
+            boost: 1.0,
+        }],
+        must_not: Vec::new(),
+    };
+
+    let run = |block: bool| {
+        set_iu_block_for_test(Some(block));
+        let mut collector = TopKCollector::new(10);
+        collect_partition_with_documents(
+            &documents,
+            leaves(),
+            &plan,
+            &NoOpMetricsCollector,
+            &mut collector,
+            Ok,
+        )
+        .unwrap();
+        set_iu_block_for_test(None);
+        collector.into_rows()
+    };
+
+    let per_document = run(false);
+    let block = run(true);
+    assert_eq!(per_document, block);
+    assert!(IU_BLOCK_ENGAGEMENTS.load(AtomicOrdering::Relaxed) > 0);
+}
+
+#[test]
+fn iu_block_face_promotes_when_must_alone_cannot_compete() {
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::inverted::encoding::compress_posting_list;
+    use crate::scalar::inverted::{
+        CompressedPostingList, LEGACY_BLOCK_SIZE, PostingList, PostingTailCodec,
+    };
+    use std::collections::HashMap;
+
+    fn posting(doc_ids: &[u64], weight: f32) -> PostingIterator {
+        let doc_ids = doc_ids
+            .iter()
+            .map(|&doc_id| u32::try_from(doc_id).unwrap())
+            .collect::<Vec<_>>();
+        let frequencies = vec![1_u32; doc_ids.len()];
+        let blocks = compress_posting_list(
+            doc_ids.len(),
+            doc_ids.iter(),
+            frequencies.iter(),
+            vec![weight; doc_ids.len()].into_iter(),
+        )
+        .unwrap();
+        PostingIterator::with_query_weight(
+            "term".to_owned(),
+            0,
+            0,
+            weight,
+            PostingList::Compressed(CompressedPostingList::new(
+                blocks,
+                weight,
+                doc_ids.len() as u32,
+                PostingTailCodec::VarintDelta,
+                LEGACY_BLOCK_SIZE,
+                None,
+                None,
+            )),
+            doc_ids.len(),
+        )
+    }
+
+    let num_docs = 300_u64;
+    let documents = TestDocuments {
+        len: num_docs as usize,
+    };
+    let scorer = Arc::new(MemBM25Scorer::new(
+        num_docs,
+        num_docs as usize,
+        HashMap::from([
+            ("m".to_owned(), num_docs as usize),
+            ("o".to_owned(), (num_docs / 2) as usize),
+        ]),
+    ));
+    let params = Arc::new(FtsSearchParams::new());
+    let leaves = || {
+        vec![
+            LoadedLeaf {
+                postings: vec![posting(&(0..num_docs).collect::<Vec<_>>(), 1.0)],
+                params: params.clone(),
+                operator: Operator::Or,
+                scorer: scorer.clone(),
+            },
+            LoadedLeaf {
+                postings: vec![posting(
+                    &(0..num_docs).step_by(2).collect::<Vec<_>>(),
+                    100.0,
+                )],
+                params: params.clone(),
+                operator: Operator::Or,
+                scorer: scorer.clone(),
+            },
+        ]
+    };
+    let plan = CompoundScorerPlan::Boolean {
+        must: vec![CompoundScorerPlan::Leaf {
+            index: 0,
+            boost: 1.0,
+        }],
+        should: vec![CompoundScorerPlan::Leaf {
+            index: 1,
+            boost: 1.0,
+        }],
+        must_not: Vec::new(),
+    };
+
+    let run = |block: bool| {
+        set_iu_block_for_test(Some(block));
+        let mut collector = TopKCollector::new(1);
+        collect_partition_with_documents(
+            &documents,
+            leaves(),
+            &plan,
+            &NoOpMetricsCollector,
+            &mut collector,
+            Ok,
+        )
+        .unwrap();
+        set_iu_block_for_test(None);
+        collector.into_rows()
+    };
+
+    IU_BLOCK_PROMOTIONS.store(0, AtomicOrdering::Relaxed);
+    let per_document = run(false);
+    let block = run(true);
+    assert_eq!(per_document, block);
+    assert!(IU_BLOCK_PROMOTIONS.load(AtomicOrdering::Relaxed) > 0);
 }

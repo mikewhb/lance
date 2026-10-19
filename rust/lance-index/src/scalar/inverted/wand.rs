@@ -60,7 +60,7 @@ use super::{
 };
 use super::{DocInfo, builder::BLOCK_SIZE};
 
-const TERMINATED_DOC_ID: u64 = u64::MAX;
+pub(super) const TERMINATED_DOC_ID: u64 = u64::MAX;
 
 /// Top-k heap entry: (scored doc, doc length, posting doc id, frequency slot).
 /// The (term, freq) pairs live outside the heap so heap churn moves a compact
@@ -261,7 +261,7 @@ static USE_MAXSCORE_SEARCH: LazyLock<bool> =
     LazyLock::new(|| std::env::var("LANCE_FTS_MAXSCORE").as_deref() != Ok("0"));
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum CompetitiveFloorMode {
+pub(super) enum CompetitiveFloorMode {
     #[default]
     Exclusive,
     Inclusive,
@@ -2025,7 +2025,7 @@ pub(super) fn score_sum_upper_bound_factor(num_values: usize) -> f64 {
 }
 
 #[inline]
-fn score_sum_cannot_compete(
+pub(super) fn score_sum_cannot_compete(
     partial_score: f32,
     remaining_upper_bound: f64,
     floor: f32,
@@ -6332,6 +6332,20 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         matches!(self.source, CursorSource::Block(_))
     }
 
+    /// Batch view of this leaf, for `ReqOptScorer`'s block face.
+    ///
+    /// Only a single-posting block source exposes the batch methods; a classic
+    /// flat leaf or a multi-term block source keeps the per-document path.
+    pub(super) fn block_batch_view(&mut self) -> Option<&mut dyn super::compound::BlockBatch> {
+        if self.wand_factor != 1.0 {
+            return None;
+        }
+        match &mut self.source {
+            CursorSource::Block(set) if set.num_terms() == 1 => Some(set),
+            _ => None,
+        }
+    }
+
     /// Drop the cached block window. Only the block-face entry points move the
     /// clause cursors; per-document moves stay inside the cached block.
     fn clear_block_face(&mut self) {
@@ -6836,7 +6850,7 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
     }
 }
 
-fn conservative_score_sum(scores: impl Iterator<Item = f32>) -> f32 {
+pub(super) fn conservative_score_sum(scores: impl Iterator<Item = f32>) -> f32 {
     let (num_scores, exact) = scores.fold((0, 0.0_f64), |(count, sum), score| {
         (count + 1, sum + f64::from(score))
     });
