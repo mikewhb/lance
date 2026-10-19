@@ -6341,7 +6341,9 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             return None;
         }
         match &mut self.source {
-            CursorSource::Block(set) if set.num_terms() == 1 => Some(set),
+            CursorSource::Block(set) if set.num_terms() == 1 && !BlockScorer::caps(set).grouped => {
+                Some(set)
+            }
             _ => None,
         }
     }

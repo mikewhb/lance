@@ -338,13 +338,20 @@ impl<D: WandDocuments> BlockScorer for BlockPostingSet<'_, D> {
 
 impl<D: WandDocuments> BlockBatch for BlockPostingSet<'_, D> {
     fn take_docs_one_block_upto(&mut self, upto: u64, out: &mut Vec<(u64, u32)>) {
-        debug_assert_eq!(self.postings.len(), 1, "batch view requires N == 1");
+        if self.postings.len() != 1 {
+            out.clear();
+            return;
+        }
         self.postings[0].take_docs_one_block_upto(upto, out);
     }
 
     fn term_scores_batch(&self, docs: &[u64], freqs: &[u32], out: &mut [f32]) {
         debug_assert_eq!(docs.len(), freqs.len());
         debug_assert_eq!(docs.len(), out.len());
+        if self.postings.len() != 1 {
+            out.fill(0.0);
+            return;
+        }
         let posting = &self.postings[0];
         for i in 0..docs.len() {
             let freq = freqs[i];
@@ -370,6 +377,9 @@ impl<D: WandDocuments> BlockBatch for BlockPostingSet<'_, D> {
 
     fn fold_optional_scores(&mut self, docs: &[u64], sums: &mut [f32]) {
         debug_assert_eq!(docs.len(), sums.len());
+        if self.postings.len() != 1 {
+            return;
+        }
         self.fold_freqs.clear();
         self.fold_freqs.resize(docs.len(), 0);
         self.postings[0].merge_optional_freqs(docs, &mut self.fold_freqs);
@@ -386,6 +396,9 @@ impl<D: WandDocuments> BlockBatch for BlockPostingSet<'_, D> {
     }
 
     fn seek_eq(&mut self, doc: u64) -> Option<u32> {
+        if self.postings.len() != 1 {
+            return None;
+        }
         self.postings[0].next(doc);
         match self.postings[0].doc() {
             Some(current) if current.doc_id() == doc => Some(current.frequency()),
@@ -394,6 +407,9 @@ impl<D: WandDocuments> BlockBatch for BlockPostingSet<'_, D> {
     }
 
     fn term_score(&self, doc: u64, freq: u32) -> f32 {
+        if self.postings.len() != 1 {
+            return 0.0;
+        }
         self.postings[0].score(
             &self.scorer,
             freq,
@@ -406,8 +422,16 @@ impl<D: WandDocuments> BlockBatch for BlockPostingSet<'_, D> {
     }
 
     fn global_upper_bound(&self) -> Option<f32> {
+        if self.postings.len() != 1 {
+            return None;
+        }
+        // Grouped expansions score their terms separately; their union
+        // posting's aggregate bound is not proven conservative for that sum.
+        if self.postings[0].has_grouped_terms() {
+            return None;
+        }
         let upper = self.postings[0].global_upper_bound(&self.scorer);
-        upper.is_finite().then_some(upper)
+        (upper.is_finite() && upper >= 0.0).then_some(upper)
     }
 
     fn cost(&self) -> usize {
