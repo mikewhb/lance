@@ -127,14 +127,14 @@ impl BlockState {
     }
 }
 
-struct ConjunctionProducer<'a> {
+pub(super) struct ConjunctionProducer<'a> {
     children: Vec<BoxScorer<'a>>,
     cost_order: Vec<usize>,
     lead_buf: BlockBuf,
 }
 
 impl<'a> ConjunctionProducer<'a> {
-    fn new(children: Vec<BoxScorer<'a>>) -> Result<Self> {
+    pub(super) fn new(children: Vec<BoxScorer<'a>>) -> Result<Self> {
         if children.is_empty() {
             return Err(Error::internal("block conjunction requires a child"));
         }

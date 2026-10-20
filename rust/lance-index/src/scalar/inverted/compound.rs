@@ -45,6 +45,8 @@ use super::{
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
 
 use self::conjunction_block::BlockConjunctionScorer;
+#[cfg(test)]
+use self::conjunction_block::ConjunctionProducer;
 use self::should_maxscore::ShouldMaxScoreScorer;
 
 const DEFAULT_BLOCK_SIZE: usize = 128;
@@ -8178,6 +8180,150 @@ impl ComposableScorer for BlockCapableChild {
     fn as_block(&mut self) -> Option<&mut dyn BlockScorer> {
         Some(self)
     }
+}
+
+/// Conjunction child with a scripted block sequence, so the producer's state
+/// machine can be driven without building postings. `Data` emits `docs` and
+/// reports `end` as the window end.
+struct ScriptedChild {
+    script: Vec<BlockStatus>,
+    step: usize,
+    docs: Vec<u64>,
+    end: u64,
+}
+
+impl BatchEvaluator for ScriptedChild {
+    fn eval_at(&mut self, docs: &[u64], out: &mut EvalOut) -> Result<()> {
+        out.clear(docs.len());
+        Ok(())
+    }
+}
+
+impl BlockScorer for ScriptedChild {
+    fn caps(&self) -> Capacities {
+        Capacities::NONE
+    }
+
+    fn seek(&mut self, target: u64) -> Result<Option<u64>> {
+        Ok(Some(target))
+    }
+
+    fn next_block(
+        &mut self,
+        _target: u64,
+        _budget: usize,
+        out: &mut BlockBuf,
+    ) -> Result<BlockStatus> {
+        let Some(status) = self.script.get(self.step).copied() else {
+            return Ok(BlockStatus::Exhausted);
+        };
+        self.step += 1;
+        match status {
+            BlockStatus::Data => {
+                out.clear();
+                out.docs.extend_from_slice(&self.docs);
+                out.scores.resize(self.docs.len(), 1.0);
+                out.keys.extend_from_slice(&self.docs);
+                out.matched.resize(self.docs.len(), true);
+                out.up_to = self.end;
+            }
+            other => return Ok(other),
+        }
+        Ok(BlockStatus::Data)
+    }
+
+    fn block_end_at(&mut self, _target: u64) -> Result<u64> {
+        Ok(self.end)
+    }
+
+    fn upper_bound(&mut self, _window: &Window) -> Result<ScoreBounds> {
+        Ok(ScoreBounds::ZERO)
+    }
+}
+
+impl ComposableScorer for ScriptedChild {
+    fn doc(&self) -> Option<u64> {
+        None
+    }
+    fn next(&mut self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+    fn advance(&mut self, _target: u64) -> Result<Option<u64>> {
+        Ok(None)
+    }
+    fn cost(&self) -> usize {
+        1
+    }
+    fn score(&mut self) -> Result<f32> {
+        Ok(0.0)
+    }
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        Ok(target)
+    }
+    fn score_bounds(&mut self, _up_to: u64) -> Result<ScoreBounds> {
+        Ok(ScoreBounds::ZERO)
+    }
+    fn set_min_competitive_score(&mut self, _min_score: f32) -> Result<()> {
+        Ok(())
+    }
+    fn as_eval(&mut self) -> Option<&mut dyn BatchEvaluator> {
+        Some(self)
+    }
+    fn as_block(&mut self) -> Option<&mut dyn BlockScorer> {
+        Some(self)
+    }
+}
+
+#[test]
+fn block_conjunction_empty_then_data_keeps_the_window_progress() {
+    let child = ScriptedChild {
+        script: vec![BlockStatus::Empty { up_to: 127 }, BlockStatus::Data],
+        step: 0,
+        docs: vec![200],
+        end: 200,
+    };
+    let mut scorer = ConjunctionProducer::new(vec![Box::new(child)]).unwrap();
+    let mut out = BlockBuf::default();
+
+    assert_eq!(
+        BlockScorer::next_block(&mut scorer, 0, 128, &mut out).unwrap(),
+        BlockStatus::Empty { up_to: 127 }
+    );
+    assert!(out.docs.is_empty(), "an empty window must not emit");
+
+    assert_eq!(
+        BlockScorer::next_block(&mut scorer, 128, 128, &mut out).unwrap(),
+        BlockStatus::Data
+    );
+    assert_eq!(out.docs, vec![200]);
+    assert_eq!(out.up_to, 200, "the produced block ends at the window end");
+
+    assert_eq!(
+        BlockScorer::next_block(&mut scorer, 201, 128, &mut out).unwrap(),
+        BlockStatus::Exhausted
+    );
+}
+
+#[test]
+fn block_conjunction_u64_max_window_terminates_without_overflow() {
+    let child = ScriptedChild {
+        script: vec![BlockStatus::Empty { up_to: u64::MAX }],
+        step: 0,
+        docs: Vec::new(),
+        end: 0,
+    };
+    let mut scorer = ConjunctionProducer::new(vec![Box::new(child)]).unwrap();
+    let mut out = BlockBuf::default();
+
+    assert_eq!(
+        BlockScorer::next_block(&mut scorer, 0, 128, &mut out).unwrap(),
+        BlockStatus::Empty { up_to: u64::MAX }
+    );
+    // The caller's `next_target` turns u64::MAX into "stop", not u64::MAX + 1.
+    assert_eq!(
+        BlockScorer::next_block(&mut scorer, u64::MAX, 128, &mut out).unwrap(),
+        BlockStatus::Exhausted
+    );
 }
 
 #[test]
