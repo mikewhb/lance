@@ -3675,7 +3675,8 @@ impl<'a> ReqOptScorer<'a> {
         })
     }
 
-    fn next_block_must(&mut self, _target: u64, out: &mut BlockBuf) -> Result<BlockStatus> {
+    fn next_block_must(&mut self, target: u64, out: &mut BlockBuf) -> Result<BlockStatus> {
+        let window_up_to;
         {
             let (required, optional) = (&mut self.required, &mut self.optional);
             let Some(required_batch) = required.block_batch() else {
@@ -3685,9 +3686,56 @@ impl<'a> ReqOptScorer<'a> {
                 return Err(Error::internal("IU block walk lost its optional batches"));
             };
 
+            // Same window protocol as the promoted face, with the REQUIRED
+            // clause as the driver and every optional as a filter.
+            let probe = {
+                let mut filters: SmallVec<[&mut dyn BlockBatch; 8]> = SmallVec::new();
+                for optional in optionals.iter_mut() {
+                    filters.push(&mut **optional);
+                }
+                Self::probe_window(required_batch, &mut filters, target)?
+            };
+            window_up_to = match probe {
+                WindowProbe::Exhausted => {
+                    self.exhausted = true;
+                    return Ok(BlockStatus::Exhausted);
+                }
+                WindowProbe::Unbounded => None,
+                WindowProbe::Window { up_to, upper, .. } => {
+                    self.windows_examined += 1;
+                    #[cfg(test)]
+                    bump_iu_block_stats(|stats| stats.windows_examined += 1);
+                    if upper < self.min_competitive_score {
+                        self.windows_skipped += 1;
+                        #[cfg(test)]
+                        bump_iu_block_stats(|stats| stats.windows_skipped += 1);
+                        out.clear();
+                        out.start = up_to;
+                        out.up_to = up_to;
+                        return Ok(BlockStatus::Empty { up_to });
+                    }
+                    Some(up_to)
+                }
+            };
+
             self.chunk.clear();
-            required_batch.take_docs_one_block_upto(TERMINATED_DOC_ID, &mut self.chunk);
+            match window_up_to {
+                Some(up_to) => required_batch.take_docs_one_block_upto(up_to, &mut self.chunk),
+                None => required_batch.take_docs_one_block_upto(TERMINATED_DOC_ID, &mut self.chunk),
+            }
             if self.chunk.is_empty() {
+                if let Some(up_to) = window_up_to {
+                    // The driver was positioned inside this window, so an empty
+                    // chunk is a kernel bug. Reporting Exhausted here would
+                    // silently drop every remaining document.
+                    self.empty_chunks += 1;
+                    #[cfg(test)]
+                    bump_iu_block_stats(|stats| stats.empty_chunks += 1);
+                    out.clear();
+                    out.start = up_to;
+                    out.up_to = up_to;
+                    return Ok(BlockStatus::Empty { up_to });
+                }
                 self.exhausted = true;
                 return Ok(BlockStatus::Exhausted);
             }
@@ -3723,6 +3771,11 @@ impl<'a> ReqOptScorer<'a> {
         }
 
         self.emit_block(out)?;
+        if let Some(up_to) = window_up_to {
+            // The window, not the last emitted document, is what the caller
+            // has already consumed; otherwise the next window would overlap.
+            out.up_to = up_to;
+        }
         std::mem::swap(&mut self.dry, &mut self.dry_next);
 
         self.terminate_if_floor_unreachable();
@@ -3817,6 +3870,8 @@ impl<'a> ReqOptScorer<'a> {
                     // chunk is a kernel bug. Reporting Exhausted here would
                     // silently drop every remaining document.
                     self.empty_chunks += 1;
+                    #[cfg(test)]
+                    bump_iu_block_stats(|stats| stats.empty_chunks += 1);
                     out.clear();
                     out.start = up_to;
                     out.up_to = up_to;
