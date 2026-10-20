@@ -18,10 +18,11 @@ use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, Result};
 use lance_select::RowAddrMask;
 use lance_tokenizer::{SimpleTokenizer, TextAnalyzer};
+use smallvec::SmallVec;
 
 use super::{
     InvertedIndex, PreparedBm25Query,
-    block::{BatchEvaluator, BlockBuf, BlockScorer, BlockStatus},
+    block::{BatchEvaluator, BlockBuf, BlockScorer, BlockStatus, Window},
     document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer},
     documents::{
         CachedRowAddressOrder, DocId, DocLengths, DocVisibility, OrderedRowAddressProjection,
@@ -270,6 +271,35 @@ pub(super) trait BlockBatch {
     fn current_doc_id(&self) -> Option<u64>;
     fn global_upper_bound(&self) -> Option<f32>;
     fn cost(&self) -> usize;
+
+    /// Metadata-only positioning: the first document at or after `target`.
+    ///
+    /// Unlike [`Self::take_docs_one_block_upto`] this moves the cursor without
+    /// materializing a block. `None` means the provider is **exhausted**, not
+    /// that it is unsupported: a provider without window bounds still answers
+    /// this, so the caller never mistakes "no bound" for "no data".
+    fn seek_to(&mut self, target: u64) -> Result<Option<u64>>;
+
+    /// Inclusive end of the block holding `target`.
+    ///
+    /// `None` means this provider has no *true* window bound (grouped terms,
+    /// phrase positions, an unsupported block size), so the caller must not
+    /// use a window derived from it.
+    #[allow(dead_code)]
+    fn window_end_at(&mut self, _target: u64) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Conservative score upper bound over `window`.
+    ///
+    /// Must be called immediately after [`Self::window_end_at`] on this same
+    /// provider: the block kernels read the anchor block that call left
+    /// behind and do not position it themselves. `None` means no bound is
+    /// available and the caller must score the window.
+    #[allow(dead_code)]
+    fn window_upper_bound(&mut self, _window: &Window) -> Result<Option<f32>> {
+        Ok(None)
+    }
 }
 
 /// Driver-facing block face for a root `ReqOptScorer`.
@@ -281,6 +311,16 @@ pub(super) trait BlockProducer {
     fn next_block(&mut self, target: u64, budget: usize, out: &mut BlockBuf)
     -> Result<BlockStatus>;
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()>;
+
+    /// Window counters for the walk, in the order
+    /// `(examined, skipped, empty_chunks)`.
+    ///
+    /// Exposed so a release build can tell "the bounds never fired" from "the
+    /// bounds fired and pruned": the gates on skip counts would otherwise be
+    /// test-only claims.
+    fn window_stats(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
 }
 
 /// Internal document-at-a-time scorer protocol for compound FTS.
@@ -3214,12 +3254,27 @@ struct ReqOptScorer<'a> {
     floor_rejected: usize,
     visibility_rejected: usize,
     floor_terminated: usize,
+    windows_examined: usize,
+    windows_skipped: usize,
+    empty_chunks: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lead {
     Must,
     Should(usize),
+}
+
+/// Outcome of the window probe shared by both block faces.
+///
+/// `Unbounded` is the safe fallback: the caller takes the block without
+/// skipping. It is returned when any live clause cannot supply a true window
+/// bound, because a window derived from a subset of the clauses would
+/// under-estimate the score of documents in the missing clauses.
+enum WindowProbe {
+    Exhausted,
+    Unbounded,
+    Window { start: u64, up_to: u64, upper: f32 },
 }
 
 impl<'a> ReqOptScorer<'a> {
@@ -3260,6 +3315,9 @@ impl<'a> ReqOptScorer<'a> {
             floor_rejected: 0,
             visibility_rejected: 0,
             floor_terminated: 0,
+            windows_examined: 0,
+            windows_skipped: 0,
+            empty_chunks: 0,
         }
     }
 
@@ -3457,6 +3515,9 @@ struct IuBlockStats {
     pub promotions: usize,
     pub floor_terminations: usize,
     pub perdoc_calls: usize,
+    pub windows_examined: usize,
+    pub windows_skipped: usize,
+    pub empty_chunks: usize,
 }
 
 #[cfg(test)]
@@ -3466,6 +3527,9 @@ thread_local! {
         promotions: 0,
         floor_terminations: 0,
         perdoc_calls: 0,
+        windows_examined: 0,
+        windows_skipped: 0,
+        empty_chunks: 0,
     }) };
 }
 
@@ -3532,7 +3596,7 @@ fn live_upper_bound(dry: &[bool], ubs: &[f32]) -> f32 {
 impl<'a> BlockProducer for ReqOptScorer<'a> {
     fn next_block(
         &mut self,
-        _target: u64,
+        target: u64,
         budget: usize,
         out: &mut BlockBuf,
     ) -> Result<BlockStatus> {
@@ -3542,18 +3606,76 @@ impl<'a> BlockProducer for ReqOptScorer<'a> {
         let _ = budget;
         self.blocks += 1;
         match self.lead {
-            Lead::Must => self.next_block_must(out),
-            Lead::Should(index) => self.next_block_should(index, out),
+            Lead::Must => self.next_block_must(target, out),
+            Lead::Should(index) => self.next_block_should(index, target, out),
         }
     }
 
     fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
         ComposableScorer::set_min_competitive_score(self, min_score)
     }
+
+    fn window_stats(&self) -> (usize, usize, usize) {
+        (
+            self.windows_examined,
+            self.windows_skipped,
+            self.empty_chunks,
+        )
+    }
 }
 
 impl<'a> ReqOptScorer<'a> {
-    fn next_block_must(&mut self, out: &mut BlockBuf) -> Result<BlockStatus> {
+    /// Phases 0–3 of the window protocol.
+    ///
+    /// `driver` is the clause that owns the cursor: the promoted SHOULD on the
+    /// promoted face, the REQUIRED clause otherwise. `filters` are the clauses
+    /// that are only probed per candidate. Only the driver is sought;
+    /// `block_end_at` moves the other clauses' block anchors, which is all the
+    /// kernels need for `upper_bound`.
+    ///
+    /// The two calls per clause must stay paired: the block kernels read the
+    /// anchor that `block_end_at` left and do not position it themselves.
+    fn probe_window(
+        driver: &mut dyn BlockBatch,
+        filters: &mut [&mut dyn BlockBatch],
+        target: u64,
+    ) -> Result<WindowProbe> {
+        let Some(driver_doc) = driver.seek_to(target)? else {
+            return Ok(WindowProbe::Exhausted);
+        };
+        // A window that starts before the driver's cursor would yield an empty
+        // chunk, which the caller must not mistake for exhaustion.
+        let start = driver_doc.max(target);
+        let Some(mut up_to) = driver.window_end_at(start)? else {
+            return Ok(WindowProbe::Unbounded);
+        };
+        for filter in filters.iter_mut() {
+            let Some(end) = filter.window_end_at(start)? else {
+                return Ok(WindowProbe::Unbounded);
+            };
+            up_to = up_to.min(end);
+        }
+        let window = Window { start, up_to };
+        let mut uppers = SmallVec::<[f32; 8]>::new();
+        let Some(driver_bound) = driver.window_upper_bound(&window)? else {
+            return Ok(WindowProbe::Unbounded);
+        };
+        uppers.push(driver_bound);
+        for filter in filters.iter_mut() {
+            let Some(bound) = filter.window_upper_bound(&window)? else {
+                return Ok(WindowProbe::Unbounded);
+            };
+            uppers.push(bound);
+        }
+        let upper = conservative_score_sum(uppers.iter().copied());
+        Ok(WindowProbe::Window {
+            start,
+            up_to,
+            upper,
+        })
+    }
+
+    fn next_block_must(&mut self, _target: u64, out: &mut BlockBuf) -> Result<BlockStatus> {
         {
             let (required, optional) = (&mut self.required, &mut self.optional);
             let Some(required_batch) = required.block_batch() else {
@@ -3615,7 +3737,12 @@ impl<'a> ReqOptScorer<'a> {
         }
     }
 
-    fn next_block_should(&mut self, index: usize, out: &mut BlockBuf) -> Result<BlockStatus> {
+    fn next_block_should(
+        &mut self,
+        index: usize,
+        target: u64,
+        out: &mut BlockBuf,
+    ) -> Result<BlockStatus> {
         {
             let (required, optional) = (&mut self.required, &mut self.optional);
             let Some(required_batch) = required.block_batch() else {
@@ -3630,14 +3757,71 @@ impl<'a> ReqOptScorer<'a> {
                 return Err(Error::internal("IU promoted lead is out of range"));
             }
 
+            // A window whose bound is already below the floor needs no
+            // per-candidate work at all. Only the lead is sought; the required
+            // clause and the other optionals contribute their block bounds and
+            // are probed per candidate below.
+            let window = {
+                let (leading, trailing) = optionals.split_at_mut(index);
+                let (lead, rest) = trailing.split_first_mut().expect("index checked");
+                let mut filters: SmallVec<[&mut dyn BlockBatch; 8]> = SmallVec::new();
+                filters.push(&mut *required_batch);
+                for optional in leading.iter_mut() {
+                    filters.push(&mut **optional);
+                }
+                for optional in rest.iter_mut() {
+                    filters.push(&mut **optional);
+                }
+                Self::probe_window(&mut **lead, &mut filters, target)?
+            };
+            let mut window_up_to = None;
+            match window {
+                WindowProbe::Exhausted => {
+                    self.exhausted = true;
+                    return Ok(BlockStatus::Exhausted);
+                }
+                WindowProbe::Unbounded => {}
+                WindowProbe::Window {
+                    start,
+                    up_to,
+                    upper,
+                } => {
+                    self.windows_examined += 1;
+                    debug_assert!(start <= up_to);
+                    if upper < self.min_competitive_score {
+                        self.windows_skipped += 1;
+                        out.clear();
+                        out.start = up_to;
+                        out.up_to = up_to;
+                        return Ok(BlockStatus::Empty { up_to });
+                    }
+                    window_up_to = Some(up_to);
+                }
+            }
+
             // `merge_optional_freqs` leaves a required-driven block parked on
             // the first optional document after the block's last document, so
             // the promoted lead always resumes strictly past the documents the
             // walk already scored. A block source that ever left the cursor on
             // a match would re-emit that document here.
             self.chunk.clear();
-            optionals[index].take_docs_one_block_upto(TERMINATED_DOC_ID, &mut self.chunk);
+            match window_up_to {
+                Some(up_to) => optionals[index].take_docs_one_block_upto(up_to, &mut self.chunk),
+                None => {
+                    optionals[index].take_docs_one_block_upto(TERMINATED_DOC_ID, &mut self.chunk)
+                }
+            }
             if self.chunk.is_empty() {
+                if let Some(up_to) = window_up_to {
+                    // The lead was positioned inside this window, so an empty
+                    // chunk is a kernel bug. Reporting Exhausted here would
+                    // silently drop every remaining document.
+                    self.empty_chunks += 1;
+                    out.clear();
+                    out.start = up_to;
+                    out.up_to = up_to;
+                    return Ok(BlockStatus::Empty { up_to });
+                }
                 self.exhausted = true;
                 return Ok(BlockStatus::Exhausted);
             }
@@ -3654,7 +3838,8 @@ impl<'a> ReqOptScorer<'a> {
 
             out.clear();
             out.start = self.candidates[0];
-            out.up_to = *self.candidates.last().expect("non-empty promoted chunk");
+            out.up_to = window_up_to
+                .unwrap_or_else(|| *self.candidates.last().expect("non-empty promoted chunk"));
             let floor = self.min_competitive_score;
 
             for i in 0..self.candidates.len() {
@@ -4719,6 +4904,14 @@ where
             },
             BlockStatus::Exhausted => break,
         }
+    }
+    // Release-visible so a gate can tell "the bounds never fired" from "the
+    // bounds fired and pruned"; the per-walk counters are otherwise invisible.
+    let (examined, skipped, empty_chunks) = root.window_stats();
+    if examined > 0 {
+        log::debug!(
+            "IU block walk: windows examined={examined} skipped={skipped} empty={empty_chunks}"
+        );
     }
     Ok(CollectionStatus::Complete)
 }
@@ -7815,7 +8008,7 @@ mod tests {
         assert!(!scorer.required_is_leaf());
     }
 }
-use crate::scalar::inverted::block::{Capacities, EvalOut, Window};
+use crate::scalar::inverted::block::{Capacities, EvalOut};
 
 /// Minimal child that advertises both block capabilities, so the scaling
 /// forwarder can be observed without building a posting source.
@@ -8174,6 +8367,121 @@ fn iu_block_face_terminates_once_the_floor_clears_every_upper_bound() {
     // Without the termination the walk would keep pulling blocks whose best
     // possible score is already below the floor.
     assert!(block_stats.floor_terminations > 0);
+}
+
+/// Minimal `BlockBatch` that answers only the window protocol, so the probe
+/// can be tested without building a scorer tree.
+struct ProbeBatch {
+    doc: Option<u64>,
+    end: Option<u64>,
+    bound: Option<f32>,
+}
+
+impl BlockBatch for ProbeBatch {
+    fn take_docs_one_block_upto(&mut self, _upto: u64, out: &mut Vec<(u64, u32)>) {
+        out.clear();
+    }
+    fn term_scores_batch(&self, _docs: &[u64], _freqs: &[u32], out: &mut [f32]) {
+        out.fill(0.0);
+    }
+    fn document_keys_batch(&self, _docs: &[u64], out: &mut Vec<Option<u64>>) {
+        out.clear();
+    }
+    fn fold_optional_scores(&mut self, _docs: &[u64], _sums: &mut [f32]) {}
+    fn seek_eq(&mut self, _doc: u64) -> Option<u32> {
+        None
+    }
+    fn term_score(&self, _doc: u64, _freq: u32) -> f32 {
+        0.0
+    }
+    fn current_doc_id(&self) -> Option<u64> {
+        self.doc
+    }
+    fn global_upper_bound(&self) -> Option<f32> {
+        self.bound
+    }
+    fn cost(&self) -> usize {
+        0
+    }
+    fn seek_to(&mut self, target: u64) -> Result<Option<u64>> {
+        Ok(self.doc.filter(|doc| *doc >= target))
+    }
+    fn window_end_at(&mut self, _target: u64) -> Result<Option<u64>> {
+        Ok(self.end)
+    }
+    fn window_upper_bound(&mut self, _window: &Window) -> Result<Option<f32>> {
+        Ok(self.bound)
+    }
+}
+
+#[test]
+fn window_probe_takes_the_minimum_end_and_sums_the_bounds() {
+    let mut driver = ProbeBatch {
+        doc: Some(10),
+        end: Some(200),
+        bound: Some(1.5),
+    };
+    let mut near = ProbeBatch {
+        doc: None,
+        end: Some(150),
+        bound: Some(0.25),
+    };
+    let mut far = ProbeBatch {
+        doc: None,
+        end: Some(400),
+        bound: Some(0.5),
+    };
+    let mut filters: [&mut dyn BlockBatch; 2] = [&mut near, &mut far];
+    match ReqOptScorer::probe_window(&mut driver, &mut filters, 5).unwrap() {
+        WindowProbe::Window {
+            start,
+            up_to,
+            upper,
+        } => {
+            assert_eq!(start, 10, "window starts at the driver cursor");
+            assert_eq!(up_to, 150, "window ends at the tightest clause");
+            // `conservative_score_sum` widens the sum by an ULP or two so a
+            // document tying the floor cannot be pruned by rounding.
+            assert!(
+                (2.25..=2.2501).contains(&upper),
+                "bounds are summed and widened: {upper}"
+            );
+        }
+        _ => panic!("a full bound set must produce a window"),
+    }
+}
+
+#[test]
+fn window_probe_falls_back_when_any_clause_has_no_bound() {
+    let mut driver = ProbeBatch {
+        doc: Some(0),
+        end: Some(10),
+        bound: Some(1.0),
+    };
+    let mut unbounded = ProbeBatch {
+        doc: None,
+        end: None,
+        bound: None,
+    };
+    let mut filters: [&mut dyn BlockBatch; 1] = [&mut unbounded];
+    assert!(matches!(
+        ReqOptScorer::probe_window(&mut driver, &mut filters, 0).unwrap(),
+        WindowProbe::Unbounded
+    ));
+}
+
+#[test]
+fn window_probe_reports_exhaustion_only_when_the_driver_runs_out() {
+    let mut driver = ProbeBatch {
+        doc: None,
+        end: Some(10),
+        bound: Some(1.0),
+    };
+    let mut filters: [&mut dyn BlockBatch; 0] = [];
+    assert!(matches!(
+        ReqOptScorer::probe_window(&mut driver, &mut filters, 50).unwrap(),
+        WindowProbe::Exhausted
+    ));
 }
 
 #[test]

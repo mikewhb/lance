@@ -15217,6 +15217,80 @@ mod tests {
     }
 
     #[test]
+    fn block_batch_exposes_window_bounds() {
+        let lengths = block_test_lengths();
+        let docs = block_test_documents(&lengths);
+        let even = block_test_clause_docs(0);
+        let posting = || {
+            PostingIterator::with_query_weight(
+                "even".to_owned(),
+                0,
+                0,
+                1.0,
+                generate_impact_posting_list_with_freqs_and_block_size(
+                    even.clone(),
+                    vec![1; even.len()],
+                    even.iter().map(|&doc| lengths[doc as usize]).collect(),
+                    128,
+                ),
+                lengths.len(),
+            )
+        };
+        let params = block_test_params();
+        let metrics = NoOpMetricsCollector;
+        let window_at = |first: u64, end: u64| crate::scalar::inverted::block::Window {
+            start: first,
+            up_to: end,
+        };
+
+        // Reference values from the cursor's own block face.
+        let mut probe = WandCursor::new_with_blocks(
+            Operator::Or,
+            vec![posting()],
+            &docs,
+            block_test_scorer(),
+            &params,
+            &metrics,
+        );
+        let target = 205_u64;
+        let first = probe.seek(target).unwrap().expect("target is in range");
+        let end = probe.block_end_at(target).unwrap();
+        let expected = probe.upper_bound(&window_at(first, end)).unwrap().upper();
+
+        let mut cursor = WandCursor::new_with_blocks(
+            Operator::Or,
+            vec![posting()],
+            &docs,
+            block_test_scorer(),
+            &params,
+            &metrics,
+        );
+        {
+            let batch = cursor.block_batch_view().expect("single compressed leaf");
+            assert_eq!(batch.seek_to(target).unwrap(), Some(first));
+            assert_eq!(batch.window_end_at(target).unwrap(), Some(end));
+            let bound = batch
+                .window_upper_bound(&window_at(first, end))
+                .unwrap()
+                .expect("window bounds are available");
+            assert_eq!(bound, expected);
+            assert!(bound >= 0.0);
+        }
+
+        // A cursor built without block sources must not pretend to have a
+        // window bound; the walk would otherwise derive a window from None.
+        let mut flat = WandCursor::new_without_blocks(
+            Operator::Or,
+            vec![posting()],
+            &docs,
+            block_test_scorer(),
+            &params,
+            &metrics,
+        );
+        assert!(flat.block_batch_view().is_none());
+    }
+
+    #[test]
     fn block_face_handles_a_single_clause() {
         let lengths = block_test_lengths();
         let docs = block_test_documents(&lengths);

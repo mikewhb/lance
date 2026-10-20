@@ -437,4 +437,29 @@ impl<D: WandDocuments> BlockBatch for BlockPostingSet<'_, D> {
     fn cost(&self) -> usize {
         self.postings[0].cost()
     }
+
+    /// Metadata-only positioning through the block kernel, so the caller can
+    /// open a window without materializing the block first.
+    fn seek_to(&mut self, target: u64) -> Result<Option<u64>> {
+        BlockScorer::seek(self, target)
+    }
+
+    /// True only when the leaf's block maxima are real window bounds. The
+    /// caller derives a window from every live clause, so a clause that can
+    /// only offer a loose bound must opt out instead of widening the window.
+    fn window_end_at(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.postings.len() != 1 || !self.caps.window_bounds {
+            return Ok(None);
+        }
+        BlockScorer::block_end_at(self, target).map(Some)
+    }
+
+    /// Reads the anchor block left by [`Self::window_end_at`]; the kernels do
+    /// not position it here.
+    fn window_upper_bound(&mut self, window: &Window) -> Result<Option<f32>> {
+        if self.postings.len() != 1 || !self.caps.window_bounds {
+            return Ok(None);
+        }
+        BlockScorer::upper_bound(self, window).map(|bounds| Some(bounds.upper()))
+    }
 }
