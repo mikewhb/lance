@@ -3584,6 +3584,14 @@ fn iu_cannot_compete(must_ub: f32, optional_ub: f32, floor: f32) -> bool {
     )
 }
 
+/// Probing a window costs `seek + (N+1) * (window_end_at + window_upper_bound)`
+/// per window, independent of how many candidates it holds. That pays only
+/// when the list-wide bound is *just* above the floor: then the per-window
+/// bound is what decides, and most windows fall below it. When the list-wide
+/// bound is far above the floor every window would be scored anyway, and the
+/// probe is pure overhead on shapes the block walk already wins.
+const WINDOW_PROBE_MARGIN: f32 = 0.05;
+
 fn live_upper_bound(dry: &[bool], ubs: &[f32]) -> f32 {
     conservative_score_sum(
         ubs.iter()
@@ -3625,12 +3633,24 @@ impl<'a> BlockProducer for ReqOptScorer<'a> {
 }
 
 impl<'a> ReqOptScorer<'a> {
+    /// Whether the list-wide bound is tight enough for a window probe to
+    /// change the outcome. See [`WINDOW_PROBE_MARGIN`].
+    fn window_probe_is_worthwhile(&self) -> bool {
+        let floor = self.min_competitive_score;
+        if !floor.is_finite() || floor <= 0.0 {
+            return false;
+        }
+        let live = live_upper_bound(&self.dry, &self.should_ubs);
+        let list_wide = conservative_score_sum([self.must_ub, live].into_iter());
+        list_wide.is_finite() && list_wide <= floor * (1.0 + WINDOW_PROBE_MARGIN)
+    }
+
     /// Phases 0–3 of the window protocol.
     ///
     /// `driver` is the clause that owns the cursor: the promoted SHOULD on the
     /// promoted face, the REQUIRED clause otherwise. `filters` are the clauses
     /// that are only probed per candidate. Only the driver is sought;
-    /// `block_end_at` moves the other clauses' block anchors, which is all the
+    /// `window_end_at` moves the other clauses' block anchors, which is all the
     /// kernels need for `upper_bound`.
     ///
     /// The two calls per clause must stay paired: the block kernels read the
@@ -3677,6 +3697,7 @@ impl<'a> ReqOptScorer<'a> {
 
     fn next_block_must(&mut self, target: u64, out: &mut BlockBuf) -> Result<BlockStatus> {
         let window_up_to;
+        let probe_worthwhile = self.window_probe_is_worthwhile();
         {
             let (required, optional) = (&mut self.required, &mut self.optional);
             let Some(required_batch) = required.block_batch() else {
@@ -3688,12 +3709,14 @@ impl<'a> ReqOptScorer<'a> {
 
             // Same window protocol as the promoted face, with the REQUIRED
             // clause as the driver and every optional as a filter.
-            let probe = {
+            let probe = if probe_worthwhile {
                 let mut filters: SmallVec<[&mut dyn BlockBatch; 8]> = SmallVec::new();
                 for optional in optionals.iter_mut() {
                     filters.push(&mut **optional);
                 }
                 Self::probe_window(required_batch, &mut filters, target)?
+            } else {
+                WindowProbe::Unbounded
             };
             window_up_to = match probe {
                 WindowProbe::Exhausted => {
@@ -3701,8 +3724,13 @@ impl<'a> ReqOptScorer<'a> {
                     return Ok(BlockStatus::Exhausted);
                 }
                 WindowProbe::Unbounded => None,
-                WindowProbe::Window { up_to, upper, .. } => {
+                WindowProbe::Window {
+                    start,
+                    up_to,
+                    upper,
+                } => {
                     self.windows_examined += 1;
+                    debug_assert!(start <= up_to);
                     #[cfg(test)]
                     bump_iu_block_stats(|stats| stats.windows_examined += 1);
                     if upper < self.min_competitive_score {
@@ -3796,6 +3824,7 @@ impl<'a> ReqOptScorer<'a> {
         target: u64,
         out: &mut BlockBuf,
     ) -> Result<BlockStatus> {
+        let probe_worthwhile = self.window_probe_is_worthwhile();
         {
             let (required, optional) = (&mut self.required, &mut self.optional);
             let Some(required_batch) = required.block_batch() else {
@@ -3814,7 +3843,7 @@ impl<'a> ReqOptScorer<'a> {
             // per-candidate work at all. Only the lead is sought; the required
             // clause and the other optionals contribute their block bounds and
             // are probed per candidate below.
-            let window = {
+            let window = if probe_worthwhile {
                 let (leading, trailing) = optionals.split_at_mut(index);
                 let (lead, rest) = trailing.split_first_mut().expect("index checked");
                 let mut filters: SmallVec<[&mut dyn BlockBatch; 8]> = SmallVec::new();
@@ -3826,6 +3855,8 @@ impl<'a> ReqOptScorer<'a> {
                     filters.push(&mut **optional);
                 }
                 Self::probe_window(&mut **lead, &mut filters, target)?
+            } else {
+                WindowProbe::Unbounded
             };
             let mut window_up_to = None;
             match window {
@@ -3840,9 +3871,13 @@ impl<'a> ReqOptScorer<'a> {
                     upper,
                 } => {
                     self.windows_examined += 1;
+                    #[cfg(test)]
+                    bump_iu_block_stats(|stats| stats.windows_examined += 1);
                     debug_assert!(start <= up_to);
                     if upper < self.min_competitive_score {
                         self.windows_skipped += 1;
+                        #[cfg(test)]
+                        bump_iu_block_stats(|stats| stats.windows_skipped += 1);
                         out.clear();
                         out.start = up_to;
                         out.up_to = up_to;
@@ -8348,6 +8383,52 @@ fn iu_block_face_matches_per_document() {
     // Once the block face is engaged, every block is produced in bulk; a
     // per-document positioning call would mean a silent fallback.
     assert_eq!(block_stats.perdoc_calls, 0);
+}
+
+#[test]
+fn iu_block_face_matches_per_document_for_every_result() {
+    let num_docs = 300_u64;
+    let documents = TestDocuments {
+        len: num_docs as usize,
+    };
+    let scorer = iu_scorer(num_docs);
+    let params = Arc::new(FtsSearchParams::new());
+    let all: Vec<u64> = (0..num_docs).collect();
+    let even: Vec<u64> = (0..num_docs).step_by(2).collect();
+    let leaves = || {
+        vec![
+            LoadedLeaf {
+                postings: vec![iu_posting(&all, 1.0)],
+                params: params.clone(),
+                operator: Operator::Or,
+                scorer: scorer.clone(),
+            },
+            LoadedLeaf {
+                postings: vec![iu_posting(&even, 1.0)],
+                params: params.clone(),
+                operator: Operator::Or,
+                scorer: scorer.clone(),
+            },
+        ]
+    };
+    let plan = iu_plan(1, 1);
+
+    // k covers the whole match set: a window whose `up_to` is wrong would
+    // drop or duplicate rows, which the top-10 tests cannot see.
+    let (per_document, _) = iu_run(&documents, leaves, &plan, num_docs as usize, false);
+    let (block, _) = iu_run(&documents, leaves, &plan, num_docs as usize, true);
+    assert_eq!(per_document, block);
+
+    let mut rows: Vec<u64> = block.iter().map(|row| row.row_id).collect();
+    let emitted = rows.len();
+    rows.sort_unstable();
+    rows.dedup();
+    assert_eq!(rows.len(), emitted, "block walk emitted a duplicate row");
+    // Fixture doc 5 has no document key, so both paths must omit it.
+    assert!(
+        !rows.contains(&5),
+        "a filtered document must not be emitted"
+    );
 }
 
 #[test]
