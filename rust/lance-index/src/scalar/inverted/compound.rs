@@ -3203,6 +3203,8 @@ struct ReqOptScorer<'a> {
     dry_next: Vec<bool>,
     must_ub: f32,
     should_ubs: Vec<f32>,
+    required_cost: usize,
+    should_costs: Vec<usize>,
     lead: Lead,
     promoted: bool,
     promotions: usize,
@@ -3247,6 +3249,8 @@ impl<'a> ReqOptScorer<'a> {
             dry_next: Vec::new(),
             must_ub: f32::NEG_INFINITY,
             should_ubs: Vec::new(),
+            required_cost: 0,
+            should_costs: Vec::new(),
             lead: Lead::Must,
             promoted: false,
             promotions: 0,
@@ -3751,6 +3755,14 @@ impl<'a> ReqOptScorer<'a> {
         }
     }
 
+    /// Switches the driver from the required list to one optional list when
+    /// only that optional can still hold the floor.
+    ///
+    /// Both modes enumerate every candidate of their driver, so the swap only
+    /// reduces work when the optional is shorter than the required list.
+    /// Promoting to a longer one multiplies the enumerated candidates by the
+    /// length ratio for the same result, which is why the cost comparison is
+    /// part of the admission rule and not just a tie-break.
     fn maybe_promote(&mut self) {
         if self.promoted || !self.min_competitive_score.is_finite() {
             return;
@@ -3758,8 +3770,16 @@ impl<'a> ReqOptScorer<'a> {
         if self.min_competitive_score <= self.must_ub {
             return;
         }
+        let mut candidate: Option<(usize, usize)> = None;
         for index in 0..self.should_ubs.len() {
             if self.dry[index] {
+                continue;
+            }
+            let cost = self.should_costs[index];
+            if cost == 0 || cost >= self.required_cost {
+                continue;
+            }
+            if candidate.is_some_and(|(cheapest, _)| cost >= cheapest) {
                 continue;
             }
             let others = conservative_score_sum(
@@ -3770,13 +3790,15 @@ impl<'a> ReqOptScorer<'a> {
                     .map(|(_, upper)| *upper),
             );
             if iu_cannot_compete(self.must_ub, others, self.min_competitive_score) {
-                self.lead = Lead::Should(index);
-                self.promoted = true;
-                self.promotions += 1;
-                #[cfg(test)]
-                bump_iu_block_stats(|stats| stats.promotions += 1);
-                return;
+                candidate = Some((cost, index));
             }
+        }
+        if let Some((_, index)) = candidate {
+            self.lead = Lead::Should(index);
+            self.promoted = true;
+            self.promotions += 1;
+            #[cfg(test)]
+            bump_iu_block_stats(|stats| stats.promotions += 1);
         }
     }
 }
@@ -3949,7 +3971,7 @@ impl ComposableScorer for ReqOptScorer<'_> {
             return None;
         }
 
-        let (must_ub, should_ubs) = {
+        let (must_ub, should_ubs, should_costs, required_cost) = {
             let required_batch = self.required.block_batch()?;
             let optionals = self.optional.block_batch_children()?;
             let required_cost = required_batch.cost();
@@ -3961,14 +3983,18 @@ impl ComposableScorer for ReqOptScorer<'_> {
             }
             let must_ub = required_batch.global_upper_bound()?;
             let mut should_ubs = Vec::with_capacity(optionals.len());
+            let mut should_costs = Vec::with_capacity(optionals.len());
             for optional in &optionals {
                 should_ubs.push(optional.global_upper_bound()?);
+                should_costs.push(optional.cost());
             }
-            (must_ub, should_ubs)
+            (must_ub, should_ubs, should_costs, required_cost)
         };
 
         self.must_ub = must_ub;
         self.should_ubs = should_ubs;
+        self.required_cost = required_cost;
+        self.should_costs = should_costs;
         self.dry = vec![false; self.should_ubs.len()];
         self.dry_next = vec![false; self.should_ubs.len()];
         self.lead = Lead::Must;
@@ -8277,9 +8303,9 @@ fn iu_block_face_matches_per_document_with_several_optionals(#[case] optionals: 
 
 #[test]
 fn iu_block_face_never_re_emits_a_document_after_promotion() {
-    // The optional covers every document, so its cursor sits exactly on each
-    // required block boundary when promotion happens. The lead must continue
-    // strictly after the documents the required side already scored.
+    // The optional is shorter than the required list but still alive when the
+    // floor rises, so promotion happens and the lead continues on documents
+    // the required side has already walked past.
     let num_docs = 300_u64;
     let documents = TestDocuments {
         len: num_docs as usize,
@@ -8287,6 +8313,7 @@ fn iu_block_face_never_re_emits_a_document_after_promotion() {
     let scorer = iu_scorer(num_docs);
     let params = Arc::new(FtsSearchParams::new());
     let all: Vec<u64> = (0..num_docs).collect();
+    let shorter: Vec<u64> = (0..280).collect();
     let leaves = || {
         vec![
             LoadedLeaf {
@@ -8296,7 +8323,7 @@ fn iu_block_face_never_re_emits_a_document_after_promotion() {
                 scorer: scorer.clone(),
             },
             LoadedLeaf {
-                postings: vec![iu_posting(&all, 100.0)],
+                postings: vec![iu_posting(&shorter, 100.0)],
                 params: params.clone(),
                 operator: Operator::Or,
                 scorer: scorer.clone(),
@@ -8315,4 +8342,50 @@ fn iu_block_face_never_re_emits_a_document_after_promotion() {
     rows.sort_unstable();
     rows.dedup();
     assert_eq!(rows.len(), total, "the block walk emitted a duplicate row");
+}
+
+#[cfg(test)]
+#[rstest::rstest]
+#[case::equal_length(300, 300)]
+#[case::optional_longer(150, 300)]
+fn iu_block_face_declines_promotion_to_a_longer_optional(
+    #[case] must_docs: u64,
+    #[case] should_docs: u64,
+) {
+    // The optional carries a huge weight, so the score condition alone would
+    // promote to it. Because it is not shorter than the required list, the
+    // promoted walk would enumerate more documents than the required-driven
+    // one and the promotion must be refused.
+    let num_docs = 300_u64;
+    let documents = TestDocuments {
+        len: num_docs as usize,
+    };
+    let scorer = iu_scorer(num_docs);
+    let params = Arc::new(FtsSearchParams::new());
+    let must: Vec<u64> = (0..must_docs).collect();
+    let should: Vec<u64> = (0..should_docs).collect();
+    let leaves = || {
+        vec![
+            LoadedLeaf {
+                postings: vec![iu_posting(&must, 1.0)],
+                params: params.clone(),
+                operator: Operator::Or,
+                scorer: scorer.clone(),
+            },
+            LoadedLeaf {
+                postings: vec![iu_posting(&should, 100.0)],
+                params: params.clone(),
+                operator: Operator::Or,
+                scorer: scorer.clone(),
+            },
+        ]
+    };
+    let plan = iu_plan(1, 1);
+
+    let (per_document, _) = iu_run(&documents, leaves, &plan, 10, false);
+    let (block, block_stats) = iu_run(&documents, leaves, &plan, 10, true);
+
+    assert_eq!(per_document, block);
+    assert!(block_stats.engagements > 0);
+    assert_eq!(block_stats.promotions, 0);
 }
