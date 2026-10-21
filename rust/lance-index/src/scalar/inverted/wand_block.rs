@@ -282,6 +282,19 @@ impl<D: WandDocuments> BatchEvaluator for BlockPostingSet<'_, D> {
 }
 
 impl<D: WandDocuments> BlockScorer for BlockPostingSet<'_, D> {
+    /// One positioning pass for the window end and its bound. The per-document
+    /// collector asks for both once per window, so the default two-pass
+    /// implementation would position every clause twice.
+    fn window_bounds_at(&mut self, target: u64) -> Result<(u64, ScoreBounds)> {
+        if target > MAX_DOC_ID {
+            return Ok((u64::MAX, ScoreBounds::ZERO));
+        }
+        match self.operator {
+            Operator::Or => self.or_kernel().window_bounds_at(target),
+            Operator::And => self.and_kernel().window_bounds_at(target),
+        }
+    }
+
     fn caps(&self) -> Capacities {
         self.caps
     }

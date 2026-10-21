@@ -168,6 +168,20 @@ pub(super) trait BlockScorer: BatchEvaluator {
 
     /// Conservative bound for the supplied window. Must be position-preserving.
     fn upper_bound(&mut self, window: &Window) -> Result<ScoreBounds>;
+
+    /// Window end and bound in one positioning pass.
+    ///
+    /// The default runs the two calls separately, which positions every clause
+    /// twice. Implementations that own their clause cursors override this to
+    /// share one positioning pass.
+    fn window_bounds_at(&mut self, target: u64) -> Result<(u64, ScoreBounds)> {
+        let up_to = self.block_end_at(target)?;
+        let bounds = self.upper_bound(&Window {
+            start: target,
+            up_to,
+        })?;
+        Ok((up_to, bounds))
+    }
 }
 
 #[allow(dead_code)]

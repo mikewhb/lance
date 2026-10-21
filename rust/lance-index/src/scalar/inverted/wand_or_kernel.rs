@@ -110,6 +110,28 @@ impl<'a, 's, S: Scorer + ?Sized, D: WandDocuments> OrUnionKernel<'a, 's, S, D> {
         Ok(up_to)
     }
 
+    /// Window end and bound sharing one positioning pass.
+    ///
+    /// `block_end_at` leaves each posting's anchor on the window block, so the
+    /// bound can be read from the same anchors without seeking again.
+    pub(super) fn window_bounds_at(
+        &mut self,
+        target: u64,
+    ) -> Result<(u64, crate::scalar::inverted::compound::ScoreBounds)> {
+        use crate::scalar::inverted::compound::ScoreBounds;
+        let mut up_to = u64::MAX;
+        for posting in self.postings.iter_mut() {
+            posting.shallow_next(target);
+            up_to = up_to.min(super::and_kernel::posting_block_up_to(posting, target));
+        }
+        let upper = super::conservative_score_sum(
+            self.postings
+                .iter()
+                .map(|posting| posting.window_max_score(Some(up_to), self.scorer)),
+        );
+        ScoreBounds::try_new(0.0, upper).map(|bounds| (up_to, bounds))
+    }
+
     /// Requires `block_end_at(target)` immediately before this call: the bound
     /// reads each posting's anchor block (`block_idx`), and this method does
     /// not position the anchor itself. Pairing the two is what keeps the bound

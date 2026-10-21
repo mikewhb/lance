@@ -6579,14 +6579,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                     self.shallow = Some((target, up_to, upper));
                     return Ok(up_to);
                 }
-                let up_to = BlockScorer::block_end_at(set, target)?;
-                let bound = BlockScorer::upper_bound(
-                    set,
-                    &Window {
-                        start: target,
-                        up_to,
-                    },
-                )?;
+                let (up_to, bound) = BlockScorer::window_bounds_at(set, target)?;
                 #[cfg(test)]
                 {
                     self.block_probes.bounds_computed += 1;

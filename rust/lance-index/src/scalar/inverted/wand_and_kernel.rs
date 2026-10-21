@@ -725,6 +725,26 @@ impl<'a, 's, S: Scorer, D: WandDocuments> AndMergeKernel<'a, 's, S, D> {
         Ok(up_to)
     }
 
+    /// Window end and bound sharing one positioning pass.
+    ///
+    /// `block_end_at` + `upper_bound` would run `shallow_next` twice per
+    /// clause; here the bound reads the anchors the first loop already set.
+    pub(super) fn window_bounds_at(&mut self, target: u64) -> Result<(u64, ScoreBounds)> {
+        self.save_block_anchors();
+        let mut up_to = TERMINATED_DOC_ID;
+        for posting in self.postings.iter_mut() {
+            posting.shallow_next(target);
+            up_to = up_to.min(posting_block_up_to(posting, target));
+        }
+        let upper = conservative_score_sum(self.postings.iter().map(|posting| {
+            posting
+                .block_max_score_up_to_with_stats(up_to, self.scorer)
+                .score
+        }));
+        self.restore_block_anchors();
+        Ok((up_to, ScoreBounds::try_new(0.0, upper)?))
+    }
+
     /// Conservative bound for `window`: the sum of every clause's block maxima
     /// over the window. Restores the block anchors it touches.
     pub(super) fn upper_bound(&mut self, window: &Window) -> Result<ScoreBounds> {
