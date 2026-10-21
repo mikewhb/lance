@@ -37,15 +37,13 @@ pub(in super::super) struct TermReqOptScorer<'a, D: WandDocuments> {
     /// Per-document norm codes and their BM25 denominator addends; scoring
     /// through them is bit-identical to `Scorer::doc_weight`.
     norms: Option<(&'a [u8], Arc<[f32; 256]>)>,
-    cost: usize,
     floor: f32,
     exhausted: bool,
     hits: Vec<(u64, u32)>,
     docs: Vec<u64>,
     freqs: Vec<u32>,
     must_scores: Vec<Option<f32>>,
-    should_sums: Vec<f32>,
-    should_matched: Vec<bool>,
+    should_sums: Vec<Option<f32>>,
     scores: Vec<f32>,
     next_hit: usize,
     /// `(doc, document key, score)` of the emitted document.
@@ -75,7 +73,6 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
         scorer: Arc<MemBM25Scorer>,
         metrics: &'a dyn MetricsCollector,
     ) -> Self {
-        let cost = must.cost().min(documents.visible_cost_upper_bound());
         let postings = std::iter::once(must).chain(shoulds).collect::<Vec<_>>();
         let global_uppers = postings
             .iter()
@@ -89,7 +86,6 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
             documents,
             scorer,
             norms,
-            cost,
             floor: f32::NEG_INFINITY,
             exhausted: false,
             hits: Vec::new(),
@@ -97,7 +93,6 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
             freqs: Vec::new(),
             must_scores: Vec::new(),
             should_sums: Vec::new(),
-            should_matched: Vec::new(),
             scores: Vec::new(),
             next_hit: 0,
             current: None,
@@ -120,7 +115,9 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
     }
 
     pub(in super::super) fn cost(&self) -> usize {
-        self.cost
+        self.postings[MUST]
+            .cost()
+            .min(self.documents.visible_cost_upper_bound())
     }
 
     pub(in super::super) fn raise_floor(&mut self, floor: f32) {
@@ -312,7 +309,6 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
             freqs,
             must_scores,
             should_sums,
-            should_matched,
             scores,
             ..
         } = self;
@@ -324,9 +320,7 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
         must_scores.clear();
         must_scores.resize(count, None);
         should_sums.clear();
-        should_sums.resize(count, 0.0);
-        should_matched.clear();
-        should_matched.resize(count, false);
+        should_sums.resize(count, None);
         for (clause, posting) in postings.iter_mut().enumerate() {
             freqs.clear();
             if clause == driver {
@@ -343,8 +337,7 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
                 if clause == MUST {
                     must_scores[slot] = Some(0.0_f32 + score);
                 } else {
-                    should_sums[slot] += score;
-                    should_matched[slot] = true;
+                    should_sums[slot] = Some(should_sums[slot].unwrap_or(0.0) + score);
                 }
             }
         }
@@ -355,11 +348,7 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
             let Some(must_score) = must_scores[slot] else {
                 continue;
             };
-            let score = if should_matched[slot] {
-                must_score + should_sums[slot]
-            } else {
-                must_score
-            };
+            let score = should_sums[slot].map_or(must_score, |should| must_score + should);
             if !score.is_finite() {
                 return Err(Error::internal(format!(
                     "required-plus-optional FTS scorer produced a non-finite score: {score}"
