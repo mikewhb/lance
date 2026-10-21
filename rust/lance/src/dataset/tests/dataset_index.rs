@@ -3268,6 +3268,103 @@ async fn test_partial_compound_hybrid_uses_mixed_approximate_statistics() {
     );
 }
 
+#[rstest]
+#[case::one_should(&["beta"])]
+#[case::two_shoulds(&["beta", "gamma"])]
+#[tokio::test]
+async fn test_one_term_must_should_scores_follow_clause_order(#[case] shoulds: &[&str]) {
+    let batch = arrow_array::record_batch!(
+        ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+        (
+            "title",
+            Utf8,
+            [
+                "alpha beta gamma",
+                "alpha alpha beta",
+                "alpha gamma gamma",
+                "beta gamma",
+                "alpha",
+                "alpha beta beta gamma",
+                "alpha delta",
+                "gamma alpha alpha alpha",
+                "beta beta",
+                "alpha beta gamma gamma",
+                "alpha gamma",
+                "delta alpha beta"
+            ]
+        )
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "title", false).await;
+    dataset.delete("id = 5").await.unwrap();
+
+    let term = |term: &str| -> FtsQuery {
+        MatchQuery::new(term.to_owned())
+            .with_column(Some("title".to_owned()))
+            .into()
+    };
+    let mut should_scores = Vec::with_capacity(shoulds.len());
+    for should in shoulds {
+        should_scores.push(
+            compound_fts_results(&dataset, term(should), None)
+                .await
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+    }
+    // The MUST score plus the matched SHOULD scores summed in clause order
+    // from zero, which is the generic ReqOpt tree's f32 order.
+    let mut expected = compound_fts_results(&dataset, term("alpha"), None)
+        .await
+        .into_iter()
+        .map(|(row_id, must_score)| {
+            let optional = should_scores
+                .iter()
+                .filter_map(|scores| scores.get(&row_id))
+                .fold(None, |sum: Option<f32>, score| {
+                    Some(sum.unwrap_or(0.0) + score)
+                });
+            (
+                row_id,
+                optional.map_or(must_score, |optional| must_score + optional),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected.sort_unstable_by(|(left_row_id, left_score), (right_row_id, right_score)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| left_row_id.cmp(right_row_id))
+    });
+    assert!(expected.len() > 3);
+
+    let query: FtsQuery = BooleanQuery::new(
+        std::iter::once((Occur::Must, term("alpha")))
+            .chain(shoulds.iter().map(|should| (Occur::Should, term(should)))),
+    )
+    .into();
+    for limit in [None, Some(3_usize)] {
+        let actual =
+            compound_fts_results(&dataset, query.clone(), limit.map(|limit| limit as i64)).await;
+        let expected = &expected[..limit.unwrap_or(expected.len())];
+        assert_eq!(
+            scored_row_bits(&actual),
+            scored_row_bits(expected),
+            "limit {limit:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_boolean_must_scores_sum_across_execution_paths() {
     let batch = arrow_array::record_batch!(
