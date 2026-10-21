@@ -57,6 +57,8 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
             && matches!(postings, [posting] if posting.is_compressed() && !posting.has_grouped_terms())
     }
 
+    /// `scorer` must give every clause's posting the same document weight as
+    /// that clause's own scorer (equal `Scorer::doc_weight_cache_key`).
     pub(in super::super) fn new(
         must: PostingIterator,
         shoulds: Vec<PostingIterator>,

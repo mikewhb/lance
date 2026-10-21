@@ -28,7 +28,7 @@ use super::{
         FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens,
         try_collect_query_tokens,
     },
-    scorer::MemBM25Scorer,
+    scorer::{MemBM25Scorer, Scorer},
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
@@ -4111,7 +4111,8 @@ where
         && leaves.len() == should.len() + 1
         && leaves.iter().all(|leaf| {
             TermReqOptScorer::<D>::accepts(&leaf.postings, &leaf.params)
-                && Arc::ptr_eq(&leaf.scorer, &leaves[must].scorer)
+                && leaf.scorer.doc_weight_cache_key().is_some()
+                && leaf.scorer.doc_weight_cache_key() == leaves[must].scorer.doc_weight_cache_key()
         })
     {
         let mut leaves = leaves.into_iter().map(Some).collect::<Vec<_>>();
