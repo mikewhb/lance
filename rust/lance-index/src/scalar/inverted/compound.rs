@@ -4064,9 +4064,9 @@ struct CollectedPartitions {
     boundary: Option<PartitionCollectionBoundary>,
 }
 
-/// Leaf indices `(must, should)` of `+must should...` when every clause is an
-/// unboosted leaf and there is no MUST_NOT.
-fn single_must_with_shoulds(plan: &CompoundScorerPlan) -> Option<(usize, Vec<usize>)> {
+/// Leaf indices `(must, should)` of `+must... should...` when every clause is
+/// an unboosted leaf and there is no MUST_NOT.
+fn musts_with_shoulds(plan: &CompoundScorerPlan) -> Option<(Vec<usize>, Vec<usize>)> {
     let CompoundScorerPlan::Boolean {
         should,
         must,
@@ -4075,20 +4075,19 @@ fn single_must_with_shoulds(plan: &CompoundScorerPlan) -> Option<(usize, Vec<usi
     else {
         return None;
     };
-    let unboosted_leaf = |child: &CompoundScorerPlan| match child {
-        CompoundScorerPlan::Leaf { index, boost } if *boost == 1.0 => Some(*index),
-        _ => None,
-    };
-    let [must] = must.as_slice() else {
-        return None;
-    };
-    if !must_not.is_empty() || should.is_empty() {
+    if must.is_empty() || should.is_empty() || !must_not.is_empty() {
         return None;
     }
-    Some((
-        unboosted_leaf(must)?,
-        should.iter().map(unboosted_leaf).collect::<Option<_>>()?,
-    ))
+    let unboosted_leaves = |children: &[CompoundScorerPlan]| {
+        children
+            .iter()
+            .map(|child| match child {
+                CompoundScorerPlan::Leaf { index, boost } if *boost == 1.0 => Some(*index),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+    };
+    Some((unboosted_leaves(must)?, unboosted_leaves(should)?))
 }
 
 fn collect_partition_with_documents<D, K>(
@@ -4103,9 +4102,9 @@ where
     D: WandDocuments + Sync,
     K: Copy + Ord,
 {
-    if let Some((must, should)) = single_must_with_shoulds(plan)
-        && leaves.len() == should.len() + 1
-        && let Some(scorer) = leaves.get(must).map(|leaf| leaf.scorer.clone())
+    if let Some((must, should)) = musts_with_shoulds(plan)
+        && leaves.len() == must.len() + should.len()
+        && let Some(scorer) = leaves.get(must[0]).map(|leaf| leaf.scorer.clone())
         && scorer.doc_weight_cache_key().is_some()
         && leaves.iter().all(|leaf| {
             TermReqOptScorer::<D>::accepts(&leaf.postings, &leaf.params)
@@ -4124,12 +4123,15 @@ where
                     ))
                 })
         };
-        let must = posting(must)?;
+        let musts = must
+            .iter()
+            .map(|&index| posting(index))
+            .collect::<Result<Vec<_>>>()?;
         let shoulds = should
             .iter()
             .map(|&index| posting(index))
             .collect::<Result<Vec<_>>>()?;
-        let mut scorer = TermReqOptScorer::new(must, shoulds, documents, scorer, metrics);
+        let mut scorer = TermReqOptScorer::new(musts, shoulds, documents, scorer, metrics);
         return collector.collect_mapped(&mut scorer, &mut map_document);
     }
 
