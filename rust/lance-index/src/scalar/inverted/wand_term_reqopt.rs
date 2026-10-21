@@ -12,32 +12,41 @@ use super::super::scorer::{MemBM25Scorer, bm25_doc_weight_with_norm};
 use super::{PostingIterator, WandDocuments, conservative_score_sum, norm_addends};
 use crate::metrics::MetricsCollector;
 
-/// One MUST and one or more SHOULD one-term postings, scored a MUST block at a
-/// time.
+/// Index of the MUST posting in [`TermReqOptScorer::postings`].
+const MUST: usize = 0;
+
+/// One MUST and one or more SHOULD one-term postings, scored a driver block at
+/// a time.
 ///
 /// Emits exactly the documents and score bits of the generic
 /// `ReqOpt(MUST, Disjunction(SHOULD...))` tree over the same postings that can
 /// still reach the competitive floor: the MUST score, plus the matched SHOULD
-/// scores summed in clause order from zero. A MUST block whose combined window
-/// bound is below the floor is skipped without decoding the SHOULD postings.
+/// scores summed in clause order from zero.
+///
+/// The MUST posting drives until the floor proves that every competitive
+/// document also contains one SHOULD clause; from then on that clause drives.
+/// A driver block whose bound plus the other clauses' window bounds is below
+/// the floor is skipped without decoding the other postings.
 pub(in super::super) struct TermReqOptScorer<'a, D: WandDocuments> {
-    must: PostingIterator,
-    shoulds: Vec<PostingIterator>,
+    /// The MUST posting, then the SHOULD postings in clause order.
+    postings: Vec<PostingIterator>,
+    global_uppers: Vec<f32>,
+    driver: usize,
     documents: &'a D,
     scorer: Arc<MemBM25Scorer>,
     /// Per-document norm codes and their BM25 denominator addends; scoring
     /// through them is bit-identical to `Scorer::doc_weight`.
     norms: Option<(&'a [u8], Arc<[f32; 256]>)>,
-    global_upper: f32,
     cost: usize,
     floor: f32,
     exhausted: bool,
     hits: Vec<(u64, u32)>,
     docs: Vec<u64>,
-    scores: Vec<f32>,
+    freqs: Vec<u32>,
+    must_scores: Vec<Option<f32>>,
     should_sums: Vec<f32>,
     should_matched: Vec<bool>,
-    should_freqs: Vec<u32>,
+    scores: Vec<f32>,
     next_hit: usize,
     /// `(doc, document key, score)` of the emitted document.
     current: Option<(u64, u64, f32)>,
@@ -67,28 +76,29 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
         metrics: &'a dyn MetricsCollector,
     ) -> Self {
         let cost = must.cost().min(documents.visible_cost_upper_bound());
-        let global_upper = conservative_score_sum(
-            std::iter::once(&must)
-                .chain(&shoulds)
-                .map(|posting| posting.global_upper_bound(&scorer)),
-        );
+        let postings = std::iter::once(must).chain(shoulds).collect::<Vec<_>>();
+        let global_uppers = postings
+            .iter()
+            .map(|posting| posting.global_upper_bound(&scorer))
+            .collect();
         let norms = documents.scoring_norms().zip(norm_addends(scorer.as_ref()));
         Self {
-            must,
-            shoulds,
+            postings,
+            global_uppers,
+            driver: MUST,
             documents,
             scorer,
             norms,
-            global_upper,
             cost,
             floor: f32::NEG_INFINITY,
             exhausted: false,
             hits: Vec::new(),
             docs: Vec::new(),
-            scores: Vec::new(),
+            freqs: Vec::new(),
+            must_scores: Vec::new(),
             should_sums: Vec::new(),
             should_matched: Vec::new(),
-            should_freqs: Vec::new(),
+            scores: Vec::new(),
             next_hit: 0,
             current: None,
             comparisons: 0,
@@ -155,18 +165,48 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
         {
             self.next_hit += 1;
         }
-        if self.next_hit == self.hits.len()
-            && self.must.current_doc_id().is_some_and(|doc| doc < target)
-        {
+        if self.next_hit == self.hits.len() {
+            self.seek_driver(target);
+        }
+        self.next()
+    }
+
+    fn seek_driver(&mut self, target: u64) {
+        let driver = &mut self.postings[self.driver];
+        if driver.current_doc_id().is_some_and(|doc| doc < target) {
             // Compressed postings hold u32 doc ids, so a larger target is past
             // every posting; `PostingIterator::next` would truncate it.
             if target > u64::from(u32::MAX) {
                 self.exhausted = true;
             } else {
-                self.must.next(target);
+                driver.next(target);
             }
         }
-        self.next()
+    }
+
+    /// Hands the drive to the rarest SHOULD clause that every document still
+    /// reaching the floor must contain, i.e. one without which the other
+    /// clauses' global bounds sum below the floor.
+    fn promote_required_should(&mut self) {
+        let floor = self.floor;
+        let uppers = &self.global_uppers;
+        let required = (1..self.postings.len())
+            .filter(|&should| {
+                conservative_score_sum(
+                    (0..uppers.len())
+                        .filter(|&clause| clause != should)
+                        .map(|clause| uppers[clause]),
+                ) < floor
+            })
+            .min_by_key(|&should| self.postings[should].cost());
+        if let Some(should) = required {
+            let frontier = self.postings[MUST].current_doc_id();
+            self.driver = should;
+            match frontier {
+                Some(frontier) => self.seek_driver(frontier),
+                None => self.exhausted = true,
+            }
+        }
     }
 
     /// Conservative bound of `posting` over `[start, end]`.
@@ -189,57 +229,80 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
         posting.block_max_score_up_to_with_stats(end, scorer).score
     }
 
-    /// Scores the next MUST block that can still reach the floor into `hits`
-    /// and `scores`. Returns false once nothing can.
-    fn score_next_block(&mut self) -> Result<bool> {
-        self.hits.clear();
-        self.next_hit = 0;
+    /// Takes the next driver block that can still reach the floor into `hits`.
+    fn take_driver_block(&mut self) -> bool {
         loop {
-            let Some(start) = self.must.current_doc_id().filter(|_| !self.exhausted) else {
-                return Ok(false);
+            if self.exhausted {
+                return false;
+            }
+            if self.floor > 0.0 {
+                if conservative_score_sum(self.global_uppers.iter().copied()) < self.floor {
+                    return false;
+                }
+                if self.driver == MUST {
+                    self.promote_required_should();
+                    if self.exhausted {
+                        return false;
+                    }
+                }
+            }
+            let driver = self.driver;
+            let Some(start) = self.postings[driver].current_doc_id() else {
+                return false;
             };
             if self.floor > 0.0 {
-                if self.global_upper < self.floor {
-                    return Ok(false);
-                }
-                self.must.shallow_next(start);
-                let end = self.must.block_end_doc();
-                let must_upper = self.must.block_max_score(self.scorer.as_ref());
                 let scorer = self.scorer.as_ref();
+                self.postings[driver].shallow_next(start);
+                let end = self.postings[driver].block_end_doc();
+                let driver_upper = self.postings[driver].block_max_score(scorer);
                 let upper = conservative_score_sum(
-                    std::iter::once(must_upper).chain(
-                        self.shoulds
+                    std::iter::once(driver_upper).chain(
+                        self.postings
                             .iter_mut()
-                            .map(|should| Self::window_upper(should, start, end, scorer)),
+                            .enumerate()
+                            .filter(|(clause, _)| *clause != driver)
+                            .map(|(_, posting)| Self::window_upper(posting, start, end, scorer)),
                     ),
                 );
                 if upper < self.floor {
-                    if !self.must.skip_current_block() {
-                        return Ok(false);
+                    if !self.postings[driver].skip_current_block() {
+                        return false;
                     }
                     continue;
                 }
             }
-            self.must.take_docs_one_block_upto(u64::MAX, &mut self.hits);
+            self.postings[driver].take_docs_one_block_upto(u64::MAX, &mut self.hits);
             if !self.hits.is_empty() {
-                break;
+                return true;
             }
+        }
+    }
+
+    /// Scores the next driver block that can still reach the floor into `hits`
+    /// and `scores`, keeping only documents that contain the MUST term.
+    /// Returns false once nothing can.
+    fn score_next_block(&mut self) -> Result<bool> {
+        self.hits.clear();
+        self.next_hit = 0;
+        if !self.take_driver_block() {
+            return Ok(false);
         }
         self.comparisons += self.hits.len();
 
         let count = self.hits.len();
+        let driver = self.driver;
         let Self {
-            must,
-            shoulds,
+            postings,
             documents,
             scorer,
             norms,
             hits,
             docs,
-            scores,
+            freqs,
+            must_scores,
             should_sums,
             should_matched,
-            should_freqs,
+            scores,
             ..
         } = self;
         let norms = norms
@@ -247,25 +310,40 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
             .map(|(codes, addends)| (*codes, addends.as_ref()));
         docs.clear();
         docs.extend(hits.iter().map(|(doc, _)| *doc));
+        must_scores.clear();
+        must_scores.resize(count, None);
         should_sums.clear();
         should_sums.resize(count, 0.0);
         should_matched.clear();
         should_matched.resize(count, false);
-        should_freqs.resize(count, 0);
-        for should in shoulds.iter_mut() {
-            should.merge_optional_freqs(docs, should_freqs);
-            for (slot, &freq) in should_freqs.iter().enumerate() {
-                if freq != 0 {
-                    should_sums[slot] +=
-                        term_score(should, docs[slot], freq, norms, scorer, *documents);
+        for (clause, posting) in postings.iter_mut().enumerate() {
+            freqs.clear();
+            if clause == driver {
+                freqs.extend(hits.iter().map(|(_, freq)| *freq));
+            } else {
+                freqs.resize(count, 0);
+                posting.merge_optional_freqs(docs, freqs);
+            }
+            for (slot, &freq) in freqs.iter().enumerate() {
+                if freq == 0 {
+                    continue;
+                }
+                let score = term_score(posting, docs[slot], freq, norms, scorer, *documents);
+                if clause == MUST {
+                    must_scores[slot] = Some(0.0_f32 + score);
+                } else {
+                    should_sums[slot] += score;
                     should_matched[slot] = true;
                 }
             }
         }
 
         scores.clear();
-        for (slot, &(doc, freq)) in hits.iter().enumerate() {
-            let must_score = 0.0_f32 + term_score(must, doc, freq, norms, scorer, *documents);
+        let mut kept = 0;
+        for slot in 0..count {
+            let Some(must_score) = must_scores[slot] else {
+                continue;
+            };
             let score = if should_matched[slot] {
                 must_score + should_sums[slot]
             } else {
@@ -276,8 +354,11 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
                     "required-plus-optional FTS scorer produced a non-finite score: {score}"
                 )));
             }
+            hits[kept] = hits[slot];
             scores.push(score);
+            kept += 1;
         }
+        hits.truncate(kept);
         Ok(true)
     }
 }

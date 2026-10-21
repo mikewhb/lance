@@ -858,10 +858,6 @@ impl<D: WandDocuments + Sync> ComposableScorer for TermReqOptScorer<'_, D> {
         Ok(())
     }
 
-    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
-        Ok(self.current_score())
-    }
-
     fn scores_non_negative(&self) -> bool {
         true
     }
@@ -4109,31 +4105,29 @@ where
 {
     if let Some((must, should)) = single_must_with_shoulds(plan)
         && leaves.len() == should.len() + 1
+        && let Some(scorer) = leaves.get(must).map(|leaf| leaf.scorer.clone())
+        && scorer.doc_weight_cache_key().is_some()
         && leaves.iter().all(|leaf| {
             TermReqOptScorer::<D>::accepts(&leaf.postings, &leaf.params)
-                && leaf.scorer.doc_weight_cache_key().is_some()
-                && leaf.scorer.doc_weight_cache_key() == leaves[must].scorer.doc_weight_cache_key()
+                && leaf.scorer.doc_weight_cache_key() == scorer.doc_weight_cache_key()
         })
     {
         let mut leaves = leaves.into_iter().map(Some).collect::<Vec<_>>();
-        let mut posting = |index: usize| -> Result<(PostingIterator, Arc<MemBM25Scorer>)> {
-            let mut leaf = leaves
+        let mut posting = |index: usize| -> Result<PostingIterator> {
+            leaves
                 .get_mut(index)
                 .and_then(Option::take)
+                .and_then(|mut leaf| leaf.postings.pop())
                 .ok_or_else(|| {
                     Error::internal(format!(
                         "compound FTS scorer references missing leaf index {index}"
                     ))
-                })?;
-            let posting = leaf.postings.pop().ok_or_else(|| {
-                Error::internal(format!("compound FTS leaf {index} has no posting"))
-            })?;
-            Ok((posting, leaf.scorer))
+                })
         };
-        let (must, scorer) = posting(must)?;
+        let must = posting(must)?;
         let shoulds = should
             .iter()
-            .map(|&index| posting(index).map(|(posting, _)| posting))
+            .map(|&index| posting(index))
             .collect::<Result<Vec<_>>>()?;
         let mut scorer = TermReqOptScorer::new(must, shoulds, documents, scorer, metrics);
         return collector.collect_mapped(&mut scorer, &mut map_document);
