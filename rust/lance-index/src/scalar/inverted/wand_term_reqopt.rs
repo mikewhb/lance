@@ -184,19 +184,29 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
         }
     }
 
-    /// Hands the drive to the rarest SHOULD clause that every document still
-    /// reaching the floor must contain, i.e. one without which the other
-    /// clauses' global bounds sum below the floor.
+    /// Global bound of `clause`; an exhausted posting cannot add to any later
+    /// document.
+    fn live_upper(&self, clause: usize) -> f32 {
+        if self.postings[clause].current_doc_id().is_some() {
+            self.global_uppers[clause]
+        } else {
+            0.0
+        }
+    }
+
+    /// Hands the drive to the rarest SHOULD clause, cheaper than the MUST
+    /// clause, that every document still reaching the floor must contain: one
+    /// without which the other clauses' bounds sum below the floor.
     fn promote_required_should(&mut self) {
-        let floor = self.floor;
-        let uppers = &self.global_uppers;
+        let must_cost = self.postings[MUST].cost();
         let required = (1..self.postings.len())
+            .filter(|&should| self.postings[should].cost() < must_cost)
             .filter(|&should| {
                 conservative_score_sum(
-                    (0..uppers.len())
+                    (0..self.postings.len())
                         .filter(|&clause| clause != should)
-                        .map(|clause| uppers[clause]),
-                ) < floor
+                        .map(|clause| self.live_upper(clause)),
+                ) < self.floor
             })
             .min_by_key(|&should| self.postings[should].cost());
         if let Some(should) = required {
@@ -236,7 +246,8 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
                 return false;
             }
             if self.floor > 0.0 {
-                if conservative_score_sum(self.global_uppers.iter().copied()) < self.floor {
+                let live = (0..self.postings.len()).map(|clause| self.live_upper(clause));
+                if conservative_score_sum(live) < self.floor {
                     return false;
                 }
                 if self.driver == MUST {
