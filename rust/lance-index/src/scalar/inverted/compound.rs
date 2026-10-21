@@ -32,7 +32,7 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        WandCursor, WandDocuments, score_sum_upper_bound_factor,
+        TermLeaf, WandCursor, WandDocuments, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -799,6 +799,67 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
 
     fn match_cost(&self) -> Option<f32> {
         self.match_cost()
+    }
+
+    fn scores_non_negative(&self) -> bool {
+        true
+    }
+}
+
+impl<D: WandDocuments + Sync> ComposableScorer for TermLeaf<'_, D> {
+    fn doc(&self) -> Option<u64> {
+        self.doc()
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        self.document_key()
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        Ok(self.next())
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        Ok(self.advance(target))
+    }
+
+    fn cost(&self) -> usize {
+        self.cost()
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        self.score()
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        Ok(self.advance_shallow(target))
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        Ok(ScoreBounds {
+            lower: 0.0,
+            upper: self.score_upper_bound(up_to)?,
+        })
+    }
+
+    fn global_score_upper_bound(&self) -> Option<f32> {
+        TermLeaf::global_score_upper_bound(self)
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        if min_score.is_nan() {
+            return Err(Error::invalid_input(
+                "minimum competitive FTS score cannot be NaN",
+            ));
+        }
+        Ok(())
+    }
+
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        if self.doc().is_none() {
+            return Ok(None);
+        }
+        self.score().map(Some)
     }
 
     fn scores_non_negative(&self) -> bool {
@@ -4007,6 +4068,33 @@ struct CollectedPartitions {
     boundary: Option<PartitionCollectionBoundary>,
 }
 
+/// Leaf indices `(must, should)` of `+must should...` when every clause is an
+/// unboosted leaf and there is no MUST_NOT.
+fn single_must_with_shoulds(plan: &CompoundScorerPlan) -> Option<(usize, Vec<usize>)> {
+    let CompoundScorerPlan::Boolean {
+        should,
+        must,
+        must_not,
+    } = plan
+    else {
+        return None;
+    };
+    let unboosted_leaf = |child: &CompoundScorerPlan| match child {
+        CompoundScorerPlan::Leaf { index, boost } if *boost == 1.0 => Some(*index),
+        _ => None,
+    };
+    let [must] = must.as_slice() else {
+        return None;
+    };
+    if !must_not.is_empty() || should.is_empty() {
+        return None;
+    }
+    Some((
+        unboosted_leaf(must)?,
+        should.iter().map(unboosted_leaf).collect::<Option<_>>()?,
+    ))
+}
+
 fn collect_partition_with_documents<D, K>(
     documents: &D,
     leaves: Vec<LoadedLeaf>,
@@ -4019,6 +4107,47 @@ where
     D: WandDocuments + Sync,
     K: Copy + Ord,
 {
+    if let Some((must, should)) = single_must_with_shoulds(plan)
+        && leaves.len() == should.len() + 1
+        && leaves
+            .iter()
+            .all(|leaf| TermLeaf::<D>::accepts(&leaf.postings, &leaf.params))
+    {
+        // The Boolean, single-child conjunction and unit-boost wrappers around
+        // this ReqOpt only forward; dropping them leaves every score unchanged.
+        let mut leaves = leaves.into_iter().map(Some).collect::<Vec<_>>();
+        let mut term_leaf = |index: usize| -> Result<BoxScorer<'_>> {
+            let mut leaf = leaves
+                .get_mut(index)
+                .and_then(Option::take)
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "compound FTS scorer references missing leaf index {index}"
+                    ))
+                })?;
+            let posting = leaf.postings.pop().ok_or_else(|| {
+                Error::internal(format!("compound FTS leaf {index} has no posting"))
+            })?;
+            Ok(Box::new(TermLeaf::new(
+                posting,
+                documents,
+                leaf.scorer,
+                metrics,
+            )))
+        };
+        let required = term_leaf(must)?;
+        let mut optional = should
+            .iter()
+            .map(|&index| term_leaf(index))
+            .collect::<Result<Vec<_>>>()?;
+        let optional: BoxScorer<'_> = match optional.len() {
+            1 => optional.swap_remove(0),
+            _ => Box::new(DisjunctionScorer::try_new(optional, DisjunctionScore::Sum)?),
+        };
+        let mut scorer = ReqOptScorer::new(required, optional);
+        return collector.collect_mapped(&mut scorer, &mut map_document);
+    }
+
     let mut leaf_scorers = leaves
         .into_iter()
         .map(|leaf| {
