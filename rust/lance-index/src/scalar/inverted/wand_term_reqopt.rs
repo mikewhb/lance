@@ -341,18 +341,23 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
                 freqs.resize(count, 0);
                 posting.merge_optional_freqs(docs, freqs);
             }
-            for (slot, &freq) in freqs.iter().enumerate() {
-                if freq == 0 {
-                    if clause < musts {
-                        must_scores[slot] = None;
-                    }
-                    continue;
+            if clause < musts {
+                for (slot, &freq) in freqs.iter().enumerate() {
+                    must_scores[slot] = match must_scores[slot] {
+                        Some(sum) if freq != 0 => Some(
+                            sum + (0.0_f32
+                                + term_score(posting, docs[slot], freq, norms, scorer, *documents)),
+                        ),
+                        _ => None,
+                    };
                 }
-                let score = term_score(posting, docs[slot], freq, norms, scorer, *documents);
-                if clause < musts {
-                    must_scores[slot] = must_scores[slot].map(|sum| sum + (0.0_f32 + score));
-                } else {
-                    should_sums[slot] = Some(should_sums[slot].unwrap_or(0.0) + score);
+            } else {
+                for (slot, &freq) in freqs.iter().enumerate() {
+                    if freq != 0 && must_scores[slot].is_some() {
+                        let score =
+                            term_score(posting, docs[slot], freq, norms, scorer, *documents);
+                        should_sums[slot] = Some(should_sums[slot].unwrap_or(0.0) + score);
+                    }
                 }
             }
         }
