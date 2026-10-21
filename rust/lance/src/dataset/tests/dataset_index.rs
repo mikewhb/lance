@@ -3269,10 +3269,15 @@ async fn test_partial_compound_hybrid_uses_mixed_approximate_statistics() {
 }
 
 #[rstest]
-#[case::one_should(&["beta"])]
-#[case::two_shoulds(&["beta", "gamma"])]
+#[case::one_must_one_should(&["alpha"], &["beta"])]
+#[case::one_must_two_shoulds(&["alpha"], &["beta", "gamma"])]
+#[case::two_musts_one_should(&["alpha", "beta"], &["gamma"])]
+#[case::two_musts_two_shoulds(&["alpha", "gamma"], &["beta", "delta"])]
 #[tokio::test]
-async fn test_one_term_must_should_scores_follow_clause_order(#[case] shoulds: &[&str]) {
+async fn test_one_term_must_should_scores_follow_clause_order(
+    #[case] musts: &[&str],
+    #[case] shoulds: &[&str],
+) {
     let batch = arrow_array::record_batch!(
         ("id", Int32, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
         (
@@ -3323,22 +3328,33 @@ async fn test_one_term_must_should_scores_follow_clause_order(#[case] shoulds: &
                 .collect::<HashMap<_, _>>(),
         );
     }
-    // The MUST score plus the matched SHOULD scores summed in clause order
-    // from zero, which is the generic ReqOpt tree's f32 order.
-    let mut expected = compound_fts_results(&dataset, term("alpha"), None)
-        .await
-        .into_iter()
-        .map(|(row_id, must_score)| {
+    let mut must_scores = Vec::with_capacity(musts.len());
+    for must in musts {
+        must_scores.push(
+            compound_fts_results(&dataset, term(must), None)
+                .await
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+        );
+    }
+    // MUST scores, then matched SHOULD scores, each summed in clause order from
+    // zero: the generic ReqOpt(Conjunction, Disjunction) tree's f32 order.
+    let mut expected = must_scores[0]
+        .keys()
+        .filter_map(|row_id| {
+            let must_score = must_scores
+                .iter()
+                .try_fold(0.0_f32, |sum, scores| Some(sum + scores.get(row_id)?))?;
             let optional = should_scores
                 .iter()
-                .filter_map(|scores| scores.get(&row_id))
+                .filter_map(|scores| scores.get(row_id))
                 .fold(None, |sum: Option<f32>, score| {
                     Some(sum.unwrap_or(0.0) + score)
                 });
-            (
-                row_id,
+            Some((
+                *row_id,
                 optional.map_or(must_score, |optional| must_score + optional),
-            )
+            ))
         })
         .collect::<Vec<_>>();
     expected.sort_unstable_by(|(left_row_id, left_score), (right_row_id, right_score)| {
@@ -3349,7 +3365,9 @@ async fn test_one_term_must_should_scores_follow_clause_order(#[case] shoulds: &
     assert!(expected.len() > 3);
 
     let query: FtsQuery = BooleanQuery::new(
-        std::iter::once((Occur::Must, term("alpha")))
+        musts
+            .iter()
+            .map(|must| (Occur::Must, term(must)))
             .chain(shoulds.iter().map(|should| (Occur::Should, term(should)))),
     )
     .into();
