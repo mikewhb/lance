@@ -32,7 +32,8 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        TermAndCursor, TermLeaf, WandCursor, WandDocuments, score_sum_upper_bound_factor,
+        TermAndCursor, TermLeaf, WandCursor, WandDocuments, required_side_floor,
+        score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -3175,6 +3176,7 @@ struct ReqOptScorer<'a> {
     confirmed: bool,
     min_competitive_score: f32,
     shallow_bounds: Option<ReqOptBounds>,
+    forwards_required_floor: bool,
 }
 
 impl<'a> ReqOptScorer<'a> {
@@ -3194,6 +3196,16 @@ impl<'a> ReqOptScorer<'a> {
             confirmed: false,
             min_competitive_score: f32::NEG_INFINITY,
             shallow_bounds: None,
+            forwards_required_floor: false,
+        }
+    }
+
+    /// Like `new`, but also forwards to `required` the least score it needs
+    /// for the sum to reach the floor, given `optional`'s global upper bound.
+    fn with_required_floor(required: BoxScorer<'a>, optional: BoxScorer<'a>) -> Self {
+        Self {
+            forwards_required_floor: true,
+            ..Self::new(required, optional)
         }
     }
 
@@ -3461,6 +3473,15 @@ impl ComposableScorer for ReqOptScorer<'_> {
         }
         if min_score > self.min_competitive_score {
             self.min_competitive_score = min_score;
+            if self.forwards_required_floor
+                && let Some(optional_upper) = self.optional.global_score_upper_bound()
+                && let Some(floor) = required_side_floor(min_score, optional_upper)
+                && floor > 0.0
+            {
+                #[cfg(test)]
+                REQUIRED_FLOORS_FORWARDED.with(|count| count.set(count.get() + 1));
+                self.required.set_min_competitive_score(floor)?;
+            }
         }
         Ok(())
     }
@@ -4132,6 +4153,7 @@ struct CollectedPartitions {
 #[cfg(test)]
 thread_local! {
     static TERM_AND_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REQUIRED_FLOORS_FORWARDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Leaf indices `(must, should)` of `+must... should...` when there is at
@@ -4226,7 +4248,7 @@ where
             } else {
                 Box::new(DisjunctionScorer::try_new(optional, DisjunctionScore::Sum)?)
             };
-            Box::new(ReqOptScorer::new(required, optional))
+            Box::new(ReqOptScorer::with_required_floor(required, optional))
         };
         return collector.collect_mapped(scorer.as_mut(), &mut map_document);
     }
@@ -7634,5 +7656,62 @@ mod tests {
             assert_eq!(score_bits(&admitted), score_bits(&generic), "limit={limit}");
         }
         assert!(skipped + pruned > 0, "the floor never pruned anything");
+    }
+
+    fn take_required_floors_forwarded() -> usize {
+        REQUIRED_FLOORS_FORWARDED.with(|count| count.replace(0))
+    }
+
+    #[test]
+    fn required_side_floor_rules_out_only_sums_below_the_floor() {
+        let floors = [0.5_f32, 1.0, 3.7, 12.25, 100.0, 1.0e6];
+        let uppers = [0.0_f32, 0.1, 1.0, 2.5, 50.0];
+        for floor in floors {
+            for optional_upper in uppers {
+                let Some(required_floor) = required_side_floor(floor, optional_upper) else {
+                    continue;
+                };
+                // The largest required score below the forwarded floor, plus the
+                // largest optional score, must still fall short of the floor.
+                let below = next_down(required_floor);
+                assert!(
+                    below + optional_upper < floor,
+                    "floor={floor} optional_upper={optional_upper} required_floor={required_floor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reqopt_forwards_the_required_floor_and_matches_the_tree() {
+        let (doc_lengths, mut terms) = front_loaded_terms(4_096);
+        terms.push(
+            (0..4_096_u32)
+                .filter(|doc| doc % 5 == 0)
+                .map(|doc| (doc, 1))
+                .collect(),
+        );
+        let corpus = Corpus::new(doc_lengths, terms);
+        let mask = RowAddrMask::all_rows();
+        let plan = must_should_plan(2, 1);
+        let (mut forwarded, mut skipped, mut pruned) = (0, 0, 0);
+        for limit in [1, 10, 100] {
+            take_required_floors_forwarded();
+            term_and_test_counters::take();
+            let admitted =
+                collect_admitted(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
+            forwarded += take_required_floors_forwarded();
+            let (window_skips, candidate_prunes) = term_and_test_counters::take();
+            skipped += window_skips;
+            pruned += candidate_prunes;
+            let generic = collect_generic(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
+            assert_eq!(take_required_floors_forwarded(), 0, "limit={limit}");
+            assert_eq!(score_bits(&admitted), score_bits(&generic), "limit={limit}");
+        }
+        assert!(forwarded > 0, "ReqOpt never forwarded a floor");
+        assert!(
+            skipped + pruned > 0,
+            "the forwarded floor never pruned anything"
+        );
     }
 }

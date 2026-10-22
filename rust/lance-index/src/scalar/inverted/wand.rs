@@ -2126,6 +2126,19 @@ fn partial_score_limit(
     Some(lo)
 }
 
+/// Inclusive floor for `required` in an f32 sum `required + optional` where
+/// `optional` scores at most `optional_upper`: a lower required score cannot
+/// bring the sum to `floor`. `None` when no required score can be ruled out.
+pub(super) fn required_side_floor(floor: f32, optional_upper: f32) -> Option<f32> {
+    let limit = partial_score_limit(
+        f64::from(optional_upper),
+        floor,
+        score_sum_upper_bound_factor(2),
+        CompetitiveFloorMode::Inclusive,
+    )?;
+    Some(next_up_f32(limit))
+}
+
 fn next_down_f32(value: f32) -> f32 {
     -next_up_f32(-value)
 }
