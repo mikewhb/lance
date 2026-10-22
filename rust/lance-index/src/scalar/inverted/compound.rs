@@ -4073,6 +4073,38 @@ thread_local! {
     static TERM_LEAVES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static FLAT_REQOPT_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FLAT_REQUIRED_ONLY_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Leaf indices `(must, should)` of `+must... should...` when there is at
+/// least one MUST, no MUST_NOT and every clause is an unboosted leaf.
+fn flat_must_should(plan: &CompoundScorerPlan) -> Option<(Vec<usize>, Vec<usize>)> {
+    let CompoundScorerPlan::Boolean {
+        should,
+        must,
+        must_not,
+    } = plan
+    else {
+        return None;
+    };
+    if must.is_empty() || !must_not.is_empty() {
+        return None;
+    }
+    let unboosted_leaves = |children: &[CompoundScorerPlan]| {
+        children
+            .iter()
+            .map(|child| match child {
+                CompoundScorerPlan::Leaf { index, boost } if *boost == 1.0 => Some(*index),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+    };
+    Some((unboosted_leaves(must)?, unboosted_leaves(should)?))
+}
+
 fn collect_partition_with_documents<D, K>(
     documents: &D,
     leaves: Vec<LoadedLeaf>,
@@ -4085,6 +4117,67 @@ where
     D: WandDocuments + Sync,
     K: Copy + Ord,
 {
+    if let Some((must, should)) = flat_must_should(plan)
+        && leaves.len() == must.len() + should.len()
+        && leaves
+            .iter()
+            .all(|leaf| TermLeaf::<D>::accepts(&leaf.postings, &leaf.params))
+    {
+        // Over one-term leaves the Boolean wrapper, unit boosts and single-child
+        // conjunctions or disjunctions only forward: a TermLeaf score is never
+        // -0.0, so adding it to zero changes no bits.
+        let mut leaves = leaves.into_iter().map(Some).collect::<Vec<_>>();
+        let mut term_leaf = |index: usize| -> Result<BoxScorer<'_>> {
+            let mut leaf = leaves
+                .get_mut(index)
+                .and_then(Option::take)
+                .ok_or_else(|| {
+                    Error::internal(format!(
+                        "compound FTS scorer references missing leaf index {index}"
+                    ))
+                })?;
+            let posting = leaf.postings.pop().ok_or_else(|| {
+                Error::internal(format!("compound FTS leaf {index} has no posting"))
+            })?;
+            #[cfg(test)]
+            TERM_LEAVES_BUILT.with(|count| count.set(count.get() + 1));
+            Ok(Box::new(TermLeaf::new(
+                posting,
+                documents,
+                leaf.scorer,
+                metrics,
+            )))
+        };
+        let mut required = must
+            .iter()
+            .map(|&index| term_leaf(index))
+            .collect::<Result<Vec<_>>>()?;
+        let required: BoxScorer<'_> = if required.len() == 1 {
+            required.swap_remove(0)
+        } else {
+            Box::new(RequiredConjunctionScorer::try_new(required)?)
+        };
+        let mut scorer: BoxScorer<'_> = if should.is_empty() {
+            #[cfg(test)]
+            FLAT_REQUIRED_ONLY_BUILT.with(|count| count.set(count.get() + 1));
+            required
+        } else {
+            let mut optional = should
+                .iter()
+                .map(|&index| term_leaf(index))
+                .collect::<Result<Vec<_>>>()?;
+            let optional: BoxScorer<'_> = if optional.len() == 1 {
+                optional.swap_remove(0)
+            } else {
+                Box::new(DisjunctionScorer::try_new(optional, DisjunctionScore::Sum)?)
+            };
+            #[cfg(test)]
+            FLAT_REQOPT_BUILT.with(|count| count.set(count.get() + 1));
+            Box::new(ReqOptScorer::new(required, optional))
+        };
+        return collector.collect_mapped(scorer.as_mut(), &mut map_document);
+    }
+
     let mut leaf_scorers = leaves
         .into_iter()
         .map(|mut leaf| {
@@ -7251,6 +7344,15 @@ mod tests {
         RowAddrMask::from_block(RowAddrTreeMap::from_iter(deleted))
     }
 
+    fn must_should_plan(musts: usize, shoulds: usize) -> CompoundScorerPlan {
+        let leaf = |index| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        CompoundScorerPlan::Boolean {
+            should: (musts..musts + shoulds).map(leaf).collect(),
+            must: (0..musts).map(leaf).collect(),
+            must_not: Vec::new(),
+        }
+    }
+
     /// The production entry point, which admits the fast path when it can.
     fn collect_admitted(
         corpus: &Corpus,
@@ -7310,6 +7412,14 @@ mod tests {
 
     fn take_term_leaves_built() -> usize {
         TERM_LEAVES_BUILT.with(|count| count.replace(0))
+    }
+
+    /// `(flat ReqOpt built, flat required-only built)` since the last call.
+    fn take_flat_paths() -> (usize, usize) {
+        (
+            FLAT_REQOPT_BUILT.with(|count| count.replace(0)),
+            FLAT_REQUIRED_ONLY_BUILT.with(|count| count.replace(0)),
+        )
     }
 
     #[test]
@@ -7373,5 +7483,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn term_leaf_trees_match_the_wand_cursor_tree_bit_for_bit() {
+        let mut order_sensitive_seeds = 0;
+        let mut seeds_without_should = 0;
+        for seed in 0..48_u64 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let musts = rng.random_range(1..=3_usize);
+            let shoulds = rng.random_range(0..=4_usize);
+            let num_docs = rng.random_range(300..=1_500_usize);
+            let mut densities = Vec::new();
+            for _ in 0..musts + shoulds {
+                densities.push(rng.random_range(0.02..0.6));
+            }
+            let corpus = random_corpus(&mut rng, num_docs, &densities);
+            let mask = deletion_mask(&mut rng, num_docs, 0.1);
+            let all = (0..musts + shoulds).collect::<Vec<_>>();
+            let leaf_at = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+            // Same clauses, listed in reverse within each group.
+            let reversed_plan = CompoundScorerPlan::Boolean {
+                must: (0..musts).rev().map(leaf_at).collect(),
+                should: (musts..musts + shoulds).rev().map(leaf_at).collect(),
+                must_not: Vec::new(),
+            };
+            let plans = [must_should_plan(musts, shoulds), reversed_plan];
+            let expected_paths = if shoulds == 0 { (0, 1) } else { (1, 0) };
+            if shoulds == 0 {
+                seeds_without_should += 1;
+            }
+            for (order, plan) in plans.iter().enumerate() {
+                for limit in [1, 3, 10, 100, num_docs] {
+                    let context = format!(
+                        "seed={seed} musts={musts} shoulds={shoulds} order={order} limit={limit}"
+                    );
+                    take_term_leaves_built();
+                    take_flat_paths();
+                    let admitted =
+                        collect_admitted(&corpus, &mask, corpus.leaves(&all), plan, limit);
+                    assert_eq!(take_term_leaves_built(), musts + shoulds, "{context}");
+                    assert_eq!(take_flat_paths(), expected_paths, "{context}");
+                    let generic = collect_generic(&corpus, &mask, corpus.leaves(&all), plan, limit);
+                    assert_eq!(take_term_leaves_built(), 0, "{context}");
+                    assert_eq!(take_flat_paths(), (0, 0), "{context}");
+                    assert_eq!(score_bits(&admitted), score_bits(&generic), "{context}");
+                }
+            }
+            // A seed pins the summation order only if reversing the clauses
+            // changes some score; two addends commute, so that takes a group of
+            // three or more.
+            let forward = score_bits(&collect_generic(
+                &corpus,
+                &mask,
+                corpus.leaves(&all),
+                &plans[0],
+                num_docs,
+            ))
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+            let reversed = score_bits(&collect_generic(
+                &corpus,
+                &mask,
+                corpus.leaves(&all),
+                &plans[1],
+                num_docs,
+            ))
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+            if forward
+                .iter()
+                .any(|(row_id, bits)| reversed.get(row_id).is_some_and(|other| other != bits))
+            {
+                order_sensitive_seeds += 1;
+            }
+        }
+        assert!(
+            order_sensitive_seeds > 0,
+            "no seed pins the summation order"
+        );
+        assert!(
+            seeds_without_should > 0,
+            "no seed covers the required-only branch"
+        );
     }
 }
