@@ -2141,11 +2141,23 @@ impl<K: Copy + Ord> TopKCollector<K> {
         self.heap
             .reserve(expected.saturating_sub(self.heap.capacity()));
 
-        scorer.set_min_competitive_score(self.competitive_score.get())?;
+        let mut forwarded_floor = self.competitive_score.get();
+        scorer.set_min_competitive_score(forwarded_floor)?;
+        if let Some(match_cost) = scorer.match_cost()
+            && (!match_cost.is_finite() || match_cost < 0.0)
+        {
+            return Err(Error::internal(format!(
+                "FTS scorer reported invalid two-phase match cost: {match_cost}"
+            )));
+        }
+        let doc_local_pruning = scorer.supports_doc_local_confirmation_pruning();
         let mut doc = scorer.next()?;
         while let Some(doc_id) = doc {
             let min_score = self.competitive_score.get();
-            scorer.set_min_competitive_score(min_score)?;
+            if min_score > forwarded_floor {
+                scorer.set_min_competitive_score(min_score)?;
+                forwarded_floor = min_score;
+            }
             let up_to = scorer.advance_shallow(doc_id)?;
             let bounds = scorer.score_bounds(up_to)?;
             if bounds.upper < min_score {
@@ -2163,7 +2175,7 @@ impl<K: Copy + Ord> TopKCollector<K> {
             // pending position confirmation. Equality remains live because row
             // id is the final top-k tie breaker.
             if min_score.is_finite()
-                && scorer.supports_doc_local_confirmation_pruning()
+                && doc_local_pruning
                 && scorer
                     .current_score_upper_bound()?
                     .is_some_and(|upper| upper < min_score)
@@ -2172,13 +2184,6 @@ impl<K: Copy + Ord> TopKCollector<K> {
                 continue;
             }
 
-            if let Some(match_cost) = scorer.match_cost()
-                && (!match_cost.is_finite() || match_cost < 0.0)
-            {
-                return Err(Error::internal(format!(
-                    "FTS scorer reported invalid two-phase match cost: {match_cost}"
-                )));
-            }
             if scorer.matches()? {
                 let score = checked_score(scorer.score()?, "compound scorer")?;
                 // A shared partition floor is already known to be globally
@@ -7566,5 +7571,16 @@ mod tests {
             seeds_without_should > 0,
             "no seed covers the required-only branch"
         );
+    }
+
+    #[test]
+    fn collector_forwards_the_floor_only_when_it_rises() {
+        // Equal scores never fall below the floor, so every document is visited.
+        let values = (0..50_u64).map(|row| (row, 1.0)).collect::<Vec<_>>();
+        let (mut scorer, work) = instrumented(materialized(&values));
+        let rows = TopKCollector::new(3).collect(scorer.as_mut()).unwrap();
+        assert_eq!(rows.len(), 3);
+        let floors = work.floors.load(AtomicOrdering::Relaxed);
+        assert!(floors <= 5, "floor forwarded {floors} times");
     }
 }
