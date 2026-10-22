@@ -24,6 +24,9 @@ use crate::metrics::MetricsCollector;
 
 #[path = "wand_and_kernel.rs"]
 mod and_kernel;
+
+#[path = "wand_and_array.rs"]
+mod and_array;
 #[path = "wand_intersection.rs"]
 mod intersection;
 #[path = "wand_maxscore.rs"]
@@ -39,6 +42,7 @@ pub(super) use term_and::TermAndCursor;
 pub(super) use term_and::test_counters as term_and_test_counters;
 pub(super) use term_leaf::TermLeaf;
 
+use self::and_array::ArrayLead;
 use self::and_kernel::{WindowList, window_bm25_score};
 use super::{
     CompressedPositionStorage,
@@ -301,12 +305,12 @@ impl CompetitiveFloorMode {
 const AND_SKEW_RATIO: usize = 32;
 
 /// Frequency buckets for the lead contribution's length-independent upper
-/// bound (see `and_candidate_cannot_beat_threshold_by_freq` and the bulk
-/// route's frequency filter).
+/// bound (see the array lead's frequency pre-filter and the bulk route's
+/// frequency filter).
 const FREQ_LUT_BUCKETS: usize = 64;
 
 /// Quiet period, in windows, between wide-bound re-probes of the array lead
-/// after a check that did not skip. See the `wb_windows_since_check` field.
+/// after a check that did not skip. See `ArrayLead::windows_since_check`.
 const WB_REPROBE_INTERVAL: u32 = 32;
 
 /// A query whose check has skipped this many windows in total latches into
@@ -2615,13 +2619,6 @@ struct AndWindowStats {
     pairwise_intersections: usize,
     windows_sliced: usize,
     windows_frequency_pruned: usize,
-    lut_prepruned: usize,
-    // Arrayed route: wide-bound checks entered (gate open), whole lead
-    // windows skipped by the check and follower leaps that jumped past the
-    // current lead window (`lead_next_target = next`).
-    wide_bound_checks: usize,
-    windows_array_skipped: usize,
-    follower_window_jumps: usize,
 }
 
 impl Eq for TailPosting {}
@@ -2679,35 +2676,12 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Document length of the last conjunction candidate: read in the
     // rejection test, consumed once by the scoring loop.
     and_candidate_doc_length: Option<u32>,
-    // Length-independent upper bounds of the lead clause's score contribution
-    // per frequency bucket, for the arrayed route's frequency pre-filter.
-    // Depends only on `lead[0]` and the scorer -- never on candidate or
-    // window state -- so it stays valid across windows; deliberately not
-    // reset between `search` calls (rebuilding it for an identical query
-    // would be pure overhead).
-    and_lead_freq_bound: Option<[f32; FREQ_LUT_BUCKETS]>,
-    // Array-backed lead: for skewed conjunctions the lead clause's
-    // current block is copied into `lead_docs`/`lead_freqs` once per window and
-    // walked by index, so moving the lead to its next candidate costs an index
-    // bump instead of a cursor seek. `and_lead_arrayed` is set by the routing in
-    // `search`; every other field is owned by this route and is only
-    // meaningful inside that route's `search` -- the `WandCursor` `seek`/`next`
-    // paths never read or maintain them.
+    // Array-backed lead for skewed conjunctions. `and_lead_arrayed` is set by
+    // the routing in `search`; `array_lead` is only meaningful inside that
+    // route's `search` -- the `WandCursor` `seek`/`next` paths never read or
+    // maintain it.
     and_lead_arrayed: bool,
-    lead_docs: Vec<u32>,
-    lead_freqs: Vec<u32>,
-    lead_pos: usize,
-    lead_first_index: usize,
-    lead_window_end: u64,
-    lead_next_target: u64,
-    // Adaptive gate for the window-level wide-bound check in `open_lead_array`.
-    // Skip rates are bimodal: a few queries skip most of their windows, almost
-    // all others skip none. Re-probing every `WB_REPROBE_INTERVAL` windows
-    // keeps zero-skip queries from paying the check on every window while
-    // still catching isolated skippable ones.
-    wb_windows_since_check: u32,
-    wb_total_skips: u32,
-    wb_always_check: bool,
+    array_lead: ArrayLead,
     // Score-first conjunction pruning is restricted to the current impact
     // format and scorers that expose the BM25 denominator contract.
     score_first_and_enabled: bool,
@@ -2730,10 +2704,6 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     bulk_and_mode_override: Option<BulkAndMode>,
     #[cfg(test)]
     bulk_and_searches: usize,
-    // Number of candidates parked by the deferred-park branch; proves a test
-    // actually exercised that ordering.
-    #[cfg(test)]
-    deferred_park_hits: usize,
     #[cfg(test)]
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
@@ -2843,17 +2813,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             and_last_doc: None,
             and_candidate_score: None,
             and_candidate_doc_length: None,
-            and_lead_freq_bound: None,
             and_lead_arrayed: false,
-            lead_docs: Vec::new(),
-            lead_freqs: Vec::new(),
-            lead_pos: 0,
-            lead_first_index: 0,
-            lead_window_end: 0,
-            lead_next_target: 0,
-            wb_windows_since_check: WB_REPROBE_INTERVAL,
-            wb_total_skips: 0,
-            wb_always_check: false,
+            array_lead: ArrayLead::new(),
             score_first_and_enabled,
             #[cfg(test)]
             disable_score_first_and: false,
@@ -2866,8 +2827,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             bulk_and_mode_override: None,
             #[cfg(test)]
             bulk_and_searches: 0,
-            #[cfg(test)]
-            deferred_park_hits: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
@@ -2989,10 +2948,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // state like any other: clearing it means a second `search` cannot
         // inherit the previous one's array or its pending target.
         self.and_lead_arrayed = false;
-        self.lead_pos = 0;
-        self.lead_next_target = 0;
-        self.lead_docs.clear();
-        self.lead_freqs.clear();
+        self.array_lead.clear();
 
         if params.phrase_slop.is_some() {
             self.invalidate_score_first_and_window();
@@ -3047,15 +3003,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     && conjunction_lists_are_skewed(&self.lead);
                 if skewed_auto {
                     // Pay for the window buffers only when the route is used.
-                    self.lead_docs.reserve(MAX_POSTING_BLOCK_SIZE);
-                    self.lead_freqs.reserve(MAX_POSTING_BLOCK_SIZE);
+                    self.array_lead.reserve();
                 }
                 self.and_lead_arrayed = skewed_auto;
                 // Defensive reset of the array route's adaptive gate so a
                 // hypothetical second `search` on the same Wand starts clean.
-                self.wb_windows_since_check = WB_REPROBE_INTERVAL;
-                self.wb_total_skips = 0;
-                self.wb_always_check = false;
+                self.array_lead.reset_gate();
                 !skewed_auto
                     && (mode.enabled_for(self.lead.len())
                         || (mode == BulkAndMode::Auto
@@ -4072,9 +4025,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .sum::<f64>()
     }
 
-    /// Build the lead clause's frequency-bucket bound table (see
-    /// `and_lead_freq_bound`). Shared by the arrayed route's pre-filter and
-    /// the bulk merge kernel so the two constructions cannot drift apart.
+    /// Build the lead clause's frequency-bucket bound table for the bulk
+    /// merge kernel. The array lead builds its table with the same function,
+    /// so the two constructions cannot drift apart.
     ///
     /// The bound assumes `Scorer::doc_weight` is non-negative and
     /// non-increasing in `doc_tokens` (see the trait contract). The sampled
@@ -4092,45 +4045,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             Some(first) => and_kernel::lead_freq_bound_lut(first, &self.scorer),
             None => [f32::INFINITY; FREQ_LUT_BUCKETS],
         }
-    }
-
-    /// Frequency-bucket pre-filter for the arrayed candidate loop: rejects
-    /// the candidate with the lead contribution's length-independent upper
-    /// bound (`doc_length = 0` maximizes the weight under the
-    /// [`Scorer::doc_weight`] contract), skipping the doc-length lookup and
-    /// the exact lead score. Mirrors the bulk route's frequency filter;
-    /// rejecting here is sound because the actual contribution with the real
-    /// doc length is never larger. `remaining_upper_bound` is the shared
-    /// follower pass computed by the caller (see `and_remaining_upper_bound`).
-    fn and_candidate_cannot_beat_threshold_by_freq(
-        &mut self,
-        freq: u32,
-        remaining_upper_bound: f64,
-    ) -> bool {
-        if !self.and_prune_active() {
-            return false;
-        }
-        if self.and_lead_freq_bound.is_none() {
-            self.and_lead_freq_bound = Some(self.build_lead_freq_bound_lut());
-        }
-        let lut_bound =
-            self.and_lead_freq_bound.as_ref().unwrap()[(freq as usize).min(FREQ_LUT_BUCKETS - 1)];
-        if !lut_bound.is_finite() {
-            return false;
-        }
-        let cannot_compete = score_sum_cannot_compete(
-            lut_bound,
-            remaining_upper_bound,
-            self.threshold,
-            score_sum_upper_bound_factor(self.num_terms),
-            self.floor_mode,
-        );
-
-        #[cfg(test)]
-        if cannot_compete {
-            self.and_window_stats.lut_prepruned += 1;
-        }
-        cannot_compete
     }
 
     fn invalidate_score_first_and_window(&mut self) {
@@ -4503,208 +4417,32 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
     }
 
-    /// Array-backed lead, for skewed conjunctions only.
-    ///
-    /// The lead clause's current block is copied into `lead_docs`/`lead_freqs`
-    /// once per window, then walked by index. Advancing the lead is an index
-    /// bump, and a follower leap skips the array by binary search, so the lead
-    /// never pays a cursor seek per candidate. Window-level pruning happens in
-    /// `open_lead_array` via the adaptive wide-bound check; inside an open
-    /// window, once the followers have matched, each candidate passes the
-    /// frequency-bucket pre-filter
-    /// (`and_candidate_cannot_beat_threshold_by_freq`) and then the exact
-    /// doc-length prune (`and_candidate_cannot_beat_threshold`). Both stages
-    /// are gated by `and_prune_active`, so a window without a positive floor
-    /// prunes neither.
+    /// Array-backed lead, for skewed conjunctions only (see [`ArrayLead`]).
     fn next_and_candidate_arrayed(&mut self) -> Option<DocInfo> {
         self.and_candidate_score = None;
         self.and_candidate_doc_length = None;
         if self.lead.len() < self.num_terms {
             return None;
         }
-        let is_vectorized_search_enabled = matches!(self.lead.len(), 3..=5);
-
-        'advance_head: loop {
-            while self.lead_pos >= self.lead_docs.len() {
-                if !self.open_lead_array() {
-                    return None;
-                }
-            }
-            let doc = self.lead_docs[self.lead_pos];
-            let freq = self.lead_freqs[self.lead_pos];
-            let lead_index = self.lead_first_index + self.lead_pos;
-            // The lead cursor is NOT parked here: the write is deferred until
-            // every follower has matched, so a candidate the followers reject
-            // never pays for it. It must still happen *before* the exact prune
-            // below, which reads the lead posting's cursor.
-            for index in 1..self.lead.len() {
-                let posting = &mut self.lead[index];
-                if posting
-                    .current_doc_id()
-                    .is_none_or(|cur| cur < u64::from(doc))
-                {
-                    posting.next_doc_id(u64::from(doc), is_vectorized_search_enabled);
-                }
-                match posting.current_doc_id() {
-                    None => return None,
-                    Some(next) if next > u64::from(doc) => {
-                        self.lead_pos = skip_lead_docs(&self.lead_docs, self.lead_pos, next);
-                        if next > self.lead_window_end {
-                            self.lead_next_target = next;
-                            self.lead_pos = self.lead_docs.len();
-                            #[cfg(test)]
-                            {
-                                self.and_window_stats.follower_window_jumps += 1;
-                            }
-                        }
-                        continue 'advance_head;
-                    }
-                    Some(_) => {}
-                }
-            }
-
-            // One shared follower-bound pass for both prune stages: the
-            // followers do not move between the LUT and the exact check, so
-            // the sum is computed once per candidate that reaches pruning.
-            // Both stages are kept -- the LUT bound is looser (doc_length is
-            // dropped), the exact check can still reject. The doc-length
-            // lookup stays after the LUT check so rejected candidates never
-            // pay it.
-            // Every follower has matched, so this candidate will not be
-            // leapfrogged. Park it now *before* the prune --
-            // `and_candidate_cannot_beat_threshold` reads the lead posting's
-            // cursor, so parking any later would let a stale candidate drive
-            // the decision.
-            self.park_lead_at(lead_index, doc, freq);
-            #[cfg(test)]
-            {
-                self.deferred_park_hits += 1;
-            }
-            let lead_doc = self.lead.first().and_then(|posting| posting.doc())?;
-            if self.and_prune_active() {
-                let remaining_upper_bound = self.and_remaining_upper_bound();
-                if self.and_candidate_cannot_beat_threshold_by_freq(freq, remaining_upper_bound) {
-                    self.lead_pos += 1;
-                    continue;
-                }
-                let doc_length = self.documents.doc_length(&lead_doc);
-                if self.and_candidate_cannot_beat_threshold(doc_length, remaining_upper_bound) {
-                    self.lead_pos += 1;
-                    continue;
-                }
-                self.lead_pos += 1;
-                self.and_last_doc = None;
-                self.and_candidate_doc_length = Some(doc_length);
-                return Some(lead_doc);
-            }
-            let doc_length = self.documents.doc_length(&lead_doc);
-            self.lead_pos += 1;
-            self.and_last_doc = None;
-            self.and_candidate_doc_length = Some(doc_length);
-            return Some(lead_doc);
-        }
+        let prune = self.and_prune_active();
+        let documents = self.documents;
+        let (lead_doc, doc_length) = self.array_lead.next_candidate(
+            &mut self.lead,
+            &self.scorer,
+            self.threshold,
+            self.floor_mode,
+            prune,
+            |doc| documents.doc_length(doc),
+        )?;
+        self.and_last_doc = None;
+        self.and_candidate_doc_length = Some(doc_length);
+        Some(lead_doc)
     }
 
-    /// The target of the window after one ending at `win_end`: `win_end + 1`
-    /// clamped into the doc-id domain. A `win_end` of `u32::MAX` (or the
-    /// u64::MAX sentinel) must terminate the walk instead of wrapping around
-    /// to doc 0; on legal input the sentinel is the only reachable case, the
-    /// clamp is defensive symmetry with the skip branch.
-    fn lead_next_target_after(win_end: u64) -> u64 {
-        if win_end >= u32::MAX as u64 {
-            TERMINATED_DOC_ID
-        } else {
-            win_end + 1
-        }
-    }
-
-    /// Copy the lead clause's current block into the arrays and move the cursor
-    /// to the window's first entry. Returns false when the lead is exhausted.
+    /// Opens the array lead's next window (see [`ArrayLead::open`]).
     fn open_lead_array(&mut self) -> bool {
-        loop {
-            if self.lead_next_target == TERMINATED_DOC_ID {
-                return false;
-            }
-            // The floor is raised by `search` before every `next()`, so it is
-            // already current here.
-            self.lead[0].next(self.lead_next_target);
-            let Some(lead_doc_id) = self.lead[0].current_doc_id() else {
-                return false;
-            };
-            let target = self.lead_next_target.max(lead_doc_id);
-            // The window is the lead clause's own block end: the rarest clause
-            // sets the window, so one window serves many candidates.
-            let win_end = Self::posting_block_up_to(&self.lead[0], target);
-
-            if self.threshold > 0.0
-                && (self.wb_always_check || self.wb_windows_since_check >= WB_REPROBE_INTERVAL)
-            {
-                self.wb_windows_since_check = 0;
-                #[cfg(test)]
-                {
-                    self.and_window_stats.wide_bound_checks += 1;
-                }
-                for posting in &mut self.lead {
-                    posting.shallow_next(target);
-                }
-                let wide_max = conservative_score_sum(self.lead.iter().map(|posting| {
-                    posting
-                        .block_max_score_up_to_with_stats(win_end, &self.scorer)
-                        .score
-                }));
-                if wide_max < self.threshold {
-                    self.wb_total_skips = self.wb_total_skips.saturating_add(1);
-                    if self.wb_total_skips >= WB_LATCH_SKIP_COUNT {
-                        self.wb_always_check = true;
-                    }
-                    #[cfg(test)]
-                    {
-                        self.and_window_stats.windows_array_skipped += 1;
-                    }
-                    if win_end == TERMINATED_DOC_ID {
-                        return false;
-                    }
-                    self.lead_next_target = Self::lead_next_target_after(win_end);
-                    continue;
-                }
-            }
-            self.wb_windows_since_check = self.wb_windows_since_check.saturating_add(1);
-
-            let Some(first_index) = self.lead[0].peek_remaining_block_docs_up_to(
-                win_end,
-                &mut self.lead_docs,
-                &mut self.lead_freqs,
-            ) else {
-                // Defensive: at this call site `win_end = max(next block
-                // boundary, target) >= lead[0]'s current doc` and the cursor's
-                // own entry is always pushed into the arrays, so the peek
-                // cannot return None. Kept as a guard for future call sites;
-                // do not widen the comment to the helper itself.
-                if win_end == TERMINATED_DOC_ID {
-                    return false;
-                }
-                self.lead_next_target = Self::lead_next_target_after(win_end);
-                continue;
-            };
-
-            self.lead_first_index = first_index;
-            self.lead_pos = 0;
-            self.lead_window_end = win_end;
-            self.lead_next_target = Self::lead_next_target_after(win_end);
-            return true;
-        }
-    }
-
-    /// Park the lead clause's cursor on an array entry without searching for it.
-    fn park_lead_at(&mut self, index: usize, doc: u32, freq: u32) {
-        self.lead[0].index = index;
-        if let PostingList::Compressed(ref list) = self.lead[0].list {
-            self.lead[0].block_idx = index >> list.block_shift();
-        }
-        self.lead[0].current_doc = Some(DocInfo::Raw(RawDocInfo {
-            doc_id: doc,
-            frequency: freq,
-        }));
+        self.array_lead
+            .open(&mut self.lead, &self.scorer, self.threshold)
     }
 
     fn posting_block_up_to(posting: &PostingIterator, target: u64) -> u64 {
@@ -8079,7 +7817,7 @@ mod tests {
                 .unwrap();
             (
                 hits,
-                wand.and_window_stats.lut_prepruned,
+                wand.array_lead.stats.lut_prepruned,
                 wand.and_lead_arrayed,
             )
         };
@@ -8167,7 +7905,7 @@ mod tests {
                 .unwrap();
             (
                 hits,
-                wand.and_window_stats.lut_prepruned,
+                wand.array_lead.stats.lut_prepruned,
                 wand.and_lead_arrayed,
             )
         };
@@ -8294,9 +8032,9 @@ mod tests {
             (
                 hits,
                 wand.and_lead_arrayed,
-                wand.and_window_stats.windows_array_skipped,
-                wand.and_window_stats.wide_bound_checks,
-                wand.wb_always_check,
+                wand.array_lead.stats.windows_skipped,
+                wand.array_lead.stats.wide_bound_checks,
+                wand.array_lead.always_check,
             )
         };
 
@@ -8380,8 +8118,8 @@ mod tests {
                 .unwrap();
             (
                 hits,
-                wand.and_window_stats.windows_array_skipped,
-                wand.wb_always_check,
+                wand.array_lead.stats.windows_skipped,
+                wand.array_lead.always_check,
             )
         };
 
@@ -8462,7 +8200,7 @@ mod tests {
             (
                 hits,
                 wand.and_lead_arrayed,
-                wand.and_window_stats.follower_window_jumps,
+                wand.array_lead.stats.follower_window_jumps,
             )
         };
 
@@ -8536,10 +8274,10 @@ mod tests {
         // Manually enter the arrayed route with a failed-check state: floor
         // positive but equal to the cold wide bound, gate freshly cooled.
         wand.and_lead_arrayed = true;
-        wand.lead_next_target = 0;
+        wand.array_lead.next_target = 0;
         wand.threshold = 3.0;
-        wand.wb_windows_since_check = 0;
-        wand.wb_always_check = false;
+        wand.array_lead.windows_since_check = 0;
+        wand.array_lead.always_check = false;
 
         // The first WB_REPROBE_INTERVAL windows cool down without a check.
         for _ in 0..WB_REPROBE_INTERVAL {
@@ -8548,20 +8286,23 @@ mod tests {
                 "the cold lead must keep opening windows"
             );
             assert_eq!(
-                wand.and_window_stats.wide_bound_checks, 0,
+                wand.array_lead.stats.wide_bound_checks, 0,
                 "the gate must stay closed during the cooldown"
             );
-            assert_eq!(wand.wb_total_skips, 0, "a failed check must not skip");
+            assert_eq!(
+                wand.array_lead.total_skips, 0,
+                "a failed check must not skip"
+            );
         }
         // Window WB_REPROBE_INTERVAL + 1 re-probes; the check fails again
         // (wide_max == threshold), so nothing is skipped and the cooldown
         // restarts.
         assert!(wand.open_lead_array());
         assert_eq!(
-            wand.and_window_stats.wide_bound_checks, 1,
+            wand.array_lead.stats.wide_bound_checks, 1,
             "the gate must re-probe exactly at the interval boundary"
         );
-        assert_eq!(wand.wb_total_skips, 0);
+        assert_eq!(wand.array_lead.total_skips, 0);
         // The failed check restarts the cooldown: the next WB_REPROBE_INTERVAL
         // - 1 windows stay unchecked, and the window exactly one interval
         // after the failed check re-probes.
@@ -8569,12 +8310,12 @@ mod tests {
             assert!(wand.open_lead_array());
         }
         assert_eq!(
-            wand.and_window_stats.wide_bound_checks, 1,
+            wand.array_lead.stats.wide_bound_checks, 1,
             "the cooldown must restart after the failed re-probe"
         );
         assert!(wand.open_lead_array());
         assert_eq!(
-            wand.and_window_stats.wide_bound_checks, 2,
+            wand.array_lead.stats.wide_bound_checks, 2,
             "the gate must re-probe one full interval after the failure"
         );
     }
@@ -8625,14 +8366,14 @@ mod tests {
         ];
         let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer);
         wand.and_lead_arrayed = true;
-        wand.lead_next_target = 0;
+        wand.array_lead.next_target = 0;
         // Floor strictly between the stale bound (1 + 2 = 3) and the true
         // contribution (64 + 2): only the correct park keeps the candidate.
         wand.threshold = 10.0;
         // Keep the periodic wide-bound gate closed so the test isolates the
         // candidate-level exact prune.
-        wand.wb_windows_since_check = 0;
-        wand.wb_always_check = false;
+        wand.array_lead.windows_since_check = 0;
+        wand.array_lead.always_check = false;
 
         let candidate = wand
             .next_and_candidate_arrayed()
@@ -8640,7 +8381,7 @@ mod tests {
         assert_eq!(candidate.doc_id(), 1);
         assert_eq!(candidate.frequency(), 64);
         assert_eq!(
-            wand.deferred_park_hits, 1,
+            wand.array_lead.stats.deferred_park_hits, 1,
             "the deferred-park branch must have run for the accepted candidate"
         );
     }
