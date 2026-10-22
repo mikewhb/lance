@@ -1142,6 +1142,12 @@ impl PostingIterator {
         self
     }
 
+    /// Places this posting at `position` in a cursor's query-order score sum.
+    pub(super) fn with_query_position(mut self, position: u32) -> Self {
+        self.position = position;
+        self
+    }
+
     pub(super) fn with_grouped_terms(mut self, terms: Arc<[GroupedTermScorer]>) -> Self {
         // Grouped postings are built at query time with the same scoring
         // lengths and scorer as this cursor.  Their baked list maximum is the
