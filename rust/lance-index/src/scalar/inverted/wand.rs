@@ -42,6 +42,25 @@ pub(super) use term_and::TermAndCursor;
 pub(super) use term_and::test_counters as term_and_test_counters;
 pub(super) use term_leaf::TermLeaf;
 
+#[cfg(test)]
+pub(super) mod or_seek_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        static REQUEUED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Postings a disjunction seek put back into its heap on this thread since
+    /// the previous call.
+    pub(in crate::scalar::inverted) fn take() -> usize {
+        REQUEUED.with(|count| count.replace(0))
+    }
+
+    pub(super) fn requeued() {
+        REQUEUED.with(|count| count.set(count.get() + 1));
+    }
+}
+
 use self::and_array::ArrayLead;
 use self::and_kernel::{WindowList, window_bm25_score};
 use super::{
@@ -6050,29 +6069,31 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
             return;
         }
 
-        let mut postings = std::mem::take(&mut self.head)
-            .into_vec()
-            .into_iter()
-            .map(|posting| posting.posting)
-            .chain(self.lead.drain(..))
-            .chain(
-                std::mem::take(&mut self.tail)
-                    .into_vec()
-                    .into_iter()
-                    .map(|posting| posting.posting),
-            )
-            .collect::<Vec<_>>();
+        // Head entries at or past `target` keep their heap slots. The heap
+        // order is total, so this matches a full rebuild while a seek pays
+        // only for the postings behind `target`.
+        let tail = std::mem::take(&mut self.tail);
         self.tail_max_score = 0.0;
-        for posting in &mut postings {
-            if posting.doc().is_some_and(|doc| doc.doc_id() < target) {
-                posting.next(target);
+        for posting in tail.into_vec() {
+            self.requeue_for_seek(posting.posting, target);
+        }
+        while let Some(posting) = self.lead.pop() {
+            self.requeue_for_seek(posting, target);
+        }
+        while matches!(self.head_doc(), Some(doc_id) if doc_id < target) {
+            if let Some(posting) = self.head.pop() {
+                self.requeue_for_seek(posting.posting, target);
             }
         }
-        self.head = postings
-            .into_iter()
-            .filter(|posting| posting.doc().is_some())
-            .map(HeadPosting::new)
-            .collect();
+    }
+
+    fn requeue_for_seek(&mut self, mut posting: Box<PostingIterator>, target: u64) {
+        if posting.current_doc_id().is_some_and(|doc| doc < target) {
+            posting.next(target);
+        }
+        #[cfg(test)]
+        or_seek_counters::requeued();
+        self.push_head(posting);
     }
 
     fn compound_shallow_bound(&mut self, target: u64) -> (u64, f32) {

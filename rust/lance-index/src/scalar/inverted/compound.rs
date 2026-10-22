@@ -4743,6 +4743,7 @@ mod tests {
         MAX_POSTING_BLOCK_SIZE, compress_posting_list_with_tail_codec_and_block_size,
     };
     use super::super::impact::build_impact_skip_data;
+    use super::super::wand::or_seek_counters;
     use super::super::wand::term_and_test_counters;
     use super::super::{CompressedPostingList, PostingTailCodec};
 
@@ -7999,5 +8000,93 @@ mod tests {
             let generic = collect_generic(&corpus, &mask, leaves(), &plan, limit);
             assert_eq!(score_bits(&admitted), score_bits(&generic), "limit={limit}");
         }
+    }
+
+    #[test]
+    fn or_cursor_seek_requeues_only_lagging_postings_and_matches_leaves() {
+        let num_docs = 8_192_u32;
+        let doc_lengths = (0..num_docs).map(|doc| 1 + doc % 17).collect::<Vec<_>>();
+        let strides = [1_u32, 97, 389, 1_021];
+        let terms = strides
+            .iter()
+            .map(|&stride| {
+                (0..num_docs)
+                    .filter(|doc| doc % stride == 0)
+                    .map(|doc| (doc, 1 + doc % 3))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let corpus = Corpus::new(doc_lengths, terms);
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let all = (0..strides.len()).collect::<Vec<_>>();
+        let postings = corpus
+            .leaves(&all)
+            .into_iter()
+            .enumerate()
+            .map(|(rank, mut leaf)| {
+                leaf.postings
+                    .pop()
+                    .expect("one posting per leaf")
+                    .with_query_position(rank as u32)
+            })
+            .collect::<Vec<_>>();
+        let mut cursor: BoxScorer<'_> = Box::new(WandCursor::new(
+            Operator::Or,
+            postings,
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::default(),
+            &metrics,
+        ));
+        let leaves = corpus
+            .leaves(&all)
+            .into_iter()
+            .map(|mut leaf| -> BoxScorer<'_> {
+                Box::new(TermLeaf::new(
+                    leaf.postings.pop().expect("one posting per leaf"),
+                    &documents,
+                    leaf.scorer,
+                    &metrics,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut reference: BoxScorer<'_> =
+            Box::new(DisjunctionScorer::try_new(leaves, DisjunctionScore::Sum).unwrap());
+
+        or_seek_counters::take();
+        let mut seeks = 0;
+        let mut target = 1_u64;
+        loop {
+            let doc = cursor.advance(target).unwrap();
+            assert_eq!(doc, reference.advance(target).unwrap(), "target={target}");
+            let Some(doc) = doc else {
+                break;
+            };
+            seeks += 1;
+            assert_eq!(
+                cursor.score().unwrap().to_bits(),
+                reference.score().unwrap().to_bits(),
+                "doc={doc}"
+            );
+            let next = cursor.next().unwrap();
+            assert_eq!(next, reference.next().unwrap(), "after doc={doc}");
+            let Some(next) = next else {
+                break;
+            };
+            assert_eq!(
+                cursor.score().unwrap().to_bits(),
+                reference.score().unwrap().to_bits(),
+                "doc={next}"
+            );
+            target = next + 37;
+        }
+        let requeued = or_seek_counters::take();
+        assert!(seeks > 100, "only {seeks} seeks");
+        assert!(
+            requeued < seeks * strides.len(),
+            "{requeued} requeues over {seeks} seeks: every seek requeued every posting"
+        );
     }
 }
