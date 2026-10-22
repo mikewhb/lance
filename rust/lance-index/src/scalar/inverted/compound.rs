@@ -4581,6 +4581,14 @@ mod tests {
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::inverted::query::MultiMatchQuery;
+    use lance_select::RowAddrTreeMap;
+
+    use super::super::encoding::{
+        MAX_POSTING_BLOCK_SIZE, compress_posting_list_with_tail_codec_and_block_size,
+    };
+    use super::super::impact::build_impact_skip_data;
+    use super::super::wand::term_reqopt_test_counters;
+    use super::super::{CompressedPostingList, PostingTailCodec};
 
     fn rows(values: &[(u64, f32)]) -> Vec<ScoredRow> {
         values
@@ -7152,5 +7160,419 @@ mod tests {
                 rows(&[(0, large_score), (1, large_score), (2, large_score)])
             );
         }
+    }
+
+    /// One compressed posting whose block bounds come from impact metadata, so
+    /// the block skipper has something to work with. `doc_lengths` must be the
+    /// same slice the `DocSet` was built from, otherwise the bounds would not
+    /// be conservative and the tests would report false failures.
+    fn impact_posting(
+        term: usize,
+        entries: &[(u32, u32)],
+        doc_lengths: &[u32],
+        scorer: &MemBM25Scorer,
+    ) -> PostingIterator {
+        let block_size = MAX_POSTING_BLOCK_SIZE;
+        let doc_ids = entries.iter().map(|&(doc, _)| doc).collect::<Vec<_>>();
+        let freqs = entries.iter().map(|&(_, freq)| freq).collect::<Vec<_>>();
+        let blocks = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            freqs.iter(),
+            vec![0.0; doc_ids.len().div_ceil(block_size)].into_iter(),
+            PostingTailCodec::VarintDelta,
+            block_size,
+        )
+        .unwrap();
+        let impact_blocks = entries
+            .chunks(block_size)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|&(doc, freq)| (doc, freq, doc_lengths[doc as usize]))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let list = PostingList::Compressed(CompressedPostingList::new(
+            blocks,
+            0.0,
+            doc_ids.len() as u32,
+            PostingTailCodec::VarintDelta,
+            block_size,
+            None,
+            Some(build_impact_skip_data(&impact_blocks).unwrap()),
+        ));
+        let token = format!("t{term}");
+        let query_weight = scorer.query_weight(&token);
+        PostingIterator::with_query_weight(
+            token,
+            term as u32,
+            0,
+            query_weight,
+            list,
+            doc_lengths.len(),
+        )
+    }
+
+    struct Corpus {
+        documents: DocSet,
+        doc_lengths: Vec<u32>,
+        scorer: Arc<MemBM25Scorer>,
+        terms: Vec<Vec<(u32, u32)>>,
+    }
+
+    impl Corpus {
+        fn new(doc_lengths: Vec<u32>, terms: Vec<Vec<(u32, u32)>>) -> Self {
+            let mut documents = DocSet::default();
+            for (doc, &length) in doc_lengths.iter().enumerate() {
+                documents.append(doc as u64, length);
+            }
+            let token_docs = terms
+                .iter()
+                .enumerate()
+                .map(|(term, entries)| (format!("t{term}"), entries.len()))
+                .collect::<HashMap<_, _>>();
+            let total_tokens = doc_lengths.iter().map(|&length| u64::from(length)).sum();
+            let scorer = Arc::new(MemBM25Scorer::new(
+                total_tokens,
+                doc_lengths.len(),
+                token_docs,
+            ));
+            Self {
+                documents,
+                doc_lengths,
+                scorer,
+                terms,
+            }
+        }
+
+        /// One one-term leaf per entry of `order`, in that order.
+        fn leaves(&self, order: &[usize]) -> Vec<LoadedLeaf> {
+            order
+                .iter()
+                .map(|&term| LoadedLeaf {
+                    postings: vec![impact_posting(
+                        term,
+                        &self.terms[term],
+                        &self.doc_lengths,
+                        &self.scorer,
+                    )],
+                    params: Arc::new(FtsSearchParams::default()),
+                    operator: Operator::Or,
+                    scorer: self.scorer.clone(),
+                })
+                .collect()
+        }
+    }
+
+    fn random_corpus(rng: &mut SmallRng, num_docs: usize, densities: &[f64]) -> Corpus {
+        let mut doc_lengths = Vec::with_capacity(num_docs);
+        for _ in 0..num_docs {
+            doc_lengths.push(rng.random_range(1..=24_u32));
+        }
+        let mut terms = Vec::with_capacity(densities.len());
+        for &density in densities {
+            let mut entries = Vec::new();
+            for doc in 0..num_docs as u32 {
+                if rng.random_bool(density) {
+                    entries.push((doc, rng.random_range(1..=6_u32)));
+                }
+            }
+            if entries.is_empty() {
+                entries.push((0, 1));
+            }
+            terms.push(entries);
+        }
+        Corpus::new(doc_lengths, terms)
+    }
+
+    fn deletion_mask(rng: &mut SmallRng, num_docs: usize, rate: f64) -> RowAddrMask {
+        let mut deleted = Vec::new();
+        for doc in 0..num_docs as u64 {
+            if rng.random_bool(rate) {
+                deleted.push(doc);
+            }
+        }
+        RowAddrMask::from_block(RowAddrTreeMap::from_iter(deleted))
+    }
+
+    fn must_should_plan(musts: usize, shoulds: usize) -> CompoundScorerPlan {
+        let leaf = |index| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+        CompoundScorerPlan::Boolean {
+            should: (musts..musts + shoulds).map(leaf).collect(),
+            must: (0..musts).map(leaf).collect(),
+            must_not: Vec::new(),
+        }
+    }
+
+    /// The production entry point, which admits the fast path when it can.
+    fn collect_admitted(
+        corpus: &Corpus,
+        mask: &RowAddrMask,
+        leaves: Vec<LoadedLeaf>,
+        plan: &CompoundScorerPlan,
+        limit: usize,
+    ) -> Vec<ScoredRow> {
+        let documents = LegacyWandDocuments::new(&corpus.documents, mask);
+        let mut collector = TopKCollector::new(limit);
+        collect_partition_with_documents(
+            &documents,
+            leaves,
+            plan,
+            &NoOpMetricsCollector,
+            &mut collector,
+            Ok,
+        )
+        .unwrap();
+        collector.into_rows()
+    }
+
+    /// The generic scorer tree over the same leaves, never the fast path.
+    fn collect_generic(
+        corpus: &Corpus,
+        mask: &RowAddrMask,
+        leaves: Vec<LoadedLeaf>,
+        plan: &CompoundScorerPlan,
+        limit: usize,
+    ) -> Vec<ScoredRow> {
+        let documents = LegacyWandDocuments::new(&corpus.documents, mask);
+        let metrics = NoOpMetricsCollector;
+        let mut leaf_scorers = leaves
+            .into_iter()
+            .map(|leaf| {
+                Some(Box::new(WandCursor::new(
+                    leaf.operator,
+                    leaf.postings,
+                    &documents,
+                    leaf.scorer,
+                    leaf.params.as_ref(),
+                    &metrics,
+                )) as BoxScorer<'_>)
+            })
+            .collect::<Vec<_>>();
+        let mut scorer = plan.build(&mut leaf_scorers).unwrap();
+        let mut collector = TopKCollector::new(limit);
+        collector.collect_mapped(scorer.as_mut(), Ok).unwrap();
+        collector.into_rows()
+    }
+
+    fn score_bits(rows: &[ScoredRow]) -> Vec<(u64, u32)> {
+        rows.iter()
+            .map(|row| (row.row_id, row.score.to_bits()))
+            .collect()
+    }
+
+    #[test]
+    fn term_reqopt_matches_the_generic_tree_bit_for_bit() {
+        let mut order_sensitive_seeds = 0;
+        for seed in 0..48_u64 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let musts = rng.random_range(1..=3_usize);
+            let shoulds = rng.random_range(1..=4_usize);
+            let num_docs = rng.random_range(300..=1_500_usize);
+            let mut densities = Vec::new();
+            for _ in 0..musts + shoulds {
+                densities.push(rng.random_range(0.02..0.6));
+            }
+            let corpus = random_corpus(&mut rng, num_docs, &densities);
+            let mask = deletion_mask(&mut rng, num_docs, 0.1);
+            let plan = must_should_plan(musts, shoulds);
+            // Clause order is varied on the *plan*, never on the leaf slice.
+            // The terms stay attached to the same leaves; only the order in
+            // which the node sums them changes. Permuting the leaf slice
+            // instead would silently turn this into a different query, and the
+            // comparison below would prove nothing about summation order.
+            let all = (0..musts + shoulds).collect::<Vec<_>>();
+            let leaf_at = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+            let reversed_plan = CompoundScorerPlan::Boolean {
+                must: (0..musts).rev().map(leaf_at).collect(),
+                should: (musts..musts + shoulds).rev().map(leaf_at).collect(),
+                must_not: Vec::new(),
+            };
+            let plans = [plan, reversed_plan];
+
+            for (order, plan) in plans.iter().enumerate() {
+                for limit in [1, 3, 10, 100, num_docs] {
+                    term_reqopt_test_counters::take();
+                    let admitted =
+                        collect_admitted(&corpus, &mask, corpus.leaves(&all), plan, limit);
+                    assert_eq!(
+                        term_reqopt_test_counters::take().built,
+                        1,
+                        "seed={seed} order={order} limit={limit}: fast path not taken"
+                    );
+                    let generic = collect_generic(&corpus, &mask, corpus.leaves(&all), plan, limit);
+                    assert_eq!(term_reqopt_test_counters::take().built, 0);
+                    assert_eq!(
+                        score_bits(&admitted),
+                        score_bits(&generic),
+                        "seed={seed} musts={musts} shoulds={shoulds} order={order} limit={limit}"
+                    );
+                }
+            }
+
+            // The same query with its clauses listed in another order must score
+            // some document differently, otherwise this seed cannot detect a
+            // wrong summation order. Two addends always commute in IEEE-754, so
+            // only seeds with at least three clauses in one group can show it;
+            // `musts` and `shoulds` are drawn from ranges that include such seeds.
+            let forward = score_bits(&collect_generic(
+                &corpus,
+                &mask,
+                corpus.leaves(&all),
+                &plans[0],
+                num_docs,
+            ))
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+            let reversed = score_bits(&collect_generic(
+                &corpus,
+                &mask,
+                corpus.leaves(&all),
+                &plans[1],
+                num_docs,
+            ))
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+            if forward
+                .iter()
+                .any(|(row_id, bits)| reversed.get(row_id).is_some_and(|other| other != bits))
+            {
+                order_sensitive_seeds += 1;
+            }
+        }
+        assert!(
+            order_sensitive_seeds > 0,
+            "no seed distinguishes clause order, so the summation order is not pinned"
+        );
+    }
+
+    #[test]
+    fn term_reqopt_promotes_a_rare_should_and_matches_the_generic_tree() {
+        let num_docs = 3_000_u32;
+        let must = (0..num_docs)
+            .filter(|doc| doc % 10 != 0)
+            .map(|doc| (doc, 1 + doc % 3))
+            .collect::<Vec<_>>();
+        let rare = (0..num_docs)
+            .filter(|doc| doc % 97 == 1)
+            .map(|doc| (doc, 4))
+            .collect::<Vec<_>>();
+        let common = (0..num_docs)
+            .filter(|doc| doc % 3 == 0)
+            .map(|doc| (doc, 1))
+            .collect::<Vec<_>>();
+        let corpus = Corpus::new(vec![8; num_docs as usize], vec![must, rare, common]);
+        let mask = RowAddrMask::all_rows();
+        let plan = must_should_plan(1, 2);
+        let mut promoted = 0;
+        for limit in [1, 3, 10] {
+            term_reqopt_test_counters::take();
+            let admitted =
+                collect_admitted(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
+            let counts = term_reqopt_test_counters::take();
+            assert_eq!(counts.built, 1, "limit={limit}");
+            promoted += counts.promoted;
+            let generic = collect_generic(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
+            assert_eq!(score_bits(&admitted), score_bits(&generic), "limit={limit}");
+        }
+        assert!(
+            promoted > 0,
+            "the rare SHOULD clause never took over the drive"
+        );
+    }
+
+    #[test]
+    fn term_reqopt_skips_blocks_below_the_floor_and_matches_the_generic_tree() {
+        let num_docs = 4_096_u32;
+        let mut doc_lengths = vec![30_u32; num_docs as usize];
+        doc_lengths[..256].fill(2);
+        let must = (0..num_docs)
+            .map(|doc| (doc, if doc < 256 { 6 } else { 1 }))
+            .collect::<Vec<_>>();
+        let should = (0..num_docs)
+            .filter(|doc| doc % 2 == 0)
+            .map(|doc| (doc, 1))
+            .collect::<Vec<_>>();
+        let corpus = Corpus::new(doc_lengths, vec![must, should]);
+        let mask = RowAddrMask::all_rows();
+        let plan = must_should_plan(1, 1);
+        let mut skipped = 0;
+        for limit in [1, 10, 100] {
+            term_reqopt_test_counters::take();
+            let admitted = collect_admitted(&corpus, &mask, corpus.leaves(&[0, 1]), &plan, limit);
+            let counts = term_reqopt_test_counters::take();
+            assert_eq!(counts.built, 1, "limit={limit}");
+            skipped += counts.skipped_blocks;
+            let generic = collect_generic(&corpus, &mask, corpus.leaves(&[0, 1]), &plan, limit);
+            assert_eq!(score_bits(&admitted), score_bits(&generic), "limit={limit}");
+        }
+        assert!(skipped > 0, "no driver block was skipped below the floor");
+    }
+
+    #[test]
+    fn term_reqopt_admission_rejects_other_shapes() {
+        let mut rng = SmallRng::seed_from_u64(7);
+        let corpus = random_corpus(&mut rng, 800, &[0.3, 0.2, 0.1]);
+        let mask = RowAddrMask::all_rows();
+        let leaf = |index, boost| CompoundScorerPlan::Leaf { index, boost };
+        let boolean = |must, should, must_not| CompoundScorerPlan::Boolean {
+            should,
+            must,
+            must_not,
+        };
+        let shapes = [
+            (
+                "boosted clause",
+                boolean(vec![leaf(0, 2.0)], vec![leaf(1, 1.0), leaf(2, 1.0)], vec![]),
+            ),
+            (
+                "must_not",
+                boolean(vec![leaf(0, 1.0)], vec![leaf(1, 1.0)], vec![leaf(2, 1.0)]),
+            ),
+            (
+                "must only",
+                boolean(
+                    vec![leaf(0, 1.0), leaf(1, 1.0), leaf(2, 1.0)],
+                    vec![],
+                    vec![],
+                ),
+            ),
+            (
+                "should only",
+                boolean(
+                    vec![],
+                    vec![leaf(0, 1.0), leaf(1, 1.0), leaf(2, 1.0)],
+                    vec![],
+                ),
+            ),
+            (
+                "nested must",
+                boolean(
+                    vec![boolean(vec![], vec![leaf(0, 1.0), leaf(1, 1.0)], vec![])],
+                    vec![leaf(2, 1.0)],
+                    vec![],
+                ),
+            ),
+        ];
+        for (name, plan) in shapes {
+            term_reqopt_test_counters::take();
+            let admitted = collect_admitted(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, 10);
+            assert_eq!(term_reqopt_test_counters::take().built, 0, "{name}");
+            let generic = collect_generic(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, 10);
+            assert_eq!(score_bits(&admitted), score_bits(&generic), "{name}");
+        }
+
+        // Clauses whose scorers disagree on document weights stay on the tree.
+        let mut leaves = corpus.leaves(&[0, 1, 2]);
+        let other = &corpus.scorer;
+        leaves[2].scorer = Arc::new(MemBM25Scorer::new(
+            other.total_tokens * 2,
+            other.num_docs,
+            other.token_docs.clone(),
+        ));
+        term_reqopt_test_counters::take();
+        collect_admitted(&corpus, &mask, leaves, &must_should_plan(1, 2), 10);
+        assert_eq!(term_reqopt_test_counters::take().built, 0, "mixed scorers");
     }
 }

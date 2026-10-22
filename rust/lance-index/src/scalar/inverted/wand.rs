@@ -31,6 +31,9 @@ mod term_reqopt;
 
 pub(super) use term_reqopt::TermReqOptScorer;
 
+#[cfg(test)]
+pub(super) use term_reqopt::test_counters as term_reqopt_test_counters;
+
 use super::{
     CompressedPositionStorage,
     documents::{DocId, DocLengths, DocVisibility},

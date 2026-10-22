@@ -3273,6 +3273,7 @@ async fn test_partial_compound_hybrid_uses_mixed_approximate_statistics() {
 #[case::one_must_two_shoulds(&["alpha"], &["beta", "gamma"])]
 #[case::two_musts_one_should(&["alpha", "beta"], &["gamma"])]
 #[case::two_musts_two_shoulds(&["alpha", "gamma"], &["beta", "delta"])]
+#[case::one_must_three_shoulds(&["alpha"], &["beta", "gamma", "delta"])]
 #[tokio::test]
 async fn test_one_term_must_should_scores_follow_clause_order(
     #[case] musts: &[&str],

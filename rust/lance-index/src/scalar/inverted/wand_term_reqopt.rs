@@ -82,6 +82,8 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
             .map(|posting| posting.global_upper_bound(&scorer))
             .collect();
         let norms = documents.scoring_norms().zip(norm_addends(scorer.as_ref()));
+        #[cfg(test)]
+        test_counters::built();
         Self {
             postings,
             musts: musts_len,
@@ -214,6 +216,8 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
             })
             .min_by_key(|&should| self.postings[should].cost());
         if let Some(should) = required {
+            #[cfg(test)]
+            test_counters::promoted();
             let frontier = self.postings[self.driver].current_doc_id();
             self.driver = should;
             match frontier {
@@ -284,6 +288,8 @@ impl<'a, D: WandDocuments> TermReqOptScorer<'a, D> {
                     ),
                 );
                 if upper < self.floor {
+                    #[cfg(test)]
+                    test_counters::skipped_block();
                     if !self.postings[driver].skip_current_block() {
                         return false;
                     }
@@ -398,5 +404,44 @@ fn term_score<D: WandDocuments>(
                 * bm25_doc_weight_with_norm(freq, addends[codes[doc as usize] as usize])
         }
         None => posting.score(scorer, freq, documents.scoring_num_tokens(doc as u32)),
+    }
+}
+
+#[cfg(test)]
+pub(in crate::scalar::inverted) mod test_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        static BUILT: Cell<usize> = const { Cell::new(0) };
+        static PROMOTED: Cell<usize> = const { Cell::new(0) };
+        static SKIPPED_BLOCKS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Decisions taken on this thread since the previous `take`.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub(in crate::scalar::inverted) struct Counts {
+        pub(in crate::scalar::inverted) built: usize,
+        pub(in crate::scalar::inverted) promoted: usize,
+        pub(in crate::scalar::inverted) skipped_blocks: usize,
+    }
+
+    pub(in crate::scalar::inverted) fn take() -> Counts {
+        Counts {
+            built: BUILT.with(|count| count.replace(0)),
+            promoted: PROMOTED.with(|count| count.replace(0)),
+            skipped_blocks: SKIPPED_BLOCKS.with(|count| count.replace(0)),
+        }
+    }
+
+    pub(super) fn built() {
+        BUILT.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn promoted() {
+        PROMOTED.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn skipped_block() {
+        SKIPPED_BLOCKS.with(|count| count.set(count.get() + 1));
     }
 }
