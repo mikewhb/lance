@@ -26,6 +26,10 @@ use crate::metrics::MetricsCollector;
 mod intersection;
 #[path = "wand_maxscore.rs"]
 mod maxscore;
+#[path = "wand_term_leaf.rs"]
+mod term_leaf;
+
+pub(super) use term_leaf::TermLeaf;
 
 use super::{
     CompressedPositionStorage,

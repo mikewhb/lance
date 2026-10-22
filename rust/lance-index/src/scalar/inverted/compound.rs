@@ -32,7 +32,7 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        WandCursor, WandDocuments, score_sum_upper_bound_factor,
+        TermLeaf, WandCursor, WandDocuments, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -799,6 +799,67 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
 
     fn match_cost(&self) -> Option<f32> {
         self.match_cost()
+    }
+
+    fn scores_non_negative(&self) -> bool {
+        true
+    }
+}
+
+impl<D: WandDocuments + Sync> ComposableScorer for TermLeaf<'_, D> {
+    fn doc(&self) -> Option<u64> {
+        self.doc()
+    }
+
+    fn document_key(&self) -> Option<u64> {
+        self.document_key()
+    }
+
+    fn next(&mut self) -> Result<Option<u64>> {
+        Ok(self.next())
+    }
+
+    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        Ok(self.advance(target))
+    }
+
+    fn cost(&self) -> usize {
+        self.cost()
+    }
+
+    fn score(&mut self) -> Result<f32> {
+        self.score()
+    }
+
+    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        Ok(self.advance_shallow(target))
+    }
+
+    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        Ok(ScoreBounds {
+            lower: 0.0,
+            upper: self.score_upper_bound(up_to)?,
+        })
+    }
+
+    fn global_score_upper_bound(&self) -> Option<f32> {
+        TermLeaf::global_score_upper_bound(self)
+    }
+
+    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
+        if min_score.is_nan() {
+            return Err(Error::invalid_input(
+                "minimum competitive FTS score cannot be NaN",
+            ));
+        }
+        Ok(())
+    }
+
+    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
+        if self.doc().is_none() {
+            return Ok(None);
+        }
+        self.score().map(Some)
     }
 
     fn scores_non_negative(&self) -> bool {
@@ -4007,6 +4068,11 @@ struct CollectedPartitions {
     boundary: Option<PartitionCollectionBoundary>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TERM_LEAVES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn collect_partition_with_documents<D, K>(
     documents: &D,
     leaves: Vec<LoadedLeaf>,
@@ -4021,9 +4087,15 @@ where
 {
     let mut leaf_scorers = leaves
         .into_iter()
-        .map(|leaf| {
+        .map(|mut leaf| {
             let scorer: BoxScorer<'_> = if leaf.postings.is_empty() {
                 Box::new(EmptyScorer)
+            } else if TermLeaf::<D>::accepts(&leaf.postings, &leaf.params)
+                && let Some(posting) = leaf.postings.pop()
+            {
+                #[cfg(test)]
+                TERM_LEAVES_BUILT.with(|count| count.set(count.get() + 1));
+                Box::new(TermLeaf::new(posting, documents, leaf.scorer, metrics))
             } else {
                 Box::new(WandCursor::new(
                     leaf.operator,
@@ -4465,6 +4537,13 @@ mod tests {
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::inverted::query::MultiMatchQuery;
+    use lance_select::RowAddrTreeMap;
+
+    use super::super::encoding::{
+        MAX_POSTING_BLOCK_SIZE, compress_posting_list_with_tail_codec_and_block_size,
+    };
+    use super::super::impact::build_impact_skip_data;
+    use super::super::{CompressedPostingList, PostingTailCodec};
 
     fn rows(values: &[(u64, f32)]) -> Vec<ScoredRow> {
         values
@@ -7035,6 +7114,264 @@ mod tests {
                 TopKCollector::new(3).collect(&mut scorer).unwrap(),
                 rows(&[(0, large_score), (1, large_score), (2, large_score)])
             );
+        }
+    }
+
+    /// One compressed posting whose block bounds come from impact metadata, so
+    /// the block skipper has something to work with. `doc_lengths` must be the
+    /// same slice the `DocSet` was built from, otherwise the bounds would not
+    /// be conservative and the tests would report false failures.
+    fn impact_posting(
+        term: usize,
+        entries: &[(u32, u32)],
+        doc_lengths: &[u32],
+        scorer: &MemBM25Scorer,
+    ) -> PostingIterator {
+        let block_size = MAX_POSTING_BLOCK_SIZE;
+        let doc_ids = entries.iter().map(|&(doc, _)| doc).collect::<Vec<_>>();
+        let freqs = entries.iter().map(|&(_, freq)| freq).collect::<Vec<_>>();
+        let blocks = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            freqs.iter(),
+            vec![0.0; doc_ids.len().div_ceil(block_size)].into_iter(),
+            PostingTailCodec::VarintDelta,
+            block_size,
+        )
+        .unwrap();
+        let impact_blocks = entries
+            .chunks(block_size)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|&(doc, freq)| (doc, freq, doc_lengths[doc as usize]))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let list = PostingList::Compressed(CompressedPostingList::new(
+            blocks,
+            0.0,
+            doc_ids.len() as u32,
+            PostingTailCodec::VarintDelta,
+            block_size,
+            None,
+            Some(build_impact_skip_data(&impact_blocks).unwrap()),
+        ));
+        let token = format!("t{term}");
+        let query_weight = scorer.query_weight(&token);
+        PostingIterator::with_query_weight(
+            token,
+            term as u32,
+            0,
+            query_weight,
+            list,
+            doc_lengths.len(),
+        )
+    }
+
+    struct Corpus {
+        documents: DocSet,
+        doc_lengths: Vec<u32>,
+        scorer: Arc<MemBM25Scorer>,
+        terms: Vec<Vec<(u32, u32)>>,
+    }
+
+    impl Corpus {
+        fn new(doc_lengths: Vec<u32>, terms: Vec<Vec<(u32, u32)>>) -> Self {
+            let mut documents = DocSet::default();
+            for (doc, &length) in doc_lengths.iter().enumerate() {
+                documents.append(doc as u64, length);
+            }
+            let token_docs = terms
+                .iter()
+                .enumerate()
+                .map(|(term, entries)| (format!("t{term}"), entries.len()))
+                .collect::<HashMap<_, _>>();
+            let total_tokens = doc_lengths.iter().map(|&length| u64::from(length)).sum();
+            let scorer = Arc::new(MemBM25Scorer::new(
+                total_tokens,
+                doc_lengths.len(),
+                token_docs,
+            ));
+            Self {
+                documents,
+                doc_lengths,
+                scorer,
+                terms,
+            }
+        }
+
+        /// One one-term leaf per entry of `order`, in that order.
+        fn leaves(&self, order: &[usize]) -> Vec<LoadedLeaf> {
+            order
+                .iter()
+                .map(|&term| LoadedLeaf {
+                    postings: vec![impact_posting(
+                        term,
+                        &self.terms[term],
+                        &self.doc_lengths,
+                        &self.scorer,
+                    )],
+                    params: Arc::new(FtsSearchParams::default()),
+                    operator: Operator::Or,
+                    scorer: self.scorer.clone(),
+                })
+                .collect()
+        }
+    }
+
+    fn random_corpus(rng: &mut SmallRng, num_docs: usize, densities: &[f64]) -> Corpus {
+        let mut doc_lengths = Vec::with_capacity(num_docs);
+        for _ in 0..num_docs {
+            doc_lengths.push(rng.random_range(1..=24_u32));
+        }
+        let mut terms = Vec::with_capacity(densities.len());
+        for &density in densities {
+            let mut entries = Vec::new();
+            for doc in 0..num_docs as u32 {
+                if rng.random_bool(density) {
+                    entries.push((doc, rng.random_range(1..=6_u32)));
+                }
+            }
+            if entries.is_empty() {
+                entries.push((0, 1));
+            }
+            terms.push(entries);
+        }
+        Corpus::new(doc_lengths, terms)
+    }
+
+    fn deletion_mask(rng: &mut SmallRng, num_docs: usize, rate: f64) -> RowAddrMask {
+        let mut deleted = Vec::new();
+        for doc in 0..num_docs as u64 {
+            if rng.random_bool(rate) {
+                deleted.push(doc);
+            }
+        }
+        RowAddrMask::from_block(RowAddrTreeMap::from_iter(deleted))
+    }
+
+    /// The production entry point, which admits the fast path when it can.
+    fn collect_admitted(
+        corpus: &Corpus,
+        mask: &RowAddrMask,
+        leaves: Vec<LoadedLeaf>,
+        plan: &CompoundScorerPlan,
+        limit: usize,
+    ) -> Vec<ScoredRow> {
+        let documents = LegacyWandDocuments::new(&corpus.documents, mask);
+        let mut collector = TopKCollector::new(limit);
+        collect_partition_with_documents(
+            &documents,
+            leaves,
+            plan,
+            &NoOpMetricsCollector,
+            &mut collector,
+            Ok,
+        )
+        .unwrap();
+        collector.into_rows()
+    }
+
+    /// The generic scorer tree over the same leaves, never the fast path.
+    fn collect_generic(
+        corpus: &Corpus,
+        mask: &RowAddrMask,
+        leaves: Vec<LoadedLeaf>,
+        plan: &CompoundScorerPlan,
+        limit: usize,
+    ) -> Vec<ScoredRow> {
+        let documents = LegacyWandDocuments::new(&corpus.documents, mask);
+        let metrics = NoOpMetricsCollector;
+        let mut leaf_scorers = leaves
+            .into_iter()
+            .map(|leaf| {
+                Some(Box::new(WandCursor::new(
+                    leaf.operator,
+                    leaf.postings,
+                    &documents,
+                    leaf.scorer,
+                    leaf.params.as_ref(),
+                    &metrics,
+                )) as BoxScorer<'_>)
+            })
+            .collect::<Vec<_>>();
+        let mut scorer = plan.build(&mut leaf_scorers).unwrap();
+        let mut collector = TopKCollector::new(limit);
+        collector.collect_mapped(scorer.as_mut(), Ok).unwrap();
+        collector.into_rows()
+    }
+
+    fn score_bits(rows: &[ScoredRow]) -> Vec<(u64, u32)> {
+        rows.iter()
+            .map(|row| (row.row_id, row.score.to_bits()))
+            .collect()
+    }
+
+    fn take_term_leaves_built() -> usize {
+        TERM_LEAVES_BUILT.with(|count| count.replace(0))
+    }
+
+    #[test]
+    fn term_leaf_trees_match_the_wand_cursor_tree_on_other_shapes() {
+        let mut rng = SmallRng::seed_from_u64(7);
+        let corpus = random_corpus(&mut rng, 1_200, &[0.3, 0.2, 0.1]);
+        let mask = deletion_mask(&mut rng, 1_200, 0.1);
+        let leaf = |index, boost| CompoundScorerPlan::Leaf { index, boost };
+        let boolean = |must, should, must_not| CompoundScorerPlan::Boolean {
+            should,
+            must,
+            must_not,
+        };
+        let shapes = [
+            (
+                "boosted clause",
+                boolean(vec![leaf(0, 2.0)], vec![leaf(1, 1.0), leaf(2, 0.5)], vec![]),
+            ),
+            (
+                "must_not",
+                boolean(vec![leaf(0, 1.0)], vec![leaf(1, 1.0)], vec![leaf(2, 1.0)]),
+            ),
+            (
+                "should only",
+                boolean(
+                    vec![],
+                    vec![leaf(0, 1.0), leaf(1, 1.0), leaf(2, 1.0)],
+                    vec![],
+                ),
+            ),
+            (
+                "nested must",
+                boolean(
+                    vec![boolean(vec![], vec![leaf(0, 1.0), leaf(1, 1.0)], vec![])],
+                    vec![leaf(2, 1.0)],
+                    vec![],
+                ),
+            ),
+            (
+                "multi match",
+                CompoundScorerPlan::MultiMatch(vec![leaf(0, 1.0), leaf(1, 1.0), leaf(2, 1.0)]),
+            ),
+        ];
+        for (name, plan) in shapes {
+            for limit in [1, 10, 100, 1_200] {
+                take_term_leaves_built();
+                let admitted =
+                    collect_admitted(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
+                assert_eq!(
+                    take_term_leaves_built(),
+                    3,
+                    "{name} limit={limit}: leaves not TermLeaf"
+                );
+                let generic =
+                    collect_generic(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
+                assert_eq!(take_term_leaves_built(), 0, "{name} limit={limit}");
+                assert_eq!(
+                    score_bits(&admitted),
+                    score_bits(&generic),
+                    "{name} limit={limit}"
+                );
+            }
         }
     }
 }
