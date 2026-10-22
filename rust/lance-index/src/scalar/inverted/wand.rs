@@ -29,6 +29,16 @@ mod intersection;
 #[path = "wand_maxscore.rs"]
 mod maxscore;
 
+#[path = "wand_term_and.rs"]
+mod term_and;
+#[path = "wand_term_leaf.rs"]
+mod term_leaf;
+
+pub(super) use term_and::TermAndCursor;
+#[cfg(test)]
+pub(super) use term_and::test_counters as term_and_test_counters;
+pub(super) use term_leaf::TermLeaf;
+
 use self::and_kernel::{WindowList, window_bm25_score};
 use super::{
     CompressedPositionStorage,
