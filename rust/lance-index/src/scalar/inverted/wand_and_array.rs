@@ -99,6 +99,25 @@ impl ArrayLead {
         self.always_check = false;
     }
 
+    /// Whether the open window has no entry left.
+    pub(super) fn window_drained(&self) -> bool {
+        self.pos >= self.docs.len()
+    }
+
+    /// Moves the walk to the first lead entry at or after `target`.
+    pub(super) fn skip_to(&mut self, target: u64) {
+        if self.pos < self.docs.len() && target <= self.window_end {
+            self.pos += self.docs[self.pos..].partition_point(|&doc| u64::from(doc) < target);
+            return;
+        }
+        self.pos = self.docs.len();
+        self.next_target = if target > u64::from(u32::MAX) {
+            TERMINATED_DOC_ID
+        } else {
+            self.next_target.max(target)
+        };
+    }
+
     /// Copies the lead clause's current block into the arrays and moves the
     /// walk to the window's first entry. Returns false when the lead is
     /// exhausted.

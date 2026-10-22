@@ -7714,4 +7714,135 @@ mod tests {
             "the forwarded floor never pruned anything"
         );
     }
+
+    /// One rare MUST clause, `musts - 1` dense ones and `shoulds` medium
+    /// SHOULD clauses, so the MUST side is skewed.
+    fn skewed_densities(rng: &mut SmallRng, musts: usize, shoulds: usize) -> Vec<f64> {
+        let mut densities = vec![rng.random_range(0.002..0.008)];
+        for _ in 1..musts {
+            densities.push(rng.random_range(0.6..0.9));
+        }
+        for _ in 0..shoulds {
+            densities.push(rng.random_range(0.02..0.4));
+        }
+        densities
+    }
+
+    #[test]
+    fn term_and_array_lead_matches_the_wand_cursor_tree_bit_for_bit() {
+        let mut order_sensitive_seeds = 0;
+        for seed in 0..32_u64 {
+            let mut rng = SmallRng::seed_from_u64(2_000 + seed);
+            let musts = rng.random_range(3..=4_usize);
+            let shoulds = rng.random_range(0..=3_usize);
+            let num_docs = rng.random_range(3_000..=6_000_usize);
+            let densities = skewed_densities(&mut rng, musts, shoulds);
+            let corpus = random_corpus(&mut rng, num_docs, &densities);
+            let mask = deletion_mask(&mut rng, num_docs, 0.1);
+            let all = (0..musts + shoulds).collect::<Vec<_>>();
+            let leaf_at = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
+            let reversed_plan = CompoundScorerPlan::Boolean {
+                must: (0..musts).rev().map(leaf_at).collect(),
+                should: (musts..musts + shoulds).rev().map(leaf_at).collect(),
+                must_not: Vec::new(),
+            };
+            let plans = [must_should_plan(musts, shoulds), reversed_plan];
+            for (order, plan) in plans.iter().enumerate() {
+                for limit in [1, 10, 100, num_docs] {
+                    let context = format!(
+                        "seed={seed} musts={musts} shoulds={shoulds} order={order} limit={limit}"
+                    );
+                    term_and_test_counters::take_arrayed();
+                    let admitted =
+                        collect_admitted(&corpus, &mask, corpus.leaves(&all), plan, limit);
+                    assert_eq!(
+                        term_and_test_counters::take_arrayed().0,
+                        1,
+                        "{context}: not array-led"
+                    );
+                    let generic = collect_generic(&corpus, &mask, corpus.leaves(&all), plan, limit);
+                    assert_eq!(score_bits(&admitted), score_bits(&generic), "{context}");
+                }
+            }
+            let forward = score_bits(&collect_generic(
+                &corpus,
+                &mask,
+                corpus.leaves(&all),
+                &plans[0],
+                num_docs,
+            ))
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+            let reversed = score_bits(&collect_generic(
+                &corpus,
+                &mask,
+                corpus.leaves(&all),
+                &plans[1],
+                num_docs,
+            ))
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+            if forward
+                .iter()
+                .any(|(row_id, bits)| reversed.get(row_id).is_some_and(|other| other != bits))
+            {
+                order_sensitive_seeds += 1;
+            }
+        }
+        assert!(
+            order_sensitive_seeds > 0,
+            "no seed pins the summation order"
+        );
+    }
+
+    /// A rare MUST clause whose short, high-frequency documents all come first,
+    /// and two dense MUST clauses.
+    fn skewed_front_loaded_terms(num_docs: u32) -> (Vec<u32>, Vec<Vec<(u32, u32)>>) {
+        let mut doc_lengths = vec![30_u32; num_docs as usize];
+        doc_lengths[..1_024].fill(2);
+        let rare = (0..num_docs)
+            .filter(|doc| doc % 40 == 0)
+            .map(|doc| (doc, if doc < 1_024 { 6 } else { 1 }))
+            .collect::<Vec<_>>();
+        let half = (0..num_docs)
+            .filter(|doc| doc % 2 == 0)
+            .map(|doc| (doc, 1))
+            .collect::<Vec<_>>();
+        let dense = (0..num_docs)
+            .filter(|doc| doc % 32 != 31)
+            .map(|doc| (doc, 1))
+            .collect::<Vec<_>>();
+        (doc_lengths, vec![rare, half, dense])
+    }
+
+    #[test]
+    fn term_and_array_lead_prunes_below_the_floor_and_matches_the_tree() {
+        let num_docs = 32_768_u32;
+        let (doc_lengths, mut terms) = skewed_front_loaded_terms(num_docs);
+        terms.push(
+            (0..num_docs)
+                .filter(|doc| doc % 7 == 0)
+                .map(|doc| (doc, 1))
+                .collect(),
+        );
+        let corpus = Corpus::new(doc_lengths, terms);
+        let mask = RowAddrMask::all_rows();
+        let mut pruned = 0;
+        for shoulds in [0, 1] {
+            let plan = must_should_plan(3, shoulds);
+            let leaves = (0..3 + shoulds).collect::<Vec<_>>();
+            for limit in [1, 10] {
+                let context = format!("shoulds={shoulds} limit={limit}");
+                term_and_test_counters::take_arrayed();
+                let admitted =
+                    collect_admitted(&corpus, &mask, corpus.leaves(&leaves), &plan, limit);
+                let (built, array_pruned) = term_and_test_counters::take_arrayed();
+                assert_eq!(built, 1, "{context}: not array-led");
+                pruned += array_pruned;
+                let generic = collect_generic(&corpus, &mask, corpus.leaves(&leaves), &plan, limit);
+                assert_eq!(score_bits(&admitted), score_bits(&generic), "{context}");
+            }
+        }
+        assert!(pruned > 0, "the array lead never pruned");
+    }
 }

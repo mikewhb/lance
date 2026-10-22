@@ -11,14 +11,15 @@ use smallvec::SmallVec;
 use super::super::scorer::{MemBM25Scorer, bm25_doc_weight_with_norm};
 #[cfg(target_arch = "x86_64")]
 use super::HAS_AVX2;
+use super::and_array::ArrayLead;
 use super::and_kernel::{
     AndWindowSlice, WindowList, and_block_bound, lead_freq_bound_lut, load_window_freqs,
     merge_window, posting_block_up_to, slice_and_window, window_bm25_score,
 };
 use super::{
     CompetitiveFloorMode, FREQ_LUT_BUCKETS, MAX_POSTING_BLOCK_SIZE, PostingIterator, PostingList,
-    TERMINATED_DOC_ID, WandDocuments, conservative_score_sum, dequantize_doc_length, norm_addends,
-    partial_score_limit, score_sum_upper_bound_factor,
+    TERMINATED_DOC_ID, WandDocuments, conjunction_lists_are_skewed, conservative_score_sum,
+    dequantize_doc_length, norm_addends, partial_score_limit, score_sum_upper_bound_factor,
 };
 use crate::metrics::MetricsCollector;
 
@@ -50,6 +51,8 @@ pub(in super::super) struct TermAndCursor<'a, D: WandDocuments> {
     cursor_scratch: Vec<usize>,
     intersection_scratch: Vec<u32>,
     freq_bound_lut: Option<[f32; FREQ_LUT_BUCKETS]>,
+    /// Array-backed lead, for skewed conjunctions of three or more clauses.
+    array: Option<ArrayLead>,
     /// `(doc, document key, score)` of the current window's survivors.
     hits: Vec<(u64, u64, f32)>,
     next_hit: usize,
@@ -89,6 +92,13 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
                 matches!(&posting.list, PostingList::Compressed(list)
                     if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
             });
+        let array = (lead.len() >= 3 && conjunction_lists_are_skewed(&lead)).then(|| {
+            #[cfg(test)]
+            test_counters::arrayed_built();
+            let mut array = ArrayLead::new();
+            array.reserve();
+            array
+        });
         let mut target = 0;
         let mut exhausted = lead.is_empty();
         for posting in &lead {
@@ -116,6 +126,7 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
             cursor_scratch: Vec::with_capacity(num_lists),
             intersection_scratch: Vec::new(),
             freq_bound_lut: None,
+            array,
             hits: Vec::with_capacity(MAX_POSTING_BLOCK_SIZE),
             next_hit: 0,
             current: None,
@@ -191,7 +202,10 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
             self.next_hit += 1;
         }
         if self.next_hit >= self.hits.len() {
-            self.target = self.target.max(target);
+            match self.array.as_mut() {
+                Some(array) => array.skip_to(target),
+                None => self.target = self.target.max(target),
+            }
         }
         self.next()
     }
@@ -209,6 +223,14 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
             .iter()
             .map(|posting| posting.block_idx)
             .collect::<SmallVec<[usize; 8]>>();
+        // Block lookup only moves forward. An array-lead window can leave a
+        // follower past `target`, so the bound probe starts at the first block
+        // and the saved cursors are restored afterwards.
+        if self.array.is_some() {
+            for posting in &mut self.lead {
+                posting.block_idx = 0;
+            }
+        }
         for posting in &mut self.lead {
             posting.shallow_next(target);
         }
@@ -239,6 +261,9 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
     fn refill(&mut self) -> bool {
         self.hits.clear();
         self.next_hit = 0;
+        if self.array.is_some() {
+            return self.refill_arrayed();
+        }
         // Window slices hold raw block pointers, which a `Send` scorer cannot
         // keep between calls.
         let mut wins = Vec::with_capacity(self.lead.len());
@@ -288,6 +313,47 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
                 self.target = (win_end + 1).max(jump_to);
             }
             if !self.hits.is_empty() {
+                return true;
+            }
+        }
+        !self.hits.is_empty()
+    }
+
+    /// Fills `hits` from the array lead, one lead window at a time.
+    fn refill_arrayed(&mut self) -> bool {
+        let Some(array) = self.array.as_mut() else {
+            return false;
+        };
+        let documents = self.documents;
+        let scorer: &MemBM25Scorer = &self.scorer;
+        let prune = self.floor > 0.0;
+        while !self.exhausted {
+            let Some((lead_doc, doc_length)) = array.next_candidate(
+                &mut self.lead,
+                scorer,
+                self.floor,
+                CompetitiveFloorMode::Inclusive,
+                prune,
+                |doc| documents.doc_length(doc),
+            ) else {
+                self.exhausted = true;
+                break;
+            };
+            self.comparisons += 1;
+            if let Some(key) = documents.document_key(&lead_doc) {
+                let mut score = 0.0_f32;
+                for &index in &self.score_order {
+                    let posting = &self.lead[index];
+                    let doc = posting.doc();
+                    debug_assert!(doc.is_some(), "every clause sits on the candidate");
+                    let freq = doc.map_or(0, |doc| doc.frequency());
+                    score += posting.score(scorer, freq, doc_length);
+                }
+                if score >= self.floor {
+                    self.hits.push((lead_doc.doc_id(), key, score));
+                }
+            }
+            if array.window_drained() && !self.hits.is_empty() {
                 return true;
             }
         }
@@ -397,6 +463,10 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
 impl<D: WandDocuments> Drop for TermAndCursor<'_, D> {
     fn drop(&mut self) {
         self.record_metrics();
+        #[cfg(test)]
+        if let Some(array) = &self.array {
+            test_counters::array_pruned(array.stats.windows_skipped + array.stats.lut_prepruned);
+        }
     }
 }
 
@@ -407,6 +477,8 @@ pub(in crate::scalar::inverted) mod test_counters {
     thread_local! {
         static SKIPPED_WINDOWS: Cell<usize> = const { Cell::new(0) };
         static PRUNED_CANDIDATES: Cell<usize> = const { Cell::new(0) };
+        static ARRAYED_BUILT: Cell<usize> = const { Cell::new(0) };
+        static ARRAY_PRUNED: Cell<usize> = const { Cell::new(0) };
     }
 
     /// `(windows skipped by their bound, candidates pruned by the lead score)`
@@ -424,5 +496,22 @@ pub(in crate::scalar::inverted) mod test_counters {
 
     pub(super) fn pruned_candidate() {
         PRUNED_CANDIDATES.with(|count| count.set(count.get() + 1));
+    }
+
+    /// `(array-led conjunctions built, lead windows and candidates their array
+    /// lead pruned)` on this thread since the previous call.
+    pub(in crate::scalar::inverted) fn take_arrayed() -> (usize, usize) {
+        (
+            ARRAYED_BUILT.with(|count| count.replace(0)),
+            ARRAY_PRUNED.with(|count| count.replace(0)),
+        )
+    }
+
+    pub(super) fn arrayed_built() {
+        ARRAYED_BUILT.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn array_pruned(pruned: usize) {
+        ARRAY_PRUNED.with(|count| count.set(count.get() + pruned));
     }
 }
