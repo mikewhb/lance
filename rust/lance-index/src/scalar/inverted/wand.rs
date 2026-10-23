@@ -24,6 +24,8 @@ use crate::metrics::MetricsCollector;
 
 #[path = "wand_and_kernel.rs"]
 mod and_kernel;
+#[path = "wand_and_walk.rs"]
+mod and_walk;
 
 #[path = "wand_and_array.rs"]
 mod and_array;
@@ -4465,358 +4467,42 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         if limit == 0 {
             return Ok(vec![]);
         }
-        let num_lists = self.lead.len();
-        let use_pairwise_intersection = num_lists >= 4
-            && self.lead.iter().all(|posting| {
-                matches!(&posting.list, PostingList::Compressed(list)
-                    if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
-            });
-        let phrase_slop = params.phrase_slop;
         // The bulk path never evaluates score-first windows, so keep the block
         // advance from preparing suffix bounds it would not use.
         self.invalidate_score_first_and_window();
         self.score_first_and_enabled = false;
-        let mut score_order = (0..num_lists).collect::<Vec<_>>();
-        score_order.sort_unstable_by_key(|&index| {
-            let posting = &self.lead[index];
-            (posting.position, posting.token_id)
-        });
-
+        let mut state = and_walk::BulkAndState::new(self, params, CompetitiveFloorMode::Exclusive);
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
-        let mut num_comparisons: usize = 0;
-        let mut wins: Vec<WindowList> = Vec::with_capacity(num_lists);
-        // Per-window candidate batch. The merge kernel only records matches;
-        // scoring then runs in two passes so the doc-length gather issues
-        // independent loads (their cache misses overlap) instead of
-        // serializing behind per-candidate branching. A window spans at most
-        // one block per clause, so a batch holds at most one block's worth.
-        let mut batch_docs: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
-        let mut batch_offs: Vec<u8> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE * num_lists);
-        let mut batch_lens: Vec<u32> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
-        let mut batch_norms: Vec<u8> = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
-        let mut cursor_scratch: Vec<usize> = Vec::with_capacity(num_lists);
-        let mut intersection_scratch: Vec<u32> = Vec::new();
-        // The frequency-bucket prune decisions only depend on the floor and
-        // the followers' block maxes, which rarely change between windows.
-        let mut freq_cannot_beat = [false; FREQ_LUT_BUCKETS];
-        // Keyed separately from the score limit: the per-candidate prune can
-        // refresh the limit in the middle of a window without touching the
-        // table, so an unchanged limit key does not mean the table is current.
-        let mut freq_cannot_beat_key: Option<(u32, u64)> = None;
-        // Per clause: the block that was sliced last and the end of that
-        // slice. Windows are contiguous, so the next slice of the same block
-        // starts where the previous one ended instead of at a binary search.
-        let mut slice_prev: SmallVec<[(usize, usize); 8]> =
-            std::iter::repeat_n((usize::MAX, 0), num_lists).collect();
-        // Norm cache: one byte-norm load plus a cached addend replaces the
-        // per-clause BM25 denominator recompute in pass B.
-        let mut norm_k = None;
-        let mut norm_k_initialized = false;
-
-        // Per-window prune LUT for the merge kernels: an upper bound of the
-        // first (rarest) clause's score by clamped frequency. Lead docs whose
-        // bound plus the remaining clauses' block maxes cannot beat the
-        // threshold are skipped before any follower advances — the same
-        // score-first ordering Lucene's conjunction scorer uses, with the
-        // doc-length dropped from the bound so no doc-length load is needed.
-        // The last bucket holds the frequency-independent sup, so clamping
-        // stays a valid upper bound. Skips only avoid work; every emitted
-        // candidate still goes through the exact per-candidate prune below.
-        let mut freq_bound_lut: Option<[f32; FREQ_LUT_BUCKETS]> = None;
-        // Exclusive limit on the first clause's partial score for the current
-        // window: scores at or below it cannot beat the floor. Recomputed only
-        // when the floor or the followers' block maxes change.
-        let mut first_score_limit: Option<f32> = None;
-        let mut first_score_limit_key: Option<(u32, u64)> = None;
-
-        // The conjunction can only start at the max of the clauses' first docs.
-        let mut target: u64 = 0;
-        for posting in &self.lead {
-            match posting.current_doc_id() {
-                Some(doc) => target = target.max(doc),
-                None => return Ok(vec![]),
+        let term_indices: Vec<u32> = self
+            .lead
+            .iter()
+            .map(|posting| posting.term_index())
+            .collect();
+        let mut visit = |doc: u32,
+                         key: u64,
+                         score: f32,
+                         doc_length: u32,
+                         freqs: &[u32]|
+         -> Result<Option<f32>> {
+            if candidates.insert(
+                ScoredDoc::new(key, score),
+                doc_length,
+                u64::from(doc),
+                term_indices.iter().copied().zip(freqs.iter().copied()),
+            )? {
+                Ok(candidates.kth_score_if_full())
+            } else {
+                Ok(None)
             }
-        }
-
-        'window: loop {
-            #[cfg(test)]
-            {
-                self.and_window_stats.windows_sliced += 1;
-            }
+        };
+        loop {
             self.raise_to_shared_floor(params.wand_factor);
-            let window_started_with_floor = self.threshold > 0.0;
-            if window_started_with_floor {
-                if num_lists >= 2 && freq_bound_lut.is_none() {
-                    freq_bound_lut = Some(self.build_lead_freq_bound_lut());
-                }
-                let advanced = self.and_advance_target(target);
-                if advanced == TERMINATED_DOC_ID {
-                    break;
-                }
-                target = advanced;
+            match self.bulk_and_step(&mut state, &mut visit)? {
+                and_walk::StepOutcome::Continue => {}
+                and_walk::StepOutcome::Done => break,
             }
-            let (win_end, jump_to, sliced) = match and_kernel::slice_and_window(
-                &mut self.lead,
-                target,
-                &mut slice_prev,
-                &mut wins,
-            ) {
-                and_kernel::AndWindowSlice::Exhausted => break 'window,
-                and_kernel::AndWindowSlice::Ready { win_end } => (win_end, 0, true),
-                and_kernel::AndWindowSlice::Empty { win_end, jump_to } => (win_end, jump_to, false),
-            };
-            if sliced {
-                // Constant within the window (block-anchored); mirrors
-                // `and_candidate_cannot_beat_threshold`'s remaining-clause
-                // bound of first-clause-exact + rest-block-max.
-                let mut others_block_max = if window_started_with_floor {
-                    Some(
-                        self.lead[1..]
-                            .iter()
-                            .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
-                            .sum::<f64>(),
-                    )
-                } else {
-                    None
-                };
-
-                batch_docs.clear();
-                batch_offs.clear();
-                // Precompute the conservative decision once per frequency
-                // bucket so the scalar and SIMD merge kernels stay
-                // floating-point-free.
-                if window_started_with_floor && num_lists >= 2 {
-                    and_kernel::load_window_freqs(&self.lead[..1], &mut wins[..1]);
-                    let others_block_max =
-                        others_block_max.expect("positive floor should initialize bounds");
-                    let key = (self.threshold.to_bits(), others_block_max.to_bits());
-                    if first_score_limit_key != Some(key) {
-                        first_score_limit = exclusive_partial_score_limit(
-                            others_block_max,
-                            self.threshold,
-                            score_sum_upper_bound_factor(num_lists),
-                        );
-                        first_score_limit_key = Some(key);
-                    }
-                    if freq_cannot_beat_key != Some(key) {
-                        let freq_bound_lut = freq_bound_lut
-                            .as_ref()
-                            .expect("positive threshold should initialize the frequency bound LUT");
-                        freq_cannot_beat = match first_score_limit {
-                            Some(limit) => {
-                                std::array::from_fn(|frequency| freq_bound_lut[frequency] <= limit)
-                            }
-                            None => [false; FREQ_LUT_BUCKETS],
-                        };
-                        freq_cannot_beat_key = Some(key);
-                    }
-                } else if freq_cannot_beat_key.is_some() {
-                    freq_cannot_beat = [false; FREQ_LUT_BUCKETS];
-                    freq_cannot_beat_key = None;
-                }
-                #[cfg(test)]
-                if freq_cannot_beat.iter().any(|&pruned| pruned) {
-                    self.and_window_stats.windows_frequency_pruned += 1;
-                }
-                #[cfg(target_arch = "x86_64")]
-                let use_avx2 = *HAS_AVX2;
-                #[cfg(not(target_arch = "x86_64"))]
-                let use_avx2 = false;
-                // The pairwise arm of the kernel is the one branch whose use
-                // cannot be observed from its outputs, so the caller records it
-                // here with the same predicate the kernel matches on.
-                #[cfg(test)]
-                if num_lists >= 4 && !window_started_with_floor && use_pairwise_intersection {
-                    self.and_window_stats.pairwise_intersections += 1;
-                }
-                and_kernel::merge_window(
-                    &wins,
-                    num_lists,
-                    use_avx2,
-                    use_pairwise_intersection,
-                    window_started_with_floor,
-                    &freq_cannot_beat,
-                    &mut batch_docs,
-                    &mut batch_offs,
-                    &mut cursor_scratch,
-                    &mut intersection_scratch,
-                );
-
-                if !batch_docs.is_empty() {
-                    and_kernel::load_window_freqs(&self.lead, &mut wins);
-                    if !norm_k_initialized {
-                        norm_k = self.norm_k_cache();
-                        norm_k_initialized = true;
-                    }
-                }
-
-                // Pass A: gather doc norms/lengths for the whole batch up
-                // front so the loads issue back-to-back and their cache
-                // misses overlap. With the norm cache, only the byte code is
-                // gathered; the exact length decodes from a tiny LUT.
-                batch_lens.clear();
-                batch_norms.clear();
-                let norm_k_ref = norm_k
-                    .as_ref()
-                    .map(|(norms, cache)| (*norms, cache.as_ref()));
-                match norm_k_ref {
-                    Some((norms, _)) => {
-                        for &doc in batch_docs.iter() {
-                            batch_norms.push(norms[doc as usize]);
-                        }
-                    }
-                    None => match self.documents.scoring_norms() {
-                        Some(norms) => {
-                            for &doc in batch_docs.iter() {
-                                batch_lens.push(dequantize_doc_length(norms[doc as usize]));
-                            }
-                        }
-                        None => {
-                            for &doc in batch_docs.iter() {
-                                batch_lens.push(self.documents.scoring_num_tokens(doc));
-                            }
-                        }
-                    },
-                }
-
-                // Pass B: prune / verify / score / insert, in doc order, with
-                // exactly the classic loop's semantics.
-                for (index, &doc) in batch_docs.iter().enumerate() {
-                    let (norm_addend, doc_length) = match norm_k_ref {
-                        Some((_, cache)) => {
-                            let code = batch_norms[index];
-                            (Some(cache[code as usize]), dequantize_doc_length(code))
-                        }
-                        None => (None, batch_lens[index]),
-                    };
-                    let offs = &batch_offs[index * num_lists..(index + 1) * num_lists];
-                    if self.threshold > 0.0 && num_lists >= 2 && others_block_max.is_none() {
-                        others_block_max = Some(
-                            self.lead[1..]
-                                .iter()
-                                .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
-                                .sum::<f64>(),
-                        );
-                    }
-                    if self.threshold > 0.0
-                        && num_lists >= 2
-                        && let Some(others_block_max) = others_block_max
-                    {
-                        let first_freq = unsafe { *wins[0].freqs.add(offs[0] as usize) };
-                        let first_score = match norm_addend {
-                            Some(addend) => {
-                                self.lead[0].query_weight
-                                    * bm25_doc_weight_with_norm(first_freq, addend)
-                            }
-                            None => self.lead[0].score(&self.scorer, first_freq, doc_length),
-                        };
-                        let key = (self.threshold.to_bits(), others_block_max.to_bits());
-                        if first_score_limit_key != Some(key) {
-                            first_score_limit = exclusive_partial_score_limit(
-                                others_block_max,
-                                self.threshold,
-                                score_sum_upper_bound_factor(num_lists),
-                            );
-                            first_score_limit_key = Some(key);
-                        }
-                        if first_score_limit.is_some_and(|limit| first_score <= limit) {
-                            continue;
-                        }
-                    }
-                    #[cfg(test)]
-                    {
-                        self.and_window_stats.candidates_returned += 1;
-                    }
-                    num_comparisons += 1;
-
-                    let Some(document_key) = self.documents.document_key_for_doc_id(doc) else {
-                        continue;
-                    };
-
-                    // Only front-load the BM25 total when a floor exists: the
-                    // skip below can only fire then, and scoring before
-                    // position confirmation would otherwise make every
-                    // position-failing candidate pay for a score it never uses.
-                    let early_score = (self.threshold > 0.0).then(|| {
-                        window_bm25_score(
-                            &self.lead,
-                            &wins,
-                            offs,
-                            &score_order,
-                            &self.scorer,
-                            norm_addend,
-                            doc_length,
-                        )
-                    });
-                    if let Some(slop) = phrase_slop {
-                        // Lance phrase score is term-frequency BM25, so this
-                        // total is exact. Skip position decode when it cannot
-                        // enter the exclusive top-k heap.
-                        if early_score
-                            .is_some_and(|score| self.exclusive_score_cannot_beat_floor(score))
-                        {
-                            continue;
-                        }
-                        // Park every clause's iterator on this doc so
-                        // `position_cursor` reads the right posting entry. The
-                        // window block is already decompressed; position blocks
-                        // decode lazily and are cached per block.
-                        for ((win, posting), &off) in
-                            wins.iter().zip(self.lead.iter_mut()).zip(offs.iter())
-                        {
-                            posting.index = win.block_start + off as usize;
-                            posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
-                                doc_id: doc,
-                                frequency: unsafe { *win.freqs.add(off as usize) },
-                            }));
-                        }
-                        let matched = if slop == 0 {
-                            self.check_exact_positions_bulk()?
-                        } else {
-                            self.check_positions(slop as i32)?
-                        };
-                        if !matched {
-                            continue;
-                        }
-                    }
-                    let score = early_score.unwrap_or_else(|| {
-                        window_bm25_score(
-                            &self.lead,
-                            &wins,
-                            offs,
-                            &score_order,
-                            &self.scorer,
-                            norm_addend,
-                            doc_length,
-                        )
-                    });
-
-                    if candidates.insert(
-                        ScoredDoc::new(document_key, score),
-                        doc_length,
-                        u64::from(doc),
-                        wins.iter().zip(self.lead.iter()).zip(offs.iter()).map(
-                            |((win, posting), &off)| {
-                                (posting.term_index(), unsafe {
-                                    *win.freqs.add(off as usize)
-                                })
-                            },
-                        ),
-                    )? && let Some(kth) = candidates.kth_score_if_full()
-                    {
-                        self.update_threshold(kth, params.wand_factor);
-                    }
-                }
-            }
-
-            if win_end == TERMINATED_DOC_ID {
-                break;
-            }
-            target = (win_end + 1).max(jump_to);
         }
-
-        metrics.record_comparisons(num_comparisons);
-
+        metrics.record_comparisons(state.num_comparisons);
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
@@ -14074,5 +13760,116 @@ mod tests {
             windows_frequency_pruned, 1,
             "the second window must apply the frequency prune table"
         );
+    }
+
+    #[test]
+    fn bulk_and_steps_match_the_one_shot_search() {
+        let num_docs = (BLOCK_SIZE * 4 + 17) as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 32 + doc_id % 57);
+        }
+        let clauses = [(3_u32, 7_u32), (4, 13), (5, 29)]
+            .iter()
+            .map(|&(modulus, salt)| {
+                (0..num_docs)
+                    .filter(|doc| (doc.wrapping_mul(2654435761).wrapping_add(salt)) % modulus < 2)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let build_postings = || {
+            clauses
+                .iter()
+                .enumerate()
+                .map(|(term_pos, doc_ids)| {
+                    PostingIterator::with_query_weight(
+                        format!("t{term_pos}"),
+                        term_pos as u32,
+                        term_pos as u32,
+                        1.0 + term_pos as f32 * 0.5,
+                        generate_posting_list(doc_ids.clone(), 8.0, None, true),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let normalize = |result: Vec<DocCandidate<u64>>| {
+            let mut rows = result
+                .into_iter()
+                .map(|candidate| {
+                    (
+                        candidate.posting_doc_id,
+                        candidate.doc_length,
+                        candidate.freqs,
+                        candidate.document,
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            rows
+        };
+
+        let one_shot = {
+            let mut wand = Wand::new(
+                Operator::And,
+                build_postings().into_iter(),
+                &docs,
+                UnitScorer,
+            )
+            .with_bulk_and_mode(BulkAndMode::On);
+            normalize(wand.search(&params, &NoOpMetricsCollector).unwrap())
+        };
+
+        let stepped = {
+            let mut wand = Wand::new(
+                Operator::And,
+                build_postings().into_iter(),
+                &docs,
+                UnitScorer,
+            )
+            .with_bulk_and_mode(BulkAndMode::On);
+            wand.invalidate_score_first_and_window();
+            wand.score_first_and_enabled = false;
+            let mut state =
+                super::and_walk::BulkAndState::new(&wand, &params, CompetitiveFloorMode::Exclusive);
+            let term_indices: Vec<u32> = wand
+                .lead
+                .iter()
+                .map(|posting| posting.term_index())
+                .collect();
+            let mut collector = TopKCollector::new(10, std::cmp::min(10, BLOCK_SIZE * 10));
+            loop {
+                wand.raise_to_shared_floor(params.wand_factor);
+                let mut visit = |doc: u32,
+                                 key: u64,
+                                 score: f32,
+                                 doc_length: u32,
+                                 freqs: &[u32]|
+                 -> Result<Option<f32>> {
+                    if collector.insert(
+                        ScoredDoc::new(key, score),
+                        doc_length,
+                        u64::from(doc),
+                        term_indices.iter().copied().zip(freqs.iter().copied()),
+                    )? {
+                        Ok(collector.kth_score_if_full())
+                    } else {
+                        Ok(None)
+                    }
+                };
+                match wand.bulk_and_step(&mut state, &mut visit).unwrap() {
+                    super::and_walk::StepOutcome::Continue => {}
+                    super::and_walk::StepOutcome::Done => break,
+                }
+            }
+            normalize(
+                collector
+                    .into_candidates(|key| wand.documents.candidate_from_key(key))
+                    .unwrap(),
+            )
+        };
+
+        assert_eq!(one_shot, stepped);
     }
 }

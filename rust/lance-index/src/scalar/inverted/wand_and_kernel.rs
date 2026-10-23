@@ -559,6 +559,35 @@ pub(super) enum AndWindowSlice {
     Empty { win_end: u64, jump_to: u64 },
 }
 
+/// Destination for one window's clause slices.
+///
+/// `slice_and_window` only clears the buffer and pushes one entry per clause.
+/// The terminal keeps a reusable `Vec`; the stepping cursor uses a stack
+/// `SmallVec`, because `WindowList` holds raw pointers and must not be stored
+/// in a `Send` scorer.
+pub(super) trait WindowSink {
+    fn clear(&mut self);
+    fn push(&mut self, window: WindowList);
+}
+
+impl WindowSink for Vec<WindowList> {
+    fn clear(&mut self) {
+        self.clear();
+    }
+    fn push(&mut self, window: WindowList) {
+        self.push(window);
+    }
+}
+
+impl<A: smallvec::Array<Item = WindowList>> WindowSink for SmallVec<A> {
+    fn clear(&mut self) {
+        self.clear();
+    }
+    fn push(&mut self, window: WindowList) {
+        self.push(window);
+    }
+}
+
 /// Positions every clause's block cursor at the block that can hold `target`,
 /// ends the window at the nearest next-block boundary, and slices each
 /// clause's decompressed block to `[target, win_end]` into `wins`.
@@ -569,7 +598,7 @@ pub(super) fn slice_and_window(
     lead: &mut [Box<PostingIterator>],
     target: u64,
     slice_prev: &mut [(usize, usize)],
-    wins: &mut Vec<WindowList>,
+    wins: &mut impl WindowSink,
 ) -> AndWindowSlice {
     debug_assert!(target <= u32::MAX as u64);
     let target32 = target as u32;
