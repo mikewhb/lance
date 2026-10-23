@@ -2211,7 +2211,6 @@ impl<K: Copy + Ord> TopKCollector<K> {
             let up_to = scorer.advance_shallow(doc_id)?;
             let bounds = scorer.score_bounds(up_to)?;
             if bounds.upper < min_score {
-                super::wand::skip_probe::collector_skip();
                 doc = if up_to == u64::MAX {
                     None
                 } else {
@@ -2219,7 +2218,6 @@ impl<K: Copy + Ord> TopKCollector<K> {
                 };
                 continue;
             }
-            super::wand::skip_probe::collector_keep();
 
             // Phrase leaves expose their score from posting frequencies before
             // positions are decoded. Composite scorers combine those doc-local
@@ -3296,7 +3294,6 @@ impl<'a> ReqOptScorer<'a> {
 
         'search: loop {
             let bounds = self.shallow_bounds.filter(|bounds| target <= bounds.up_to);
-            let mut required_alone = false;
 
             if self.min_competitive_score.is_finite()
                 && self.min_competitive_score > 0.0
@@ -3305,12 +3302,6 @@ impl<'a> ReqOptScorer<'a> {
                 && Self::usable_bounds(bounds.combined)
             {
                 if bounds.combined.upper < self.min_competitive_score {
-                    let span = if bounds.up_to == u64::MAX {
-                        0
-                    } else {
-                        bounds.up_to.saturating_sub(target).saturating_add(1)
-                    };
-                    super::wand::skip_probe::combined_skip(span);
                     if bounds.up_to == u64::MAX {
                         return Ok(self.exhaust());
                     }
@@ -3320,19 +3311,12 @@ impl<'a> ReqOptScorer<'a> {
                 }
 
                 if bounds.required.upper < self.min_competitive_score {
-                    super::wand::skip_probe::note_intersect_bounds(
-                        bounds.required.upper,
-                        bounds.combined.upper,
-                        self.min_competitive_score,
-                    );
-                    super::wand::skip_probe::intersect_window();
                     // The optional contribution is necessary throughout this
                     // cached shallow range. Intersect approximations until
                     // both sides agree or the range is exhausted.
                     let Some(mut required_doc) = self.required.advance(target)? else {
                         return Ok(self.exhaust());
                     };
-                    super::wand::skip_probe::intersect_step();
                     if required_doc > bounds.up_to {
                         target = required_doc;
                         self.shallow_bounds = None;
@@ -3366,7 +3350,6 @@ impl<'a> ReqOptScorer<'a> {
                         let Some(next_required) = self.required.advance(optional_doc)? else {
                             return Ok(self.exhaust());
                         };
-                        super::wand::skip_probe::intersect_step();
                         if next_required > bounds.up_to {
                             target = next_required;
                             self.shallow_bounds = None;
@@ -3374,19 +3357,12 @@ impl<'a> ReqOptScorer<'a> {
                         }
                         required_doc = next_required;
                     }
-                } else {
-                    required_alone = true;
                 }
             }
 
             let Some(required_doc) = self.required.advance(target)? else {
                 return Ok(self.exhaust());
             };
-            if required_alone {
-                super::wand::skip_probe::required_alone_step();
-            } else {
-                super::wand::skip_probe::direct_step();
-            }
             self.set_current(Some(required_doc));
             self.set_optional_required(false);
             return Ok(self.current);
@@ -3499,17 +3475,12 @@ impl ComposableScorer for ReqOptScorer<'_> {
             self.min_competitive_score = min_score;
             if self.forwards_required_floor
                 && let Some(optional_upper) = self.optional.global_score_upper_bound()
+                && let Some(floor) = required_side_floor(min_score, optional_upper)
+                && floor > 0.0
             {
-                if let Some(floor) = required_side_floor(min_score, optional_upper)
-                    && floor > 0.0
-                {
-                    super::wand::skip_probe::note_forward(min_score, optional_upper, Some(floor));
-                    #[cfg(test)]
-                    REQUIRED_FLOORS_FORWARDED.with(|count| count.set(count.get() + 1));
-                    self.required.set_min_competitive_score(floor)?;
-                } else {
-                    super::wand::skip_probe::note_forward(min_score, optional_upper, None);
-                }
+                #[cfg(test)]
+                REQUIRED_FLOORS_FORWARDED.with(|count| count.set(count.get() + 1));
+                self.required.set_min_competitive_score(floor)?;
             }
         }
         Ok(())
