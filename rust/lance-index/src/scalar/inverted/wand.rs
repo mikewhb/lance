@@ -2143,28 +2143,45 @@ fn partial_score_limit(
             limit = down;
         }
     }
-    // The walk did not converge (pathological inputs); fall back to an exact
-    // binary search over the ordered f32 bit patterns.
-    let mut lo = f32::MIN;
-    let mut hi = f32::MAX;
-    if !rejects(lo) {
+    // The walk spans a few ULPs of the limit, which falls short when the other
+    // clauses' bound is much larger than the limit: binary search the f32
+    // values in numeric order instead.
+    let mut lo = ordered_f32_key(f32::MIN);
+    let mut hi = ordered_f32_key(f32::MAX);
+    if !rejects(f32_from_ordered_key(lo)) {
         return None;
     }
-    if rejects(hi) {
-        return Some(hi);
+    if rejects(f32_from_ordered_key(hi)) {
+        return Some(f32::MAX);
     }
-    for _ in 0..64 {
-        let mid = f32::from_bits(((lo.to_bits() as i64 + hi.to_bits() as i64) / 2) as u32);
-        if mid == lo || mid == hi {
-            break;
-        }
-        if rejects(mid) {
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if rejects(f32_from_ordered_key(mid)) {
             lo = mid;
         } else {
             hi = mid;
         }
     }
-    Some(lo)
+    Some(f32_from_ordered_key(lo))
+}
+
+/// Position of a finite `value` on an integer line that orders f32 values
+/// numerically, with both zeros at 0.
+fn ordered_f32_key(value: f32) -> i64 {
+    let bits = value.to_bits();
+    if bits & 0x8000_0000 == 0 {
+        i64::from(bits)
+    } else {
+        -i64::from(bits & 0x7fff_ffff)
+    }
+}
+
+fn f32_from_ordered_key(key: i64) -> f32 {
+    if key >= 0 {
+        f32::from_bits(key as u32)
+    } else {
+        f32::from_bits(0x8000_0000 | (-key) as u32)
+    }
 }
 
 /// Inclusive floor for `required` in an f32 sum `required + optional` where
@@ -6205,6 +6222,54 @@ fn next_up_f64(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn partial_score_limit_finds_the_boundary_past_the_ulp_walk() {
+        // The limit (about 0.1) has ULPs 16 times finer than the sum (about
+        // 1.0), so a few ULP steps from the estimate cannot reach it.
+        let floor = next_up_f32(1.0);
+        let remaining = f64::from(0.9_f32);
+        for mode in [
+            CompetitiveFloorMode::Exclusive,
+            CompetitiveFloorMode::Inclusive,
+        ] {
+            let rejects = |score: f32| score_sum_cannot_compete(score, remaining, floor, 1.0, mode);
+            let limit = partial_score_limit(remaining, floor, 1.0, mode)
+                .expect("low partial scores are rejected");
+            assert!(rejects(limit), "{mode:?} limit={limit}");
+            assert!(!rejects(next_up_f32(limit)), "{mode:?} limit={limit}");
+            assert!(limit > 0.09, "{mode:?} limit={limit}");
+        }
+        for floor_step in 1..=40_u32 {
+            for remaining_step in 0..=60_u32 {
+                let floor = floor_step as f32 * 0.987;
+                let remaining = f64::from(remaining_step as f32 * 0.493);
+                for factor in [1.0, score_sum_upper_bound_factor(3)] {
+                    for mode in [
+                        CompetitiveFloorMode::Exclusive,
+                        CompetitiveFloorMode::Inclusive,
+                    ] {
+                        let rejects = |score: f32| {
+                            score_sum_cannot_compete(score, remaining, floor, factor, mode)
+                        };
+                        let context =
+                            format!("floor={floor} remaining={remaining} factor={factor} {mode:?}");
+                        match partial_score_limit(remaining, floor, factor, mode) {
+                            Some(limit) => {
+                                assert!(rejects(limit), "{context} limit={limit}");
+                                if limit < f32::MAX {
+                                    assert!(
+                                        !rejects(next_up_f32(limit)),
+                                        "{context} limit={limit}"
+                                    );
+                                }
+                            }
+                            None => assert!(!rejects(f32::MIN), "{context}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// `exclusive_partial_score_limit` must agree with `score_sum_cannot_compete`
     /// for every f32 partial score: scores at or below the limit are rejected,
