@@ -334,7 +334,7 @@ fn conjunction_lists_are_skewed(lead: &[Box<PostingIterator>]) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum BulkAndMode {
+pub(super) enum BulkAndMode {
     #[default]
     Auto,
     On,
@@ -346,7 +346,7 @@ enum BulkAndMode {
 /// `Arrayed` runs the classic per-document leapfrog but slices the lead's
 /// documents into windows first; `Bulk` runs the block-merge walk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AndRoute {
+pub(super) enum AndRoute {
     Arrayed,
     Bulk,
     Classic,
@@ -1629,6 +1629,24 @@ impl PostingIterator {
         }
     }
 
+    /// Move the block cursor to the block that can hold `doc`, searching the
+    /// block index from the first block instead of from the current one.
+    ///
+    /// [`Self::shallow_next`] only moves forward, which is right when the
+    /// cursor trails the probe. A route that parks the cursor at a candidate
+    /// (the array lead, the window walk) can sit past the probe's block, and a
+    /// forward-only search would then bound the wrong block.
+    fn seek_block_from_start(&mut self, doc: u64) {
+        let PostingList::Compressed(ref list) = self.list else {
+            return;
+        };
+        debug_assert!(doc <= u32::MAX as u64);
+        // Starting the helper at block 0 searches the whole index: it returns
+        // the last block whose first doc id is <= `doc`.
+        self.block_idx =
+            self.block_idx_for_doc_by_least_doc_id(list, 0, doc as u32, list.blocks.len());
+    }
+
     /// Anchored level0 impact bound of the current block: (doc_up_to, max_score),
     /// memoized until the block cursor moves. The frontier marker decodes only
     /// the leading varint and is `u32::MAX` for a null entry or a malformed
@@ -2698,6 +2716,10 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // maintain it.
     and_lead_arrayed: bool,
     array_lead: ArrayLead,
+    // Set by `WandCursor` when it builds the bulk conjunction state. The block
+    // cursor of `lead` then belongs to the window walk, so a shallow probe must
+    // not steer it: `compound_shallow_bound` restores the anchors afterwards.
+    and_batched: bool,
     // Score-first conjunction pruning is restricted to the current impact
     // format and scorers that expose the BM25 denominator contract.
     score_first_and_enabled: bool,
@@ -2831,6 +2853,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             and_candidate_doc_length: None,
             and_lead_arrayed: false,
             array_lead: ArrayLead::new(),
+            and_batched: false,
             score_first_and_enabled,
             #[cfg(test)]
             disable_score_first_and: false,
@@ -4055,7 +4078,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     }
 
     fn prepare_score_first_and_window(&mut self) {
-        if !self.score_first_and_enabled {
+        // The window walk never reads score-first state, so a batch-driven
+        // wand must not pay to prepare a window nobody will use. Unlike the
+        // terminal, the cursor keeps the flag itself intact: it describes the
+        // conjunction, and only the walk changed.
+        if !self.score_first_and_enabled || self.and_batched {
             return;
         }
         self.score_first_and_suffix_bounds.clear();
@@ -5516,6 +5543,18 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     comparisons: usize,
     metrics_recorded: bool,
     metrics: &'a dyn MetricsCollector,
+    // Window-walking conjunction state, present only on the bulk route. The
+    // buffer below is what the walk produced and has not handed out yet;
+    // `and_next` indexes it. Both vectors are reused across refills so the
+    // walk never allocates per candidate.
+    and_batch: Option<and_walk::BulkAndState<'a>>,
+    and_cands: Vec<(u64, Option<f32>, u32)>,
+    and_freqs: Vec<u32>,
+    and_next: usize,
+    // Norm-code addends for the buffered candidates, resolved once per cursor
+    // from the same source the walk uses, so both score the same bits.
+    and_norm_addends: Option<NormKCache<'a>>,
+    and_norm_addends_initialized: bool,
 }
 
 impl<'a, D: WandDocuments> WandCursor<'a, D> {
@@ -5543,7 +5582,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         if params.phrase_slop.is_some() {
             wand.score_first_and_enabled = false;
         }
-        Self {
+        let mut cursor = Self {
             wand,
             phrase_slop: params.phrase_slop,
             wand_factor: params.wand_factor,
@@ -5557,6 +5596,88 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             comparisons: 0,
             metrics_recorded: false,
             metrics,
+            and_batch: None,
+            and_cands: Vec::new(),
+            and_freqs: Vec::new(),
+            and_next: 0,
+            and_norm_addends: None,
+            and_norm_addends_initialized: false,
+        };
+        cursor.select_and_route();
+        cursor
+    }
+
+    /// Pick the conjunction stride for this cursor, mirroring what the terminal
+    /// does before it starts a search.
+    ///
+    /// Only a plain conjunction over compressed, ungrouped postings with at
+    /// least two clauses has a choice. Every other cursor keeps handing out one
+    /// document at a time, so this leaves it untouched.
+    fn select_and_route(&mut self) {
+        if self.wand.operator != Operator::And
+            || self.phrase_slop.is_some()
+            || self.wand.lead.len() < 2
+            || !self
+                .wand
+                .lead
+                .iter()
+                .all(|posting| posting.is_compressed() && !posting.has_grouped_terms())
+        {
+            return;
+        }
+        let mode = self
+            .wand
+            .bulk_and_mode_override
+            .unwrap_or_else(|| *BULK_AND_MODE);
+        match self.wand.and_route(mode) {
+            AndRoute::Bulk => {
+                self.and_batch = Some(and_walk::BulkAndState::new(
+                    &self.wand,
+                    // `BulkAndState::new` reads only these two parameters.
+                    &FtsSearchParams {
+                        wand_factor: self.wand_factor,
+                        phrase_slop: self.phrase_slop,
+                        ..FtsSearchParams::new()
+                    },
+                    self.wand.floor_mode,
+                ));
+                self.wand.and_batched = true;
+                self.and_cands.reserve(MAX_POSTING_BLOCK_SIZE);
+                self.and_freqs
+                    .reserve(MAX_POSTING_BLOCK_SIZE * self.wand.lead.len());
+            }
+            AndRoute::Arrayed => {
+                // Pay for the window buffers only when the route is used.
+                self.wand.array_lead.reserve();
+                self.wand.and_lead_arrayed = true;
+                self.wand.array_lead.reset_gate();
+            }
+            AndRoute::Classic => {}
+        }
+    }
+
+    /// Test hook: force one conjunction route through the same selection the
+    /// constructor runs, so one process can drive all three.
+    #[cfg(test)]
+    pub(super) fn with_bulk_and_route(mut self, mode: BulkAndMode) -> Self {
+        self.wand.bulk_and_mode_override = Some(mode);
+        self.and_batch = None;
+        self.wand.and_batched = false;
+        self.wand.and_lead_arrayed = false;
+        self.wand.array_lead.clear();
+        self.select_and_route();
+        self
+    }
+
+    /// Test hook: the route this cursor actually drives.
+    #[cfg(test)]
+    pub(super) fn and_route(&self) -> AndRoute {
+        if self.and_batch.is_some() {
+            AndRoute::Bulk
+        } else if self.wand.and_lead_arrayed {
+            AndRoute::Arrayed
+        } else {
+            AndRoute::Classic
         }
     }
 
@@ -5578,12 +5699,140 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
 
     fn record_metrics(&mut self) {
         if !self.metrics_recorded {
-            self.metrics.record_comparisons(self.comparisons);
+            // The window walk counts its own candidates, so a batch cursor has
+            // no per-document count of its own to add.
+            let walked = self
+                .and_batch
+                .as_ref()
+                .map_or(0, |state| state.num_comparisons);
+            self.metrics.record_comparisons(self.comparisons + walked);
             self.metrics_recorded = true;
         }
     }
 
+    /// Norm-code addends for scored candidates, or `None` when the documents
+    /// have no dense norm slab and scoring must go through the doc length.
+    fn batch_norm_addends(&mut self) -> Option<NormKCache<'a>> {
+        if !self.and_norm_addends_initialized {
+            self.and_norm_addends = self.wand.norm_k_cache();
+            self.and_norm_addends_initialized = true;
+        }
+        self.and_norm_addends.clone()
+    }
+
+    /// Hand out the next buffered candidate, walking the conjunction window by
+    /// window until one appears or the walk ends.
+    fn batch_next(&mut self) -> Result<Option<u64>> {
+        loop {
+            if let Some(doc) = self.batch_hand_out()? {
+                return Ok(Some(doc));
+            }
+            if !self.batch_refill()? {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Walk one or more windows until the buffer holds a candidate.
+    ///
+    /// Returns whether anything was buffered. The visit closure only copies what
+    /// the hand-out needs: the walk has already scored the candidate for its own
+    /// prune, and that score is not the hand-out's (the hand-out needs the
+    /// query-order sum under the cursor's floor mode).
+    fn batch_refill(&mut self) -> Result<bool> {
+        self.and_cands.clear();
+        self.and_freqs.clear();
+        self.and_next = 0;
+        let norm_addends = self.batch_norm_addends();
+        while self.and_cands.is_empty() {
+            let Some(state) = self.and_batch.as_mut() else {
+                return Ok(false);
+            };
+            if state.done {
+                return Ok(false);
+            }
+            self.wand.raise_to_shared_floor(state.wand_factor);
+            let mut visit = |doc: u32,
+                             _key: u64,
+                             _score: f32,
+                             length: u32,
+                             freqs: &[u32]|
+             -> Result<Option<f32>> {
+                let addend = norm_addends
+                    .as_ref()
+                    .map(|(norms, addends)| addends[norms[doc as usize] as usize]);
+                self.and_cands.push((u64::from(doc), addend, length));
+                self.and_freqs.extend_from_slice(freqs);
+                Ok(None)
+            };
+            // A step that reports `Done` may still have buffered the final
+            // window's candidates, so only the loop condition decides whether
+            // the walk is over.
+            self.wand.bulk_and_step(state, &mut visit)?;
+        }
+        Ok(true)
+    }
+
+    /// Position on the next buffered candidate, skipping documents the
+    /// visibility mapping does not resolve.
+    fn batch_hand_out(&mut self) -> Result<Option<u64>> {
+        let num_lists = self.and_batch.as_ref().map_or(0, |state| state.num_lists);
+        while self.and_next < self.and_cands.len() {
+            let index = self.and_next;
+            self.and_next += 1;
+            let (doc, addend, doc_length) = self.and_cands[index];
+            let doc_id = doc as u32;
+            let Some(document_key) = self.wand.documents.document_key_for_doc_id(doc_id) else {
+                continue;
+            };
+            let freqs = &self.and_freqs[index * num_lists..(index + 1) * num_lists];
+            let score = self.batch_score(freqs, addend, doc_length);
+            self.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                doc_id,
+                // The lead clause of the window, as the per-document route
+                // reports it.
+                frequency: freqs[0],
+            }));
+            self.current_document_key = Some(document_key);
+            self.current_score = score;
+            // Batch mode never carries a phrase, so the document is confirmed.
+            self.confirmation = Some(true);
+            self.shallow = None;
+            return Ok(Some(doc));
+        }
+        Ok(None)
+    }
+
+    /// Sum one candidate's per-clause BM25 contributions in query order.
+    ///
+    /// `freqs` is in lead order, so this visits the clauses through
+    /// `score_order` and adds them in exactly the order the per-document route
+    /// uses, which is what keeps the two bit-identical.
+    fn batch_score(&self, freqs: &[u32], addend: Option<f32>, doc_length: u32) -> f32 {
+        let Some(state) = self.and_batch.as_ref() else {
+            return 0.0;
+        };
+        let mut score = 0.0_f32;
+        for &clause in state.score_order.iter() {
+            let posting = &self.wand.lead[clause];
+            let freq = freqs[clause];
+            score += match addend {
+                Some(addend) => posting.query_weight * bm25_doc_weight_with_norm(freq, addend),
+                None => posting.score(&self.wand.scorer, freq, doc_length),
+            };
+        }
+        score
+    }
+
     fn position_next(&mut self) -> Result<Option<u64>> {
+        if self.and_batch.is_some() {
+            let next = self.batch_next()?;
+            if next.is_none() {
+                self.clear_current();
+                self.record_metrics();
+            }
+            return Ok(next);
+        }
         loop {
             let Some((doc, and_score)) = self.wand.next()? else {
                 self.clear_current();
@@ -5629,7 +5878,38 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             return Ok(self.doc());
         }
         self.clear_current();
+        if self.and_batch.is_some() {
+            return self.advance_batch(target);
+        }
         self.wand.seek(target);
+        self.position_next()
+    }
+
+    /// `advance` on the bulk route: the walk is driven by the state's target,
+    /// not by the clause cursors, so a jump either discards buffered candidates
+    /// or moves the next window.
+    fn advance_batch(&mut self, target: u64) -> Result<Option<u64>> {
+        // No posting doc id can reach a target past the u32 doc-id domain.
+        if target > u32::MAX as u64 {
+            if let Some(state) = self.and_batch.as_mut() {
+                state.done = true;
+            }
+            self.clear_current();
+            self.record_metrics();
+            return Ok(None);
+        }
+        while self.and_next < self.and_cands.len() && self.and_cands[self.and_next].0 < target {
+            self.and_next += 1;
+        }
+        if self.and_next == self.and_cands.len()
+            && let Some(state) = self.and_batch.as_mut()
+        {
+            // Nothing is buffered, so the next window may start at `target`:
+            // the walk must not re-emit documents below it.
+            state.target = state.target.max(target);
+        }
+        // Re-entering the batch path hands out a surviving buffered candidate
+        // or refills from the raised target.
         self.position_next()
     }
 
@@ -5754,6 +6034,12 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
         self.and_last_doc = None;
         self.invalidate_score_first_and_window();
         if self.operator == Operator::And {
+            // The array lead owns the walk in the arrayed route: without this
+            // the jump would only move the clause cursors and the next open
+            // would resume from the array's stale position.
+            if self.and_lead_arrayed {
+                self.array_lead.skip_to(target);
+            }
             for posting in &mut self.lead {
                 if posting.doc().is_some_and(|doc| doc.doc_id() < target) {
                     posting.next(target);
@@ -5804,15 +6090,28 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
             );
         }
 
-        let saved_block_indices = self.score_first_and_enabled.then(|| {
+        // Routes that keep their own walk state (score-first, the array lead,
+        // the window walk) take the block anchors away from that state to bound
+        // a probe, so put them back: the returned bound is immutable, and an
+        // external probe must not steer the exact walk.
+        let restore_block_indices =
+            self.score_first_and_enabled || self.and_lead_arrayed || self.and_batched;
+        let saved_block_indices = restore_block_indices.then(|| {
             self.lead
                 .iter()
                 .map(|posting| posting.block_idx)
                 .collect::<SmallVec<[usize; 8]>>()
         });
+        let arrayed = self.and_lead_arrayed;
         let mut up_to = TERMINATED_DOC_ID;
         for posting in &mut self.lead {
-            posting.shallow_next(target);
+            // The array route parks the clause cursor at a candidate, which can
+            // already be past the probe's block, so search from the start.
+            if arrayed {
+                posting.seek_block_from_start(target);
+            } else {
+                posting.shallow_next(target);
+            }
             up_to = up_to.min(Self::posting_block_up_to(posting, target));
         }
         let upper = conservative_score_sum(
@@ -5821,9 +6120,6 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
                 .map(|posting| posting.block_max_score(&self.scorer)),
         );
         if let Some(saved_block_indices) = saved_block_indices {
-            // The returned bound is immutable. Restore the internal shallow
-            // anchors so an external probe cannot steer exact iteration or
-            // discard a still-valid score-first window.
             for (posting, block_idx) in self.lead.iter_mut().zip(saved_block_indices) {
                 posting.block_idx = block_idx;
             }
@@ -11697,6 +11993,9 @@ mod tests {
             .collect();
         let params = FtsSearchParams::default();
         let metrics = NoOpMetricsCollector;
+        // A 4-5 clause cursor over impact-listed clauses now batches, and the
+        // batch walk never evaluates score-first windows. Pin this case to the
+        // classic route, which is where the window it asserts about exists.
         let mut cursor = WandCursor::new(
             Operator::And,
             postings,
@@ -11708,7 +12007,8 @@ mod tests {
             )),
             &params,
             &metrics,
-        );
+        )
+        .with_bulk_and_route(BulkAndMode::Off);
         assert!(cursor.wand.score_first_and_enabled);
         assert_eq!(cursor.next().unwrap(), Some(0));
         assert_eq!(cursor.wand.up_to, Some(TERMINATED_DOC_ID));

@@ -4706,6 +4706,7 @@ mod tests {
     };
     use super::super::impact::build_impact_skip_data;
     use super::super::wand::term_and_test_counters;
+    use super::super::wand::{AndRoute, BulkAndMode};
     use super::super::{CompressedPostingList, PostingTailCodec};
 
     fn rows(values: &[(u64, f32)]) -> Vec<ScoredRow> {
@@ -7290,6 +7291,19 @@ mod tests {
         doc_lengths: &[u32],
         scorer: &MemBM25Scorer,
     ) -> PostingIterator {
+        impact_posting_at(term, 0, entries, doc_lengths, scorer)
+    }
+
+    /// [`impact_posting`] with an explicit position in the query, so a
+    /// conjunction's clauses can have a query order distinct from the order the
+    /// wand sorts them into by cost.
+    fn impact_posting_at(
+        term: usize,
+        position: u32,
+        entries: &[(u32, u32)],
+        doc_lengths: &[u32],
+        scorer: &MemBM25Scorer,
+    ) -> PostingIterator {
         let block_size = MAX_POSTING_BLOCK_SIZE;
         let doc_ids = entries.iter().map(|&(doc, _)| doc).collect::<Vec<_>>();
         let freqs = entries.iter().map(|&(_, freq)| freq).collect::<Vec<_>>();
@@ -7325,7 +7339,7 @@ mod tests {
         PostingIterator::with_query_weight(
             token,
             term as u32,
-            0,
+            position,
             query_weight,
             list,
             doc_lengths.len(),
@@ -7362,6 +7376,13 @@ mod tests {
                 scorer,
                 terms,
             }
+        }
+
+        /// Score quantized document lengths, which turns on the norm-code
+        /// addend path in both scoring routes.
+        fn quantized(mut self) -> Self {
+            self.documents.set_quantized_scoring(true);
+            self
         }
 
         /// One one-term leaf per entry of `order`, in that order.
@@ -7844,5 +7865,310 @@ mod tests {
             }
         }
         assert!(pruned > 0, "the array lead never pruned");
+    }
+
+    /// One conjunction cursor over `postings`, with the route forced through the
+    /// same selection `WandCursor::new` runs.
+    fn and_cursor<'a, 'd: 'a>(
+        documents: &'a LegacyWandDocuments<'d>,
+        postings: Vec<PostingIterator>,
+        scorer: Arc<MemBM25Scorer>,
+        metrics: &'a dyn MetricsCollector,
+        mode: BulkAndMode,
+    ) -> WandCursor<'a, LegacyWandDocuments<'d>> {
+        WandCursor::new(
+            Operator::And,
+            postings,
+            documents,
+            scorer,
+            &FtsSearchParams::new(),
+            metrics,
+        )
+        .with_bulk_and_route(mode)
+    }
+
+    /// `clauses` conjunction postings, one per term, in query order.
+    fn and_postings(corpus: &Corpus, clauses: usize) -> Vec<PostingIterator> {
+        (0..clauses)
+            .map(|term| {
+                impact_posting_at(
+                    term,
+                    term as u32,
+                    &corpus.terms[term],
+                    &corpus.doc_lengths,
+                    &corpus.scorer,
+                )
+            })
+            .collect()
+    }
+
+    /// Densities of one conjunction arrangement. `0` is skewed (so the route
+    /// table picks the array lead), `1` balanced, `2` ordered so the wand's cost
+    /// sort leaves the clauses in query order.
+    fn and_densities(clauses: usize, shape: usize) -> Vec<f64> {
+        const SKEWED: [f64; 5] = [0.9, 0.02, 0.01, 0.01, 0.01];
+        const ORDERED: [f64; 5] = [0.32, 0.45, 0.58, 0.7, 0.82];
+        match shape {
+            0 => SKEWED[..clauses].to_vec(),
+            1 => vec![0.5; clauses],
+            _ => ORDERED[..clauses].to_vec(),
+        }
+    }
+
+    /// Both cursors must sit on the same document with the same score bits.
+    fn assert_same_candidate<D: WandDocuments>(
+        bulk: &mut WandCursor<'_, D>,
+        classic: &mut WandCursor<'_, D>,
+        context: &str,
+    ) {
+        assert_eq!(bulk.doc(), classic.doc(), "{context}: doc id");
+        assert_eq!(
+            bulk.document_key(),
+            classic.document_key(),
+            "{context}: key"
+        );
+        assert_eq!(
+            bulk.matches().unwrap(),
+            classic.matches().unwrap(),
+            "{context}"
+        );
+        assert_eq!(
+            bulk.current_score().unwrap().to_bits(),
+            classic.current_score().unwrap().to_bits(),
+            "{context}: score"
+        );
+    }
+
+    /// Every document a cursor hands out, with its score bits.
+    fn drain_and<D: WandDocuments>(cursor: &mut WandCursor<'_, D>) -> Vec<(u64, u32)> {
+        let mut out = Vec::new();
+        while let Some(doc) = cursor.next().unwrap() {
+            out.push((doc, cursor.current_score().unwrap().to_bits()));
+        }
+        out
+    }
+
+    /// The batch conjunction must return exactly what the per-document route
+    /// returns, bit for bit, under the same probes from a compound collector.
+    #[test]
+    fn and_cursor_batch_matches_the_per_doc_cursor_bit_for_bit() {
+        let mut bulk_routes = 0_usize;
+        let mut classic_routes = 0_usize;
+        let mut arrayed_routes = 0_usize;
+        let mut compared = 0_usize;
+        let mut drained = 0_usize;
+        for seed in 0..3_u64 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let num_docs = rng.random_range(400..=900_usize);
+            for clauses in 2..=5_usize {
+                for shape in 0..3_usize {
+                    // Both scoring paths must agree: exact doc lengths, and the
+                    // quantized norm codes that score through the addend cache.
+                    for quantized in [false, true] {
+                        let corpus =
+                            random_corpus(&mut rng, num_docs, &and_densities(clauses, shape));
+                        let corpus = if quantized {
+                            corpus.quantized()
+                        } else {
+                            corpus
+                        };
+                        let mask = RowAddrMask::all_rows();
+                        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+                        let metrics = NoOpMetricsCollector;
+                        let context = format!(
+                            "seed={seed} clauses={clauses} shape={shape} quantized={quantized}"
+                        );
+
+                        let mut bulk = and_cursor(
+                            &documents,
+                            and_postings(&corpus, clauses),
+                            corpus.scorer.clone(),
+                            &metrics,
+                            BulkAndMode::On,
+                        );
+                        let mut classic = and_cursor(
+                            &documents,
+                            and_postings(&corpus, clauses),
+                            corpus.scorer.clone(),
+                            &metrics,
+                            BulkAndMode::Off,
+                        );
+                        assert_eq!(bulk.and_route(), AndRoute::Bulk, "{context}");
+                        assert_eq!(classic.and_route(), AndRoute::Classic, "{context}");
+                        bulk_routes += 1;
+                        classic_routes += 1;
+
+                        let mut floor = 0.0_f32;
+                        for _ in 0..512 {
+                            match rng.random_range(0..16_u32) {
+                                0..=3 => {
+                                    let a = bulk.next().unwrap();
+                                    let b = classic.next().unwrap();
+                                    assert_eq!(a, b, "{context}: next");
+                                    if a.is_none() {
+                                        break;
+                                    }
+                                    compared += 1;
+                                    assert_same_candidate(&mut bulk, &mut classic, &context);
+                                }
+                                4 => {
+                                    floor = floor.max(rng.random_range(0.0..0.35_f32));
+                                    bulk.set_min_competitive_score(floor).unwrap();
+                                    classic.set_min_competitive_score(floor).unwrap();
+                                }
+                                5 => {
+                                    let target =
+                                        bulk.doc().unwrap_or(0) + rng.random_range(0..32_u64);
+                                    let bulk_up_to = bulk.advance_shallow(target).unwrap();
+                                    let classic_up_to = classic.advance_shallow(target).unwrap();
+                                    assert!(
+                                        bulk_up_to >= target && classic_up_to >= target,
+                                        "{context}: shallow range below {target}"
+                                    );
+                                    for (cursor, up_to) in
+                                        [(&mut bulk, bulk_up_to), (&mut classic, classic_up_to)]
+                                    {
+                                        let bound = cursor.score_upper_bound(up_to).unwrap();
+                                        if let Some(doc) = cursor.doc()
+                                            && doc >= target
+                                            && doc <= up_to
+                                        {
+                                            let score = cursor.current_score().unwrap();
+                                            assert!(
+                                                bound >= score,
+                                                "{context}: bound {bound} below score {score} \
+                                             for doc {doc} in [{target}, {up_to}]"
+                                            );
+                                        }
+                                    }
+                                    assert_eq!(bulk.doc(), classic.doc(), "{context}: shallow doc");
+                                }
+                                6..=11 => {
+                                    let target =
+                                        bulk.doc().unwrap_or(0) + rng.random_range(1..64_u64);
+                                    let a = bulk.advance(target).unwrap();
+                                    let b = classic.advance(target).unwrap();
+                                    assert_eq!(a, b, "{context}: advance({target})");
+                                    if let Some(doc) = a {
+                                        assert!(doc >= target, "{context}: advance went backwards");
+                                        compared += 1;
+                                        assert_same_candidate(&mut bulk, &mut classic, &context);
+                                    }
+                                }
+                                _ => {
+                                    // A plain probe of the score without moving.
+                                    if bulk.doc().is_some() {
+                                        assert_same_candidate(&mut bulk, &mut classic, &context);
+                                    }
+                                }
+                            }
+                        }
+
+                        // The routed cursor must agree with the per-document route
+                        // on the whole corpus, whatever route `Auto` picked.
+                        let mut routed = and_cursor(
+                            &documents,
+                            and_postings(&corpus, clauses),
+                            corpus.scorer.clone(),
+                            &metrics,
+                            BulkAndMode::Auto,
+                        );
+                        match routed.and_route() {
+                            AndRoute::Bulk => bulk_routes += 1,
+                            AndRoute::Classic => classic_routes += 1,
+                            AndRoute::Arrayed => arrayed_routes += 1,
+                        }
+                        let mut routed_classic = and_cursor(
+                            &documents,
+                            and_postings(&corpus, clauses),
+                            corpus.scorer.clone(),
+                            &metrics,
+                            BulkAndMode::Off,
+                        );
+                        let routed_docs = drain_and(&mut routed);
+                        drained += routed_docs.len();
+                        assert_eq!(
+                            routed_docs,
+                            drain_and(&mut routed_classic),
+                            "{context}: routed cursor"
+                        );
+                    }
+                }
+            }
+        }
+        // Both the interleaved probes and the whole-corpus drains must have
+        // covered real documents, not just empty conjunctions.
+        assert!(
+            compared > 100,
+            "too few interleaved comparisons: {compared}"
+        );
+        assert!(drained > 500, "too few compared documents: {drained}");
+        assert!(bulk_routes > 0, "the bulk route was never exercised");
+        assert!(classic_routes > 0, "the classic route was never exercised");
+        assert!(
+            arrayed_routes > 0,
+            "the arrayed route was never exercised: {bulk_routes}/{classic_routes}/{arrayed_routes}"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordedComparisons(AtomicUsize);
+
+    impl MetricsCollector for RecordedComparisons {
+        fn record_parts_loaded(&self, _: usize) {}
+        fn record_index_loads(&self, _: usize) {}
+        fn record_comparisons(&self, count: usize) {
+            self.0
+                .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The batch cursor scores a document only when it hands one out: its
+    /// comparison count is the number of hand-outs, and a positive floor makes
+    /// both counts smaller because the walk prunes before counting.
+    #[test]
+    fn and_cursor_batch_scores_only_handed_out_candidates() {
+        let mut rng = SmallRng::seed_from_u64(0x5EED_1234);
+        let num_docs = 1_200;
+        let corpus = random_corpus(&mut rng, num_docs, &[0.6, 0.5, 0.4]);
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+
+        let run = |floor: Option<f32>| -> (usize, f32) {
+            let metrics = RecordedComparisons::default();
+            let mut cursor = and_cursor(
+                &documents,
+                and_postings(&corpus, 3),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::On,
+            );
+            assert_eq!(cursor.and_route(), AndRoute::Bulk);
+            if let Some(floor) = floor {
+                cursor.set_min_competitive_score(floor).unwrap();
+            }
+            let mut handed_out = 0;
+            let mut best = f32::NEG_INFINITY;
+            while cursor.next().unwrap().is_some() {
+                handed_out += 1;
+                best = best.max(cursor.current_score().unwrap());
+            }
+            assert_eq!(
+                metrics.0.load(std::sync::atomic::Ordering::Relaxed),
+                handed_out,
+                "the batch walk scored a candidate it did not hand out"
+            );
+            (handed_out, best)
+        };
+
+        let (unpruned, best) = run(None);
+        assert!(unpruned > 1);
+        // The top document's own score is the floor: every document the merge
+        // can prove cannot reach it is pruned before it is ever scored.
+        let (pruned, _) = run(Some(best));
+        assert!(
+            pruned < unpruned,
+            "the floor did not prune: {pruned} of {unpruned}"
+        );
     }
 }
