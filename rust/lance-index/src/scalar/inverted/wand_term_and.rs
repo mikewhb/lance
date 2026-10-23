@@ -273,6 +273,7 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
                 break;
             }
             if self.floor > 0.0 {
+                super::skip_probe::note_and_floor(self.floor);
                 if self.bound.is_none_or(|(up_to, _)| self.target > up_to) {
                     let bound =
                         and_block_bound(&mut self.lead, &*self.scorer, self.target, self.floor);
@@ -281,6 +282,7 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
                 if let Some((up_to, upper)) = self.bound
                     && upper < self.floor
                 {
+                    super::skip_probe::and_skipped_window();
                     #[cfg(test)]
                     test_counters::skipped_window();
                     if up_to == TERMINATED_DOC_ID {
@@ -303,7 +305,9 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
                 }
                 AndWindowSlice::Empty { win_end, jump_to } => (win_end, jump_to),
                 AndWindowSlice::Ready { win_end } => {
+                    let before = self.hits.len();
                     self.collect_window(&mut wins);
+                    super::skip_probe::and_ready_window(self.hits.len() - before);
                     (win_end, 0)
                 }
             };

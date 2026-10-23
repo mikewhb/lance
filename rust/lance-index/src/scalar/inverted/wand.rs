@@ -37,6 +37,186 @@ mod term_and;
 #[path = "wand_term_leaf.rs"]
 mod term_leaf;
 
+/// Counts taken by `LANCE_FTS_SKIP_PROBE`. The search decisions are unchanged.
+pub(super) mod skip_probe {
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+    static READY: AtomicBool = AtomicBool::new(false);
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+
+    static COMBINED_SKIPS: AtomicU64 = AtomicU64::new(0);
+    static COMBINED_SPAN: AtomicU64 = AtomicU64::new(0);
+    static INTERSECT_WINDOWS: AtomicU64 = AtomicU64::new(0);
+    static INTERSECT_STEPS: AtomicU64 = AtomicU64::new(0);
+    static REQUIRED_ALONE_STEPS: AtomicU64 = AtomicU64::new(0);
+    static DIRECT_STEPS: AtomicU64 = AtomicU64::new(0);
+    static AND_SKIPPED: AtomicU64 = AtomicU64::new(0);
+    static AND_READY: AtomicU64 = AtomicU64::new(0);
+    static AND_HITS: AtomicU64 = AtomicU64::new(0);
+    static COLLECTOR_SKIPS: AtomicU64 = AtomicU64::new(0);
+    static COLLECTOR_KEEPS: AtomicU64 = AtomicU64::new(0);
+    static FORWARDS_POS: AtomicU64 = AtomicU64::new(0);
+    static FORWARDS_NONE: AtomicU64 = AtomicU64::new(0);
+    static LAST_COMP: AtomicU32 = AtomicU32::new(0);
+    static LAST_OPT: AtomicU32 = AtomicU32::new(0);
+    static LAST_FWD: AtomicU32 = AtomicU32::new(0);
+    static LAST_REQ: AtomicU32 = AtomicU32::new(0);
+    static LAST_COMBINED: AtomicU32 = AtomicU32::new(0);
+    static LAST_FLOOR: AtomicU32 = AtomicU32::new(0);
+    static LAST_AND_FLOOR: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "C" {
+        unsafe fn atexit(cb: unsafe extern "C" fn());
+    }
+
+    unsafe extern "C" fn dump_at_exit() {
+        dump();
+    }
+
+    fn on() -> bool {
+        if !READY.swap(true, Ordering::Relaxed) {
+            let enabled = std::env::var_os("LANCE_FTS_SKIP_PROBE").is_some();
+            ENABLED.store(enabled, Ordering::Relaxed);
+            if enabled {
+                unsafe { atexit(dump_at_exit) };
+            }
+        }
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    #[allow(clippy::print_stderr)]
+    fn dump() {
+        let fwd = if FORWARDS_POS.load(Ordering::Relaxed) == 0 {
+            "none".to_string()
+        } else {
+            format!("{}", f32::from_bits(LAST_FWD.load(Ordering::Relaxed)))
+        };
+        eprintln!(
+            "SKIP_PROBE combined_skips={} combined_span={} intersect_windows={} intersect_steps={} required_alone_steps={} direct_steps={} and_skipped_windows={} and_ready_windows={} and_hit_docs={} collector_skips={} collector_keeps={} forwards_pos={} forwards_none={} competitive={} optional_upper={} forwarded_floor={} last_intersect_required_upper={} last_intersect_combined_upper={} last_intersect_floor={} term_and_floor={}",
+            COMBINED_SKIPS.load(Ordering::Relaxed),
+            COMBINED_SPAN.load(Ordering::Relaxed),
+            INTERSECT_WINDOWS.load(Ordering::Relaxed),
+            INTERSECT_STEPS.load(Ordering::Relaxed),
+            REQUIRED_ALONE_STEPS.load(Ordering::Relaxed),
+            DIRECT_STEPS.load(Ordering::Relaxed),
+            AND_SKIPPED.load(Ordering::Relaxed),
+            AND_READY.load(Ordering::Relaxed),
+            AND_HITS.load(Ordering::Relaxed),
+            COLLECTOR_SKIPS.load(Ordering::Relaxed),
+            COLLECTOR_KEEPS.load(Ordering::Relaxed),
+            FORWARDS_POS.load(Ordering::Relaxed),
+            FORWARDS_NONE.load(Ordering::Relaxed),
+            f32::from_bits(LAST_COMP.load(Ordering::Relaxed)),
+            f32::from_bits(LAST_OPT.load(Ordering::Relaxed)),
+            fwd,
+            f32::from_bits(LAST_REQ.load(Ordering::Relaxed)),
+            f32::from_bits(LAST_COMBINED.load(Ordering::Relaxed)),
+            f32::from_bits(LAST_FLOOR.load(Ordering::Relaxed)),
+            f32::from_bits(LAST_AND_FLOOR.load(Ordering::Relaxed)),
+        );
+    }
+
+    #[inline]
+    pub(crate) fn combined_skip(span: u64) {
+        if on() {
+            COMBINED_SKIPS.fetch_add(1, Ordering::Relaxed);
+            COMBINED_SPAN.fetch_add(span, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn intersect_window() {
+        if on() {
+            INTERSECT_WINDOWS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn intersect_step() {
+        if on() {
+            INTERSECT_STEPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn required_alone_step() {
+        if on() {
+            REQUIRED_ALONE_STEPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn direct_step() {
+        if on() {
+            DIRECT_STEPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn and_skipped_window() {
+        if on() {
+            AND_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn and_ready_window(hits: usize) {
+        if on() {
+            AND_READY.fetch_add(1, Ordering::Relaxed);
+            AND_HITS.fetch_add(hits as u64, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn collector_skip() {
+        if on() {
+            COLLECTOR_SKIPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn collector_keep() {
+        if on() {
+            COLLECTOR_KEEPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn note_forward(competitive: f32, optional_upper: f32, forwarded: Option<f32>) {
+        if !on() {
+            return;
+        }
+        LAST_COMP.store(competitive.to_bits(), Ordering::Relaxed);
+        LAST_OPT.store(optional_upper.to_bits(), Ordering::Relaxed);
+        match forwarded {
+            Some(floor) => {
+                FORWARDS_POS.fetch_add(1, Ordering::Relaxed);
+                LAST_FWD.store(floor.to_bits(), Ordering::Relaxed);
+            }
+            None => {
+                FORWARDS_NONE.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn note_intersect_bounds(required_upper: f32, combined_upper: f32, floor: f32) {
+        if !on() {
+            return;
+        }
+        LAST_REQ.store(required_upper.to_bits(), Ordering::Relaxed);
+        LAST_COMBINED.store(combined_upper.to_bits(), Ordering::Relaxed);
+        LAST_FLOOR.store(floor.to_bits(), Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn note_and_floor(floor: f32) {
+        if on() {
+            LAST_AND_FLOOR.store(floor.to_bits(), Ordering::Relaxed);
+        }
+    }
+}
+
 pub(super) use term_and::TermAndCursor;
 #[cfg(test)]
 pub(super) use term_and::test_counters as term_and_test_counters;
