@@ -33,6 +33,7 @@ use super::{
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
         TermLeaf, WandCursor, WandDocuments, required_side_floor, score_sum_upper_bound_factor,
+        single_posting_route_accepts,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -4139,7 +4140,8 @@ where
         && leaves.iter().all(|leaf| {
             // The tree scales a lone MUST leaf's floor by the wand factor,
             // which is approximate unless the factor is one.
-            leaf.params.wand_factor == 1.0 && TermLeaf::<D>::accepts(&leaf.postings, &leaf.params)
+            leaf.params.wand_factor == 1.0
+                && single_posting_route_accepts(&leaf.postings, &leaf.params)
         })
         && must.iter().all(|&index| {
             leaves[index].scorer.doc_weight_cache_key() == must_scorer.doc_weight_cache_key()
@@ -4150,8 +4152,13 @@ where
         // same terms in the same order: every score keeps its bits.
         //
         // The conjunction cursor scores with the first MUST clause's params,
-        // so capture them before `leaves` is emptied below.
+        // so capture them before `leaves` is emptied below. A lone SHOULD leaf
+        // scores with its own params.
         let must_params = leaves[must[0]].params.clone();
+        let should_params = should
+            .iter()
+            .map(|&index| leaves[index].params.clone())
+            .collect::<Vec<_>>();
         // One cursor scores every SHOULD posting with one scorer.
         let should_cursor = (should.len() >= 2
             && should.iter().all(|&index| {
@@ -4193,7 +4200,14 @@ where
         // single-child conjunction forwards it.
         let required: BoxScorer<'_> = if musts.len() == 1 {
             let posting = musts.into_iter().next().expect("one MUST clause");
-            Box::new(TermLeaf::new(posting, documents, must_scorer, metrics))
+            Box::new(WandCursor::new(
+                Operator::And,
+                vec![posting],
+                documents,
+                must_scorer,
+                &must_params,
+                metrics,
+            ))
         } else {
             Box::new(WandCursor::new(
                 Operator::And,
@@ -4236,9 +4250,17 @@ where
         } else {
             let mut optional = should
                 .iter()
-                .map(|&index| -> Result<BoxScorer<'_>> {
+                .enumerate()
+                .map(|(rank, &index)| -> Result<BoxScorer<'_>> {
                     let (posting, scorer) = take(index)?;
-                    Ok(Box::new(TermLeaf::new(posting, documents, scorer, metrics)))
+                    Ok(Box::new(WandCursor::new(
+                        Operator::Or,
+                        vec![posting],
+                        documents,
+                        scorer,
+                        &should_params[rank],
+                        metrics,
+                    )))
                 })
                 .collect::<Result<Vec<_>>>()?;
             let optional: BoxScorer<'_> = if optional.len() == 1 {
@@ -7465,7 +7487,8 @@ mod tests {
         collector.into_rows()
     }
 
-    /// The generic scorer tree over the same leaves, never the fast path.
+    /// The generic scorer tree over the same leaves, never the fast path and
+    /// never the single-posting route, so it stays an independent reference.
     fn collect_generic(
         corpus: &Corpus,
         mask: &RowAddrMask,
@@ -7478,7 +7501,7 @@ mod tests {
         let mut leaf_scorers = leaves
             .into_iter()
             .map(|leaf| {
-                Some(Box::new(WandCursor::new(
+                Some(Box::new(WandCursor::new_without_single_route(
                     leaf.operator,
                     leaf.postings,
                     &documents,
@@ -7525,6 +7548,35 @@ mod tests {
                     cursor_counters::take_batched(),
                     usize::from(musts >= 2),
                     "musts={musts} limit={limit}"
+                );
+            }
+        }
+    }
+
+    /// A flat query whose leaves are one-term clauses builds them on the
+    /// single-posting route, on the MUST and on the SHOULD side alike, and the
+    /// results still match the generic route bit for bit.
+    #[test]
+    fn flat_one_term_leaves_use_the_single_posting_route() {
+        let mut rng = SmallRng::seed_from_u64(0x51_1D);
+        let corpus = random_corpus(&mut rng, 900, &[0.3, 0.25, 0.2]);
+        let mask = RowAddrMask::all_rows();
+        for (musts, shoulds) in [(1_usize, 0_usize), (1, 2), (2, 1)] {
+            let plan = must_should_plan(musts, shoulds);
+            let all = (0..musts + shoulds).collect::<Vec<_>>();
+            for limit in [1, 10, 100] {
+                cursor_counters::take_single_posting_cursors();
+                let admitted = collect_admitted(&corpus, &mask, corpus.leaves(&all), &plan, limit);
+                let built = cursor_counters::take_single_posting_cursors();
+                assert!(
+                    built >= 1,
+                    "musts={musts} shoulds={shoulds} limit={limit}: {built}"
+                );
+                let generic = collect_generic(&corpus, &mask, corpus.leaves(&all), &plan, limit);
+                assert_eq!(
+                    score_bits(&admitted),
+                    score_bits(&generic),
+                    "musts={musts} shoulds={shoulds} limit={limit}"
                 );
             }
         }
