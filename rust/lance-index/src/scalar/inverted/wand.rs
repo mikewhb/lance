@@ -2699,6 +2699,12 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         static SINGLE_POSTING_BLOCKS_SKIPPED: Cell<usize> = const { Cell::new(0) };
         /// Cursors built on the single-posting route, since the previous reset.
         static SINGLE_POSTING_CURSORS: Cell<usize> = const { Cell::new(0) };
+        /// One-step seeks a batched conjunction cursor ran because the caller
+        /// jumped past what its window walk had covered.
+        static AND_CURSOR_SEEK_STEPS: Cell<usize> = const { Cell::new(0) };
+        /// Windows a batched conjunction cursor walked, since the previous
+        /// reset.
+        static AND_CURSOR_BATCH_REFILLS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn and_cursor_batched() {
@@ -2735,6 +2741,14 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         SINGLE_POSTING_CURSORS.with(|count| count.set(count.get() + 1));
     }
 
+    pub(super) fn and_cursor_seek_step() {
+        AND_CURSOR_SEEK_STEPS.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn and_cursor_batch_refill() {
+        AND_CURSOR_BATCH_REFILLS.with(|count| count.set(count.get() + 1));
+    }
+
     pub(in crate::scalar::inverted) fn take_batched() -> usize {
         AND_CURSORS_BATCHED.with(|count| count.replace(0))
     }
@@ -2761,6 +2775,14 @@ pub(in crate::scalar::inverted) mod cursor_counters {
 
     pub(in crate::scalar::inverted) fn take_single_posting_cursors() -> usize {
         SINGLE_POSTING_CURSORS.with(|count| count.replace(0))
+    }
+
+    pub(in crate::scalar::inverted) fn take_and_cursor_seek_steps() -> usize {
+        AND_CURSOR_SEEK_STEPS.with(|count| count.replace(0))
+    }
+
+    pub(in crate::scalar::inverted) fn take_and_cursor_batch_refills() -> usize {
+        AND_CURSOR_BATCH_REFILLS.with(|count| count.replace(0))
     }
 }
 
@@ -5694,6 +5716,12 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     and_batch: Option<and_walk::BulkAndState<'a>>,
     and_cands: Vec<(u64, f32, u32)>,
     and_next: usize,
+    // Highest document the window walk has covered, until a seek step moves
+    // past it. A jump beyond `frontier + 1` cannot be served by the walk.
+    batch_frontier: Option<u64>,
+    // Whether the last handed-out document came from a one-step seek instead of
+    // the walk. The next sequential call restarts the walk after that document.
+    seeking: bool,
     // Present when the whole query is one compressed, ungrouped posting and no
     // phrase is involved. The cursor then steps that posting directly instead
     // of driving the WAND heap; `wand` holds no postings in that case.
@@ -5796,6 +5824,8 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             and_batch: None,
             and_cands: Vec::new(),
             and_next: 0,
+            batch_frontier: None,
+            seeking: false,
             single,
             exhausted: empty_intersection,
         };
@@ -5866,6 +5896,8 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         self.wand.and_batched = false;
         self.wand.and_lead_arrayed = false;
         self.wand.array_lead.clear();
+        self.batch_frontier = None;
+        self.seeking = false;
         self.select_and_route();
         self
     }
@@ -5991,9 +6023,14 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         self.and_next = 0;
         while self.and_cands.is_empty() {
             let Some(state) = self.and_batch.as_mut() else {
+                self.exhausted = true;
                 return Ok(false);
             };
             if state.done {
+                // The walk is over: no later jump may restart it from the
+                // clause cursors, which now trail the documents already
+                // handed out.
+                self.exhausted = true;
                 return Ok(false);
             }
             self.wand.raise_to_shared_floor(state.wand_factor);
@@ -6011,7 +6048,12 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             // A step that reports `Done` may still have buffered the final
             // window's candidates, so only the loop condition decides whether
             // the walk is over.
+            #[cfg(test)]
+            cursor_counters::and_cursor_batch_refill();
             self.wand.bulk_and_step(state, &mut visit)?;
+            // `bulk_and_step` leaves `target` one past the window it walked,
+            // which is how far this route has already covered.
+            self.batch_frontier = Some(state.target.saturating_sub(1));
         }
         Ok(true)
     }
@@ -6103,6 +6145,12 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             // document; there is no tier state to flush first.
             return self.position_next();
         }
+        if self.seeking {
+            // A seek step handed out the current document; the walk restarts
+            // right after it.
+            let from = self.doc().map_or(0, |doc| doc.saturating_add(1));
+            self.resume_batch(from);
+        }
         if let Some(doc) = self.current_doc
             && self.wand.operator == Operator::Or
         {
@@ -6135,9 +6183,9 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         self.position_next()
     }
 
-    /// `advance` on the bulk route: the walk is driven by the state's target,
-    /// not by the clause cursors, so a jump either discards buffered candidates
-    /// or moves the next window.
+    /// `advance` on the bulk route: a jump either keeps the window walk going
+    /// from the target, or, when it lands past everything the walk has covered,
+    /// is served by one seek step.
     fn advance_batch(&mut self, target: u64) -> Result<Option<u64>> {
         // No posting doc id can reach a target past the u32 doc-id domain.
         if target > u32::MAX as u64 {
@@ -6153,9 +6201,25 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         while self.and_next < self.and_cands.len() && self.and_cands[self.and_next].0 < target {
             self.and_next += 1;
         }
-        if self.and_next == self.and_cands.len()
-            && let Some(state) = self.and_batch.as_mut()
-        {
+        if self.and_next < self.and_cands.len() {
+            // A buffered candidate still covers the target.
+            return self.position_next();
+        }
+        let covered = self
+            .batch_frontier
+            .map_or(0, |frontier| frontier.saturating_add(1));
+        if target > covered {
+            // The walk would have to decode and merge a window the caller will
+            // not read; one seek step answers the jump instead.
+            return self.seek_one(target);
+        }
+        if self.seeking {
+            let from = self
+                .doc()
+                .map_or(target, |doc| doc.saturating_add(1).max(target));
+            self.resume_batch(from);
+        }
+        if let Some(state) = self.and_batch.as_mut() {
             // Nothing is buffered, so the next window may start at `target`:
             // the walk must not re-emit documents below it.
             state.target = state.target.max(target);
@@ -6163,6 +6227,58 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         // Re-entering the batch path hands out a surviving buffered candidate
         // or refills from the raised target.
         self.position_next()
+    }
+
+    /// Serves one `advance` with a seek instead of a window walk.
+    ///
+    /// The classic route is reused as-is: it moves the clause cursors with
+    /// `next`, so their `index` and current document stay aligned for the walk
+    /// that resumes later. Only the buffered candidates are dropped, since all
+    /// of them lie below the target.
+    fn seek_one(&mut self, target: u64) -> Result<Option<u64>> {
+        self.and_next = self.and_cands.len();
+        #[cfg(test)]
+        cursor_counters::and_cursor_seek_step();
+        self.wand.seek(target);
+        let found = self.position_classic()?;
+        match found {
+            Some(doc) => {
+                self.seeking = true;
+                self.batch_frontier = Some(doc);
+            }
+            // Nothing at or after the target: the conjunction is over.
+            None => self.exhausted = true,
+        }
+        Ok(found)
+    }
+
+    /// Restarts the window walk at `from` after a seek step.
+    ///
+    /// The walk resumes from the clause cursors the seek left behind, so its
+    /// per-block slice bookkeeping no longer describes them; the buffered
+    /// candidates belong to the abandoned walk and are dropped.
+    fn resume_batch(&mut self, from: u64) {
+        if from > u64::from(u32::MAX) {
+            // No posting holds a document past the doc-id domain, so the walk
+            // has nothing left to produce.
+            if let Some(state) = self.and_batch.as_mut() {
+                state.done = true;
+            }
+            self.exhausted = true;
+            self.and_cands.clear();
+            self.and_next = 0;
+            self.seeking = false;
+            return;
+        }
+        if let Some(state) = self.and_batch.as_mut() {
+            state.target = from;
+            // Same sentinel `BulkAndState::new` starts from: it makes the next
+            // slice begin at the target block instead of a remembered offset.
+            state.slice_prev.fill((usize::MAX, 0));
+        }
+        self.and_cands.clear();
+        self.and_next = 0;
+        self.seeking = false;
     }
 
     pub(super) fn cost(&self) -> usize {

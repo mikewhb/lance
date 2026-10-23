@@ -8132,6 +8132,191 @@ mod tests {
         );
     }
 
+    /// A jump far past what the window walk has covered must hand out the same
+    /// documents and score bits as the per-document route, for every driving
+    /// pattern.
+    #[test]
+    fn and_cursor_far_advances_seek_and_match_bit_for_bit() {
+        let mut rng = SmallRng::seed_from_u64(0x5EE_C0DE);
+        let block = MAX_POSTING_BLOCK_SIZE as u64;
+        let mut compared = 0_usize;
+        for clauses in 2..=5_usize {
+            for shape in 0..3_usize {
+                let corpus = random_corpus(&mut rng, 6_000, &and_densities(clauses, shape));
+                let mask = RowAddrMask::all_rows();
+                let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+                let metrics = NoOpMetricsCollector;
+                for sequence in 0..3_usize {
+                    let context = format!("clauses={clauses} shape={shape} seq={sequence}");
+                    let mut batch = and_cursor(
+                        &documents,
+                        and_postings(&corpus, clauses),
+                        corpus.scorer.clone(),
+                        &metrics,
+                        BulkAndMode::On,
+                    );
+                    let mut classic = and_cursor(
+                        &documents,
+                        and_postings(&corpus, clauses),
+                        corpus.scorer.clone(),
+                        &metrics,
+                        BulkAndMode::Off,
+                    );
+                    assert_eq!(batch.and_route(), AndRoute::Bulk, "{context}");
+                    let mut steps = 0_usize;
+                    'drive: while steps < 3_000 {
+                        steps += 1;
+                        let far = match sequence {
+                            // Only far jumps, each starting two blocks past the
+                            // last handed-out document.
+                            0 => Some(batch.doc().map_or(2 * block, |doc| doc + 2 * block)),
+                            // Twenty sequential calls, then one far jump.
+                            1 => (steps % 21 == 0)
+                                .then(|| batch.doc().map_or(2 * block, |doc| doc + 2 * block)),
+                            // Random mix.
+                            _ => (rng.random_range(0..8_u32) == 0)
+                                .then(|| batch.doc().map_or(2 * block, |doc| doc + 2 * block)),
+                        };
+                        let (a, b) = match far {
+                            Some(target) => (
+                                batch.advance(target).unwrap(),
+                                classic.advance(target).unwrap(),
+                            ),
+                            None => (batch.next().unwrap(), classic.next().unwrap()),
+                        };
+                        assert_eq!(a, b, "{context}: step {steps}");
+                        let Some(_) = a else {
+                            break 'drive;
+                        };
+                        compared += 1;
+                        assert_same_candidate(&mut batch, &mut classic, &context);
+                    }
+                }
+            }
+        }
+        assert!(compared > 500, "only {compared} documents compared");
+    }
+
+    /// A jump past the walk's covered range must be served by one seek step, not
+    /// by decoding and merging a window the caller will not read.
+    #[test]
+    fn and_cursor_far_advances_do_not_refill_windows() {
+        let mut rng = SmallRng::seed_from_u64(0x5EE_0002);
+        let block = MAX_POSTING_BLOCK_SIZE as u64;
+        let mut total_seeks = 0_usize;
+        for clauses in 2..=5_usize {
+            let corpus = random_corpus(&mut rng, 6_000, &and_densities(clauses, 1));
+            let mask = RowAddrMask::all_rows();
+            let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+            let metrics = NoOpMetricsCollector;
+            let mut batch = and_cursor(
+                &documents,
+                and_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::On,
+            );
+            let mut classic = and_cursor(
+                &documents,
+                and_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::Off,
+            );
+            assert_eq!(batch.and_route(), AndRoute::Bulk);
+            cursor_counters::take_and_cursor_seek_steps();
+            cursor_counters::take_and_cursor_batch_refills();
+
+            // Every target starts two blocks past the last handed-out document,
+            // so every call is a jump the walk cannot serve.
+            let mut jumps = 0_usize;
+            let mut target = 2 * block;
+            loop {
+                jumps += 1;
+                let a = batch.advance(target).unwrap();
+                let b = classic.advance(target).unwrap();
+                assert_eq!(a, b, "clauses={clauses} advance({target})");
+                let Some(doc) = a else {
+                    break;
+                };
+                assert_same_candidate(&mut batch, &mut classic, "far advance");
+                target = doc + 2 * block;
+            }
+            assert_eq!(
+                cursor_counters::take_and_cursor_seek_steps(),
+                jumps,
+                "clauses={clauses}: one seek per jump"
+            );
+            assert_eq!(
+                cursor_counters::take_and_cursor_batch_refills(),
+                0,
+                "clauses={clauses}: a jump refilled a window"
+            );
+            total_seeks += jumps;
+        }
+        assert!(total_seeks > 20, "only {total_seeks} seeks");
+    }
+
+    /// After a seek step the walk must resume right after the document the seek
+    /// found, with the same results as the per-document route.
+    #[test]
+    fn and_cursor_returns_to_batch_after_a_seek() {
+        let mut rng = SmallRng::seed_from_u64(0x5EE_0003);
+        let block = MAX_POSTING_BLOCK_SIZE as u64;
+        for clauses in 2..=5_usize {
+            let corpus = random_corpus(&mut rng, 6_000, &and_densities(clauses, 1));
+            let mask = RowAddrMask::all_rows();
+            let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+            let metrics = NoOpMetricsCollector;
+            let mut batch = and_cursor(
+                &documents,
+                and_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::On,
+            );
+            let mut classic = and_cursor(
+                &documents,
+                and_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::Off,
+            );
+            cursor_counters::take_and_cursor_seek_steps();
+            cursor_counters::take_and_cursor_batch_refills();
+
+            let start = 4 * block;
+            let a = batch.advance(start).unwrap();
+            let b = classic.advance(start).unwrap();
+            assert_eq!(a, b, "clauses={clauses}: advance({start})");
+            let Some(_) = a else {
+                continue;
+            };
+            assert_eq!(
+                cursor_counters::take_and_cursor_seek_steps(),
+                1,
+                "clauses={clauses}: the first jump was not a seek"
+            );
+
+            let mut followed = 0_usize;
+            for _ in 0..100 {
+                let a = batch.next().unwrap();
+                let b = classic.next().unwrap();
+                assert_eq!(a, b, "clauses={clauses}: next after the seek");
+                let Some(_) = a else {
+                    break;
+                };
+                followed += 1;
+                assert_same_candidate(&mut batch, &mut classic, "after a seek");
+            }
+            assert!(followed > 0, "clauses={clauses}: nothing followed the seek");
+            assert!(
+                cursor_counters::take_and_cursor_batch_refills() > 0,
+                "clauses={clauses}: the walk never resumed"
+            );
+        }
+    }
+
     #[derive(Default)]
     struct RecordedComparisons(AtomicUsize);
 
