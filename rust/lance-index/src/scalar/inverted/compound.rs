@@ -4154,7 +4154,6 @@ struct CollectedPartitions {
 thread_local! {
     static TERM_AND_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REQUIRED_FLOORS_FORWARDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static SHOULD_CURSORS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Leaf indices `(must, should)` of `+must... should...` when there is at
@@ -4211,18 +4210,6 @@ where
         // Over one-term leaves the Boolean wrapper, unit boosts and the
         // single-child disjunction only forward, and the conjunction sums the
         // same terms in the same order: every score keeps its bits.
-        // One cursor scores every SHOULD posting with one scorer.
-        let should_cursor = (should.len() >= 2
-            && should.iter().all(|&index| {
-                leaves[index].scorer.doc_weight_cache_key()
-                    == leaves[should[0]].scorer.doc_weight_cache_key()
-            }))
-        .then(|| {
-            (
-                leaves[should[0]].scorer.clone(),
-                leaves[should[0]].params.clone(),
-            )
-        });
         let mut leaves = leaves.into_iter().map(Some).collect::<Vec<_>>();
         let mut take = |index: usize| -> Result<(PostingIterator, Arc<MemBM25Scorer>)> {
             let mut leaf = leaves
@@ -4248,31 +4235,6 @@ where
             Box::new(TermAndCursor::new(musts, documents, must_scorer, metrics));
         let mut scorer: BoxScorer<'_> = if should.is_empty() {
             required
-        } else if let Some((should_scorer, should_params)) = should_cursor {
-            let postings = should
-                .iter()
-                .enumerate()
-                .map(|(rank, &index)| {
-                    take(index).map(|(posting, _)| posting.with_query_position(rank as u32))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let cursor = WandCursor::new(
-                Operator::Or,
-                postings,
-                documents,
-                should_scorer,
-                &should_params,
-                metrics,
-            );
-            // The cursor stops bounding the disjunction once a posting runs
-            // out, and the bound is cached on first use.
-            let _ = cursor.global_score_upper_bound();
-            #[cfg(test)]
-            SHOULD_CURSORS_BUILT.with(|count| count.set(count.get() + 1));
-            Box::new(ReqOptScorer::with_required_floor(
-                required,
-                Box::new(cursor),
-            ))
         } else {
             let mut optional = should
                 .iter()
@@ -7885,81 +7847,6 @@ mod tests {
         assert!(pruned > 0, "the array lead never pruned");
     }
 
-    fn take_should_cursors_built() -> usize {
-        SHOULD_CURSORS_BUILT.with(|count| count.replace(0))
-    }
-
-    #[test]
-    fn should_cursor_trees_match_the_wand_cursor_tree_bit_for_bit() {
-        let mut order_sensitive_seeds = 0;
-        for seed in 0..40_u64 {
-            let mut rng = SmallRng::seed_from_u64(3_000 + seed);
-            let musts = rng.random_range(1..=3_usize);
-            let shoulds = rng.random_range(2..=5_usize);
-            let num_docs = rng.random_range(300..=1_500_usize);
-            let mut densities = Vec::new();
-            for _ in 0..musts + shoulds {
-                densities.push(rng.random_range(0.02..0.6));
-            }
-            let corpus = random_corpus(&mut rng, num_docs, &densities);
-            let mask = deletion_mask(&mut rng, num_docs, 0.1);
-            let all = (0..musts + shoulds).collect::<Vec<_>>();
-            let leaf_at = |index: usize| CompoundScorerPlan::Leaf { index, boost: 1.0 };
-            // Same clauses with the SHOULD group listed in reverse.
-            let reversed_plan = CompoundScorerPlan::Boolean {
-                must: (0..musts).map(leaf_at).collect(),
-                should: (musts..musts + shoulds).rev().map(leaf_at).collect(),
-                must_not: Vec::new(),
-            };
-            let plans = [must_should_plan(musts, shoulds), reversed_plan];
-            for (order, plan) in plans.iter().enumerate() {
-                for limit in [1, 3, 10, 100, num_docs] {
-                    let context = format!(
-                        "seed={seed} musts={musts} shoulds={shoulds} order={order} limit={limit}"
-                    );
-                    take_should_cursors_built();
-                    let admitted =
-                        collect_admitted(&corpus, &mask, corpus.leaves(&all), plan, limit);
-                    assert_eq!(
-                        take_should_cursors_built(),
-                        1,
-                        "{context}: no SHOULD cursor"
-                    );
-                    let generic = collect_generic(&corpus, &mask, corpus.leaves(&all), plan, limit);
-                    assert_eq!(score_bits(&admitted), score_bits(&generic), "{context}");
-                }
-            }
-            let forward = score_bits(&collect_generic(
-                &corpus,
-                &mask,
-                corpus.leaves(&all),
-                &plans[0],
-                num_docs,
-            ))
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-            let reversed = score_bits(&collect_generic(
-                &corpus,
-                &mask,
-                corpus.leaves(&all),
-                &plans[1],
-                num_docs,
-            ))
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-            if forward
-                .iter()
-                .any(|(row_id, bits)| reversed.get(row_id).is_some_and(|other| other != bits))
-            {
-                order_sensitive_seeds += 1;
-            }
-        }
-        assert!(
-            order_sensitive_seeds > 0,
-            "no seed pins the SHOULD summation order"
-        );
-    }
-
     #[test]
     fn should_clauses_scored_differently_keep_separate_leaves() {
         let mut rng = SmallRng::seed_from_u64(11);
@@ -7992,11 +7879,9 @@ mod tests {
         };
         let plan = must_should_plan(1, 2);
         for limit in [1, 10, 100, 1_000] {
-            take_should_cursors_built();
             take_term_and_built();
             let admitted = collect_admitted(&corpus, &mask, leaves(), &plan, limit);
             assert_eq!(take_term_and_built(), 1, "limit={limit}");
-            assert_eq!(take_should_cursors_built(), 0, "limit={limit}");
             let generic = collect_generic(&corpus, &mask, leaves(), &plan, limit);
             assert_eq!(score_bits(&admitted), score_bits(&generic), "limit={limit}");
         }

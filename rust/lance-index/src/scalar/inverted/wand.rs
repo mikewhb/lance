@@ -1162,6 +1162,7 @@ impl PostingIterator {
     }
 
     /// Places this posting at `position` in a cursor's query-order score sum.
+    #[cfg(test)]
     pub(super) fn with_query_position(mut self, position: u32) -> Self {
         self.position = position;
         self
