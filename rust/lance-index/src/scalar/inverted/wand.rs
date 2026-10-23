@@ -341,6 +341,17 @@ enum BulkAndMode {
     Off,
 }
 
+/// Which stride `Wand::and_route` picked for a top-k conjunction.
+///
+/// `Arrayed` runs the classic per-document leapfrog but slices the lead's
+/// documents into windows first; `Bulk` runs the block-merge walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AndRoute {
+    Arrayed,
+    Bulk,
+    Classic,
+}
+
 impl BulkAndMode {
     fn parse(value: &str) -> Option<Self> {
         let value = value.trim();
@@ -2990,45 +3001,26 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // clause conjunction under `Auto` skips the merge and leapfrogs instead;
         // `On` and `Off` still match the bulk decision exactly, so the override
         // stays a faithful control.
-        if self.operator == Operator::And
-            && !self.lead.is_empty()
-            && self
-                .lead
-                .iter()
-                .all(|posting| posting.is_compressed() && !posting.has_grouped_terms())
-            && {
-                let mode = self
-                    .bulk_and_mode_override
-                    .unwrap_or_else(|| *BULK_AND_MODE);
-                // The array route is semantics-preserving for any compressed
-                // list (byte-identical results on a 128-block corpus), so it
-                // carries no format guard; block_size is a tuning parameter.
-                let skewed_auto = mode == BulkAndMode::Auto
-                    && self.lead.len() >= 3
-                    && conjunction_lists_are_skewed(&self.lead);
-                if skewed_auto {
-                    // Pay for the window buffers only when the route is used.
-                    self.array_lead.reserve();
+        if self.operator == Operator::And {
+            let route = self.and_route(
+                self.bulk_and_mode_override
+                    .unwrap_or_else(|| *BULK_AND_MODE),
+            );
+            if route == AndRoute::Arrayed {
+                // Pay for the window buffers only when the route is used.
+                self.array_lead.reserve();
+            }
+            self.and_lead_arrayed = route == AndRoute::Arrayed;
+            // Defensive reset of the array route's adaptive gate so a
+            // hypothetical second `search` on the same Wand starts clean.
+            self.array_lead.reset_gate();
+            if route == AndRoute::Bulk {
+                #[cfg(test)]
+                {
+                    self.bulk_and_searches += 1;
                 }
-                self.and_lead_arrayed = skewed_auto;
-                // Defensive reset of the array route's adaptive gate so a
-                // hypothetical second `search` on the same Wand starts clean.
-                self.array_lead.reset_gate();
-                !skewed_auto
-                    && (mode.enabled_for(self.lead.len())
-                        || (mode == BulkAndMode::Auto
-                            && self.lead.len() >= 4
-                            && self.lead.iter().all(|posting| {
-                                matches!(&posting.list, PostingList::Compressed(list)
-                                    if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
-                            })))
+                return self.and_bulk_search(params, metrics);
             }
-        {
-            #[cfg(test)]
-            {
-                self.bulk_and_searches += 1;
-            }
-            return self.and_bulk_search(params, metrics);
         }
 
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
@@ -4461,6 +4453,43 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     /// full `PostingIterator::next` call per clause to a couple of loads.
     /// Window skipping, per-candidate pruning, scoring, and heap semantics
     /// mirror the classic loop exactly, so results are identical.
+    /// Which stride a top-k conjunction takes, decided in one place so the
+    /// terminal and the conjunction cursor cannot disagree.
+    ///
+    /// `Arrayed` drives the same leapfrog loop as `Classic`; the lead's
+    /// documents are sliced into windows first.
+    fn and_route(&self, mode: BulkAndMode) -> AndRoute {
+        if self.operator != Operator::And
+            || self.lead.is_empty()
+            || !self
+                .lead
+                .iter()
+                .all(|posting| posting.is_compressed() && !posting.has_grouped_terms())
+        {
+            return AndRoute::Classic;
+        }
+        // The array route is semantics-preserving for any compressed list
+        // (byte-identical results on a 128-block corpus), so it carries no
+        // format guard; block_size is a tuning parameter.
+        if mode == BulkAndMode::Auto
+            && self.lead.len() >= 3
+            && conjunction_lists_are_skewed(&self.lead)
+        {
+            return AndRoute::Arrayed;
+        }
+        let block_merge = mode == BulkAndMode::Auto
+            && self.lead.len() >= 4
+            && self.lead.iter().all(|posting| {
+                matches!(&posting.list, PostingList::Compressed(list)
+                    if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
+            });
+        if mode.enabled_for(self.lead.len()) || block_merge {
+            AndRoute::Bulk
+        } else {
+            AndRoute::Classic
+        }
+    }
+
     fn and_bulk_search(
         &mut self,
         params: &FtsSearchParams,
