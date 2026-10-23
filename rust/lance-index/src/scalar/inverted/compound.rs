@@ -7872,7 +7872,11 @@ mod tests {
             term_and_test_counters::take_lazy();
             let admitted =
                 collect_admitted(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
-            let (collected, scored) = term_and_test_counters::take_lazy();
+            let (collected, scored, handed) = term_and_test_counters::take_lazy();
+            assert_eq!(
+                scored, handed,
+                "limit={limit}: scored {scored}, handed out {handed}"
+            );
             assert!(
                 scored < collected,
                 "limit={limit}: scored {scored} of {collected}"

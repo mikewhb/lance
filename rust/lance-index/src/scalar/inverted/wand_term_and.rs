@@ -219,6 +219,8 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
                     continue;
                 };
                 self.current = Some((doc, key, score));
+                #[cfg(test)]
+                test_counters::handed_candidate();
                 return Some(doc);
             }
             if !self.refill() {
@@ -584,6 +586,7 @@ pub(in crate::scalar::inverted) mod test_counters {
         static ARRAY_PRUNED: Cell<usize> = const { Cell::new(0) };
         static COLLECTED: Cell<usize> = const { Cell::new(0) };
         static SCORED: Cell<usize> = const { Cell::new(0) };
+        static HANDED: Cell<usize> = const { Cell::new(0) };
     }
 
     /// `(windows skipped by their bound, candidates pruned by the lead score)`
@@ -620,12 +623,13 @@ pub(in crate::scalar::inverted) mod test_counters {
         ARRAY_PRUNED.with(|count| count.set(count.get() + pruned));
     }
 
-    /// `(candidates collected, candidates scored)` on this thread since the
-    /// previous call.
-    pub(in crate::scalar::inverted) fn take_lazy() -> (usize, usize) {
+    /// `(candidates collected, candidates fully scored, candidates handed out)`
+    /// on this thread since the previous call.
+    pub(in crate::scalar::inverted) fn take_lazy() -> (usize, usize, usize) {
         (
             COLLECTED.with(|count| count.replace(0)),
             SCORED.with(|count| count.replace(0)),
+            HANDED.with(|count| count.replace(0)),
         )
     }
 
@@ -635,5 +639,9 @@ pub(in crate::scalar::inverted) mod test_counters {
 
     pub(super) fn scored_candidate() {
         SCORED.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn handed_candidate() {
+        HANDED.with(|count| count.set(count.get() + 1));
     }
 }
