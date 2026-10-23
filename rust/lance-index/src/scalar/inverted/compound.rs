@@ -8271,6 +8271,386 @@ mod tests {
         assert_eq!(cursor.advance(0).unwrap(), None);
     }
 
+    /// The single-posting route must hand out the same documents, keys, score
+    /// bits and shallow bounds as the dedicated one-term leaf, under the same
+    /// interleaved probes and with no floor to prune on.
+    #[test]
+    fn single_posting_cursor_matches_term_leaf_bit_for_bit() {
+        let mut rng = SmallRng::seed_from_u64(0x51_1E);
+        let num_docs = 1_200_usize;
+        let corpus = random_corpus(&mut rng, num_docs, &[0.35]);
+        let mask = deletion_mask(&mut rng, num_docs, 0.1);
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let posting = || impact_posting(0, &corpus.terms[0], &corpus.doc_lengths, &corpus.scorer);
+
+        let mut cursor = WandCursor::new(
+            Operator::And,
+            vec![posting()],
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::default(),
+            &metrics,
+        );
+        let mut leaf = TermLeaf::new(posting(), &documents, corpus.scorer.clone(), &metrics);
+
+        let mut compared = 0_usize;
+        for _ in 0..2_000 {
+            match rng.random_range(0..7_u32) {
+                0..=1 => {
+                    let a = cursor.next().unwrap();
+                    let b = leaf.next();
+                    assert_eq!(a, b, "next");
+                    if a.is_none() {
+                        break;
+                    }
+                    compared += 1;
+                }
+                2..=3 => {
+                    let target = cursor.doc().unwrap_or(0) + rng.random_range(0..600_u64);
+                    let a = cursor.advance(target).unwrap();
+                    let b = leaf.advance(target);
+                    assert_eq!(a, b, "advance({target})");
+                    if a.is_some() {
+                        assert!(a.unwrap() >= target, "advance went backwards");
+                        compared += 1;
+                    }
+                }
+                4 | 5 => {
+                    let target = cursor.doc().unwrap_or(0);
+                    let up_to = cursor.advance_shallow(target).unwrap();
+                    assert_eq!(up_to, leaf.advance_shallow(target), "shallow({target})");
+                    assert_eq!(cursor.doc(), leaf.doc(), "shallow moved the document");
+                    let span = (up_to - target).min(1_000);
+                    let probe = target + rng.random_range(0..=span);
+                    assert_eq!(
+                        cursor.score_upper_bound(probe).unwrap().to_bits(),
+                        leaf.score_upper_bound(probe).unwrap().to_bits(),
+                        "bound({probe})"
+                    );
+                }
+                _ => {
+                    if cursor.doc().is_some() {
+                        assert_eq!(cursor.doc(), leaf.doc(), "doc");
+                        assert_eq!(cursor.document_key(), leaf.document_key(), "key");
+                        assert_eq!(
+                            cursor.current_score().unwrap().to_bits(),
+                            leaf.score().unwrap().to_bits(),
+                            "score"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(compared > 100, "only {compared} documents compared");
+
+        // A posting that matches nothing ends on the first `next`.
+        let empty = |term: usize| {
+            impact_posting_at(term, term as u32, &[], &corpus.doc_lengths, &corpus.scorer)
+        };
+        let mut cursor = WandCursor::new(
+            Operator::And,
+            vec![empty(0)],
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::default(),
+            &metrics,
+        );
+        let mut leaf = TermLeaf::new(empty(0), &documents, corpus.scorer.clone(), &metrics);
+        assert_eq!(cursor.next().unwrap(), None);
+        assert_eq!(leaf.next(), None);
+
+        // Past the compressed doc-id domain the route ends instead of truncating.
+        let mut cursor = WandCursor::new(
+            Operator::And,
+            vec![posting()],
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::default(),
+            &metrics,
+        );
+        assert_eq!(cursor.advance(u64::from(u32::MAX) + 10).unwrap(), None);
+    }
+
+    /// The single-posting route must agree with the generic WAND route over the
+    /// same posting: same documents, keys and score bits, whatever the driving
+    /// pattern.
+    #[test]
+    fn single_posting_cursor_matches_the_wand_route_bit_for_bit() {
+        let mut rng = SmallRng::seed_from_u64(0xC0FF_EE);
+        let num_docs = 900_usize;
+        let corpus = random_corpus(&mut rng, num_docs, &[0.25]);
+        let mask = deletion_mask(&mut rng, num_docs, 0.1);
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let posting = || impact_posting(0, &corpus.terms[0], &corpus.doc_lengths, &corpus.scorer);
+
+        let mut single = WandCursor::new(
+            Operator::And,
+            vec![posting()],
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::default(),
+            &metrics,
+        );
+        let mut generic = WandCursor::new_without_single_route(
+            Operator::And,
+            vec![posting()],
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::default(),
+            &metrics,
+        );
+
+        let mut compared = 0_usize;
+        for _ in 0..2_000 {
+            match rng.random_range(0..7_u32) {
+                0..=2 => {
+                    let a = single.next().unwrap();
+                    let b = generic.next().unwrap();
+                    assert_eq!(a, b, "next");
+                    if a.is_none() {
+                        break;
+                    }
+                    compared += 1;
+                    assert_same_candidate(&mut single, &mut generic, "next");
+                }
+                3..=5 => {
+                    let target = single.doc().unwrap_or(0) + rng.random_range(0..800_u64);
+                    let a = single.advance(target).unwrap();
+                    let b = generic.advance(target).unwrap();
+                    assert_eq!(a, b, "advance({target})");
+                    if a.is_some() {
+                        compared += 1;
+                        assert_same_candidate(&mut single, &mut generic, "advance");
+                    }
+                }
+                _ => {
+                    // A shallow probe must leave both routes on their document.
+                    let target = single.doc().unwrap_or(0) + rng.random_range(0..32_u64);
+                    single.advance_shallow(target).unwrap();
+                    generic.advance_shallow(target).unwrap();
+                    assert_eq!(single.doc(), generic.doc(), "probe doc");
+                }
+            }
+        }
+        assert!(compared > 100, "only {compared} documents compared");
+    }
+
+    /// A rising competitive floor must not change which documents reach the top
+    /// of a one-term cursor, alone or as the optional side of a ReqOpt.
+    #[test]
+    fn single_posting_cursor_top_k_matches_under_a_rising_floor() {
+        let mut rng = SmallRng::seed_from_u64(0xF100_0001);
+        let num_docs = 1_000_usize;
+        let corpus = random_corpus(&mut rng, num_docs, &[0.4, 0.3]);
+        let mask = deletion_mask(&mut rng, num_docs, 0.05);
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let params = FtsSearchParams::default();
+        let posting = |term: usize, position: u32| {
+            impact_posting_at(
+                term,
+                position,
+                &corpus.terms[term],
+                &corpus.doc_lengths,
+                &corpus.scorer,
+            )
+        };
+
+        for limit in [1, 10, 100] {
+            let collect = |single_route: bool| -> Vec<ScoredRow> {
+                let mut cursor: BoxScorer<'_> = if single_route {
+                    Box::new(WandCursor::new(
+                        Operator::And,
+                        vec![posting(0, 0)],
+                        &documents,
+                        corpus.scorer.clone(),
+                        &params,
+                        &metrics,
+                    ))
+                } else {
+                    Box::new(WandCursor::new_without_single_route(
+                        Operator::And,
+                        vec![posting(0, 0)],
+                        &documents,
+                        corpus.scorer.clone(),
+                        &params,
+                        &metrics,
+                    ))
+                };
+                TopKCollector::new(limit).collect(cursor.as_mut()).unwrap()
+            };
+            assert_eq!(
+                collect(true),
+                collect(false),
+                "one-term cursor, limit={limit}"
+            );
+
+            let required = |single_route: bool| -> BoxScorer<'_> {
+                if single_route {
+                    Box::new(WandCursor::new(
+                        Operator::And,
+                        vec![posting(0, 0)],
+                        &documents,
+                        corpus.scorer.clone(),
+                        &params,
+                        &metrics,
+                    ))
+                } else {
+                    Box::new(WandCursor::new_without_single_route(
+                        Operator::And,
+                        vec![posting(0, 0)],
+                        &documents,
+                        corpus.scorer.clone(),
+                        &params,
+                        &metrics,
+                    ))
+                }
+            };
+            let optional = |single_route: bool| -> BoxScorer<'_> {
+                if single_route {
+                    Box::new(WandCursor::new(
+                        Operator::Or,
+                        vec![posting(1, 1)],
+                        &documents,
+                        corpus.scorer.clone(),
+                        &params,
+                        &metrics,
+                    ))
+                } else {
+                    Box::new(WandCursor::new_without_single_route(
+                        Operator::Or,
+                        vec![posting(1, 1)],
+                        &documents,
+                        corpus.scorer.clone(),
+                        &params,
+                        &metrics,
+                    ))
+                }
+            };
+            let mut reqopt: BoxScorer<'_> = Box::new(ReqOptScorer::with_required_floor(
+                required(true),
+                optional(true),
+            ));
+            let mut reference: BoxScorer<'_> = Box::new(ReqOptScorer::with_required_floor(
+                required(false),
+                optional(false),
+            ));
+            assert_eq!(
+                TopKCollector::new(limit).collect(reqopt.as_mut()).unwrap(),
+                TopKCollector::new(limit)
+                    .collect(reference.as_mut())
+                    .unwrap(),
+                "ReqOpt of one-term cursors, limit={limit}"
+            );
+        }
+    }
+
+    /// Positioning must not decode frequencies; only scoring does.
+    #[test]
+    fn single_posting_cursor_decodes_frequencies_only_when_scored() {
+        let block = MAX_POSTING_BLOCK_SIZE;
+        let num_docs = block * 4;
+        let doc_lengths = vec![6_u32; num_docs];
+        let entries = (0..num_docs as u32)
+            .step_by(3)
+            .map(|doc| (doc, 1 + doc % 5))
+            .collect::<Vec<_>>();
+        let corpus = Corpus::new(doc_lengths, vec![entries]);
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let mut cursor = WandCursor::new(
+            Operator::And,
+            vec![impact_posting(
+                0,
+                &corpus.terms[0],
+                &corpus.doc_lengths,
+                &corpus.scorer,
+            )],
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::default(),
+            &metrics,
+        );
+
+        for block_idx in 0..4_usize {
+            let target = (block_idx * block + 1) as u64;
+            assert!(cursor.advance(target).unwrap().is_some(), "{target}");
+            assert_eq!(
+                cursor.single_frequency_blocks_decoded(),
+                0,
+                "positioning decoded a frequency block at {target}"
+            );
+        }
+        cursor.current_score().unwrap();
+        assert_eq!(cursor.single_frequency_blocks_decoded(), 1);
+    }
+
+    /// With a floor, the route skips blocks whose bound cannot reach it, and the
+    /// top-k is the same as the generic route's under the same floor.
+    #[test]
+    fn single_posting_cursor_skips_blocks_below_the_floor() {
+        let block = MAX_POSTING_BLOCK_SIZE;
+        let num_docs = block * 4;
+        let doc_lengths = vec![8_u32; num_docs];
+        let mut entries = (0..num_docs as u32)
+            .step_by(7)
+            .map(|doc| (doc, 1))
+            .collect::<Vec<_>>();
+        // One high-frequency document in the first block sets the floor above
+        // every other block's bound.
+        entries[0] = (5, 12);
+        let corpus = Corpus::new(doc_lengths, vec![entries]);
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let posting = || impact_posting(0, &corpus.terms[0], &corpus.doc_lengths, &corpus.scorer);
+        let params = FtsSearchParams::default();
+
+        let mut probe = WandCursor::new(
+            Operator::And,
+            vec![posting()],
+            &documents,
+            corpus.scorer.clone(),
+            &params,
+            &metrics,
+        );
+        let mut best = f32::NEG_INFINITY;
+        while probe.next().unwrap().is_some() {
+            best = best.max(probe.current_score().unwrap());
+        }
+        assert!(best > 0.0);
+
+        let mut single = WandCursor::new(
+            Operator::And,
+            vec![posting()],
+            &documents,
+            corpus.scorer.clone(),
+            &params,
+            &metrics,
+        );
+        let mut generic = WandCursor::new_without_single_route(
+            Operator::And,
+            vec![posting()],
+            &documents,
+            corpus.scorer.clone(),
+            &params,
+            &metrics,
+        );
+        single.set_min_competitive_score(best).unwrap();
+        generic.set_min_competitive_score(best).unwrap();
+        cursor_counters::take_single_posting_blocks_skipped();
+
+        let single_rows = TopKCollector::new(1).collect(&mut single).unwrap();
+        let skipped = cursor_counters::take_single_posting_blocks_skipped();
+        let generic_rows = TopKCollector::new(1).collect(&mut generic).unwrap();
+        assert_eq!(score_bits(&single_rows), score_bits(&generic_rows));
+        assert_eq!(single_rows.len(), 1);
+        assert!(skipped > 0, "the floor skipped no block");
+    }
+
     /// Two or more one-term SHOULD clauses are summed by a single disjunction
     /// cursor whose postings keep clause order, so the scores match the tree
     /// bit for bit.

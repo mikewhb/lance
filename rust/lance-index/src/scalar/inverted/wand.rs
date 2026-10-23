@@ -37,6 +37,9 @@ mod maxscore;
 #[path = "wand_term_leaf.rs"]
 mod term_leaf;
 
+#[path = "wand_single.rs"]
+mod single;
+
 pub(super) use term_leaf::TermLeaf;
 
 #[cfg(test)]
@@ -2696,6 +2699,11 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         /// Block-max window refreshes a disjunction cursor ran, since the
         /// previous reset.
         static OR_WINDOW_REFRESHES: Cell<usize> = const { Cell::new(0) };
+        /// Blocks a single-posting cursor skipped because their bound could not
+        /// reach the floor, since the previous reset.
+        static SINGLE_POSTING_BLOCKS_SKIPPED: Cell<usize> = const { Cell::new(0) };
+        /// Cursors built on the single-posting route, since the previous reset.
+        static SINGLE_POSTING_CURSORS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn and_cursor_batched() {
@@ -2724,6 +2732,14 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         OR_WINDOW_REFRESHES.with(|count| count.set(count.get() + 1));
     }
 
+    pub(super) fn single_posting_block_skipped() {
+        SINGLE_POSTING_BLOCKS_SKIPPED.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn single_posting_cursor_built() {
+        SINGLE_POSTING_CURSORS.with(|count| count.set(count.get() + 1));
+    }
+
     pub(in crate::scalar::inverted) fn take_batched() -> usize {
         AND_CURSORS_BATCHED.with(|count| count.replace(0))
     }
@@ -2742,6 +2758,14 @@ pub(in crate::scalar::inverted) mod cursor_counters {
 
     pub(in crate::scalar::inverted) fn take_or_window_refreshes() -> usize {
         OR_WINDOW_REFRESHES.with(|count| count.replace(0))
+    }
+
+    pub(in crate::scalar::inverted) fn take_single_posting_blocks_skipped() -> usize {
+        SINGLE_POSTING_BLOCKS_SKIPPED.with(|count| count.replace(0))
+    }
+
+    pub(in crate::scalar::inverted) fn take_single_posting_cursors() -> usize {
+        SINGLE_POSTING_CURSORS.with(|count| count.replace(0))
     }
 }
 
@@ -5633,6 +5657,20 @@ impl<'a> PositionCursor<'a> {
     }
 }
 
+/// Whether `postings` can be served by the single-posting route with the same
+/// documents, keys and scores.
+///
+/// The route steps the posting directly, so it needs dense postings doc ids and
+/// a leaf whose score is exactly one posting's contribution: a phrase needs
+/// positions, and a grouped leaf scores several expansions of one clause.
+pub(super) fn single_posting_route_accepts(
+    postings: &[PostingIterator],
+    params: &FtsSearchParams,
+) -> bool {
+    params.phrase_slop.is_none()
+        && matches!(postings, [posting] if posting.is_compressed() && !posting.has_grouped_terms())
+}
+
 /// Incremental posting-backed scorer used by compound FTS.
 ///
 /// Unlike [`Wand::search`], this cursor does not own a top-k heap. It exposes
@@ -5661,6 +5699,10 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     and_batch: Option<and_walk::BulkAndState<'a>>,
     and_cands: Vec<(u64, f32, u32)>,
     and_next: usize,
+    // Present when the whole query is one compressed, ungrouped posting and no
+    // phrase is involved. The cursor then steps that posting directly instead
+    // of driving the WAND heap; `wand` holds no postings in that case.
+    single: Option<single::SinglePosting>,
     // A conjunction with a clause that matches nothing has an empty
     // intersection. `Wand::new` would drop that clause and hand out documents
     // missing a required term, so the cursor stays empty instead.
@@ -5675,6 +5717,34 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         scorer: Arc<MemBM25Scorer>,
         params: &FtsSearchParams,
         metrics: &'a dyn MetricsCollector,
+    ) -> Self {
+        Self::build(operator, postings, documents, scorer, params, metrics, true)
+    }
+
+    /// Test hook: the same cursor with the single-posting route disabled, so a
+    /// test can compare both routes over the same posting.
+    #[cfg(test)]
+    pub(super) fn new_without_single_route(
+        operator: Operator,
+        postings: Vec<PostingIterator>,
+        documents: &'a D,
+        scorer: Arc<MemBM25Scorer>,
+        params: &FtsSearchParams,
+        metrics: &'a dyn MetricsCollector,
+    ) -> Self {
+        Self::build(
+            operator, postings, documents, scorer, params, metrics, false,
+        )
+    }
+
+    fn build(
+        operator: Operator,
+        postings: Vec<PostingIterator>,
+        documents: &'a D,
+        scorer: Arc<MemBM25Scorer>,
+        params: &FtsSearchParams,
+        metrics: &'a dyn MetricsCollector,
+        single_route: bool,
     ) -> Self {
         let empty_intersection = operator == Operator::And
             && postings
@@ -5691,6 +5761,20 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         }
         .unwrap_or_default()
         .min(documents.visible_cost_upper_bound());
+        let (postings, single) = if single_route && single_posting_route_accepts(&postings, params)
+        {
+            let mut postings = postings;
+            let posting = postings
+                .pop()
+                .expect("one posting satisfied the single-posting route");
+            #[cfg(test)]
+            {
+                cursor_counters::single_posting_cursor_built();
+            }
+            (Vec::new(), Some(single::SinglePosting::new(posting)))
+        } else {
+            (postings, None)
+        };
         let mut wand = Wand::new(operator, postings.into_iter(), documents, scorer)
             .with_floor_mode(CompetitiveFloorMode::Inclusive);
         if operator == Operator::Or {
@@ -5717,6 +5801,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             and_batch: None,
             and_cands: Vec::new(),
             and_next: 0,
+            single,
             exhausted: empty_intersection,
         };
         cursor.select_and_route();
@@ -5812,11 +5897,17 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     }
 
     pub(super) fn doc(&self) -> Option<u64> {
-        self.current_doc.map(|doc| doc.doc_id())
+        match self.single.as_ref() {
+            Some(single) => single.doc(),
+            None => self.current_doc.map(|doc| doc.doc_id()),
+        }
     }
 
     pub(super) fn document_key(&self) -> Option<u64> {
-        self.current_document_key
+        match self.single.as_ref() {
+            Some(single) => single.document_key(),
+            None => self.current_document_key,
+        }
     }
 
     fn clear_current(&mut self) {
@@ -5825,6 +5916,9 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         self.current_score = 0.0;
         self.confirmation = None;
         self.shallow = None;
+        if let Some(single) = self.single.as_mut() {
+            single.clear_current();
+        }
     }
 
     fn record_metrics(&mut self) {
@@ -5835,9 +5929,48 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                 .and_batch
                 .as_ref()
                 .map_or(0, |state| state.num_comparisons);
-            self.metrics.record_comparisons(self.comparisons + walked);
+            let single = self
+                .single
+                .as_ref()
+                .map_or(0, |single| single.comparisons());
+            self.metrics
+                .record_comparisons(self.comparisons + walked + single);
             self.metrics_recorded = true;
         }
+    }
+
+    /// `next` on the single-posting route.
+    fn single_next(&mut self) -> Option<u64> {
+        let Some(target) = self
+            .single
+            .as_ref()
+            .and_then(single::SinglePosting::next_target)
+        else {
+            return None;
+        };
+        self.single_position(target)
+    }
+
+    /// `advance` on the single-posting route.
+    fn single_advance(&mut self, target: u64) -> Option<u64> {
+        if self.doc().is_some_and(|doc| doc >= target) {
+            return self.doc();
+        }
+        self.single_position(target)
+    }
+
+    /// Repositions the single posting; `None` once it is exhausted.
+    fn single_position(&mut self, target: u64) -> Option<u64> {
+        let Some(single) = self.single.as_mut() else {
+            return None;
+        };
+        single.position(
+            target,
+            self.wand.documents,
+            &self.wand.scorer,
+            self.wand.threshold,
+            self.wand.floor_mode,
+        )
     }
 
     /// Hand out the next buffered candidate, walking the conjunction window by
@@ -5918,6 +6051,14 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             self.record_metrics();
             return Ok(None);
         }
+        if self.single.is_some() {
+            let next = self.single_next();
+            if next.is_none() {
+                self.clear_current();
+                self.record_metrics();
+            }
+            return Ok(next);
+        }
         if self.and_batch.is_some() {
             let next = self.batch_next()?;
             if next.is_none() {
@@ -5926,6 +6067,11 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             }
             return Ok(next);
         }
+        self.position_classic()
+    }
+
+    /// Find the next document by driving the WAND heap one candidate at a time.
+    fn position_classic(&mut self) -> Result<Option<u64>> {
         loop {
             let Some((doc, and_score)) = self.wand.next()? else {
                 self.clear_current();
@@ -5957,6 +6103,11 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     }
 
     pub(super) fn next(&mut self) -> Result<Option<u64>> {
+        if self.single.is_some() {
+            // `position_next` advances the single posting past the current
+            // document; there is no tier state to flush first.
+            return self.position_next();
+        }
         if let Some(doc) = self.current_doc
             && self.wand.operator == Operator::Or
         {
@@ -5969,6 +6120,14 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     pub(super) fn advance(&mut self, target: u64) -> Result<Option<u64>> {
         if self.exhausted {
             return Ok(None);
+        }
+        if self.single.is_some() {
+            let found = self.single_advance(target);
+            if found.is_none() {
+                self.clear_current();
+                self.record_metrics();
+            }
+            return Ok(found);
         }
         if self.doc().is_some_and(|doc| doc >= target) {
             return Ok(self.doc());
@@ -6016,18 +6175,28 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     }
 
     pub(super) fn global_score_upper_bound(&self) -> Option<f32> {
+        if let Some(single) = self.single.as_ref() {
+            return single.global_score_upper_bound(&self.wand.scorer);
+        }
         *self
             .global_score_upper_bound
             .get_or_init(|| self.wand.compound_global_score_upper_bound())
     }
 
-    pub(super) fn current_score(&self) -> Result<f32> {
+    pub(super) fn current_score(&mut self) -> Result<f32> {
+        if let Some(single) = self.single.as_mut() {
+            return single.score(self.wand.documents, &self.wand.scorer);
+        }
         self.current_doc
             .map(|_| self.current_score)
             .ok_or_else(|| Error::internal("posting FTS scorer is not positioned on a document"))
     }
 
     pub(super) fn matches(&mut self) -> Result<bool> {
+        if self.single.is_some() {
+            // The single-posting route never carries a phrase.
+            return Ok(self.doc().is_some());
+        }
         let Some(_) = self.current_doc else {
             return Ok(false);
         };
@@ -6047,12 +6216,18 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     }
 
     pub(super) fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+        if let Some(single) = self.single.as_mut() {
+            return Ok(single.advance_shallow(target, &self.wand.scorer));
+        }
         let (up_to, upper) = self.wand.compound_shallow_bound(target);
         self.shallow = Some((target, up_to, upper));
         Ok(up_to)
     }
 
     pub(super) fn score_upper_bound(&self, up_to: u64) -> Result<f32> {
+        if let Some(single) = self.single.as_ref() {
+            return single.score_upper_bound(up_to);
+        }
         let (target, shallow_up_to, upper) = self.shallow.ok_or_else(|| {
             Error::internal("score bound requires advance_shallow on the posting FTS scorer")
         })?;
@@ -6062,6 +6237,15 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             )));
         }
         Ok(upper)
+    }
+
+    /// Test hook: blocks whose decoded frequencies the single-posting route has
+    /// materialized so far.
+    #[cfg(test)]
+    pub(super) fn single_frequency_blocks_decoded(&self) -> usize {
+        self.single
+            .as_ref()
+            .map_or(0, single::SinglePosting::frequency_blocks_decoded)
     }
 
     pub(super) fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {

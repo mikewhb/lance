@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Direct stepping for a cursor whose query is one compressed posting.
+//!
+//! A one-term query needs no heap: the posting itself is the candidate order.
+//! The cursor only has to skip blocks whose bound cannot reach the competitive
+//! floor, keep the visibility check, and decode frequencies when a positioned
+//! document is actually scored.
+
+use std::cell::OnceCell;
+
+use lance_core::{Error, Result};
+
+use super::super::scorer::Scorer;
+use super::{
+    CompetitiveFloorMode, DocInfo, PostingIterator, RawDocInfo, TERMINATED_DOC_ID, WandDocuments,
+    and_kernel, conservative_score_sum,
+};
+
+/// Walk state of the single-posting route.
+///
+/// Holds only what a direct walk needs; the document mapping, the scorer and
+/// the metric sink stay on the cursor that owns this state.
+pub(super) struct SinglePosting {
+    posting: PostingIterator,
+    /// Whether `position` has run at least once. The first `next` starts at 0;
+    /// every later one starts after `current_doc`.
+    started: bool,
+    current_doc: Option<DocInfo>,
+    current_document_key: Option<u64>,
+    /// Computed on the first `score`; most positioned documents are never
+    /// scored.
+    current_score: Option<f32>,
+    /// `(target, up_to, upper)` of the last `advance_shallow`.
+    shallow: Option<(u64, u64, f32)>,
+    global_score_upper_bound: OnceCell<Option<f32>>,
+    comparisons: usize,
+}
+
+impl SinglePosting {
+    pub(super) fn new(posting: PostingIterator) -> Self {
+        Self {
+            posting,
+            started: false,
+            current_doc: None,
+            current_document_key: None,
+            current_score: None,
+            shallow: None,
+            global_score_upper_bound: OnceCell::new(),
+            comparisons: 0,
+        }
+    }
+
+    pub(super) fn doc(&self) -> Option<u64> {
+        self.current_doc.map(|doc| doc.doc_id())
+    }
+
+    pub(super) fn document_key(&self) -> Option<u64> {
+        self.current_document_key
+    }
+
+    pub(super) fn comparisons(&self) -> usize {
+        self.comparisons
+    }
+
+    /// Drops the positioned document and everything derived from it.
+    pub(super) fn clear_current(&mut self) {
+        self.current_doc = None;
+        self.current_document_key = None;
+        self.current_score = None;
+        self.shallow = None;
+    }
+
+    /// Where the next `next()` search starts: 0 before the first positioning,
+    /// one past the current document afterwards, and nothing once the posting
+    /// is exhausted.
+    pub(super) fn next_target(&self) -> Option<u64> {
+        match self.current_doc {
+            Some(doc) => Some(doc.doc_id().saturating_add(1)),
+            None if !self.started => Some(0),
+            None => None,
+        }
+    }
+
+    /// Positions on the first visible document at or after `target`.
+    ///
+    /// With a floor, a block whose conservative bound cannot reach it is
+    /// skipped whole. The bound is anchored on the block that actually holds
+    /// the match, so a block cursor that stopped short of `target` can never
+    /// bound a document it does not contain.
+    pub(super) fn position<D, S>(
+        &mut self,
+        mut target: u64,
+        documents: &D,
+        scorer: &S,
+        floor: f32,
+        floor_mode: CompetitiveFloorMode,
+    ) -> Option<u64>
+    where
+        D: WandDocuments,
+        S: Scorer + ?Sized,
+    {
+        self.clear_current();
+        self.started = true;
+        loop {
+            // Compressed postings hold u32 doc ids, so a larger target is past
+            // every posting; `PostingIterator::next` would truncate it.
+            if target > u64::from(u32::MAX) {
+                return None;
+            }
+            let mut up_to = target;
+            if floor > 0.0 {
+                self.posting.shallow_next(target);
+                up_to = and_kernel::posting_block_up_to(&self.posting, target);
+                let upper =
+                    conservative_score_sum(std::iter::once(self.posting.block_max_score(scorer)));
+                if floor_mode.rejects_upper_bound(f64::from(upper), floor) {
+                    if up_to == TERMINATED_DOC_ID {
+                        return None;
+                    }
+                    #[cfg(test)]
+                    super::cursor_counters::single_posting_block_skipped();
+                    target = up_to.saturating_add(1);
+                    continue;
+                }
+            }
+            // `next_doc_id` materializes the doc id only; the frequency stays
+            // undecoded until `score`.
+            self.posting.next_doc_id(target, false);
+            let Some(doc_id) = self.posting.current_doc_id() else {
+                return None;
+            };
+            if floor > 0.0 && doc_id > up_to {
+                // The anchored block ends before this document: bound the
+                // block that holds it before deciding anything.
+                target = doc_id;
+                continue;
+            }
+            self.comparisons += 1;
+            let doc = DocInfo::Raw(RawDocInfo {
+                doc_id: doc_id as u32,
+                frequency: 0,
+            });
+            let Some(document_key) = documents.document_key(&doc) else {
+                target = doc_id.saturating_add(1);
+                continue;
+            };
+            self.current_doc = Some(doc);
+            self.current_document_key = Some(document_key);
+            return Some(doc_id);
+        }
+    }
+
+    /// The current document's score, computed on first use.
+    pub(super) fn score<D, S>(&mut self, documents: &D, scorer: &S) -> Result<f32>
+    where
+        D: WandDocuments,
+        S: Scorer + ?Sized,
+    {
+        if let Some(score) = self.current_score {
+            return Ok(score);
+        }
+        let doc = self
+            .current_doc
+            .ok_or_else(|| Error::internal("posting FTS scorer is not positioned on a document"))?;
+        // Reading the document decodes this block's frequencies, which is the
+        // only place the walk needs them.
+        let posting_doc = self
+            .posting
+            .doc()
+            .ok_or_else(|| Error::internal("posting FTS scorer is not positioned on a document"))?;
+        let doc_length = documents.doc_length(&doc);
+        // Same fold-from-zero as the query-order sum of a one-clause cursor, so
+        // the bits match the heap route.
+        let score = 0.0_f32
+            + self
+                .posting
+                .score(scorer, posting_doc.frequency(), doc_length);
+        self.current_score = Some(score);
+        Ok(score)
+    }
+
+    /// Bounds `[target, up_to]` without moving the current document.
+    pub(super) fn advance_shallow<S: Scorer + ?Sized>(&mut self, target: u64, scorer: &S) -> u64 {
+        self.posting.shallow_next(target);
+        let (up_to, upper) = match self.posting.block_first_doc() {
+            // `target` falls in the gap before the anchored block: no postings.
+            Some(first) if first > target => (first.saturating_sub(1).max(target), 0.0),
+            _ => {
+                let up_to = self.posting.block_end_doc().max(target);
+                let upper = conservative_score_sum(std::iter::once(
+                    self.posting.window_max_score(Some(up_to), scorer),
+                ));
+                (up_to, upper)
+            }
+        };
+        self.shallow = Some((target, up_to, upper));
+        up_to
+    }
+
+    pub(super) fn score_upper_bound(&self, up_to: u64) -> Result<f32> {
+        let (target, shallow_up_to, upper) = self.shallow.ok_or_else(|| {
+            Error::internal("score bound requires advance_shallow on the posting FTS scorer")
+        })?;
+        if up_to < target || up_to > shallow_up_to {
+            return Err(Error::internal(format!(
+                "posting FTS score bound up_to={up_to} is outside shallow range [{target}, {shallow_up_to}]"
+            )));
+        }
+        Ok(upper)
+    }
+
+    pub(super) fn global_score_upper_bound<S: Scorer + ?Sized>(&self, scorer: &S) -> Option<f32> {
+        *self.global_score_upper_bound.get_or_init(|| {
+            let upper =
+                conservative_score_sum(std::iter::once(self.posting.global_upper_bound(scorer)));
+            (upper.is_finite() && upper >= 0.0).then_some(upper)
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn frequency_blocks_decoded(&self) -> usize {
+        self.posting.frequency_blocks_decoded()
+    }
+}
