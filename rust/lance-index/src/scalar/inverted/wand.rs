@@ -2046,6 +2046,9 @@ fn score_sum_cannot_compete(
 
 type ScoreContribution = ((u32, u32), f32);
 
+/// Exclusive-mode reference for `partial_score_limit`, kept as the oracle the
+/// limit tests compare against.
+#[cfg(test)]
 fn exclusive_partial_score_limit(
     remaining_upper_bound: f64,
     floor: f32,
@@ -13810,66 +13813,96 @@ mod tests {
             rows
         };
 
-        let one_shot = {
-            let mut wand = Wand::new(
-                Operator::And,
-                build_postings().into_iter(),
-                &docs,
-                UnitScorer,
-            )
-            .with_bulk_and_mode(BulkAndMode::On);
-            normalize(wand.search(&params, &NoOpMetricsCollector).unwrap())
-        };
-
-        let stepped = {
-            let mut wand = Wand::new(
-                Operator::And,
-                build_postings().into_iter(),
-                &docs,
-                UnitScorer,
-            )
-            .with_bulk_and_mode(BulkAndMode::On);
-            wand.invalidate_score_first_and_window();
-            wand.score_first_and_enabled = false;
-            let mut state =
-                super::and_walk::BulkAndState::new(&wand, &params, CompetitiveFloorMode::Exclusive);
-            let term_indices: Vec<u32> = wand
-                .lead
-                .iter()
-                .map(|posting| posting.term_index())
-                .collect();
-            let mut collector = TopKCollector::new(10, std::cmp::min(10, BLOCK_SIZE * 10));
-            loop {
-                wand.raise_to_shared_floor(params.wand_factor);
-                let mut visit = |doc: u32,
-                                 key: u64,
-                                 score: f32,
-                                 doc_length: u32,
-                                 freqs: &[u32]|
-                 -> Result<Option<f32>> {
-                    if collector.insert(
-                        ScoredDoc::new(key, score),
-                        doc_length,
-                        u64::from(doc),
-                        term_indices.iter().copied().zip(freqs.iter().copied()),
-                    )? {
-                        Ok(collector.kth_score_if_full())
-                    } else {
-                        Ok(None)
-                    }
-                };
-                match wand.bulk_and_step(&mut state, &mut visit).unwrap() {
-                    super::and_walk::StepOutcome::Continue => {}
-                    super::and_walk::StepOutcome::Done => break,
+        // Each drive returns its rows and the threshold the walk ended with, so
+        // the pair also pins the moment the shared floor is picked up.
+        let drive = |floor: Option<f32>| {
+            let shared = || floor.map(|score| Arc::new(AtomicU32::new(score.to_bits())));
+            let one_shot = {
+                let mut wand = Wand::new(
+                    Operator::And,
+                    build_postings().into_iter(),
+                    &docs,
+                    UnitScorer,
+                )
+                .with_bulk_and_mode(BulkAndMode::On);
+                if let Some(shared) = shared() {
+                    wand = wand.with_shared_threshold(shared);
                 }
-            }
-            normalize(
-                collector
-                    .into_candidates(|key| wand.documents.candidate_from_key(key))
-                    .unwrap(),
-            )
+                let rows = normalize(wand.search(&params, &NoOpMetricsCollector).unwrap());
+                (rows, wand.threshold)
+            };
+
+            let stepped = {
+                let mut wand = Wand::new(
+                    Operator::And,
+                    build_postings().into_iter(),
+                    &docs,
+                    UnitScorer,
+                )
+                .with_bulk_and_mode(BulkAndMode::On);
+                if let Some(shared) = shared() {
+                    wand = wand.with_shared_threshold(shared);
+                }
+                wand.invalidate_score_first_and_window();
+                wand.score_first_and_enabled = false;
+                let mut state = super::and_walk::BulkAndState::new(
+                    &wand,
+                    &params,
+                    CompetitiveFloorMode::Exclusive,
+                );
+                let term_indices: Vec<u32> = wand
+                    .lead
+                    .iter()
+                    .map(|posting| posting.term_index())
+                    .collect();
+                let mut collector = TopKCollector::new(10, std::cmp::min(10, BLOCK_SIZE * 10));
+                loop {
+                    wand.raise_to_shared_floor(params.wand_factor);
+                    let mut visit = |doc: u32,
+                                     key: u64,
+                                     score: f32,
+                                     doc_length: u32,
+                                     freqs: &[u32]|
+                     -> Result<Option<f32>> {
+                        if collector.insert(
+                            ScoredDoc::new(key, score),
+                            doc_length,
+                            u64::from(doc),
+                            term_indices.iter().copied().zip(freqs.iter().copied()),
+                        )? {
+                            Ok(collector.kth_score_if_full())
+                        } else {
+                            Ok(None)
+                        }
+                    };
+                    match wand.bulk_and_step(&mut state, &mut visit).unwrap() {
+                        super::and_walk::StepOutcome::Continue => {}
+                        super::and_walk::StepOutcome::Done => break,
+                    }
+                }
+                let rows = normalize(
+                    collector
+                        .into_candidates(|key| wand.documents.candidate_from_key(key))
+                        .unwrap(),
+                );
+                (rows, wand.threshold)
+            };
+
+            assert_eq!(one_shot, stepped);
+            one_shot
         };
 
-        assert_eq!(one_shot, stepped);
+        let (unfloored, kth_score) = drive(None);
+        assert!(!unfloored.is_empty());
+
+        // A positive floor makes the frequency table, the first-clause limit and
+        // the per-window `raise_to_shared_floor` observable. Half the kth score
+        // keeps the heap full while still pruning part of the stream.
+        let (floored, threshold) = drive(Some(kth_score * 0.5));
+        assert!(
+            threshold > 0.0,
+            "the shared floor must reach the conjunction walk"
+        );
+        assert_eq!(floored.len(), unfloored.len());
     }
 }

@@ -17,7 +17,37 @@ use smallvec::SmallVec;
 use super::*;
 
 /// Candidate callback: document, key, score, length, per-clause frequencies.
-pub(super) type BulkVisit<'v> = dyn FnMut(u32, u64, f32, u32, &[u32]) -> Result<Option<f32>> + 'v;
+///
+/// `bulk_and_step` stays generic over it rather than taking `&mut dyn` so the
+/// visit body (the heap insert and the kth-score query) inlines into the
+/// per-candidate loop.
+pub(super) trait BulkVisit {
+    fn visit(
+        &mut self,
+        doc: u32,
+        key: u64,
+        score: f32,
+        length: u32,
+        freqs: &[u32],
+    ) -> Result<Option<f32>>;
+}
+
+impl<F> BulkVisit for F
+where
+    F: FnMut(u32, u64, f32, u32, &[u32]) -> Result<Option<f32>>,
+{
+    #[inline]
+    fn visit(
+        &mut self,
+        doc: u32,
+        key: u64,
+        score: f32,
+        length: u32,
+        freqs: &[u32],
+    ) -> Result<Option<f32>> {
+        self(doc, key, score, length, freqs)
+    }
+}
 
 /// One step's outcome: another window may be available, or the walk ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +73,8 @@ pub(super) struct BulkAndState<'a> {
     pub(super) batch_norms: Vec<u8>,
     pub(super) cursor_scratch: Vec<usize>,
     pub(super) intersection_scratch: Vec<u32>,
+    /// Per-clause frequencies of the candidate being visited, in lead order.
+    pub(super) hit_freqs: Vec<u32>,
     pub(super) freq_cannot_beat: [bool; FREQ_LUT_BUCKETS],
     pub(super) freq_cannot_beat_key: Option<(u32, u64)>,
     pub(super) freq_bound_lut: Option<[f32; FREQ_LUT_BUCKETS]>,
@@ -60,8 +92,11 @@ pub(super) struct BulkAndState<'a> {
 impl<'a> BulkAndState<'a> {
     /// Capture the state the one-shot walk used to build at entry.
     ///
-    /// `wand` must already be positioned at the first candidate of every
-    /// clause; `and_bulk_search` does that before it starts.
+    /// The caller owns positioning: every clause must already point at a
+    /// document before the first step. `num_lists`, the clause order and the
+    /// norm cache are snapshots of `wand`, so the returned state may only be
+    /// driven by the wand that built it — any other wand would index the
+    /// window buffers with a foreign clause count.
     pub(super) fn new<S: Scorer, D: WandDocuments>(
         wand: &Wand<'a, S, D>,
         params: &FtsSearchParams,
@@ -98,6 +133,7 @@ impl<'a> BulkAndState<'a> {
             batch_norms: Vec::with_capacity(MAX_POSTING_BLOCK_SIZE),
             cursor_scratch: Vec::with_capacity(num_lists),
             intersection_scratch: Vec::new(),
+            hit_freqs: Vec::with_capacity(num_lists),
             freq_cannot_beat: [false; FREQ_LUT_BUCKETS],
             freq_cannot_beat_key: None,
             freq_bound_lut: None,
@@ -112,6 +148,16 @@ impl<'a> BulkAndState<'a> {
             floor_mode,
         }
     }
+
+    /// Exact-score rejection under this state's floor mode.
+    ///
+    /// Mirrors `Wand::exclusive_score_cannot_beat_floor`, but reads the mode the
+    /// caller passed in rather than the wand's, so every prune inside one step
+    /// agrees on whether a tying score competes.
+    #[inline]
+    fn score_cannot_beat_floor(&self, score: f32, threshold: f32) -> bool {
+        threshold > 0.0 && score.is_finite() && !self.floor_mode.accepts_score(score, threshold)
+    }
 }
 
 impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
@@ -122,10 +168,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     /// order. `visit` returns the new kth score when the top-k heap filled;
     /// the threshold is raised before the walk continues, exactly as the
     /// one-shot loop did.
-    pub(super) fn bulk_and_step(
+    pub(super) fn bulk_and_step<V: BulkVisit>(
         &mut self,
         state: &mut BulkAndState<'a>,
-        visit: &mut BulkVisit<'_>,
+        visit: &mut V,
     ) -> Result<StepOutcome> {
         if state.done {
             return Ok(StepOutcome::Done);
@@ -148,7 +194,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             state.target = advanced;
         }
 
-        let mut wins: SmallVec<[WindowList; 8]> = SmallVec::new();
+        let mut wins: SmallVec<[WindowList; 16]> = SmallVec::new();
         let (win_end, jump_to, sliced) = match and_kernel::slice_and_window(
             &mut self.lead,
             state.target,
@@ -266,7 +312,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     },
                 }
 
-                let mut hit_freqs: Vec<u32> = Vec::with_capacity(num_lists);
                 for (index, &doc) in state.batch_docs.iter().enumerate() {
                     let (norm_addend, doc_length) = match norm_k_ref {
                         Some((_, cache)) => {
@@ -335,9 +380,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         )
                     });
                     if let Some(slop) = state.phrase_slop {
-                        if early_score
-                            .is_some_and(|score| self.exclusive_score_cannot_beat_floor(score))
-                        {
+                        if early_score.is_some_and(|score| {
+                            state.score_cannot_beat_floor(score, self.threshold)
+                        }) {
                             continue;
                         }
                         for ((win, posting), &off) in
@@ -370,11 +415,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         )
                     });
 
-                    hit_freqs.clear();
+                    state.hit_freqs.clear();
                     for (win, &off) in wins.iter().zip(offs.iter()) {
-                        hit_freqs.push(unsafe { *win.freqs.add(off as usize) });
+                        state
+                            .hit_freqs
+                            .push(unsafe { *win.freqs.add(off as usize) });
                     }
-                    if let Some(kth) = visit(doc, document_key, score, doc_length, &hit_freqs)? {
+                    if let Some(kth) =
+                        visit.visit(doc, document_key, score, doc_length, &state.hit_freqs)?
+                    {
                         self.update_threshold(kth, state.wand_factor);
                     }
                 }
