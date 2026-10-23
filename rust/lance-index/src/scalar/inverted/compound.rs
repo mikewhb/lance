@@ -3260,6 +3260,23 @@ impl<'a> ReqOptScorer<'a> {
         Ok(self.optional_matches)
     }
 
+    /// Window from `target` bounded by both sides' block bounds; the optional
+    /// side is left at or after `target`.
+    fn shallow_window(&mut self, target: u64) -> Result<u64> {
+        self.shallow_bounds = None;
+        let mut up_to = self.required.advance_shallow(target)?;
+        match self.ensure_optional_at_or_after(target)? {
+            Some(optional_doc) if optional_doc <= target => {
+                up_to = up_to.min(self.optional.advance_shallow(target)?);
+            }
+            Some(optional_doc) => {
+                up_to = up_to.min(optional_doc.saturating_sub(1));
+            }
+            None => {}
+        }
+        Ok(up_to)
+    }
+
     fn usable_bounds(bounds: ScoreBounds) -> bool {
         bounds.lower.is_finite() && bounds.upper.is_finite() && bounds.lower <= bounds.upper
     }
@@ -3298,10 +3315,22 @@ impl<'a> ReqOptScorer<'a> {
         }
 
         'search: loop {
+            let pruning =
+                self.min_competitive_score.is_finite() && self.min_competitive_score > 0.0;
+            // Bound the window before moving the required side, so a window
+            // that cannot compete costs no required-side iteration.
+            if pruning
+                && self
+                    .shallow_bounds
+                    .as_ref()
+                    .is_none_or(|bounds| target > bounds.up_to)
+            {
+                let up_to = self.shallow_window(target)?;
+                self.bounds(up_to)?;
+            }
             let bounds = self.shallow_bounds.filter(|bounds| target <= bounds.up_to);
 
-            if self.min_competitive_score.is_finite()
-                && self.min_competitive_score > 0.0
+            if pruning
                 && let Some(bounds) = bounds
                 && Self::usable_bounds(bounds.required)
                 && Self::usable_bounds(bounds.combined)
@@ -3310,9 +3339,17 @@ impl<'a> ReqOptScorer<'a> {
                     if bounds.up_to == u64::MAX {
                         return Ok(self.exhaust());
                     }
-                    target = bounds.up_to + 1;
-                    self.shallow_bounds = None;
-                    continue;
+                    // A child can report a zero-width window (`up_to == target`)
+                    // on every call while another source boundary sits at or
+                    // behind the target. Stepping one id would walk empty
+                    // row-address space without moving the required iterator.
+                    // Only a window that extends past the target is a real
+                    // skip; otherwise the required side advances below.
+                    if bounds.up_to > target {
+                        target = bounds.up_to + 1;
+                        self.shallow_bounds = None;
+                        continue;
+                    }
                 }
 
                 if bounds.required.upper < self.min_competitive_score {
@@ -3437,18 +3474,7 @@ impl ComposableScorer for ReqOptScorer<'_> {
         {
             return Ok(bounds.up_to);
         }
-        self.shallow_bounds = None;
-        let mut up_to = self.required.advance_shallow(target)?;
-        match self.ensure_optional_at_or_after(target)? {
-            Some(optional_doc) if optional_doc <= target => {
-                up_to = up_to.min(self.optional.advance_shallow(target)?);
-            }
-            Some(optional_doc) => {
-                up_to = up_to.min(optional_doc.saturating_sub(1));
-            }
-            None => {}
-        }
-        Ok(up_to)
+        self.shallow_window(target)
     }
 
     fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
@@ -7857,6 +7883,61 @@ mod tests {
             }
         }
         assert!(pruned > 0, "the array lead never pruned");
+    }
+
+    type OptionalDecisiveRows = (Vec<(u64, f32)>, Vec<(u64, f32)>);
+
+    fn decisive_optional_rows(num_docs: u64, stride: u64) -> OptionalDecisiveRows {
+        let required = (0..num_docs).map(|doc| (doc, 0.1)).collect::<Vec<_>>();
+        // The first 16 rows fill any top 10 at once, so the floor passes the
+        // required side's bound before the long tail.
+        let optional = (0..num_docs)
+            .filter(|&doc| doc < 16 || doc % stride == 0)
+            .map(|doc| (doc, 5.0))
+            .collect::<Vec<_>>();
+        (required, optional)
+    }
+
+    fn reqopt_top_k_and_required_advances(
+        required: &[(u64, f32)],
+        optional: &[(u64, f32)],
+        limit: usize,
+    ) -> (Vec<ScoredRow>, usize) {
+        let (required_scorer, work) = instrumented(materialized(required));
+        let mut scorer = ReqOptScorer::new(required_scorer, materialized(optional));
+        let rows = TopKCollector::new(limit).collect(&mut scorer).unwrap();
+        (rows, work.advances.load(AtomicOrdering::Relaxed))
+    }
+
+    fn reqopt_oracle(
+        required: &[(u64, f32)],
+        optional: &[(u64, f32)],
+        limit: usize,
+    ) -> Vec<ScoredRow> {
+        let leaves = [
+            required.iter().copied().collect::<HashMap<_, _>>(),
+            optional.iter().copied().collect::<HashMap<_, _>>(),
+        ];
+        exhaustive_compound_top_k(&must_should_plan(1, 1), &leaves, limit)
+    }
+
+    #[test]
+    fn reqopt_bounds_a_window_before_advancing_the_required_side() {
+        let (required, optional) = decisive_optional_rows(65_536, 4_096);
+        for limit in [1, 3, 10] {
+            let (rows, advances) = reqopt_top_k_and_required_advances(&required, &optional, limit);
+            assert_eq!(
+                score_bits(&rows),
+                score_bits(&reqopt_oracle(&required, &optional, limit))
+            );
+            // 512 required windows of 128 rows, 16 of them with optional rows:
+            // skipping the other windows without moving the required side
+            // keeps this far below one advance per window.
+            assert!(
+                advances < 200,
+                "limit={limit}: {advances} required advances"
+            );
+        }
     }
 
     #[test]
