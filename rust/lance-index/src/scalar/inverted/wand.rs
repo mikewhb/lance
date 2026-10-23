@@ -34,14 +34,9 @@ mod intersection;
 #[path = "wand_maxscore.rs"]
 mod maxscore;
 
-#[path = "wand_term_and.rs"]
-mod term_and;
 #[path = "wand_term_leaf.rs"]
 mod term_leaf;
 
-pub(super) use term_and::TermAndCursor;
-#[cfg(test)]
-pub(super) use term_and::test_counters as term_and_test_counters;
 pub(super) use term_leaf::TermLeaf;
 
 use self::and_array::ArrayLead;
@@ -2669,14 +2664,52 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         /// Conjunction cursors that took a batched (`Bulk` or `Arrayed`)
         /// route, since the previous reset.
         static AND_CURSORS_BATCHED: Cell<usize> = const { Cell::new(0) };
+        /// Conjunction cursors that took the array lead.
+        static AND_CURSORS_ARRAYED: Cell<usize> = const { Cell::new(0) };
+        /// `(windows skipped by their bound, windows whose frequency table
+        /// pruned candidates)` summed over dropped conjunction cursors.
+        static AND_WINDOW_PRUNES: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+        /// Lead windows and candidates the array lead pruned, summed over
+        /// dropped conjunction cursors.
+        static AND_ARRAY_PRUNES: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn and_cursor_batched() {
         AND_CURSORS_BATCHED.with(|count| count.set(count.get() + 1));
     }
 
-    pub(in crate::scalar::inverted) fn take() -> usize {
+    pub(super) fn and_cursor_arrayed() {
+        AND_CURSORS_ARRAYED.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn add_window_prunes(windows_skipped: usize, frequency_pruned: usize) {
+        AND_WINDOW_PRUNES.with(|counts| {
+            let (skipped, pruned) = counts.get();
+            counts.set((
+                skipped.saturating_add(windows_skipped),
+                pruned.saturating_add(frequency_pruned),
+            ));
+        });
+    }
+
+    pub(super) fn add_array_prunes(pruned: usize) {
+        AND_ARRAY_PRUNES.with(|count| count.set(count.get().saturating_add(pruned)));
+    }
+
+    pub(in crate::scalar::inverted) fn take_batched() -> usize {
         AND_CURSORS_BATCHED.with(|count| count.replace(0))
+    }
+
+    pub(in crate::scalar::inverted) fn take_arrayed() -> usize {
+        AND_CURSORS_ARRAYED.with(|count| count.replace(0))
+    }
+
+    pub(in crate::scalar::inverted) fn take_window_prunes() -> (usize, usize) {
+        AND_WINDOW_PRUNES.with(|counts| counts.replace((0, 0)))
+    }
+
+    pub(in crate::scalar::inverted) fn take_array_prunes() -> usize {
+        AND_ARRAY_PRUNES.with(|count| count.replace(0))
     }
 }
 
@@ -4648,9 +4681,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             #[cfg(test)]
             {
                 self.and_window_stats.windows_skipped += 1;
-                // The one-term conjunction tests still read window skips
-                // through the old module until the dedicated cursor is gone.
-                term_and::test_counters::skipped_window();
             }
             if up_to == TERMINATED_DOC_ID {
                 return TERMINATED_DOC_ID;
@@ -5676,10 +5706,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                 #[cfg(test)]
                 {
                     cursor_counters::and_cursor_batched();
-                    // The one-term conjunction tests read the array-lead
-                    // counters through this module until the dedicated cursor
-                    // is gone, so report the same event there.
-                    term_and::test_counters::arrayed_built();
+                    cursor_counters::and_cursor_arrayed();
                 }
             }
             AndRoute::Classic => {}
@@ -5987,11 +6014,16 @@ impl<D: WandDocuments> Drop for WandCursor<'_, D> {
     fn drop(&mut self) {
         self.record_metrics();
         #[cfg(test)]
-        if self.wand.and_lead_arrayed {
-            // See `select_and_route`: the one-term conjunction tests still
-            // read the array lead's prune counts from the old module.
-            let stats = &self.wand.array_lead.stats;
-            term_and::test_counters::array_pruned(stats.windows_skipped + stats.lut_prepruned);
+        {
+            let stats = &self.wand.and_window_stats;
+            cursor_counters::add_window_prunes(
+                stats.windows_skipped,
+                stats.windows_frequency_pruned,
+            );
+            if self.wand.and_lead_arrayed {
+                let array = &self.wand.array_lead.stats;
+                cursor_counters::add_array_prunes(array.windows_skipped + array.lut_prepruned);
+            }
         }
     }
 }

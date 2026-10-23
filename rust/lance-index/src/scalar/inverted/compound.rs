@@ -32,8 +32,7 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        TermAndCursor, TermLeaf, WandCursor, WandDocuments, required_side_floor,
-        score_sum_upper_bound_factor,
+        TermLeaf, WandCursor, WandDocuments, required_side_floor, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -860,68 +859,6 @@ impl<D: WandDocuments + Sync> ComposableScorer for TermLeaf<'_, D> {
             return Ok(None);
         }
         self.score().map(Some)
-    }
-
-    fn scores_non_negative(&self) -> bool {
-        true
-    }
-}
-
-impl<D: WandDocuments + Sync> ComposableScorer for TermAndCursor<'_, D> {
-    fn doc(&self) -> Option<u64> {
-        self.doc()
-    }
-
-    fn document_key(&self) -> Option<u64> {
-        self.document_key()
-    }
-
-    fn next(&mut self) -> Result<Option<u64>> {
-        Ok(self.next())
-    }
-
-    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
-        Ok(self.advance(target))
-    }
-
-    fn cost(&self) -> usize {
-        self.cost()
-    }
-
-    fn score(&mut self) -> Result<f32> {
-        self.current_score()
-            .ok_or_else(|| Error::internal("posting FTS scorer is not positioned on a document"))
-    }
-
-    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
-        Ok(self.advance_shallow(target))
-    }
-
-    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
-        let upper = self.score_upper_bound(up_to).ok_or_else(|| {
-            Error::internal(format!(
-                "conjunction FTS score bound up_to={up_to} is outside its shallow range"
-            ))
-        })?;
-        Ok(ScoreBounds { lower: 0.0, upper })
-    }
-
-    fn global_score_upper_bound(&self) -> Option<f32> {
-        TermAndCursor::global_score_upper_bound(self)
-    }
-
-    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
-        if min_score.is_nan() {
-            return Err(Error::invalid_input(
-                "minimum competitive FTS score cannot be NaN",
-            ));
-        }
-        self.raise_floor(min_score);
-        Ok(())
-    }
-
-    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
-        Ok(self.current_score())
     }
 
     fn scores_non_negative(&self) -> bool {
@@ -4152,7 +4089,7 @@ struct CollectedPartitions {
 
 #[cfg(test)]
 thread_local! {
-    static TERM_AND_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FLAT_MUSTS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REQUIRED_FLOORS_FORWARDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -4237,7 +4174,7 @@ where
             })
             .collect::<Result<Vec<_>>>()?;
         #[cfg(test)]
-        TERM_AND_BUILT.with(|count| count.set(count.get() + 1));
+        FLAT_MUSTS_BUILT.with(|count| count.set(count.get() + 1));
         // One conjunction cursor scores every MUST posting in query order. A
         // lone clause steps its posting directly, exactly as the tree's
         // single-child conjunction forwards it.
@@ -4727,7 +4664,6 @@ mod tests {
     };
     use super::super::impact::build_impact_skip_data;
     use super::super::wand::cursor_counters;
-    use super::super::wand::term_and_test_counters;
     use super::super::wand::{AndRoute, BulkAndMode};
     use super::super::{CompressedPostingList, PostingTailCodec};
 
@@ -7523,8 +7459,8 @@ mod tests {
             .collect()
     }
 
-    fn take_term_and_built() -> usize {
-        TERM_AND_BUILT.with(|count| count.replace(0))
+    fn take_flat_musts_built() -> usize {
+        FLAT_MUSTS_BUILT.with(|count| count.replace(0))
     }
 
     /// Every conjunction of two or more MUST clauses is served by one batched
@@ -7538,10 +7474,10 @@ mod tests {
             let plan = must_should_plan(musts, 0);
             let all = (0..musts).collect::<Vec<_>>();
             for limit in [1, 10, 100] {
-                cursor_counters::take();
+                cursor_counters::take_batched();
                 collect_admitted(&corpus, &mask, corpus.leaves(&all), &plan, limit);
                 assert_eq!(
-                    cursor_counters::take(),
+                    cursor_counters::take_batched(),
                     usize::from(musts >= 2),
                     "musts={musts} limit={limit}"
                 );
@@ -7581,12 +7517,12 @@ mod tests {
                     let context = format!(
                         "seed={seed} musts={musts} shoulds={shoulds} order={order} limit={limit}"
                     );
-                    take_term_and_built();
+                    take_flat_musts_built();
                     let admitted =
                         collect_admitted(&corpus, &mask, corpus.leaves(&all), plan, limit);
-                    assert_eq!(take_term_and_built(), 1, "{context}: not admitted");
+                    assert_eq!(take_flat_musts_built(), 1, "{context}: not admitted");
                     let generic = collect_generic(&corpus, &mask, corpus.leaves(&all), plan, limit);
-                    assert_eq!(take_term_and_built(), 0, "{context}");
+                    assert_eq!(take_flat_musts_built(), 0, "{context}");
                     assert_eq!(score_bits(&admitted), score_bits(&generic), "{context}");
                 }
             }
@@ -7671,10 +7607,10 @@ mod tests {
         ];
         for (name, plan) in shapes {
             for limit in [1, 10, 100, 1_200] {
-                take_term_and_built();
+                take_flat_musts_built();
                 let admitted =
                     collect_admitted(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
-                assert_eq!(take_term_and_built(), 0, "{name} limit={limit}");
+                assert_eq!(take_flat_musts_built(), 0, "{name} limit={limit}");
                 let generic =
                     collect_generic(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
                 assert_eq!(
@@ -7710,13 +7646,13 @@ mod tests {
         let plan = must_should_plan(2, 0);
         let (mut skipped, mut pruned) = (0, 0);
         for limit in [1, 10, 100] {
-            term_and_test_counters::take();
-            take_term_and_built();
+            cursor_counters::take_window_prunes();
+            take_flat_musts_built();
             let admitted = collect_admitted(&corpus, &mask, corpus.leaves(&[0, 1]), &plan, limit);
-            assert_eq!(take_term_and_built(), 1, "limit={limit}");
-            let (window_skips, candidate_prunes) = term_and_test_counters::take();
+            assert_eq!(take_flat_musts_built(), 1, "limit={limit}");
+            let (window_skips, frequency_prunes) = cursor_counters::take_window_prunes();
             skipped += window_skips;
-            pruned += candidate_prunes;
+            pruned += frequency_prunes;
             let generic = collect_generic(&corpus, &mask, corpus.leaves(&[0, 1]), &plan, limit);
             assert_eq!(score_bits(&admitted), score_bits(&generic), "limit={limit}");
         }
@@ -7762,13 +7698,13 @@ mod tests {
         let (mut forwarded, mut skipped, mut pruned) = (0, 0, 0);
         for limit in [1, 10, 100] {
             take_required_floors_forwarded();
-            term_and_test_counters::take();
+            cursor_counters::take_window_prunes();
             let admitted =
                 collect_admitted(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
             forwarded += take_required_floors_forwarded();
-            let (window_skips, candidate_prunes) = term_and_test_counters::take();
+            let (window_skips, frequency_prunes) = cursor_counters::take_window_prunes();
             skipped += window_skips;
-            pruned += candidate_prunes;
+            pruned += frequency_prunes;
             let generic = collect_generic(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
             assert_eq!(take_required_floors_forwarded(), 0, "limit={limit}");
             assert_eq!(score_bits(&admitted), score_bits(&generic), "limit={limit}");
@@ -7817,11 +7753,11 @@ mod tests {
                     let context = format!(
                         "seed={seed} musts={musts} shoulds={shoulds} order={order} limit={limit}"
                     );
-                    term_and_test_counters::take_arrayed();
+                    cursor_counters::take_arrayed();
                     let admitted =
                         collect_admitted(&corpus, &mask, corpus.leaves(&all), plan, limit);
                     assert_eq!(
-                        term_and_test_counters::take_arrayed().0,
+                        cursor_counters::take_arrayed(),
                         1,
                         "{context}: not array-led"
                     );
@@ -7898,12 +7834,16 @@ mod tests {
             let leaves = (0..3 + shoulds).collect::<Vec<_>>();
             for limit in [1, 10] {
                 let context = format!("shoulds={shoulds} limit={limit}");
-                term_and_test_counters::take_arrayed();
+                cursor_counters::take_arrayed();
+                cursor_counters::take_array_prunes();
                 let admitted =
                     collect_admitted(&corpus, &mask, corpus.leaves(&leaves), &plan, limit);
-                let (built, array_pruned) = term_and_test_counters::take_arrayed();
-                assert_eq!(built, 1, "{context}: not array-led");
-                pruned += array_pruned;
+                assert_eq!(
+                    cursor_counters::take_arrayed(),
+                    1,
+                    "{context}: not array-led"
+                );
+                pruned += cursor_counters::take_array_prunes();
                 let generic = collect_generic(&corpus, &mask, corpus.leaves(&leaves), &plan, limit);
                 assert_eq!(score_bits(&admitted), score_bits(&generic), "{context}");
             }
