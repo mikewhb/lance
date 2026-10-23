@@ -7848,6 +7848,41 @@ mod tests {
     }
 
     #[test]
+    fn term_and_cursor_scores_only_the_candidates_it_hands_out() {
+        // A rare, heavy SHOULD clause decides the top documents, so ReqOpt
+        // jumps the conjunction from one of its documents to the next.
+        let num_docs = 8_192_u32;
+        let mut doc_lengths = vec![30_u32; num_docs as usize];
+        for doc in (0..num_docs).filter(|doc| doc % 101 == 0) {
+            doc_lengths[doc as usize] = 3;
+        }
+        let every = (0..num_docs).map(|doc| (doc, 1)).collect::<Vec<_>>();
+        let even = (0..num_docs)
+            .filter(|doc| doc % 2 == 0)
+            .map(|doc| (doc, 1))
+            .collect::<Vec<_>>();
+        let rare = (0..num_docs)
+            .filter(|doc| doc % 101 == 0)
+            .map(|doc| (doc, 4))
+            .collect::<Vec<_>>();
+        let corpus = Corpus::new(doc_lengths, vec![every, even, rare]);
+        let mask = RowAddrMask::all_rows();
+        let plan = must_should_plan(2, 1);
+        for limit in [1, 10] {
+            term_and_test_counters::take_lazy();
+            let admitted =
+                collect_admitted(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
+            let (collected, scored) = term_and_test_counters::take_lazy();
+            assert!(
+                scored < collected,
+                "limit={limit}: scored {scored} of {collected}"
+            );
+            let generic = collect_generic(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
+            assert_eq!(score_bits(&admitted), score_bits(&generic), "limit={limit}");
+        }
+    }
+
+    #[test]
     fn should_clauses_scored_differently_keep_separate_leaves() {
         let mut rng = SmallRng::seed_from_u64(11);
         let corpus = random_corpus(&mut rng, 1_000, &[0.3, 0.2, 0.25]);
