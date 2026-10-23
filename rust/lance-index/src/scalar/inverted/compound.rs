@@ -8317,6 +8317,237 @@ mod tests {
         }
     }
 
+    /// A jump that stays inside the range the walk has already covered must be
+    /// served by walking the next window: only a jump past the frontier is
+    /// allowed to cost a one-step seek.
+    #[test]
+    fn and_cursor_near_advances_stay_on_the_walk() {
+        let mut rng = SmallRng::seed_from_u64(0x5EE_0004);
+        for clauses in 2..=3_usize {
+            let corpus = random_corpus(&mut rng, 6_000, &and_densities(clauses, 1));
+            let mask = RowAddrMask::all_rows();
+            let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+            let metrics = NoOpMetricsCollector;
+            let mut batch = and_cursor(
+                &documents,
+                and_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::On,
+            );
+            let mut classic = and_cursor(
+                &documents,
+                and_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::Off,
+            );
+            assert_eq!(batch.and_route(), AndRoute::Bulk);
+
+            // Position both cursors on a document the walk has already covered.
+            let first = batch.next().unwrap();
+            assert_eq!(
+                first,
+                classic.next().unwrap(),
+                "clauses={clauses}: first next"
+            );
+            assert!(
+                first.is_some(),
+                "clauses={clauses}: nothing to advance from"
+            );
+            cursor_counters::take_and_cursor_seek_steps();
+            cursor_counters::take_and_cursor_batch_refills();
+
+            // `doc + 1` always lies inside the covered range: the window that
+            // produced `doc` ends at or after it. Going 200 steps empties the
+            // buffer, so at least one advance has to walk the next window.
+            let mut advances = 0_usize;
+            for _ in 0..200 {
+                let Some(doc) = batch.doc() else {
+                    break;
+                };
+                let target = doc + 1;
+                let a = batch.advance(target).unwrap();
+                let b = classic.advance(target).unwrap();
+                assert_eq!(a, b, "clauses={clauses}: advance({target})");
+                let Some(found) = a else {
+                    break;
+                };
+                assert!(
+                    found >= target,
+                    "clauses={clauses}: advance({target}) went backwards to {found}"
+                );
+                advances += 1;
+                assert_same_candidate(&mut batch, &mut classic, "near advance");
+            }
+            assert!(advances > 0, "clauses={clauses}: no near advance ran");
+            assert_eq!(
+                cursor_counters::take_and_cursor_seek_steps(),
+                0,
+                "clauses={clauses}: a near advance sought instead of walking"
+            );
+            assert!(
+                cursor_counters::take_and_cursor_batch_refills() > 0,
+                "clauses={clauses}: a near advance never walked a window"
+            );
+        }
+    }
+
+    /// The very first advance must not be mistaken for a jump past the walk:
+    /// the frontier starts at the first window's start, not at zero, so the
+    /// first step into that window walks it instead of paying for a seek.
+    #[test]
+    fn and_cursor_first_advance_into_the_first_window_walks() {
+        // Both clauses start late, so the first window starts at a document an
+        // empty frontier would have called a far jump.
+        let num_docs = 400_usize;
+        let doc_lengths = vec![8_u32; num_docs];
+        let term = |start: u32| (start..start + 40).map(|doc| (doc, 1)).collect::<Vec<_>>();
+        let corpus = Corpus::new(doc_lengths, vec![term(10), term(20)]);
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let mut batch = and_cursor(
+            &documents,
+            and_postings(&corpus, 2),
+            corpus.scorer.clone(),
+            &metrics,
+            BulkAndMode::On,
+        );
+        let mut classic = and_cursor(
+            &documents,
+            and_postings(&corpus, 2),
+            corpus.scorer.clone(),
+            &metrics,
+            BulkAndMode::Off,
+        );
+        assert_eq!(batch.and_route(), AndRoute::Bulk);
+
+        // The walk's first window starts where the last clause starts.
+        let first_window_start = corpus
+            .terms
+            .iter()
+            .map(|entries| entries[0].0)
+            .max()
+            .expect("two clauses");
+        cursor_counters::take_and_cursor_seek_steps();
+        cursor_counters::take_and_cursor_batch_refills();
+
+        assert_eq!(
+            batch.advance(u64::from(first_window_start)).unwrap(),
+            Some(u64::from(first_window_start))
+        );
+        assert_eq!(
+            batch.doc(),
+            classic.advance(u64::from(first_window_start)).unwrap()
+        );
+        assert_eq!(
+            cursor_counters::take_and_cursor_seek_steps(),
+            0,
+            "the first advance into the first window sought"
+        );
+        assert!(
+            cursor_counters::take_and_cursor_batch_refills() > 0,
+            "the first advance into the first window never walked it"
+        );
+    }
+
+    /// A floor that arrives after the walk already switched to the window route
+    /// must prune without losing a document it can admit: everything at or
+    /// above the floor is still handed out, with the same score bits as the
+    /// per-document route under the same late floor.
+    #[test]
+    fn and_cursor_accepts_a_floor_after_the_route_switched() {
+        let mut rng = SmallRng::seed_from_u64(0x5EE_0005);
+        let block = MAX_POSTING_BLOCK_SIZE as u64;
+        for clauses in 2..=3_usize {
+            let corpus = random_corpus(&mut rng, 6_000, &and_densities(clauses, 1));
+            let mask = RowAddrMask::all_rows();
+            let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+            let metrics = NoOpMetricsCollector;
+
+            // Score the whole conjunction once, unfiltered, so the late floor
+            // can be picked from the real score distribution.
+            let mut scores = Vec::new();
+            {
+                let mut probe = and_cursor(
+                    &documents,
+                    and_postings(&corpus, clauses),
+                    corpus.scorer.clone(),
+                    &metrics,
+                    BulkAndMode::On,
+                );
+                while probe.next().unwrap().is_some() {
+                    scores.push(probe.current_score().unwrap());
+                }
+            }
+            scores.sort_by(f32::total_cmp);
+            assert!(
+                scores.len() > 512,
+                "clauses={clauses}: the probe walk handed out only {} documents",
+                scores.len()
+            );
+            // A quarter of the documents are below this floor, so more of them
+            // stay above it than the warm-up below can consume.
+            let floor = scores[scores.len() / 4];
+            assert!(floor > 0.0, "clauses={clauses}: floor {floor}");
+
+            let mut batch = and_cursor(
+                &documents,
+                and_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::On,
+            );
+            let mut classic = and_cursor(
+                &documents,
+                and_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::Off,
+            );
+            assert_eq!(batch.and_route(), AndRoute::Bulk);
+
+            // Walk far enough that the route has sliced windows, then let the
+            // floor arrive.
+            for _ in 0..2 * block {
+                let a = batch.next().unwrap();
+                let b = classic.next().unwrap();
+                assert_eq!(a, b, "clauses={clauses}: warm-up next");
+                let Some(_) = a else {
+                    break;
+                };
+                assert_same_candidate(&mut batch, &mut classic, "warm-up");
+            }
+            // `wand_factor` is 1.0 here, so the API floor is the internal
+            // threshold and exact scores compare against it directly.
+            for cursor in [&mut batch, &mut classic] {
+                cursor.set_min_competitive_score(floor).unwrap();
+            }
+
+            let drain_above = |cursor: &mut WandCursor<'_, LegacyWandDocuments<'_>>| {
+                let mut out = Vec::new();
+                while cursor.next().unwrap().is_some() {
+                    let score = cursor.current_score().unwrap();
+                    if score >= floor {
+                        out.push((cursor.doc().unwrap(), score.to_bits()));
+                    }
+                }
+                out
+            };
+            let batch_rows = drain_above(&mut batch);
+            let classic_rows = drain_above(&mut classic);
+            assert!(
+                !batch_rows.is_empty(),
+                "clauses={clauses}: the late floor left nothing to compare"
+            );
+            assert_eq!(
+                batch_rows, classic_rows,
+                "clauses={clauses}: a late floor changed what the walk handed out"
+            );
+        }
+    }
+
     #[derive(Default)]
     struct RecordedComparisons(AtomicUsize);
 
@@ -8450,7 +8681,8 @@ mod tests {
 
     /// The single-posting route must agree with the generic WAND route over the
     /// same posting: same documents, keys and score bits, whatever the driving
-    /// pattern.
+    /// pattern, and a shallow probe on either route must bound the documents it
+    /// has already handed out.
     #[test]
     fn single_posting_cursor_matches_the_wand_route_bit_for_bit() {
         let mut rng = SmallRng::seed_from_u64(0xC0FF_EE);
@@ -8469,6 +8701,12 @@ mod tests {
             &FtsSearchParams::default(),
             &metrics,
         );
+        // Guard the differential test itself: both constructors are the same
+        // call, so a route regression would compare a cursor with its twin.
+        assert!(
+            cursor_counters::take_single_posting_cursors() >= 1,
+            "the single-posting route was not selected"
+        );
         let mut generic = WandCursor::new_without_single_route(
             Operator::And,
             vec![posting()],
@@ -8478,6 +8716,9 @@ mod tests {
             &metrics,
         );
 
+        // Exact scores of the documents handed out so far. Both routes agree on
+        // them bit for bit, so one list serves both bound checks below.
+        let mut handed_out: Vec<(u64, f32)> = Vec::new();
         let mut compared = 0_usize;
         for _ in 0..2_000 {
             match rng.random_range(0..7_u32) {
@@ -8490,57 +8731,109 @@ mod tests {
                     }
                     compared += 1;
                     assert_same_candidate(&mut single, &mut generic, "next");
+                    handed_out.push((single.doc().unwrap(), single.current_score().unwrap()));
                 }
                 3..=5 => {
                     let target = single.doc().unwrap_or(0) + rng.random_range(0..800_u64);
                     let a = single.advance(target).unwrap();
                     let b = generic.advance(target).unwrap();
                     assert_eq!(a, b, "advance({target})");
-                    if a.is_some() {
+                    if let Some(found) = a {
+                        assert!(
+                            found >= target,
+                            "advance({target}) went backwards to {found}"
+                        );
                         compared += 1;
                         assert_same_candidate(&mut single, &mut generic, "advance");
+                        handed_out.push((single.doc().unwrap(), single.current_score().unwrap()));
                     }
                 }
                 _ => {
                     // A shallow probe must leave both routes on their document.
-                    let target = single.doc().unwrap_or(0) + rng.random_range(0..32_u64);
-                    single.advance_shallow(target).unwrap();
-                    generic.advance_shallow(target).unwrap();
+                    // The routes may anchor different blocks (the single route
+                    // can report the gap before its block, the conjunction
+                    // route the end of the previous one), so only the range
+                    // relations are compared, never the `up_to` values. A
+                    // probe is only meaningful from a positioned document:
+                    // `target` must not fall behind the cursor.
+                    let Some(doc) = single.doc() else {
+                        continue;
+                    };
+                    let target = doc + rng.random_range(0..32_u64);
+                    let single_up_to = single.advance_shallow(target).unwrap();
+                    let generic_up_to = generic.advance_shallow(target).unwrap();
                     assert_eq!(single.doc(), generic.doc(), "probe doc");
+                    for (route, cursor, up_to) in [
+                        ("single", &mut single, single_up_to),
+                        ("generic", &mut generic, generic_up_to),
+                    ] {
+                        assert!(
+                            up_to >= target,
+                            "{route}: shallow({target}) ended before its target at {up_to}"
+                        );
+                        let bound = cursor.score_upper_bound(up_to).unwrap();
+                        for &(doc, score) in &handed_out {
+                            if doc >= target && doc <= up_to {
+                                assert!(
+                                    bound >= score,
+                                    "{route}: bound {bound} for [{target}, {up_to}] does not \
+                                     cover doc {doc} scored {score}"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
         assert!(compared > 100, "only {compared} documents compared");
 
         // A posting that matches nothing ends on the first `next`, and a target
-        // past the compressed doc-id domain ends instead of truncating.
+        // past the compressed doc-id domain ends instead of truncating. Both
+        // operators have a single-posting route, and neither may revive after
+        // the walk was told the range is over.
         let empty = |term: usize| {
             impact_posting_at(term, term as u32, &[], &corpus.doc_lengths, &corpus.scorer)
         };
-        let mut single = WandCursor::new(
-            Operator::And,
-            vec![empty(0)],
-            &documents,
-            corpus.scorer.clone(),
-            &FtsSearchParams::default(),
-            &metrics,
-        );
-        let mut generic = WandCursor::new_without_single_route(
-            Operator::And,
-            vec![empty(0)],
-            &documents,
-            corpus.scorer.clone(),
-            &FtsSearchParams::default(),
-            &metrics,
-        );
-        assert_eq!(single.next().unwrap(), None);
-        assert_eq!(generic.next().unwrap(), None);
-        for cursor in [&mut single, &mut generic] {
-            assert_eq!(
-                cursor.advance(u64::from(u32::MAX) + 10).unwrap(),
-                None,
-                "advance past the doc-id domain"
+        for operator in [Operator::And, Operator::Or] {
+            let mut single = WandCursor::new(
+                operator,
+                vec![empty(0)],
+                &documents,
+                corpus.scorer.clone(),
+                &FtsSearchParams::default(),
+                &metrics,
             );
+            assert!(
+                cursor_counters::take_single_posting_cursors() >= 1,
+                "{operator:?}: the single-posting route was not selected"
+            );
+            let mut generic = WandCursor::new_without_single_route(
+                operator,
+                vec![empty(0)],
+                &documents,
+                corpus.scorer.clone(),
+                &FtsSearchParams::default(),
+                &metrics,
+            );
+            assert_eq!(single.next().unwrap(), None, "{operator:?}: empty posting");
+            assert_eq!(generic.next().unwrap(), None, "{operator:?}: empty posting");
+            for cursor in [&mut single, &mut generic] {
+                assert_eq!(
+                    cursor.advance(0).unwrap(),
+                    None,
+                    "{operator:?}: an empty posting revived on advance"
+                );
+                assert_eq!(
+                    cursor.advance(u64::from(u32::MAX) + 10).unwrap(),
+                    None,
+                    "{operator:?}: advance past the doc-id domain"
+                );
+                assert_eq!(
+                    cursor.advance(0).unwrap(),
+                    None,
+                    "{operator:?}: a smaller target revived the cursor"
+                );
+            }
         }
         let mut single = WandCursor::new(
             Operator::And,
@@ -8554,6 +8847,11 @@ mod tests {
             single.advance(u64::from(u32::MAX) + 10).unwrap(),
             None,
             "a live posting must end past the doc-id domain"
+        );
+        assert_eq!(
+            single.advance(0).unwrap(),
+            None,
+            "a smaller target revived a cursor that ended past the doc-id domain"
         );
     }
 
@@ -8581,14 +8879,21 @@ mod tests {
         for limit in [1, 10, 100] {
             let collect = |single_route: bool| -> Vec<ScoredRow> {
                 let mut cursor: BoxScorer<'_> = if single_route {
-                    Box::new(WandCursor::new(
+                    let cursor = WandCursor::new(
                         Operator::And,
                         vec![posting(0, 0)],
                         &documents,
                         corpus.scorer.clone(),
                         &params,
                         &metrics,
-                    ))
+                    );
+                    // Guard the differential test: without this the two branches
+                    // are the same constructor and the comparison is vacuous.
+                    assert!(
+                        cursor_counters::take_single_posting_cursors() >= 1,
+                        "the single-posting route was not selected"
+                    );
+                    Box::new(cursor)
                 } else {
                     Box::new(WandCursor::new_without_single_route(
                         Operator::And,
