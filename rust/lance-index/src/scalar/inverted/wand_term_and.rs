@@ -224,15 +224,15 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
             .map(|posting| posting.block_idx)
             .collect::<SmallVec<[usize; 8]>>();
         // Block lookup only moves forward. An array-lead window can leave a
-        // follower past `target`, so the bound probe starts at the first block
-        // and the saved cursors are restored afterwards.
-        if self.array.is_some() {
-            for posting in &mut self.lead {
-                posting.block_idx = 0;
-            }
-        }
+        // follower past `target`, so the bound probe searches every block and
+        // the saved cursors are restored afterwards.
+        let from_start = self.array.is_some();
         for posting in &mut self.lead {
-            posting.shallow_next(target);
+            if from_start {
+                posting.seek_block_from_start(target);
+            } else {
+                posting.shallow_next(target);
+            }
         }
         let up_to = self
             .lead

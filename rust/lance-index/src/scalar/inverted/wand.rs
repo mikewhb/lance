@@ -1642,6 +1642,17 @@ impl PostingIterator {
         }
     }
 
+    /// Moves the block cursor to the block that can hold `least_id`, searching
+    /// every block rather than only those after the current cursor.
+    fn seek_block_from_start(&mut self, least_id: u64) {
+        if let PostingList::Compressed(ref list) = self.list {
+            let least_id = u32::try_from(least_id).unwrap_or(u32::MAX);
+            let block_idx =
+                self.block_idx_for_doc_by_least_doc_id(list, 0, least_id, list.blocks.len());
+            self.block_idx = block_idx;
+        }
+    }
+
     /// Anchored level0 impact bound of the current block: (doc_up_to, max_score),
     /// memoized until the block cursor moves. The frontier marker decodes only
     /// the leading varint and is `u32::MAX` for a null entry or a malformed
