@@ -4473,18 +4473,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         and_kernel::posting_block_up_to(posting, target)
     }
 
-    /// Bulk conjunction search. The window ends at the nearest next-block
-    /// boundary across the clauses, so within a window every clause
-    /// contributes exactly one decompressed block and the intersection is a
-    /// plain merge over `u32` slices — the per-candidate cost drops from a
-    /// full `PostingIterator::next` call per clause to a couple of loads.
-    /// Window skipping, per-candidate pruning, scoring, and heap semantics
-    /// mirror the classic loop exactly, so results are identical.
-    /// Which stride a top-k conjunction takes, decided in one place so the
-    /// terminal and the conjunction cursor cannot disagree.
+    /// Which stride a top-k conjunction takes.
     ///
     /// `Arrayed` drives the same leapfrog loop as `Classic`; the lead's
-    /// documents are sliced into windows first.
+    /// documents are sliced into windows first. Callers that narrow the
+    /// admission test first (the conjunction cursor rejects phrase queries and
+    /// single clauses) must still read the answer from here.
     fn and_route(&self, mode: BulkAndMode) -> AndRoute {
         if self.operator != Operator::And
             || self.lead.is_empty()
@@ -4495,9 +4489,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         {
             return AndRoute::Classic;
         }
-        // The array route is semantics-preserving for any compressed list
-        // (byte-identical results on a 128-block corpus), so it carries no
-        // format guard; block_size is a tuning parameter.
+        // The array route is semantics-preserving for any compressed list, so
+        // it carries no format guard; block_size is a tuning parameter.
         if mode == BulkAndMode::Auto
             && self.lead.len() >= 3
             && conjunction_lists_are_skewed(&self.lead)
@@ -4517,6 +4510,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
     }
 
+    /// Bulk conjunction search. The window ends at the nearest next-block
+    /// boundary across the clauses, so within a window every clause
+    /// contributes exactly one decompressed block and the intersection is a
+    /// plain merge over `u32` slices — the per-candidate cost drops from a
+    /// full `PostingIterator::next` call per clause to a couple of loads.
+    /// Window skipping, per-candidate pruning, scoring, and heap semantics
+    /// mirror the classic loop exactly, so results are identical.
     fn and_bulk_search(
         &mut self,
         params: &FtsSearchParams,
@@ -5544,17 +5544,14 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     metrics_recorded: bool,
     metrics: &'a dyn MetricsCollector,
     // Window-walking conjunction state, present only on the bulk route. The
-    // buffer below is what the walk produced and has not handed out yet;
-    // `and_next` indexes it. Both vectors are reused across refills so the
-    // walk never allocates per candidate.
+    // buffer below is what the walk produced and has not handed out yet, as
+    // (doc id, length, score, lead frequency); `and_next` indexes it. The walk
+    // already scored each candidate in query order, so the hand-out copies that
+    // score instead of recomputing it. The vector is reused across refills so
+    // the walk never allocates per candidate.
     and_batch: Option<and_walk::BulkAndState<'a>>,
-    and_cands: Vec<(u64, Option<f32>, u32)>,
-    and_freqs: Vec<u32>,
+    and_cands: Vec<(u64, f32, u32)>,
     and_next: usize,
-    // Norm-code addends for the buffered candidates, resolved once per cursor
-    // from the same source the walk uses, so both score the same bits.
-    and_norm_addends: Option<NormKCache<'a>>,
-    and_norm_addends_initialized: bool,
 }
 
 impl<'a, D: WandDocuments> WandCursor<'a, D> {
@@ -5598,10 +5595,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             metrics,
             and_batch: None,
             and_cands: Vec::new(),
-            and_freqs: Vec::new(),
             and_next: 0,
-            and_norm_addends: None,
-            and_norm_addends_initialized: false,
         };
         cursor.select_and_route();
         cursor
@@ -5643,8 +5637,6 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                 ));
                 self.wand.and_batched = true;
                 self.and_cands.reserve(MAX_POSTING_BLOCK_SIZE);
-                self.and_freqs
-                    .reserve(MAX_POSTING_BLOCK_SIZE * self.wand.lead.len());
             }
             AndRoute::Arrayed => {
                 // Pay for the window buffers only when the route is used.
@@ -5671,6 +5663,15 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
 
     /// Test hook: the route this cursor actually drives.
     #[cfg(test)]
+    /// Candidates the window walk produced so far; zero on the per-document
+    /// route, so a test can tell whether the batch path really ran.
+    #[cfg(test)]
+    pub(super) fn and_walk_compared(&self) -> usize {
+        self.and_batch
+            .as_ref()
+            .map_or(0, |state| state.num_comparisons)
+    }
+
     pub(super) fn and_route(&self) -> AndRoute {
         if self.and_batch.is_some() {
             AndRoute::Bulk
@@ -5710,16 +5711,6 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         }
     }
 
-    /// Norm-code addends for scored candidates, or `None` when the documents
-    /// have no dense norm slab and scoring must go through the doc length.
-    fn batch_norm_addends(&mut self) -> Option<NormKCache<'a>> {
-        if !self.and_norm_addends_initialized {
-            self.and_norm_addends = self.wand.norm_k_cache();
-            self.and_norm_addends_initialized = true;
-        }
-        self.and_norm_addends.clone()
-    }
-
     /// Hand out the next buffered candidate, walking the conjunction window by
     /// window until one appears or the walk ends.
     fn batch_next(&mut self) -> Result<Option<u64>> {
@@ -5735,15 +5726,12 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
 
     /// Walk one or more windows until the buffer holds a candidate.
     ///
-    /// Returns whether anything was buffered. The visit closure only copies what
-    /// the hand-out needs: the walk has already scored the candidate for its own
-    /// prune, and that score is not the hand-out's (the hand-out needs the
-    /// query-order sum under the cursor's floor mode).
+    /// Returns whether anything was buffered. The visit closure copies what the
+    /// hand-out needs; the score it receives is already the query-order sum the
+    /// per-document route reports, so it is kept rather than recomputed.
     fn batch_refill(&mut self) -> Result<bool> {
         self.and_cands.clear();
-        self.and_freqs.clear();
         self.and_next = 0;
-        let norm_addends = self.batch_norm_addends();
         while self.and_cands.is_empty() {
             let Some(state) = self.and_batch.as_mut() else {
                 return Ok(false);
@@ -5754,15 +5742,13 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             self.wand.raise_to_shared_floor(state.wand_factor);
             let mut visit = |doc: u32,
                              _key: u64,
-                             _score: f32,
-                             length: u32,
+                             score: f32,
+                             _length: u32,
                              freqs: &[u32]|
              -> Result<Option<f32>> {
-                let addend = norm_addends
-                    .as_ref()
-                    .map(|(norms, addends)| addends[norms[doc as usize] as usize]);
-                self.and_cands.push((u64::from(doc), addend, length));
-                self.and_freqs.extend_from_slice(freqs);
+                // The lead clause's frequency is what the per-document route
+                // reports as the candidate's frequency.
+                self.and_cands.push((u64::from(doc), score, freqs[0]));
                 Ok(None)
             };
             // A step that reports `Done` may still have buffered the final
@@ -5776,22 +5762,16 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     /// Position on the next buffered candidate, skipping documents the
     /// visibility mapping does not resolve.
     fn batch_hand_out(&mut self) -> Result<Option<u64>> {
-        let num_lists = self.and_batch.as_ref().map_or(0, |state| state.num_lists);
         while self.and_next < self.and_cands.len() {
-            let index = self.and_next;
+            let (doc, score, lead_freq) = self.and_cands[self.and_next];
             self.and_next += 1;
-            let (doc, addend, doc_length) = self.and_cands[index];
             let doc_id = doc as u32;
             let Some(document_key) = self.wand.documents.document_key_for_doc_id(doc_id) else {
                 continue;
             };
-            let freqs = &self.and_freqs[index * num_lists..(index + 1) * num_lists];
-            let score = self.batch_score(freqs, addend, doc_length);
             self.current_doc = Some(DocInfo::Raw(RawDocInfo {
                 doc_id,
-                // The lead clause of the window, as the per-document route
-                // reports it.
-                frequency: freqs[0],
+                frequency: lead_freq,
             }));
             self.current_document_key = Some(document_key);
             self.current_score = score;
@@ -5801,27 +5781,6 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             return Ok(Some(doc));
         }
         Ok(None)
-    }
-
-    /// Sum one candidate's per-clause BM25 contributions in query order.
-    ///
-    /// `freqs` is in lead order, so this visits the clauses through
-    /// `score_order` and adds them in exactly the order the per-document route
-    /// uses, which is what keeps the two bit-identical.
-    fn batch_score(&self, freqs: &[u32], addend: Option<f32>, doc_length: u32) -> f32 {
-        let Some(state) = self.and_batch.as_ref() else {
-            return 0.0;
-        };
-        let mut score = 0.0_f32;
-        for &clause in state.score_order.iter() {
-            let posting = &self.wand.lead[clause];
-            let freq = freqs[clause];
-            score += match addend {
-                Some(addend) => posting.query_weight * bm25_doc_weight_with_norm(freq, addend),
-                None => posting.score(&self.wand.scorer, freq, doc_length),
-            };
-        }
-        score
     }
 
     fn position_next(&mut self) -> Result<Option<u64>> {
@@ -5894,6 +5853,8 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             if let Some(state) = self.and_batch.as_mut() {
                 state.done = true;
             }
+            // Nothing buffered may surface after this jump either.
+            self.and_next = self.and_cands.len();
             self.clear_current();
             self.record_metrics();
             return Ok(None);

@@ -8171,4 +8171,50 @@ mod tests {
             "the floor did not prune: {pruned} of {unpruned}"
         );
     }
+
+    #[test]
+    fn and_cursor_default_route_walks_the_windows() {
+        let mut rng = SmallRng::seed_from_u64(11);
+        let corpus = random_corpus(&mut rng, 700, &and_densities(2, 1));
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+
+        let drain = |cursor: &mut WandCursor<'_, LegacyWandDocuments<'_>>| {
+            let mut handed = 0;
+            while cursor.next().unwrap().is_some() {
+                handed += 1;
+            }
+            handed
+        };
+
+        let mut batched = WandCursor::new(
+            Operator::And,
+            and_postings(&corpus, 2),
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::new(),
+            &metrics,
+        );
+        assert_eq!(
+            batched.and_route(),
+            AndRoute::Bulk,
+            "a two-clause conjunction over impact lists batches without an override"
+        );
+        let handed_out = drain(&mut batched);
+        assert!(handed_out > 0);
+        assert!(
+            batched.and_walk_compared() > 0,
+            "the default route never drove the window walk"
+        );
+
+        let mut classic = and_cursor(
+            &documents,
+            and_postings(&corpus, 2),
+            corpus.scorer.clone(),
+            &metrics,
+            BulkAndMode::Off,
+        );
+        assert_eq!(handed_out, drain(&mut classic));
+    }
 }
