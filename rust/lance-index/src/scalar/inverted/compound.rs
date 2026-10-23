@@ -3055,12 +3055,15 @@ struct ReqOptScorer<'a> {
     min_competitive_score: f32,
     shallow_bounds: Option<ReqOptBounds>,
     forwards_required_floor: bool,
+    /// Bound of every required score, read once.
+    required_global_upper: Option<f32>,
 }
 
 impl<'a> ReqOptScorer<'a> {
     fn new(required: BoxScorer<'a>, optional: BoxScorer<'a>) -> Self {
         debug_assert!(required.scores_non_negative());
         debug_assert!(optional.scores_non_negative());
+        let required_global_upper = required.global_score_upper_bound();
         Self {
             required,
             optional,
@@ -3075,6 +3078,7 @@ impl<'a> ReqOptScorer<'a> {
             min_competitive_score: f32::NEG_INFINITY,
             shallow_bounds: None,
             forwards_required_floor: false,
+            required_global_upper,
         }
     }
 
@@ -3190,6 +3194,18 @@ impl<'a> ReqOptScorer<'a> {
         'search: loop {
             let pruning =
                 self.min_competitive_score.is_finite() && self.min_competitive_score > 0.0;
+            // Once the required side alone can never reach the floor, every
+            // competitive document also matches the optional side.
+            let optional_always_required = pruning
+                && self
+                    .required_global_upper
+                    .is_some_and(|upper| upper < self.min_competitive_score);
+            if optional_always_required {
+                let Some(optional_doc) = self.ensure_optional_at_or_after(target)? else {
+                    return Ok(self.exhaust());
+                };
+                target = target.max(optional_doc);
+            }
             // Bound the window before moving the required side, so a window
             // that cannot compete costs no required-side iteration.
             if pruning
@@ -3225,7 +3241,7 @@ impl<'a> ReqOptScorer<'a> {
                     }
                 }
 
-                if bounds.required.upper < self.min_competitive_score {
+                if optional_always_required || bounds.required.upper < self.min_competitive_score {
                     // The optional contribution is necessary throughout this
                     // cached shallow range. Intersect approximations until
                     // both sides agree or the range is exhausted.
@@ -7758,25 +7774,25 @@ mod tests {
         let corpus = Corpus::new(doc_lengths, terms);
         let mask = RowAddrMask::all_rows();
         let plan = must_should_plan(2, 1);
-        let (mut forwarded, mut skipped, mut pruned) = (0, 0, 0);
+        let mut forwarded = 0;
         for limit in [1, 10, 100] {
             take_required_floors_forwarded();
             cursor_counters::take_window_prunes();
             let admitted =
                 collect_admitted(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
             forwarded += take_required_floors_forwarded();
-            let (window_skips, candidate_prunes) = cursor_counters::take_window_prunes();
-            skipped += window_skips;
-            pruned += candidate_prunes;
+            // Leftover conjunction prunes are drained, not asserted: once the
+            // floor passes the required side's bound, ReqOpt requires an
+            // optional match on every document and only ever advances the
+            // conjunction to those, so it no longer walks windows the floor
+            // could skip. `reqopt_bounds_a_window_before_advancing_the_required_side`
+            // pins that scheduling instead.
+            cursor_counters::take_window_prunes();
             let generic = collect_generic(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
             assert_eq!(take_required_floors_forwarded(), 0, "limit={limit}");
             assert_eq!(score_bits(&admitted), score_bits(&generic), "limit={limit}");
         }
         assert!(forwarded > 0, "ReqOpt never forwarded a floor");
-        assert!(
-            skipped + pruned > 0,
-            "the forwarded floor never pruned anything"
-        );
     }
 
     /// One rare MUST clause, `musts - 1` dense ones and `shoulds` medium
@@ -7965,6 +7981,25 @@ mod tests {
             assert!(
                 advances < 200,
                 "limit={limit}: {advances} required advances"
+            );
+        }
+    }
+
+    #[test]
+    fn reqopt_lets_a_decisive_optional_side_drive() {
+        let (required, optional) = decisive_optional_rows(65_536, 4_096);
+        for limit in [1, 3, 10] {
+            let (rows, advances) = reqopt_top_k_and_required_advances(&required, &optional, limit);
+            assert_eq!(
+                score_bits(&rows),
+                score_bits(&reqopt_oracle(&required, &optional, limit))
+            );
+            // Every optional row is a candidate; the required side is moved
+            // to each of them and little else.
+            assert!(
+                advances <= 2 * optional.len() + 8,
+                "limit={limit}: {advances} required advances for {} optional rows",
+                optional.len()
             );
         }
     }
