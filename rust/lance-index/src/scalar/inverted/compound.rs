@@ -8670,11 +8670,12 @@ mod tests {
     /// Positioning must not decode frequencies; only scoring does.
     #[test]
     fn single_posting_cursor_decodes_frequencies_only_when_scored() {
+        // One entry per document fills one posting block per `block` documents,
+        // so each advance below lands in the next block.
         let block = MAX_POSTING_BLOCK_SIZE;
         let num_docs = block * 4;
         let doc_lengths = vec![6_u32; num_docs];
         let entries = (0..num_docs as u32)
-            .step_by(3)
             .map(|doc| (doc, 1 + doc % 5))
             .collect::<Vec<_>>();
         let corpus = Corpus::new(doc_lengths, vec![entries]);
@@ -8715,13 +8716,12 @@ mod tests {
         let block = MAX_POSTING_BLOCK_SIZE;
         let num_docs = block * 4;
         let doc_lengths = vec![8_u32; num_docs];
-        let mut entries = (0..num_docs as u32)
-            .step_by(7)
-            .map(|doc| (doc, 1))
+        // One entry per document gives one posting block per `block`
+        // documents. One high-frequency document in the first block sets the
+        // floor above every other block's bound.
+        let entries = (0..num_docs as u32)
+            .map(|doc| (doc, if doc == 5 { 12 } else { 1 }))
             .collect::<Vec<_>>();
-        // One high-frequency document in the first block sets the floor above
-        // every other block's bound.
-        entries[0] = (5, 12);
         let corpus = Corpus::new(doc_lengths, vec![entries]);
         let mask = RowAddrMask::all_rows();
         let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
@@ -8762,6 +8762,10 @@ mod tests {
         single.set_min_competitive_score(best).unwrap();
         generic.set_min_competitive_score(best).unwrap();
         cursor_counters::take_single_posting_blocks_skipped();
+
+        // A probe far ahead of the current document must not steer the block
+        // anchor the skip below relies on.
+        let _ = single.advance_shallow((num_docs - 1) as u64);
 
         let single_rows = TopKCollector::new(1).collect(&mut single).unwrap();
         let skipped = cursor_counters::take_single_posting_blocks_skipped();

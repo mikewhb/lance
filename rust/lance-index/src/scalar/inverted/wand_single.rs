@@ -182,7 +182,12 @@ impl SinglePosting {
     }
 
     /// Bounds `[target, up_to]` without moving the current document.
+    ///
+    /// The probe anchors the block cursor ahead when `target` is far from the
+    /// current document, so the anchor is put back before returning: a later
+    /// skip must bound the block that holds the document it is about to leave.
     pub(super) fn advance_shallow<S: Scorer + ?Sized>(&mut self, target: u64, scorer: &S) -> u64 {
+        let anchored_block = self.posting.block_idx;
         self.posting.shallow_next(target);
         let (up_to, upper) = match self.posting.block_first_doc() {
             // `target` falls in the gap before the anchored block: no postings.
@@ -195,6 +200,7 @@ impl SinglePosting {
                 (up_to, upper)
             }
         };
+        self.posting.block_idx = anchored_block;
         self.shallow = Some((target, up_to, upper));
         up_to
     }
