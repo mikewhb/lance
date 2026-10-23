@@ -29,6 +29,9 @@ use crate::metrics::MetricsCollector;
 /// competitive floor, scored as the clauses' scores summed from zero in
 /// clause order: the score of a `RequiredConjunctionScorer` over the same
 /// one-term leaves.
+/// Cached lead-score limit for one `(floor bits, follower-bound bits)` key.
+type LeadLimitCache = ((u32, u64), Option<f32>, [bool; FREQ_LUT_BUCKETS]);
+
 pub(in super::super) struct TermAndCursor<'a, D: WandDocuments> {
     /// Cheapest posting first: the window kernels prune on `lead[0]`.
     #[allow(clippy::vec_box)]
@@ -51,6 +54,9 @@ pub(in super::super) struct TermAndCursor<'a, D: WandDocuments> {
     cursor_scratch: Vec<usize>,
     intersection_scratch: Vec<u32>,
     freq_bound_lut: Option<[f32; FREQ_LUT_BUCKETS]>,
+    /// `(key, lead score limit, frequency buckets that cannot beat it)` of the
+    /// last pruned window, keyed by the floor and the followers' block bound.
+    limit_cache: Option<LeadLimitCache>,
     /// Array-backed lead, for skewed conjunctions of three or more clauses.
     array: Option<ArrayLead>,
     /// `(doc, document key, score)` of the current window's survivors.
@@ -126,6 +132,7 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
             cursor_scratch: Vec::with_capacity(num_lists),
             intersection_scratch: Vec::new(),
             freq_bound_lut: None,
+            limit_cache: None,
             array,
             hits: Vec::with_capacity(MAX_POSTING_BLOCK_SIZE),
             next_hit: 0,
@@ -372,17 +379,26 @@ impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
                 .iter()
                 .map(|posting| f64::from(posting.block_max_score(scorer)))
                 .sum::<f64>();
-            first_score_limit = partial_score_limit(
-                others,
-                self.floor,
-                score_sum_upper_bound_factor(num_lists),
-                CompetitiveFloorMode::Inclusive,
-            );
-            if let Some(limit) = first_score_limit {
-                let lut = self
-                    .freq_bound_lut
-                    .get_or_insert_with(|| lead_freq_bound_lut(&self.lead[0], scorer));
-                freq_cannot_beat = std::array::from_fn(|frequency| lut[frequency] <= limit);
+            let key = (self.floor.to_bits(), others.to_bits());
+            if self.limit_cache.is_none_or(|(cached, _, _)| cached != key) {
+                let limit = partial_score_limit(
+                    others,
+                    self.floor,
+                    score_sum_upper_bound_factor(num_lists),
+                    CompetitiveFloorMode::Inclusive,
+                );
+                let mut cannot_beat = [false; FREQ_LUT_BUCKETS];
+                if let Some(limit) = limit {
+                    let lut = self
+                        .freq_bound_lut
+                        .get_or_insert_with(|| lead_freq_bound_lut(&self.lead[0], scorer));
+                    cannot_beat = std::array::from_fn(|frequency| lut[frequency] <= limit);
+                }
+                self.limit_cache = Some((key, limit, cannot_beat));
+            }
+            if let Some((_, limit, cannot_beat)) = self.limit_cache {
+                first_score_limit = limit;
+                freq_cannot_beat = cannot_beat;
             }
             load_window_freqs(&self.lead[..1], &mut wins[..1]);
         }
