@@ -1155,6 +1155,12 @@ impl PostingIterator {
         self
     }
 
+    /// Places this posting at `position` in a cursor's query-order score sum.
+    pub(super) fn with_query_position(mut self, position: u32) -> Self {
+        self.position = position;
+        self
+    }
+
     pub(super) fn with_grouped_terms(mut self, terms: Arc<[GroupedTermScorer]>) -> Self {
         // Grouped postings are built at query time with the same scoring
         // lengths and scorer as this cursor.  Their baked list maximum is the
@@ -2653,6 +2659,25 @@ struct AndWindowStats {
     pairwise_intersections: usize,
     windows_sliced: usize,
     windows_frequency_pruned: usize,
+}
+
+#[cfg(test)]
+pub(in crate::scalar::inverted) mod cursor_counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Conjunction cursors that took a batched (`Bulk` or `Arrayed`)
+        /// route, since the previous reset.
+        static AND_CURSORS_BATCHED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn and_cursor_batched() {
+        AND_CURSORS_BATCHED.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(in crate::scalar::inverted) fn take() -> usize {
+        AND_CURSORS_BATCHED.with(|count| count.replace(0))
+    }
 }
 
 impl Eq for TailPosting {}
@@ -4623,6 +4648,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             #[cfg(test)]
             {
                 self.and_window_stats.windows_skipped += 1;
+                // The one-term conjunction tests still read window skips
+                // through the old module until the dedicated cursor is gone.
+                term_and::test_counters::skipped_window();
             }
             if up_to == TERMINATED_DOC_ID {
                 return TERMINATED_DOC_ID;
@@ -5637,12 +5665,22 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                 ));
                 self.wand.and_batched = true;
                 self.and_cands.reserve(MAX_POSTING_BLOCK_SIZE);
+                #[cfg(test)]
+                cursor_counters::and_cursor_batched();
             }
             AndRoute::Arrayed => {
                 // Pay for the window buffers only when the route is used.
                 self.wand.array_lead.reserve();
                 self.wand.and_lead_arrayed = true;
                 self.wand.array_lead.reset_gate();
+                #[cfg(test)]
+                {
+                    cursor_counters::and_cursor_batched();
+                    // The one-term conjunction tests read the array-lead
+                    // counters through this module until the dedicated cursor
+                    // is gone, so report the same event there.
+                    term_and::test_counters::arrayed_built();
+                }
             }
             AndRoute::Classic => {}
         }
@@ -5948,6 +5986,13 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
 impl<D: WandDocuments> Drop for WandCursor<'_, D> {
     fn drop(&mut self) {
         self.record_metrics();
+        #[cfg(test)]
+        if self.wand.and_lead_arrayed {
+            // See `select_and_route`: the one-term conjunction tests still
+            // read the array lead's prune counts from the old module.
+            let stats = &self.wand.array_lead.stats;
+            term_and::test_counters::array_pruned(stats.windows_skipped + stats.lut_prepruned);
+        }
     }
 }
 

@@ -4210,6 +4210,10 @@ where
         // Over one-term leaves the Boolean wrapper, unit boosts and the
         // single-child disjunction only forward, and the conjunction sums the
         // same terms in the same order: every score keeps its bits.
+        //
+        // The conjunction cursor scores with the first MUST clause's params,
+        // so capture them before `leaves` is emptied below.
+        let must_params = leaves[must[0]].params.clone();
         let mut leaves = leaves.into_iter().map(Some).collect::<Vec<_>>();
         let mut take = |index: usize| -> Result<(PostingIterator, Arc<MemBM25Scorer>)> {
             let mut leaf = leaves
@@ -4227,12 +4231,29 @@ where
         };
         let musts = must
             .iter()
-            .map(|&index| take(index).map(|(posting, _)| posting))
+            .enumerate()
+            .map(|(rank, &index)| {
+                take(index).map(|(posting, _)| posting.with_query_position(rank as u32))
+            })
             .collect::<Result<Vec<_>>>()?;
         #[cfg(test)]
         TERM_AND_BUILT.with(|count| count.set(count.get() + 1));
-        let required: BoxScorer<'_> =
-            Box::new(TermAndCursor::new(musts, documents, must_scorer, metrics));
+        // One conjunction cursor scores every MUST posting in query order. A
+        // lone clause steps its posting directly, exactly as the tree's
+        // single-child conjunction forwards it.
+        let required: BoxScorer<'_> = if musts.len() == 1 {
+            let posting = musts.into_iter().next().expect("one MUST clause");
+            Box::new(TermLeaf::new(posting, documents, must_scorer, metrics))
+        } else {
+            Box::new(WandCursor::new(
+                Operator::And,
+                musts,
+                documents,
+                must_scorer,
+                &must_params,
+                metrics,
+            ))
+        };
         let mut scorer: BoxScorer<'_> = if should.is_empty() {
             required
         } else {
@@ -4705,6 +4726,7 @@ mod tests {
         MAX_POSTING_BLOCK_SIZE, compress_posting_list_with_tail_codec_and_block_size,
     };
     use super::super::impact::build_impact_skip_data;
+    use super::super::wand::cursor_counters;
     use super::super::wand::term_and_test_counters;
     use super::super::wand::{AndRoute, BulkAndMode};
     use super::super::{CompressedPostingList, PostingTailCodec};
@@ -7503,6 +7525,28 @@ mod tests {
 
     fn take_term_and_built() -> usize {
         TERM_AND_BUILT.with(|count| count.replace(0))
+    }
+
+    /// Every conjunction of two or more MUST clauses is served by one batched
+    /// `WandCursor`, while a lone MUST clause stays a direct leaf.
+    #[test]
+    fn flat_must_clauses_build_one_batched_conjunction_cursor() {
+        let mut rng = SmallRng::seed_from_u64(11);
+        for musts in 1..=5_usize {
+            let corpus = random_corpus(&mut rng, 1_500, &vec![0.3; musts]);
+            let mask = RowAddrMask::all_rows();
+            let plan = must_should_plan(musts, 0);
+            let all = (0..musts).collect::<Vec<_>>();
+            for limit in [1, 10, 100] {
+                cursor_counters::take();
+                collect_admitted(&corpus, &mask, corpus.leaves(&all), &plan, limit);
+                assert_eq!(
+                    cursor_counters::take(),
+                    usize::from(musts >= 2),
+                    "musts={musts} limit={limit}"
+                );
+            }
+        }
     }
 
     #[test]

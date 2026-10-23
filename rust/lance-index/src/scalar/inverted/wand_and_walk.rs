@@ -355,6 +355,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             .first_score_limit
                             .is_some_and(|limit| first_score <= limit)
                         {
+                            #[cfg(test)]
+                            // The one-term conjunction tests still read this
+                            // lead-score prune through the old module.
+                            super::term_and::test_counters::pruned_candidate();
                             continue;
                         }
                     }

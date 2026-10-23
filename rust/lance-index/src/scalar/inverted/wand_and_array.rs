@@ -100,6 +100,7 @@ impl ArrayLead {
     }
 
     /// Whether the open window has no entry left.
+    #[allow(dead_code)] // Only the dedicated one-term cursor read this.
     pub(super) fn window_drained(&self) -> bool {
         self.pos >= self.docs.len()
     }

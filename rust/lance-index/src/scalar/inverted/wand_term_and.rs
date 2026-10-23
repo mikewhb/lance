@@ -29,6 +29,7 @@ use crate::metrics::MetricsCollector;
 /// competitive floor, scored as the clauses' scores summed from zero in
 /// clause order: the score of a `RequiredConjunctionScorer` over the same
 /// one-term leaves.
+#[allow(dead_code)] // The tree no longer builds this cursor; the next commit deletes it.
 pub(in super::super) struct TermAndCursor<'a, D: WandDocuments> {
     /// Cheapest posting first: the window kernels prune on `lead[0]`.
     #[allow(clippy::vec_box)]
@@ -64,6 +65,7 @@ pub(in super::super) struct TermAndCursor<'a, D: WandDocuments> {
     metrics: &'a dyn MetricsCollector,
 }
 
+#[allow(dead_code)]
 impl<'a, D: WandDocuments> TermAndCursor<'a, D> {
     /// `postings` in clause order. `scorer` must give every posting the same
     /// document weight as that clause's own scorer.
@@ -490,11 +492,11 @@ pub(in crate::scalar::inverted) mod test_counters {
         )
     }
 
-    pub(super) fn skipped_window() {
+    pub(in crate::scalar::inverted) fn skipped_window() {
         SKIPPED_WINDOWS.with(|count| count.set(count.get() + 1));
     }
 
-    pub(super) fn pruned_candidate() {
+    pub(in crate::scalar::inverted) fn pruned_candidate() {
         PRUNED_CANDIDATES.with(|count| count.set(count.get() + 1));
     }
 
@@ -507,11 +509,11 @@ pub(in crate::scalar::inverted) mod test_counters {
         )
     }
 
-    pub(super) fn arrayed_built() {
+    pub(in crate::scalar::inverted) fn arrayed_built() {
         ARRAYED_BUILT.with(|count| count.set(count.get() + 1));
     }
 
-    pub(super) fn array_pruned(pruned: usize) {
+    pub(in crate::scalar::inverted) fn array_pruned(pruned: usize) {
         ARRAY_PRUNED.with(|count| count.set(count.get() + pruned));
     }
 }
