@@ -4225,14 +4225,21 @@ where
             })?;
             Ok((posting, leaf.scorer))
         };
-        let musts = must
+        let mut musts = must
             .iter()
             .map(|&index| take(index).map(|(posting, _)| posting))
             .collect::<Result<Vec<_>>>()?;
         #[cfg(test)]
         TERM_AND_BUILT.with(|count| count.set(count.get() + 1));
-        let required: BoxScorer<'_> =
-            Box::new(TermAndCursor::new(musts, documents, must_scorer, metrics));
+        let required: BoxScorer<'_> = match musts.pop() {
+            Some(posting) if musts.is_empty() => {
+                Box::new(TermLeaf::new(posting, documents, must_scorer, metrics))
+            }
+            last => {
+                musts.extend(last);
+                Box::new(TermAndCursor::new(musts, documents, must_scorer, metrics))
+            }
+        };
         let mut scorer: BoxScorer<'_> = if should.is_empty() {
             required
         } else {
