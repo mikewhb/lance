@@ -2654,6 +2654,8 @@ struct AndWindowStats {
     pairwise_intersections: usize,
     windows_sliced: usize,
     windows_frequency_pruned: usize,
+    /// Candidates the lead's score limit rejected before they were scored.
+    candidates_pruned: usize,
 }
 
 #[cfg(test)]
@@ -2666,8 +2668,8 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         static AND_CURSORS_BATCHED: Cell<usize> = const { Cell::new(0) };
         /// Conjunction cursors that took the array lead.
         static AND_CURSORS_ARRAYED: Cell<usize> = const { Cell::new(0) };
-        /// `(windows skipped by their bound, windows whose frequency table
-        /// pruned candidates)` summed over dropped conjunction cursors.
+        /// `(windows skipped by their bound, candidates rejected by the lead's
+        /// score limit)` summed over dropped conjunction cursors.
         static AND_WINDOW_PRUNES: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
         /// Lead windows and candidates the array lead pruned, summed over
         /// dropped conjunction cursors.
@@ -5610,6 +5612,10 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     and_batch: Option<and_walk::BulkAndState<'a>>,
     and_cands: Vec<(u64, f32, u32)>,
     and_next: usize,
+    // A conjunction with a clause that matches nothing has an empty
+    // intersection. `Wand::new` would drop that clause and hand out documents
+    // missing a required term, so the cursor stays empty instead.
+    exhausted: bool,
 }
 
 impl<'a, D: WandDocuments> WandCursor<'a, D> {
@@ -5621,6 +5627,10 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         params: &FtsSearchParams,
         metrics: &'a dyn MetricsCollector,
     ) -> Self {
+        let empty_intersection = operator == Operator::And
+            && postings
+                .iter()
+                .any(|posting| posting.current_doc_id().is_none());
         let cost = match operator {
             Operator::And => postings.iter().map(PostingIterator::cost).min(),
             Operator::Or => Some(
@@ -5654,6 +5664,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             and_batch: None,
             and_cands: Vec::new(),
             and_next: 0,
+            exhausted: empty_intersection,
         };
         cursor.select_and_route();
         cursor
@@ -5849,6 +5860,11 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     }
 
     fn position_next(&mut self) -> Result<Option<u64>> {
+        if self.exhausted {
+            self.clear_current();
+            self.record_metrics();
+            return Ok(None);
+        }
         if self.and_batch.is_some() {
             let next = self.batch_next()?;
             if next.is_none() {
@@ -5898,6 +5914,9 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     }
 
     pub(super) fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+        if self.exhausted {
+            return Ok(None);
+        }
         if self.doc().is_some_and(|doc| doc >= target) {
             return Ok(self.doc());
         }
@@ -6016,10 +6035,7 @@ impl<D: WandDocuments> Drop for WandCursor<'_, D> {
         #[cfg(test)]
         {
             let stats = &self.wand.and_window_stats;
-            cursor_counters::add_window_prunes(
-                stats.windows_skipped,
-                stats.windows_frequency_pruned,
-            );
+            cursor_counters::add_window_prunes(stats.windows_skipped, stats.candidates_pruned);
             if self.wand.and_lead_arrayed {
                 let array = &self.wand.array_lead.stats;
                 cursor_counters::add_array_prunes(array.windows_skipped + array.lut_prepruned);

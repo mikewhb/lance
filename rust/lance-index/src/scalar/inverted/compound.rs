@@ -7650,9 +7650,9 @@ mod tests {
             take_flat_musts_built();
             let admitted = collect_admitted(&corpus, &mask, corpus.leaves(&[0, 1]), &plan, limit);
             assert_eq!(take_flat_musts_built(), 1, "limit={limit}");
-            let (window_skips, frequency_prunes) = cursor_counters::take_window_prunes();
+            let (window_skips, candidate_prunes) = cursor_counters::take_window_prunes();
             skipped += window_skips;
-            pruned += frequency_prunes;
+            pruned += candidate_prunes;
             let generic = collect_generic(&corpus, &mask, corpus.leaves(&[0, 1]), &plan, limit);
             assert_eq!(score_bits(&admitted), score_bits(&generic), "limit={limit}");
         }
@@ -7702,9 +7702,9 @@ mod tests {
             let admitted =
                 collect_admitted(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
             forwarded += take_required_floors_forwarded();
-            let (window_skips, frequency_prunes) = cursor_counters::take_window_prunes();
+            let (window_skips, candidate_prunes) = cursor_counters::take_window_prunes();
             skipped += window_skips;
-            pruned += frequency_prunes;
+            pruned += candidate_prunes;
             let generic = collect_generic(&corpus, &mask, corpus.leaves(&[0, 1, 2]), &plan, limit);
             assert_eq!(take_required_floors_forwarded(), 0, "limit={limit}");
             assert_eq!(score_bits(&admitted), score_bits(&generic), "limit={limit}");
@@ -8200,5 +8200,29 @@ mod tests {
             BulkAndMode::Off,
         );
         assert_eq!(handed_out, drain(&mut classic));
+    }
+
+    #[test]
+    fn and_cursor_with_an_empty_clause_hands_out_nothing() {
+        let mut rng = SmallRng::seed_from_u64(5);
+        let corpus = random_corpus(&mut rng, 400, &and_densities(2, 1));
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+
+        let mut postings = and_postings(&corpus, 2);
+        // Replace the second clause with one that matches nothing.
+        postings[1] = impact_posting_at(1, 1, &[], &corpus.doc_lengths, &corpus.scorer);
+
+        let mut cursor = WandCursor::new(
+            Operator::And,
+            postings,
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::new(),
+            &metrics,
+        );
+        assert_eq!(cursor.next().unwrap(), None);
+        assert_eq!(cursor.advance(0).unwrap(), None);
     }
 }

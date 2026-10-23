@@ -355,6 +355,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             .first_score_limit
                             .is_some_and(|limit| first_score <= limit)
                         {
+                            #[cfg(test)]
+                            {
+                                self.and_window_stats.candidates_pruned += 1;
+                            }
                             continue;
                         }
                     }
