@@ -8693,31 +8693,42 @@ mod tests {
         let metrics = NoOpMetricsCollector;
         let posting = || impact_posting(0, &corpus.terms[0], &corpus.doc_lengths, &corpus.scorer);
 
-        let mut single = WandCursor::new(
-            Operator::And,
-            vec![posting()],
-            &documents,
-            corpus.scorer.clone(),
-            &FtsSearchParams::default(),
-            &metrics,
-        );
+        // A cursor pair over the same posting. A generation ends as soon as the
+        // posting is walked out, which the random jump sequence reaches long
+        // before the step budget runs out, so the loop restarts on a fresh pair
+        // instead of ending the comparison.
+        let fresh = || {
+            let single = WandCursor::new(
+                Operator::And,
+                vec![posting()],
+                &documents,
+                corpus.scorer.clone(),
+                &FtsSearchParams::default(),
+                &metrics,
+            );
+            let generic = WandCursor::new_without_single_route(
+                Operator::And,
+                vec![posting()],
+                &documents,
+                corpus.scorer.clone(),
+                &FtsSearchParams::default(),
+                &metrics,
+            );
+            (single, generic)
+        };
+        let (mut single, mut generic) = fresh();
         // Guard the differential test itself: both constructors are the same
         // call, so a route regression would compare a cursor with its twin.
         assert!(
             cursor_counters::take_single_posting_cursors() >= 1,
             "the single-posting route was not selected"
         );
-        let mut generic = WandCursor::new_without_single_route(
-            Operator::And,
-            vec![posting()],
-            &documents,
-            corpus.scorer.clone(),
-            &FtsSearchParams::default(),
-            &metrics,
-        );
 
         // Exact scores of the documents handed out so far. Both routes agree on
-        // them bit for bit, so one list serves both bound checks below.
+        // them bit for bit, so one list serves both bound checks below. The
+        // list spans restarts: every generation walks the same posting, so a
+        // bound taken from a fresh cursor still covers the documents listed
+        // here.
         let mut handed_out: Vec<(u64, f32)> = Vec::new();
         let mut compared = 0_usize;
         for _ in 0..2_000 {
@@ -8727,7 +8738,10 @@ mod tests {
                     let b = generic.next().unwrap();
                     assert_eq!(a, b, "next");
                     if a.is_none() {
-                        break;
+                        // Both routes walked the posting to its end; the next
+                        // generation starts the same comparison over.
+                        (single, generic) = fresh();
+                        continue;
                     }
                     compared += 1;
                     assert_same_candidate(&mut single, &mut generic, "next");
@@ -8738,15 +8752,20 @@ mod tests {
                     let a = single.advance(target).unwrap();
                     let b = generic.advance(target).unwrap();
                     assert_eq!(a, b, "advance({target})");
-                    if let Some(found) = a {
-                        assert!(
-                            found >= target,
-                            "advance({target}) went backwards to {found}"
-                        );
-                        compared += 1;
-                        assert_same_candidate(&mut single, &mut generic, "advance");
-                        handed_out.push((single.doc().unwrap(), single.current_score().unwrap()));
-                    }
+                    let Some(found) = a else {
+                        // A jump past the last posting document exhausts both
+                        // routes; restart rather than spend the budget on a
+                        // cursor that has nothing left to hand out.
+                        (single, generic) = fresh();
+                        continue;
+                    };
+                    assert!(
+                        found >= target,
+                        "advance({target}) went backwards to {found}"
+                    );
+                    compared += 1;
+                    assert_same_candidate(&mut single, &mut generic, "advance");
+                    handed_out.push((single.doc().unwrap(), single.current_score().unwrap()));
                 }
                 _ => {
                     // A shallow probe must leave both routes on their document.
