@@ -27,6 +27,12 @@ pub(super) struct SinglePosting {
     /// Whether `position` has run at least once. The first `next` starts at 0;
     /// every later one starts after `current_doc`.
     started: bool,
+    /// Set once the walk was told the remaining range is over for good: no
+    /// posting holds a document past the doc-id domain, so every later call
+    /// must answer `None` too. Without the latch a smaller target afterwards
+    /// would revive the cursor and hand out documents again, which the batched
+    /// conjunction route avoids through `state.done`.
+    done: bool,
     current_doc: Option<DocInfo>,
     current_document_key: Option<u64>,
     /// Computed on the first `score`; most positioned documents are never
@@ -43,6 +49,7 @@ impl SinglePosting {
         Self {
             posting,
             started: false,
+            done: false,
             current_doc: None,
             current_document_key: None,
             current_score: None,
@@ -103,10 +110,16 @@ impl SinglePosting {
     {
         self.clear_current();
         self.started = true;
+        if self.done {
+            return None;
+        }
         loop {
             // Compressed postings hold u32 doc ids, so a larger target is past
-            // every posting; `PostingIterator::next` would truncate it.
+            // every posting; `PostingIterator::next` would truncate it. The
+            // call ends here and so does the cursor: a later smaller target
+            // must not hand out documents the earlier one skipped over.
             if target > u64::from(u32::MAX) {
+                self.done = true;
                 return None;
             }
             let mut up_to = target;
@@ -187,6 +200,16 @@ impl SinglePosting {
     /// current document, so the anchor is put back before returning: a later
     /// skip must bound the block that holds the document it is about to leave.
     pub(super) fn advance_shallow<S: Scorer + ?Sized>(&mut self, target: u64, scorer: &S) -> u64 {
+        // Compressed postings hold u32 doc ids, so a target past that domain
+        // bounds an empty range; `shallow_next` would truncate it. Report the
+        // terminated range the blocked conjunction route reports for a range
+        // with no documents left (`compound_shallow_bound` returns
+        // `TERMINATED_DOC_ID` with an exhausted block's 0.0 bound) and leave
+        // the current document where it is.
+        if target > u64::from(u32::MAX) {
+            self.shallow = Some((target, TERMINATED_DOC_ID, 0.0));
+            return TERMINATED_DOC_ID;
+        }
         let anchored_block = self.posting.block_idx;
         self.posting.shallow_next(target);
         let (up_to, upper) = match self.posting.block_first_doc() {

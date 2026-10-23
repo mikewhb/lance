@@ -5718,7 +5718,11 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     and_next: usize,
     // Highest document the window walk has covered, until a seek step moves
     // past it. A jump beyond `frontier + 1` cannot be served by the walk.
-    batch_frontier: Option<u64>,
+    // Seeded with the first window's start minus one when the walk is built,
+    // so an `advance` into that window is not mistaken for a far jump; only
+    // meaningful while `and_batch` is present, which is why it is a plain
+    // number rather than an absent-before-the-first-window option.
+    batch_frontier: u64,
     // Whether the last handed-out document came from a one-step seek instead of
     // the walk. The next sequential call restarts the walk after that document.
     seeking: bool,
@@ -5824,7 +5828,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             and_batch: None,
             and_cands: Vec::new(),
             and_next: 0,
-            batch_frontier: None,
+            batch_frontier: 0,
             seeking: false,
             single,
             exhausted: empty_intersection,
@@ -5857,7 +5861,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             .unwrap_or_else(|| *BULK_AND_MODE);
         match self.wand.and_route(mode) {
             AndRoute::Bulk => {
-                self.and_batch = Some(and_walk::BulkAndState::new(
+                let state = and_walk::BulkAndState::new(
                     &self.wand,
                     // `BulkAndState::new` reads only these two parameters.
                     &FtsSearchParams {
@@ -5866,7 +5870,12 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                         ..FtsSearchParams::new()
                     },
                     self.wand.floor_mode,
-                ));
+                );
+                // The walk starts its first window at `state.target`, so that
+                // is the first document it can serve: a jump into the window
+                // is not a far jump and needs no seek step.
+                self.batch_frontier = state.target.saturating_sub(1);
+                self.and_batch = Some(state);
                 self.wand.and_batched = true;
                 self.and_cands.reserve(MAX_POSTING_BLOCK_SIZE);
                 #[cfg(test)]
@@ -5896,7 +5905,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         self.wand.and_batched = false;
         self.wand.and_lead_arrayed = false;
         self.wand.array_lead.clear();
-        self.batch_frontier = None;
+        self.batch_frontier = 0;
         self.seeking = false;
         self.select_and_route();
         self
@@ -6053,7 +6062,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             self.wand.bulk_and_step(state, &mut visit)?;
             // `bulk_and_step` leaves `target` one past the window it walked,
             // which is how far this route has already covered.
-            self.batch_frontier = Some(state.target.saturating_sub(1));
+            self.batch_frontier = state.target.saturating_sub(1);
         }
         Ok(true)
     }
@@ -6205,9 +6214,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             // A buffered candidate still covers the target.
             return self.position_next();
         }
-        let covered = self
-            .batch_frontier
-            .map_or(0, |frontier| frontier.saturating_add(1));
+        let covered = self.batch_frontier.saturating_add(1);
         if target > covered {
             // The walk would have to decode and merge a window the caller will
             // not read; one seek step answers the jump instead.
@@ -6244,7 +6251,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         match found {
             Some(doc) => {
                 self.seeking = true;
-                self.batch_frontier = Some(doc);
+                self.batch_frontier = doc;
             }
             // Nothing at or after the target: the conjunction is over.
             None => self.exhausted = true,
