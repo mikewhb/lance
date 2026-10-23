@@ -32,7 +32,7 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        TermLeaf, WandCursor, WandDocuments, required_side_floor, score_sum_upper_bound_factor,
+        WandCursor, WandDocuments, required_side_floor, score_sum_upper_bound_factor,
         single_posting_route_accepts,
     },
 };
@@ -800,66 +800,6 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
 
     fn match_cost(&self) -> Option<f32> {
         self.match_cost()
-    }
-
-    fn scores_non_negative(&self) -> bool {
-        true
-    }
-}
-impl<D: WandDocuments + Sync> ComposableScorer for TermLeaf<'_, D> {
-    fn doc(&self) -> Option<u64> {
-        self.doc()
-    }
-
-    fn document_key(&self) -> Option<u64> {
-        self.document_key()
-    }
-
-    fn next(&mut self) -> Result<Option<u64>> {
-        Ok(self.next())
-    }
-
-    fn advance(&mut self, target: u64) -> Result<Option<u64>> {
-        Ok(self.advance(target))
-    }
-
-    fn cost(&self) -> usize {
-        self.cost()
-    }
-
-    fn score(&mut self) -> Result<f32> {
-        self.score()
-    }
-
-    fn advance_shallow(&mut self, target: u64) -> Result<u64> {
-        Ok(self.advance_shallow(target))
-    }
-
-    fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
-        Ok(ScoreBounds {
-            lower: 0.0,
-            upper: self.score_upper_bound(up_to)?,
-        })
-    }
-
-    fn global_score_upper_bound(&self) -> Option<f32> {
-        TermLeaf::global_score_upper_bound(self)
-    }
-
-    fn set_min_competitive_score(&mut self, min_score: f32) -> Result<()> {
-        if min_score.is_nan() {
-            return Err(Error::invalid_input(
-                "minimum competitive FTS score cannot be NaN",
-            ));
-        }
-        Ok(())
-    }
-
-    fn current_score_upper_bound(&mut self) -> Result<Option<f32>> {
-        if self.doc().is_none() {
-            return Ok(None);
-        }
-        self.score().map(Some)
     }
 
     fn scores_non_negative(&self) -> bool {
@@ -8323,107 +8263,6 @@ mod tests {
         assert_eq!(cursor.advance(0).unwrap(), None);
     }
 
-    /// The single-posting route must hand out the same documents, keys, score
-    /// bits and shallow bounds as the dedicated one-term leaf, under the same
-    /// interleaved probes and with no floor to prune on.
-    #[test]
-    fn single_posting_cursor_matches_term_leaf_bit_for_bit() {
-        let mut rng = SmallRng::seed_from_u64(0x51_1E);
-        let num_docs = 1_200_usize;
-        let corpus = random_corpus(&mut rng, num_docs, &[0.35]);
-        let mask = deletion_mask(&mut rng, num_docs, 0.1);
-        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
-        let metrics = NoOpMetricsCollector;
-        let posting = || impact_posting(0, &corpus.terms[0], &corpus.doc_lengths, &corpus.scorer);
-
-        let mut cursor = WandCursor::new(
-            Operator::And,
-            vec![posting()],
-            &documents,
-            corpus.scorer.clone(),
-            &FtsSearchParams::default(),
-            &metrics,
-        );
-        let mut leaf = TermLeaf::new(posting(), &documents, corpus.scorer.clone(), &metrics);
-
-        let mut compared = 0_usize;
-        for _ in 0..2_000 {
-            match rng.random_range(0..7_u32) {
-                0..=1 => {
-                    let a = cursor.next().unwrap();
-                    let b = leaf.next();
-                    assert_eq!(a, b, "next");
-                    if a.is_none() {
-                        break;
-                    }
-                    compared += 1;
-                }
-                2..=3 => {
-                    let target = cursor.doc().unwrap_or(0) + rng.random_range(0..600_u64);
-                    let a = cursor.advance(target).unwrap();
-                    let b = leaf.advance(target);
-                    assert_eq!(a, b, "advance({target})");
-                    if a.is_some() {
-                        assert!(a.unwrap() >= target, "advance went backwards");
-                        compared += 1;
-                    }
-                }
-                4 | 5 => {
-                    let target = cursor.doc().unwrap_or(0);
-                    let up_to = cursor.advance_shallow(target).unwrap();
-                    assert_eq!(up_to, leaf.advance_shallow(target), "shallow({target})");
-                    assert_eq!(cursor.doc(), leaf.doc(), "shallow moved the document");
-                    let span = (up_to - target).min(1_000);
-                    let probe = target + rng.random_range(0..=span);
-                    assert_eq!(
-                        cursor.score_upper_bound(probe).unwrap().to_bits(),
-                        leaf.score_upper_bound(probe).unwrap().to_bits(),
-                        "bound({probe})"
-                    );
-                }
-                _ => {
-                    if cursor.doc().is_some() {
-                        assert_eq!(cursor.doc(), leaf.doc(), "doc");
-                        assert_eq!(cursor.document_key(), leaf.document_key(), "key");
-                        assert_eq!(
-                            cursor.current_score().unwrap().to_bits(),
-                            leaf.score().unwrap().to_bits(),
-                            "score"
-                        );
-                    }
-                }
-            }
-        }
-        assert!(compared > 100, "only {compared} documents compared");
-
-        // A posting that matches nothing ends on the first `next`.
-        let empty = |term: usize| {
-            impact_posting_at(term, term as u32, &[], &corpus.doc_lengths, &corpus.scorer)
-        };
-        let mut cursor = WandCursor::new(
-            Operator::And,
-            vec![empty(0)],
-            &documents,
-            corpus.scorer.clone(),
-            &FtsSearchParams::default(),
-            &metrics,
-        );
-        let mut leaf = TermLeaf::new(empty(0), &documents, corpus.scorer.clone(), &metrics);
-        assert_eq!(cursor.next().unwrap(), None);
-        assert_eq!(leaf.next(), None);
-
-        // Past the compressed doc-id domain the route ends instead of truncating.
-        let mut cursor = WandCursor::new(
-            Operator::And,
-            vec![posting()],
-            &documents,
-            corpus.scorer.clone(),
-            &FtsSearchParams::default(),
-            &metrics,
-        );
-        assert_eq!(cursor.advance(u64::from(u32::MAX) + 10).unwrap(), None);
-    }
-
     /// The single-posting route must agree with the generic WAND route over the
     /// same posting: same documents, keys and score bits, whatever the driving
     /// pattern.
@@ -8487,6 +8326,50 @@ mod tests {
             }
         }
         assert!(compared > 100, "only {compared} documents compared");
+
+        // A posting that matches nothing ends on the first `next`, and a target
+        // past the compressed doc-id domain ends instead of truncating.
+        let empty = |term: usize| {
+            impact_posting_at(term, term as u32, &[], &corpus.doc_lengths, &corpus.scorer)
+        };
+        let mut single = WandCursor::new(
+            Operator::And,
+            vec![empty(0)],
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::default(),
+            &metrics,
+        );
+        let mut generic = WandCursor::new_without_single_route(
+            Operator::And,
+            vec![empty(0)],
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::default(),
+            &metrics,
+        );
+        assert_eq!(single.next().unwrap(), None);
+        assert_eq!(generic.next().unwrap(), None);
+        for cursor in [&mut single, &mut generic] {
+            assert_eq!(
+                cursor.advance(u64::from(u32::MAX) + 10).unwrap(),
+                None,
+                "advance past the doc-id domain"
+            );
+        }
+        let mut single = WandCursor::new(
+            Operator::And,
+            vec![posting()],
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::default(),
+            &metrics,
+        );
+        assert_eq!(
+            single.advance(u64::from(u32::MAX) + 10).unwrap(),
+            None,
+            "a live posting must end past the doc-id domain"
+        );
     }
 
     /// A rising competitive floor must not change which documents reach the top
@@ -8863,10 +8746,12 @@ mod tests {
             .leaves(&all)
             .into_iter()
             .map(|mut leaf| -> BoxScorer<'_> {
-                Box::new(TermLeaf::new(
-                    leaf.postings.pop().expect("one posting per leaf"),
+                Box::new(WandCursor::new_without_single_route(
+                    leaf.operator,
+                    vec![leaf.postings.pop().expect("one posting per leaf")],
                     &documents,
                     leaf.scorer,
+                    leaf.params.as_ref(),
                     &metrics,
                 ))
             })
@@ -8950,10 +8835,12 @@ mod tests {
                 .leaves(&all)
                 .into_iter()
                 .map(|mut leaf| -> BoxScorer<'_> {
-                    Box::new(TermLeaf::new(
-                        leaf.postings.pop().expect("one posting per leaf"),
+                    Box::new(WandCursor::new_without_single_route(
+                        leaf.operator,
+                        vec![leaf.postings.pop().expect("one posting per leaf")],
                         &documents,
                         leaf.scorer,
+                        leaf.params.as_ref(),
                         &metrics,
                     ))
                 })

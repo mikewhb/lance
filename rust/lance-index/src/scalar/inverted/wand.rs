@@ -34,13 +34,8 @@ mod intersection;
 #[path = "wand_maxscore.rs"]
 mod maxscore;
 
-#[path = "wand_term_leaf.rs"]
-mod term_leaf;
-
 #[path = "wand_single.rs"]
 mod single;
-
-pub(super) use term_leaf::TermLeaf;
 
 #[cfg(test)]
 pub(super) mod or_seek_counters {
