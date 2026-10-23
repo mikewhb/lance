@@ -3163,6 +3163,8 @@ impl ComposableScorer for BoostScorer<'_> {
 /// cannot reach the floor on its own.
 #[derive(Clone, Copy)]
 struct ReqOptBounds {
+    /// First document the cached bounds cover.
+    from: u64,
     up_to: u64,
     required: ScoreBounds,
     combined: ScoreBounds,
@@ -3181,6 +3183,8 @@ struct ReqOptScorer<'a> {
     confirmed: bool,
     min_competitive_score: f32,
     shallow_bounds: Option<ReqOptBounds>,
+    /// Start of the shallow window last opened for `shallow_bounds`.
+    window_from: u64,
     forwards_required_floor: bool,
     /// Bound of every required score, read once.
     required_global_upper: Option<f32>,
@@ -3204,6 +3208,7 @@ impl<'a> ReqOptScorer<'a> {
             confirmed: false,
             min_competitive_score: f32::NEG_INFINITY,
             shallow_bounds: None,
+            window_from: 0,
             forwards_required_floor: false,
             required_global_upper,
         }
@@ -3268,6 +3273,7 @@ impl<'a> ReqOptScorer<'a> {
     /// side is left at or after `target`.
     fn shallow_window(&mut self, target: u64) -> Result<u64> {
         self.shallow_bounds = None;
+        self.window_from = target;
         let mut up_to = self.required.advance_shallow(target)?;
         match self.ensure_optional_at_or_after(target)? {
             Some(optional_doc) if optional_doc <= target => {
@@ -3286,8 +3292,12 @@ impl<'a> ReqOptScorer<'a> {
     }
 
     fn bounds(&mut self, up_to: u64) -> Result<ReqOptBounds> {
+        // A parent may ask for a prefix of this window after the children have
+        // moved and cleared their own shallow state. The cached upper bound
+        // still covers every document in that prefix.
         if let Some(bounds) = self.shallow_bounds
-            && bounds.up_to == up_to
+            && bounds.from <= up_to
+            && up_to <= bounds.up_to
         {
             return Ok(bounds);
         }
@@ -3305,6 +3315,7 @@ impl<'a> ReqOptScorer<'a> {
         };
         let combined = required.add(optional);
         let bounds = ReqOptBounds {
+            from: self.window_from,
             up_to,
             required,
             combined,
@@ -3486,6 +3497,7 @@ impl ComposableScorer for ReqOptScorer<'_> {
     fn advance_shallow(&mut self, target: u64) -> Result<u64> {
         let target = self.current.map_or(target, |current| target.max(current));
         if let Some(bounds) = self.shallow_bounds
+            && bounds.from <= target
             && target <= bounds.up_to
         {
             return Ok(bounds.up_to);
@@ -7973,6 +7985,126 @@ mod tests {
                 optional.len()
             );
         }
+    }
+
+    /// One posting whose block ends at `block_end`. `advance` drops the shallow
+    /// mark, so `score_bounds` is only valid after `advance_shallow`.
+    struct WindowEndScorer {
+        doc_id: u64,
+        score: f32,
+        block_end: u64,
+        positioned: bool,
+        shallow_end: Option<u64>,
+    }
+
+    impl WindowEndScorer {
+        fn new(doc_id: u64, score: f32, block_end: u64) -> Self {
+            Self {
+                doc_id,
+                score,
+                block_end,
+                positioned: false,
+                shallow_end: None,
+            }
+        }
+    }
+
+    impl ComposableScorer for WindowEndScorer {
+        fn doc(&self) -> Option<u64> {
+            self.positioned.then_some(self.doc_id)
+        }
+
+        fn next(&mut self) -> Result<Option<u64>> {
+            let target = if self.positioned {
+                self.doc_id.saturating_add(1)
+            } else {
+                0
+            };
+            self.advance(target)
+        }
+
+        fn advance(&mut self, target: u64) -> Result<Option<u64>> {
+            if self.positioned && self.doc_id >= target {
+                return Ok(Some(self.doc_id));
+            }
+            self.shallow_end = None;
+            if self.doc_id < target {
+                self.positioned = false;
+                return Ok(None);
+            }
+            self.positioned = true;
+            Ok(Some(self.doc_id))
+        }
+
+        fn cost(&self) -> usize {
+            1
+        }
+
+        fn score(&mut self) -> Result<f32> {
+            Ok(self.score)
+        }
+
+        fn advance_shallow(&mut self, target: u64) -> Result<u64> {
+            let up_to = self.block_end.max(target);
+            self.shallow_end = Some(up_to);
+            Ok(up_to)
+        }
+
+        fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+            let Some(end) = self.shallow_end else {
+                return Err(Error::internal(
+                    "score bound requires advance_shallow on the window-end scorer",
+                ));
+            };
+            if up_to > end {
+                return Err(Error::internal(format!(
+                    "window-end bound up_to={up_to} is past shallow end {end}"
+                )));
+            }
+            Ok(ScoreBounds {
+                lower: 0.0,
+                upper: self.score,
+            })
+        }
+
+        fn global_score_upper_bound(&self) -> Option<f32> {
+            Some(self.score)
+        }
+
+        fn set_min_competitive_score(&mut self, _min_score: f32) -> Result<()> {
+            Ok(())
+        }
+
+        fn scores_non_negative(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn reqopt_reuses_a_wider_window_when_a_parent_narrows_it() {
+        let required = WindowEndScorer::new(20, 0.2, 100);
+        let optional = WindowEndScorer::new(20, 5.0, 100);
+        let positive = BooleanScorer::try_new(
+            vec![Box::new(optional)],
+            vec![Box::new(required)],
+            Vec::new(),
+        )
+        .unwrap();
+        let mut boost = BoostScorer::try_new(
+            Box::new(positive),
+            Box::new(WindowEndScorer::new(20, 0.0, 50)),
+            1.0,
+        )
+        .unwrap();
+        boost.set_min_competitive_score(1.0).unwrap();
+
+        let doc = boost.next().unwrap().expect("the boosted hit stays live");
+        assert_eq!(doc, 20);
+        let up_to = boost.advance_shallow(doc).unwrap();
+        assert_eq!(up_to, 50, "the negative side narrows the positive window");
+        boost
+            .score_bounds(up_to)
+            .expect("a prefix of the cached ReqOpt window reuses that window");
     }
 
     #[test]
