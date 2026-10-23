@@ -8476,4 +8476,101 @@ mod tests {
             "{requeued} requeues over {seeks} seeks: every seek requeued every posting"
         );
     }
+
+    /// Under no floor a disjunction cursor only positions itself: it never
+    /// refreshes a block-max window and never walks the tail. Once a floor
+    /// arrives the bookkeeping resumes, and pruning still drops exactly the
+    /// documents whose score is below it.
+    #[test]
+    fn or_cursor_without_a_floor_skips_wand_bookkeeping() {
+        let num_docs = 4_096_u32;
+        let doc_lengths = (0..num_docs).map(|doc| 1 + doc % 19).collect::<Vec<_>>();
+        let strides = [1_u32, 53, 211, 677];
+        let terms = strides
+            .iter()
+            .map(|&stride| {
+                (0..num_docs)
+                    .filter(|doc| doc % stride == 0)
+                    .map(|doc| (doc, 1 + doc % 5))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let corpus = Corpus::new(doc_lengths, terms);
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let all = (0..strides.len()).collect::<Vec<_>>();
+        let postings = || {
+            corpus
+                .leaves(&all)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, mut leaf)| {
+                    leaf.postings
+                        .pop()
+                        .expect("one posting per leaf")
+                        .with_query_position(rank as u32)
+                })
+                .collect::<Vec<_>>()
+        };
+        let reference = || {
+            let leaves = corpus
+                .leaves(&all)
+                .into_iter()
+                .map(|mut leaf| -> BoxScorer<'_> {
+                    Box::new(TermLeaf::new(
+                        leaf.postings.pop().expect("one posting per leaf"),
+                        &documents,
+                        leaf.scorer,
+                        &metrics,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            Box::new(DisjunctionScorer::try_new(leaves, DisjunctionScore::Sum).unwrap())
+        };
+        // Hand out `floor_after` documents, raise the floor, keep going, and
+        // report the window refreshes seen before the floor.
+        let drain = |floor_after: Option<usize>| -> (Vec<(u64, u32)>, usize, usize) {
+            let mut cursor = WandCursor::new(
+                Operator::Or,
+                postings(),
+                &documents,
+                corpus.scorer.clone(),
+                &FtsSearchParams::default(),
+                &metrics,
+            );
+            let mut reference = reference();
+            cursor_counters::take_or_window_refreshes();
+            let mut before_floor = 0;
+            let mut rows = Vec::new();
+            while let Some(doc) = cursor.next().unwrap() {
+                assert_eq!(reference.next().unwrap(), Some(doc));
+                let bits = cursor.score().unwrap().to_bits();
+                assert_eq!(reference.score().unwrap().to_bits(), bits, "doc={doc}");
+                rows.push((doc, bits));
+                if floor_after == Some(rows.len()) {
+                    before_floor = cursor_counters::take_or_window_refreshes();
+                    cursor.set_min_competitive_score(f32::MIN_POSITIVE).unwrap();
+                }
+            }
+            assert_eq!(reference.next().unwrap(), None);
+            let after_floor = cursor_counters::take_or_window_refreshes();
+            (rows, before_floor, after_floor)
+        };
+
+        let (unfloored, before, after) = drain(None);
+        assert!(unfloored.len() > 100, "only {} documents", unfloored.len());
+        assert_eq!(
+            before + after,
+            0,
+            "a disjunction without a floor scouted windows"
+        );
+
+        // A floor that no reached block bound can fall below rejects nothing,
+        // so the documents and their score bits are unchanged.
+        let (floored, before, after) = drain(Some(10));
+        assert_eq!(before, 0, "the floor-free prefix scouted windows");
+        assert!(after > 0, "the floor never refreshed a window");
+        assert_eq!(floored, unfloored);
+    }
 }

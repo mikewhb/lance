@@ -2693,6 +2693,9 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         /// Lead windows and candidates the array lead pruned, summed over
         /// dropped conjunction cursors.
         static AND_ARRAY_PRUNES: Cell<usize> = const { Cell::new(0) };
+        /// Block-max window refreshes a disjunction cursor ran, since the
+        /// previous reset.
+        static OR_WINDOW_REFRESHES: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn and_cursor_batched() {
@@ -2717,6 +2720,10 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         AND_ARRAY_PRUNES.with(|count| count.set(count.get().saturating_add(pruned)));
     }
 
+    pub(super) fn or_window_refresh() {
+        OR_WINDOW_REFRESHES.with(|count| count.set(count.get() + 1));
+    }
+
     pub(in crate::scalar::inverted) fn take_batched() -> usize {
         AND_CURSORS_BATCHED.with(|count| count.replace(0))
     }
@@ -2731,6 +2738,10 @@ pub(in crate::scalar::inverted) mod cursor_counters {
 
     pub(in crate::scalar::inverted) fn take_array_prunes() -> usize {
         AND_ARRAY_PRUNES.with(|count| count.replace(0))
+    }
+
+    pub(in crate::scalar::inverted) fn take_or_window_refreshes() -> usize {
+        OR_WINDOW_REFRESHES.with(|count| count.replace(0))
     }
 }
 
@@ -2799,6 +2810,10 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // cursor of `lead` then belongs to the window walk, so a shallow probe must
     // not steer it: `compound_shallow_bound` restores the anchors afterwards.
     and_batched: bool,
+    // Set by `WandCursor` for a disjunction: the cursor recomputes every
+    // candidate's score in query order, so `next` may skip the per-candidate
+    // score and window bookkeeping while there is no floor to compare against.
+    or_score_recomputed: bool,
     // Score-first conjunction pruning is restricted to the current impact
     // format and scorers that expose the BM25 denominator contract.
     score_first_and_enabled: bool,
@@ -2933,6 +2948,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             and_lead_arrayed: false,
             array_lead: ArrayLead::new(),
             and_batched: false,
+            or_score_recomputed: false,
             score_first_and_enabled,
             #[cfg(test)]
             disable_score_first_and: false,
@@ -4289,6 +4305,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             return Ok(candidate.map(|doc| (doc, self.and_candidate_score.unwrap_or(0.0))));
         }
 
+        // With no floor nothing can be rejected, so the disjunction only has to
+        // report the next candidate. The window refresh, the candidate score
+        // and the tail walk exist to compare that score against a floor, and
+        // the caller scores the candidate itself in query order.
+        let unfloored = self.threshold <= 0.0 && self.or_score_recomputed;
         loop {
             let Some(target) = self.head_doc() else {
                 if self.advance_tail_to_next_or_window() {
@@ -4297,12 +4318,21 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 return Ok(None);
             };
 
-            if self.up_to.is_none_or(|up_to| target > up_to) {
+            if !unfloored && self.up_to.is_none_or(|up_to| target > up_to) {
+                #[cfg(test)]
+                cursor_counters::or_window_refresh();
                 self.update_max_scores(target);
             }
             self.move_head_doc_to_lead(target);
             if self.lead.is_empty() {
                 continue;
+            }
+            if unfloored {
+                let Some(first_doc) = self.lead.first().and_then(|posting| posting.doc()) else {
+                    self.push_back_leads(target + 1);
+                    continue;
+                };
+                return Ok(Some((first_doc, 0.0)));
             }
 
             // Block-Max WAND pruning: skip the whole window when its score upper
@@ -5663,6 +5693,10 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         .min(documents.visible_cost_upper_bound());
         let mut wand = Wand::new(operator, postings.into_iter(), documents, scorer)
             .with_floor_mode(CompetitiveFloorMode::Inclusive);
+        if operator == Operator::Or {
+            // The cursor scores each candidate itself, in query order.
+            wand.or_score_recomputed = true;
+        }
         if params.phrase_slop.is_some() {
             wand.score_first_and_enabled = false;
         }
@@ -6038,9 +6072,14 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         }
         let floor = min_score * self.wand_factor;
         if floor > self.wand.threshold {
-            if self.wand.score_first_and_enabled && self.wand.threshold <= 0.0 && floor > 0.0 {
+            if self.wand.threshold <= 0.0 && floor > 0.0 {
+                // Nothing scouted a block window while there was no floor, so
+                // the next candidate has to establish one before pruning uses
+                // it.
                 self.wand.up_to = None;
-                self.wand.invalidate_score_first_and_window();
+                if self.wand.score_first_and_enabled {
+                    self.wand.invalidate_score_first_and_window();
+                }
             }
             self.wand.threshold = floor;
         }
