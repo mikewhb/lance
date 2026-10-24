@@ -13,9 +13,10 @@ use std::cell::OnceCell;
 use lance_core::{Error, Result};
 
 use super::super::scorer::Scorer;
+use super::and_kernel::{self, LeadBound};
 use super::{
     CompetitiveFloorMode, DocInfo, PostingIterator, RawDocInfo, TERMINATED_DOC_ID, WandDocuments,
-    and_kernel, conservative_score_sum,
+    conservative_score_sum,
 };
 
 /// Walk state of the single-posting route.
@@ -41,6 +42,10 @@ pub(super) struct SinglePosting {
     /// `(target, up_to, upper)` of the last `advance_shallow`.
     shallow: Option<(u64, u64, f32)>,
     global_score_upper_bound: OnceCell<Option<f32>>,
+    /// The one lead-bound decision for this posting. The single route is
+    /// built only for cursors, so it starts in inclusive mode; `position`
+    /// re-aligns the mode if a caller ever passes the other one.
+    lead_bound: LeadBound,
     comparisons: usize,
 }
 
@@ -55,6 +60,7 @@ impl SinglePosting {
             current_score: None,
             shallow: None,
             global_score_upper_bound: OnceCell::new(),
+            lead_bound: LeadBound::new(CompetitiveFloorMode::Inclusive, 1),
             comparisons: 0,
         }
     }
@@ -128,7 +134,18 @@ impl SinglePosting {
                 up_to = and_kernel::posting_block_up_to(&self.posting, target);
                 let upper =
                     conservative_score_sum(std::iter::once(self.posting.block_max_score(scorer)));
-                if floor_mode.rejects_upper_bound(f64::from(upper), floor) {
+                // The old test was `floor_mode.rejects_upper_bound(upper, floor)`.
+                // With `others = 0.0` and one clause (`factor = 1`),
+                // `score_sum_cannot_compete(s, 0.0, floor, 1.0, mode)` reduces
+                // to `outward_f32_upper_bound(f64::from(s))` -- exactly `s` for
+                // every `f32` -- compared to the floor, so the limit is the
+                // largest rejected `f32` (the floor itself in exclusive mode,
+                // its predecessor in inclusive mode) and `rejects_score(upper)`
+                // accepts unless `upper` was already rejected. The skipped set
+                // is therefore unchanged.
+                self.lead_bound.set_floor_mode(floor_mode);
+                self.lead_bound.prepare(&self.posting, scorer, floor, 0.0);
+                if self.lead_bound.rejects_score(upper) {
                     if up_to == TERMINATED_DOC_ID {
                         return None;
                     }

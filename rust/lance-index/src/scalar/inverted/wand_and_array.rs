@@ -12,11 +12,10 @@
 //! exact doc-length prune.
 
 use super::super::scorer::Scorer;
-use super::and_kernel::{lead_freq_bound_lut, posting_block_up_to};
+use super::and_kernel::{LeadBound, posting_block_up_to};
 use super::{
-    CompetitiveFloorMode, DocInfo, FREQ_LUT_BUCKETS, MAX_POSTING_BLOCK_SIZE, PostingIterator,
-    PostingList, RawDocInfo, TERMINATED_DOC_ID, WB_LATCH_SKIP_COUNT, WB_REPROBE_INTERVAL,
-    conservative_score_sum, score_sum_cannot_compete, score_sum_upper_bound_factor, skip_lead_docs,
+    DocInfo, MAX_POSTING_BLOCK_SIZE, PostingIterator, PostingList, RawDocInfo, TERMINATED_DOC_ID,
+    WB_LATCH_SKIP_COUNT, WB_REPROBE_INTERVAL, conservative_score_sum, skip_lead_docs,
 };
 
 /// Walk state of the array-backed lead. `lead[0]` of the driving conjunction
@@ -37,12 +36,6 @@ pub(super) struct ArrayLead {
     pub(super) windows_since_check: u32,
     pub(super) total_skips: u32,
     pub(super) always_check: bool,
-    // Length-independent upper bounds of the lead clause's score contribution
-    // per frequency bucket. Depends only on the lead clause and the scorer --
-    // never on candidate or window state -- so it stays valid across windows
-    // and is deliberately kept by `clear` (rebuilding it for an identical
-    // query would be pure overhead).
-    freq_bound: Option<[f32; FREQ_LUT_BUCKETS]>,
     #[cfg(test)]
     pub(super) stats: ArrayLeadStats,
 }
@@ -73,7 +66,6 @@ impl ArrayLead {
             windows_since_check: WB_REPROBE_INTERVAL,
             total_skips: 0,
             always_check: false,
-            freq_bound: None,
             #[cfg(test)]
             stats: ArrayLeadStats::default(),
         }
@@ -208,7 +200,7 @@ impl ArrayLead {
         lead: &mut [Box<PostingIterator>],
         scorer: &S,
         floor: f32,
-        floor_mode: CompetitiveFloorMode,
+        lead_bound: &mut LeadBound,
         prune: bool,
         doc_length: impl Fn(&DocInfo) -> u32,
     ) -> Option<(DocInfo, u32)> {
@@ -269,19 +261,8 @@ impl ArrayLead {
                     .iter()
                     .map(|posting| f64::from(posting.block_max_score(scorer)))
                     .sum::<f64>();
-                let lut = self
-                    .freq_bound
-                    .get_or_insert_with(|| lead_freq_bound_lut(&lead[0], scorer));
-                let lut_bound = lut[(freq as usize).min(FREQ_LUT_BUCKETS - 1)];
-                if lut_bound.is_finite()
-                    && score_sum_cannot_compete(
-                        lut_bound,
-                        remaining_upper_bound,
-                        floor,
-                        score_sum_upper_bound_factor(num_terms),
-                        floor_mode,
-                    )
-                {
+                lead_bound.prepare(&lead[0], scorer, floor, remaining_upper_bound);
+                if lead_bound.rejects_freq(freq) {
                     #[cfg(test)]
                     {
                         self.stats.lut_prepruned += 1;
@@ -290,13 +271,7 @@ impl ArrayLead {
                     continue;
                 }
                 let length = doc_length(&lead_doc);
-                if score_sum_cannot_compete(
-                    lead[0].score(scorer, lead_doc.frequency(), length),
-                    remaining_upper_bound,
-                    floor,
-                    score_sum_upper_bound_factor(num_terms),
-                    floor_mode,
-                ) {
+                if lead_bound.rejects_score(lead[0].score(scorer, lead_doc.frequency(), length)) {
                     self.pos += 1;
                     continue;
                 }

@@ -23,8 +23,9 @@ use super::super::scorer::{Scorer, bm25_doc_weight_with_norm};
 #[cfg(target_arch = "x86_64")]
 use super::find_next_geq_avx2;
 use super::{
-    FREQ_LUT_BUCKETS, PostingIterator, PostingList, TERMINATED_DOC_ID, conservative_score_sum,
-    find_next_geq, find_next_geq_scalar, intersection,
+    CompetitiveFloorMode, FREQ_LUT_BUCKETS, PostingIterator, PostingList, TERMINATED_DOC_ID,
+    conservative_score_sum, find_next_geq, find_next_geq_scalar, intersection, partial_score_limit,
+    score_sum_upper_bound_factor,
 };
 use smallvec::SmallVec;
 
@@ -695,6 +696,94 @@ pub(super) fn load_window_freqs(lead: &[Box<PostingIterator>], wins: &mut [Windo
     }
 }
 
+/// Single owner of the "can the lead still reach the floor" decision.
+///
+/// A conjunction prunes a candidate when the lead's bound plus the followers'
+/// bound cannot compete, and pre-filters it by frequency bucket. The two tests
+/// are the same predicate at different inputs: `partial_score_limit` is the
+/// largest `f32` lead score that `score_sum_cannot_compete` still rejects, so
+/// `rejects_score` is exactly that predicate and `rejects_freq` is its
+/// frequency-bucket relaxation. Keeping both plus the mask here means the
+/// classic, arrayed, bulk and single-posting routes cannot drift apart.
+///
+/// The limit depends only on the floor and the followers' bound; every
+/// candidate in a window shares those, so `prepare` recomputes them only when
+/// the `(floor, others)` bit patterns change. The frequency table depends only
+/// on the lead clause and the scorer and is built once.
+pub(super) struct LeadBound {
+    floor_mode: CompetitiveFloorMode,
+    factor: f64,
+    lut: Option<[f32; FREQ_LUT_BUCKETS]>,
+    key: Option<(u32, u64)>,
+    limit: Option<f32>,
+    freq_rejected: [bool; FREQ_LUT_BUCKETS],
+}
+
+impl LeadBound {
+    pub(super) fn new(floor_mode: CompetitiveFloorMode, num_terms: usize) -> Self {
+        Self {
+            floor_mode,
+            factor: score_sum_upper_bound_factor(num_terms),
+            lut: None,
+            key: None,
+            limit: None,
+            freq_rejected: [false; FREQ_LUT_BUCKETS],
+        }
+    }
+
+    /// Aligns the cached floor mode with a caller that decides it after
+    /// construction. The frequency table is mode-independent and survives; a
+    /// mode change only invalidates the limit.
+    pub(super) fn set_floor_mode(&mut self, floor_mode: CompetitiveFloorMode) {
+        if self.floor_mode != floor_mode {
+            self.floor_mode = floor_mode;
+            self.key = None;
+            self.limit = None;
+        }
+    }
+
+    /// Recomputes the limit only when `(floor, others)` changed.
+    pub(super) fn prepare<S: Scorer + ?Sized>(
+        &mut self,
+        lead: &PostingIterator,
+        scorer: &S,
+        floor: f32,
+        others: f64,
+    ) {
+        let lut = self
+            .lut
+            .get_or_insert_with(|| lead_freq_bound_lut(lead, scorer));
+        let key = (floor.to_bits(), others.to_bits());
+        if self.key == Some(key) {
+            return;
+        }
+        self.limit = partial_score_limit(others, floor, self.factor, self.floor_mode);
+        self.freq_rejected = match self.limit {
+            Some(limit) => std::array::from_fn(|frequency| lut[frequency] <= limit),
+            None => [false; FREQ_LUT_BUCKETS],
+        };
+        self.key = Some(key);
+    }
+
+    /// Whether this frequency bucket's lead bound is at or below the limit.
+    #[inline]
+    pub(super) fn rejects_freq(&self, freq: u32) -> bool {
+        self.freq_rejected[(freq as usize).min(FREQ_LUT_BUCKETS - 1)]
+    }
+
+    /// Whether a lead score at or below the limit cannot compete.
+    #[inline]
+    pub(super) fn rejects_score(&self, score: f32) -> bool {
+        self.limit.is_some_and(|limit| score <= limit)
+    }
+
+    /// The per-frequency rejection mask for the bulk merge kernels.
+    #[inline]
+    pub(super) fn freq_rejected(&self) -> &[bool; FREQ_LUT_BUCKETS] {
+        &self.freq_rejected
+    }
+}
+
 /// Upper bound of `lead`'s score by clamped frequency, independent of the
 /// document length. A negative query weight gets an all-infinite table, so
 /// the pre-filter never fires for it.
@@ -704,6 +793,14 @@ pub(super) fn lead_freq_bound_lut<S: Scorer + ?Sized>(
 ) -> [f32; FREQ_LUT_BUCKETS] {
     let mut lut = [f32::INFINITY; FREQ_LUT_BUCKETS];
     if lead.query_weight < 0.0 {
+        return lut;
+    }
+    // A grouped leaf scores its expansions through `GroupedTermScorer`, not
+    // `query_weight * doc_weight`, so a per-frequency table is not an upper
+    // bound for it. No route frequency-filters a grouped lead, but a classic
+    // route still builds this table through `LeadBound`; leaving it infinite
+    // keeps that construction harmless.
+    if lead.has_grouped_terms() {
         return lut;
     }
     // Prefer the scorer's explicit per-frequency upper bound. A scorer

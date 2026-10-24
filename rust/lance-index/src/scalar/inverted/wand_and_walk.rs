@@ -75,17 +75,14 @@ pub(super) struct BulkAndState<'a> {
     pub(super) intersection_scratch: Vec<u32>,
     /// Per-clause frequencies of the candidate being visited, in lead order.
     pub(super) hit_freqs: Vec<u32>,
-    pub(super) freq_cannot_beat: [bool; FREQ_LUT_BUCKETS],
-    pub(super) freq_cannot_beat_key: Option<(u32, u64)>,
-    pub(super) freq_bound_lut: Option<[f32; FREQ_LUT_BUCKETS]>,
     pub(super) slice_prev: SmallVec<[(usize, usize); 8]>,
     pub(super) norm_k: Option<NormKCache<'a>>,
     pub(super) norm_k_initialized: bool,
-    pub(super) first_score_limit: Option<f32>,
-    pub(super) first_score_limit_key: Option<(u32, u64)>,
     pub(super) target: u64,
     pub(super) num_comparisons: usize,
     pub(super) done: bool,
+    /// Floor mode for the phrase early-score check. The lead-bound decisions
+    /// read the wand's `LeadBound`, which carries the same mode.
     pub(super) floor_mode: CompetitiveFloorMode,
 }
 
@@ -134,14 +131,9 @@ impl<'a> BulkAndState<'a> {
             cursor_scratch: Vec::with_capacity(num_lists),
             intersection_scratch: Vec::new(),
             hit_freqs: Vec::with_capacity(num_lists),
-            freq_cannot_beat: [false; FREQ_LUT_BUCKETS],
-            freq_cannot_beat_key: None,
-            freq_bound_lut: None,
             slice_prev: std::iter::repeat_n((usize::MAX, 0), num_lists).collect(),
             norm_k: None,
             norm_k_initialized: false,
-            first_score_limit: None,
-            first_score_limit_key: None,
             target,
             num_comparisons: 0,
             done,
@@ -183,9 +175,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
         let window_started_with_floor = self.threshold > 0.0;
         if window_started_with_floor {
-            if num_lists >= 2 && state.freq_bound_lut.is_none() {
-                state.freq_bound_lut = Some(self.build_lead_freq_bound_lut());
-            }
             let advanced = self.and_advance_target(state.target);
             if advanced == TERMINATED_DOC_ID {
                 state.done = true;
@@ -226,33 +215,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             if window_started_with_floor && num_lists >= 2 {
                 and_kernel::load_window_freqs(&self.lead[..1], &mut wins[..1]);
                 let others = others_block_max.expect("positive floor should initialize bounds");
-                let key = (self.threshold.to_bits(), others.to_bits());
-                if state.first_score_limit_key != Some(key) {
-                    state.first_score_limit = partial_score_limit(
-                        others,
-                        self.threshold,
-                        score_sum_upper_bound_factor(num_lists),
-                        state.floor_mode,
-                    );
-                    state.first_score_limit_key = Some(key);
-                }
-                if state.freq_cannot_beat_key != Some(key) {
-                    let lut = state
-                        .freq_bound_lut
-                        .as_ref()
-                        .expect("positive threshold should initialize the frequency bound LUT");
-                    state.freq_cannot_beat = match state.first_score_limit {
-                        Some(limit) => std::array::from_fn(|frequency| lut[frequency] <= limit),
-                        None => [false; FREQ_LUT_BUCKETS],
-                    };
-                    state.freq_cannot_beat_key = Some(key);
-                }
-            } else if state.freq_cannot_beat_key.is_some() {
-                state.freq_cannot_beat = [false; FREQ_LUT_BUCKETS];
-                state.freq_cannot_beat_key = None;
+                self.lead_bound
+                    .prepare(&self.lead[0], &self.scorer, self.threshold, others);
             }
             #[cfg(test)]
-            if state.freq_cannot_beat.iter().any(|&pruned| pruned) {
+            if window_started_with_floor
+                && num_lists >= 2
+                && self.lead_bound.freq_rejected().iter().any(|&pruned| pruned)
+            {
                 self.and_window_stats.windows_frequency_pruned += 1;
             }
             #[cfg(target_arch = "x86_64")]
@@ -269,7 +239,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 use_avx2,
                 state.use_pairwise_intersection,
                 window_started_with_floor,
-                &state.freq_cannot_beat,
+                self.lead_bound.freq_rejected(),
                 &mut state.batch_docs,
                 &mut state.batch_offs,
                 &mut state.cursor_scratch,
@@ -341,20 +311,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             }
                             None => self.lead[0].score(&self.scorer, first_freq, doc_length),
                         };
-                        let key = (self.threshold.to_bits(), others_block_max.to_bits());
-                        if state.first_score_limit_key != Some(key) {
-                            state.first_score_limit = partial_score_limit(
-                                others_block_max,
-                                self.threshold,
-                                score_sum_upper_bound_factor(num_lists),
-                                state.floor_mode,
-                            );
-                            state.first_score_limit_key = Some(key);
-                        }
-                        if state
-                            .first_score_limit
-                            .is_some_and(|limit| first_score <= limit)
-                        {
+                        self.lead_bound.prepare(
+                            &self.lead[0],
+                            &self.scorer,
+                            self.threshold,
+                            others_block_max,
+                        );
+                        if self.lead_bound.rejects_score(first_score) {
                             #[cfg(test)]
                             {
                                 self.and_window_stats.candidates_pruned += 1;

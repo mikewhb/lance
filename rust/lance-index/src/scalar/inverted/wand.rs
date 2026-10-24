@@ -60,7 +60,7 @@ pub(super) mod or_seek_counters {
 }
 
 use self::and_array::ArrayLead;
-use self::and_kernel::{WindowList, window_bm25_score};
+use self::and_kernel::{LeadBound, WindowList, window_bm25_score};
 use super::{
     CompressedPositionStorage,
     documents::{DocId, DocLengths, DocVisibility},
@@ -2948,6 +2948,10 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // maintain it.
     and_lead_arrayed: bool,
     array_lead: ArrayLead,
+    // The one place every conjunction route decides whether a lead bound can
+    // still reach the floor. Built from the floor mode and clause count, and
+    // reused across windows and candidates via its `(floor, others)` cache.
+    lead_bound: LeadBound,
     // Set by `WandCursor` when it builds the bulk conjunction state. The block
     // cursor of `lead` then belongs to the window walk, so a shallow probe must
     // not steer it: `compound_shallow_bound` restores the anchors afterwards.
@@ -3077,6 +3081,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 .doc_norm(1)
                 .is_some_and(|norm| norm.is_finite() && norm >= 0.0);
 
+        let lead_bound = LeadBound::new(CompetitiveFloorMode::Exclusive, lead.len());
+
         Self {
             // Standalone leaf top-k keeps its established exclusive floor.
             // Composable cursors switch to an inclusive floor because their
@@ -3100,6 +3106,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             and_candidate_doc_length: None,
             and_lead_arrayed: false,
             array_lead: ArrayLead::new(),
+            lead_bound,
             and_batched: false,
             or_windowed: false,
             or_window_bound: None,
@@ -3152,6 +3159,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
     fn with_floor_mode(mut self, mode: CompetitiveFloorMode) -> Self {
         self.floor_mode = mode;
+        self.lead_bound = LeadBound::new(mode, self.lead.len());
         self
     }
 
@@ -4253,7 +4261,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     /// pre-filter because the LUT bound (doc_length dropped) is looser and
     /// can pass candidates the exact test rejects.
     fn and_candidate_cannot_beat_threshold(
-        &self,
+        &mut self,
         doc_length: u32,
         remaining_upper_bound: f64,
     ) -> bool {
@@ -4267,14 +4275,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let Some(doc) = first.doc() else {
             return false;
         };
-
-        score_sum_cannot_compete(
-            first.score(&self.scorer, doc.frequency(), doc_length),
-            remaining_upper_bound,
-            self.threshold,
-            score_sum_upper_bound_factor(self.num_terms),
-            self.floor_mode,
-        )
+        let lead_score = first.score(&self.scorer, doc.frequency(), doc_length);
+        self.lead_bound
+            .prepare(first, &self.scorer, self.threshold, remaining_upper_bound);
+        self.lead_bound.rejects_score(lead_score)
     }
 
     /// Shared preconditions of the AND candidate prunes: both stages only
@@ -4299,9 +4303,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .sum::<f64>()
     }
 
-    /// Build the lead clause's frequency-bucket bound table for the bulk
-    /// merge kernel. The array lead builds its table with the same function,
-    /// so the two constructions cannot drift apart.
+    /// Build the lead clause's frequency-bucket bound table.
     ///
     /// The bound assumes `Scorer::doc_weight` is non-negative and
     /// non-increasing in `doc_tokens` (see the trait contract). The sampled
@@ -4314,6 +4316,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     /// into a lower bound, so for such leads the LUT is left all-infinite
     /// (the pre-filter never fires) and callers fall back to exact
     /// candidate checks.
+    ///
+    /// `LeadBound` builds the same table for every route; only tests read the
+    /// wand's copy directly.
+    #[cfg(test)]
     fn build_lead_freq_bound_lut(&self) -> [f32; FREQ_LUT_BUCKETS] {
         match self.lead.first() {
             Some(first) => and_kernel::lead_freq_bound_lut(first, &self.scorer),
@@ -4722,7 +4728,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             &mut self.lead,
             &self.scorer,
             self.threshold,
-            self.floor_mode,
+            &mut self.lead_bound,
             prune,
             |doc| documents.doc_length(doc),
         )?;
@@ -7451,6 +7457,64 @@ mod tests {
             },
         },
     };
+
+    /// `LeadBound` must make exactly the `score_sum_cannot_compete` decision.
+    /// Its limit is the largest rejected `f32`, so every score at or below it
+    /// is rejected and every score above it competes, in both floor modes.
+    #[test]
+    fn lead_bound_matches_the_rejection_predicate() {
+        let list = generate_posting_list(vec![0, 1, 2], 1.0, None, true);
+        let lead = PostingIterator::new(String::from("lead"), 0, 0, list, 3);
+        let scorer = UnitScorer;
+        let num_terms = 3;
+        let factor = score_sum_upper_bound_factor(num_terms);
+
+        // Deterministic xorshift; the masked bits stay finite and non-negative
+        // while spanning the f32 exponent range.
+        let mut rng = 0x9e37_79b9_u32;
+        let mut next_random = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            f32::from_bits(rng & 0x7f7f_ffff)
+        };
+
+        for mode in [
+            CompetitiveFloorMode::Exclusive,
+            CompetitiveFloorMode::Inclusive,
+        ] {
+            for floor in [1e-30_f32, 0.1, 1.0, 7.3, 1e3] {
+                for others in [0.0_f64, 0.05, 0.9, 5.0] {
+                    let mut bound = LeadBound::new(mode, num_terms);
+                    bound.prepare(&lead, &scorer, floor, others);
+                    let context = format!("floor={floor} others={others} {mode:?}");
+                    let checked = |score: f32, bound: &LeadBound| {
+                        assert_eq!(
+                            bound.rejects_score(score),
+                            score_sum_cannot_compete(score, others, floor, factor, mode),
+                            "{context} score={score}"
+                        );
+                    };
+                    if let Some(limit) = partial_score_limit(others, floor, factor, mode) {
+                        checked(limit, &bound);
+                        let mut score = limit;
+                        for _ in 0..16 {
+                            score = next_up_f32(score);
+                            checked(score, &bound);
+                        }
+                        let mut score = limit;
+                        for _ in 0..16 {
+                            score = next_down_f32(score);
+                            checked(score, &bound);
+                        }
+                    }
+                    for _ in 0..1_000 {
+                        checked(next_random(), &bound);
+                    }
+                }
+            }
+        }
+    }
 
     struct CostOnlyDocuments {
         total_docs: usize,
