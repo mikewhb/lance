@@ -3093,6 +3093,14 @@ struct ReqOptBounds {
     combined: ScoreBounds,
 }
 
+/// What the optional-driven whole-block check decided.
+enum OptionalBlockSkip {
+    /// The block cannot compete; restart the search at this target.
+    Jump(u64),
+    /// The last optional block cannot compete; nothing is left.
+    Exhausted,
+}
+
 struct ReqOptScorer<'a> {
     required: BoxScorer<'a>,
     optional: BoxScorer<'a>,
@@ -3109,6 +3117,13 @@ struct ReqOptScorer<'a> {
     /// `(target, up_to)` the last `advance_shallow` published, so a wider
     /// `score_bounds` query knows the range it may answer from the children.
     shallow_reported: Option<(u64, u64)>,
+    /// End of the optional block whose whole-block bound could not compete.
+    /// Remembering it makes the wide check run once per optional block instead
+    /// of once per candidate inside it. A rising floor does not clear it: a
+    /// stale entry only costs a missed jump, never correctness.
+    wide_failed_up_to: Option<u64>,
+    #[cfg(test)]
+    wide_block_jump_disabled: bool,
     forwards_required_floor: bool,
     /// Bound of every required score, read once.
     required_global_upper: Option<f32>,
@@ -3133,6 +3148,9 @@ impl<'a> ReqOptScorer<'a> {
             min_competitive_score: f32::NEG_INFINITY,
             shallow_bounds: None,
             shallow_reported: None,
+            wide_failed_up_to: None,
+            #[cfg(test)]
+            wide_block_jump_disabled: false,
             forwards_required_floor: false,
             required_global_upper,
         }
@@ -3214,6 +3232,56 @@ impl<'a> ReqOptScorer<'a> {
         bounds.lower.is_finite() && bounds.upper.is_finite() && bounds.lower <= bounds.upper
     }
 
+    #[cfg(test)]
+    fn wide_block_jump_enabled(&self) -> bool {
+        !self.wide_block_jump_disabled
+    }
+
+    #[cfg(not(test))]
+    fn wide_block_jump_enabled(&self) -> bool {
+        true
+    }
+
+    /// Try to drop the optional side's whole block before the required side
+    /// moves.
+    ///
+    /// Only sound on the optional-driven schedule, where the required side's
+    /// global bound is already below the floor: a document without an optional
+    /// match cannot compete, so the combined bound over the optional block
+    /// decides the whole block. The result is a jump decision only: it is not
+    /// stored in `shallow_bounds`, so the narrow path below sees exactly the
+    /// bounds it saw before.
+    fn try_skip_optional_block(&mut self, target: u64) -> Result<Option<OptionalBlockSkip>> {
+        if !self.wide_block_jump_enabled()
+            || self
+                .wide_failed_up_to
+                .is_some_and(|failed_up_to| target <= failed_up_to)
+        {
+            return Ok(None);
+        }
+        // The optional's block end fixes the range; anchoring the required side
+        // before the wide query lets it answer over the same range.
+        let up_to = self.optional.advance_shallow(target)?;
+        self.required.advance_shallow(target)?;
+        let wide = self
+            .required
+            .score_bounds(up_to)?
+            .add(self.optional.score_bounds(up_to)?);
+        #[cfg(test)]
+        WIDE_BLOCK_CHECKS.with(|count| count.set(count.get() + 1));
+        if Self::usable_bounds(wide) && wide.upper < self.min_competitive_score {
+            #[cfg(test)]
+            WIDE_BLOCK_JUMPS.with(|count| count.set(count.get() + 1));
+            if up_to == u64::MAX {
+                return Ok(Some(OptionalBlockSkip::Exhausted));
+            }
+            self.shallow_bounds = None;
+            return Ok(Some(OptionalBlockSkip::Jump(up_to + 1)));
+        }
+        self.wide_failed_up_to = Some(up_to);
+        Ok(None)
+    }
+
     fn bounds(&mut self, up_to: u64) -> Result<ReqOptBounds> {
         if let Some(bounds) = self.shallow_bounds
             && bounds.up_to == up_to
@@ -3261,6 +3329,17 @@ impl<'a> ReqOptScorer<'a> {
                     return Ok(self.exhaust());
                 };
                 target = target.max(optional_doc);
+                // With the optional side driving, try to drop its whole block
+                // before the required side moves at all. A failed check leaves
+                // the schedule below untouched.
+                match self.try_skip_optional_block(target)? {
+                    Some(OptionalBlockSkip::Jump(next)) => {
+                        target = next;
+                        continue 'search;
+                    }
+                    Some(OptionalBlockSkip::Exhausted) => return Ok(self.exhaust()),
+                    None => {}
+                }
             }
             // Bound the window before moving the required side, so a window
             // that cannot compete costs no required-side iteration.
@@ -4157,6 +4236,8 @@ thread_local! {
     static FLAT_MUSTS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REQUIRED_FLOORS_FORWARDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SHOULD_CURSORS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WIDE_BLOCK_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WIDE_BLOCK_JUMPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Leaf indices `(must, should)` of `+must... should...` when there is at
@@ -8124,6 +8205,300 @@ mod tests {
                 "limit={limit}: {advances} required advances for {} optional rows",
                 optional.len()
             );
+        }
+    }
+
+    /// Per-leaf scores of `term`, computed the way `PostingIterator::score`
+    /// does, for the exhaustive oracle.
+    fn term_scores(corpus: &Corpus, term: usize) -> HashMap<u64, f32> {
+        let query_weight = corpus.scorer.query_weight(&format!("t{term}"));
+        corpus.terms[term]
+            .iter()
+            .map(|&(doc, freq)| {
+                let score = 0.0_f32
+                    + query_weight
+                        * corpus
+                            .scorer
+                            .doc_weight(freq, corpus.doc_lengths[doc as usize]);
+                (u64::from(doc), score)
+            })
+            .collect()
+    }
+
+    fn take_wide_block_checks() -> usize {
+        WIDE_BLOCK_CHECKS.with(|count| count.replace(0))
+    }
+
+    fn take_wide_block_jumps() -> usize {
+        WIDE_BLOCK_JUMPS.with(|count| count.replace(0))
+    }
+
+    /// Two dense required terms plus a decisive optional term. One optional row
+    /// every 16 documents fills 16 posting blocks of 256 entries; the first
+    /// block is high-frequency (it fills the top 10 at once) and every later
+    /// block is low-frequency, so its whole-block bound is below the floor.
+    fn decisive_cursor_corpus() -> Corpus {
+        let num_docs = 65_536_u32;
+        let doc_lengths = vec![10_u32; num_docs as usize];
+        let dense = (0..num_docs).map(|doc| (doc, 1_u32)).collect::<Vec<_>>();
+        let optional = (0..num_docs)
+            .filter(|doc| doc % 16 == 0)
+            .map(|doc| (doc, if doc < 4_096 { 8 } else { 1 }))
+            .collect::<Vec<_>>();
+        Corpus::new(doc_lengths, vec![dense.clone(), dense, optional])
+    }
+
+    /// The same decisive shape, but every optional block also holds one
+    /// high-frequency row, so the whole-block bound can never fall below the
+    /// floor.
+    fn noisy_cursor_corpus() -> Corpus {
+        let num_docs = 65_536_u32;
+        let doc_lengths = vec![10_u32; num_docs as usize];
+        let dense = (0..num_docs).map(|doc| (doc, 1_u32)).collect::<Vec<_>>();
+        let optional = (0..num_docs)
+            .filter(|doc| doc % 16 == 0)
+            .map(|doc| (doc, if doc % 4_096 == 0 { 8 } else { 1 }))
+            .collect::<Vec<_>>();
+        Corpus::new(doc_lengths, vec![dense.clone(), dense, optional])
+    }
+
+    #[test]
+    fn reqopt_skips_whole_optional_blocks_with_the_required_range_bound() {
+        let corpus = decisive_cursor_corpus();
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let params = FtsSearchParams::default();
+        let leaves = vec![
+            term_scores(&corpus, 0),
+            term_scores(&corpus, 1),
+            term_scores(&corpus, 2),
+        ];
+        let plan = must_should_plan(2, 1);
+
+        let run = |wide: bool, limit: usize| -> (Vec<ScoredRow>, usize, usize) {
+            let (required, work) = instrumented(Box::new(and_cursor(
+                &documents,
+                and_postings(&corpus, 2),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::On,
+            )));
+            let optional = Box::new(WandCursor::new(
+                Operator::Or,
+                vec![impact_posting(
+                    2,
+                    &corpus.terms[2],
+                    &corpus.doc_lengths,
+                    &corpus.scorer,
+                )],
+                &documents,
+                corpus.scorer.clone(),
+                &params,
+                &metrics,
+            ));
+            let mut scorer = ReqOptScorer::new(required, optional);
+            scorer.wide_block_jump_disabled = !wide;
+            let rows = TopKCollector::new(limit).collect(&mut scorer).unwrap();
+            (
+                rows,
+                work.advances.load(AtomicOrdering::Relaxed),
+                work.shallow_advances.load(AtomicOrdering::Relaxed),
+            )
+        };
+
+        for limit in [1, 3, 10] {
+            take_wide_block_checks();
+            take_wide_block_jumps();
+            let (wide_rows, wide_advances, wide_shallow) = run(true, limit);
+            let checks = take_wide_block_checks();
+            let jumps = take_wide_block_jumps();
+            let (plain_rows, plain_advances, plain_shallow) = run(false, limit);
+            let expected = exhaustive_compound_top_k(&plan, &leaves, limit);
+            assert_eq!(
+                score_bits(&wide_rows),
+                score_bits(&expected),
+                "limit={limit}"
+            );
+            assert_eq!(
+                score_bits(&wide_rows),
+                score_bits(&plain_rows),
+                "limit={limit}: wide jump changed the result"
+            );
+            assert!(checks > 0, "limit={limit}: the wide check never ran");
+            assert!(
+                jumps > 0,
+                "limit={limit}: no whole optional block was skipped"
+            );
+            // The narrow skip already avoids moving the required iterator
+            // through a block whose bound cannot compete, so the jump never
+            // adds an `advance`; what it removes is the per-required-block
+            // shallow probe the narrow window needs to reach the same answer.
+            assert!(
+                wide_advances <= plain_advances,
+                "limit={limit}: {wide_advances} required advances with the jump, \
+                 {plain_advances} without"
+            );
+            assert!(
+                wide_shallow < plain_shallow,
+                "limit={limit}: {wide_shallow} required shallow probes with the jump, \
+                 {plain_shallow} without"
+            );
+        }
+    }
+
+    #[test]
+    fn reqopt_wide_check_never_adds_required_advances() {
+        let corpus = noisy_cursor_corpus();
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let params = FtsSearchParams::default();
+        let leaves = vec![
+            term_scores(&corpus, 0),
+            term_scores(&corpus, 1),
+            term_scores(&corpus, 2),
+        ];
+        let plan = must_should_plan(2, 1);
+
+        let run = |wide: bool, limit: usize| -> (Vec<ScoredRow>, usize) {
+            let (required, work) = instrumented(Box::new(and_cursor(
+                &documents,
+                and_postings(&corpus, 2),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::On,
+            )));
+            let optional = Box::new(WandCursor::new(
+                Operator::Or,
+                vec![impact_posting(
+                    2,
+                    &corpus.terms[2],
+                    &corpus.doc_lengths,
+                    &corpus.scorer,
+                )],
+                &documents,
+                corpus.scorer.clone(),
+                &params,
+                &metrics,
+            ));
+            let mut scorer = ReqOptScorer::new(required, optional);
+            scorer.wide_block_jump_disabled = !wide;
+            let rows = TopKCollector::new(limit).collect(&mut scorer).unwrap();
+            (rows, work.advances.load(AtomicOrdering::Relaxed))
+        };
+
+        for limit in [1, 3, 10] {
+            take_wide_block_checks();
+            take_wide_block_jumps();
+            let (wide_rows, wide_advances) = run(true, limit);
+            let checks = take_wide_block_checks();
+            let jumps = take_wide_block_jumps();
+            let (plain_rows, plain_advances) = run(false, limit);
+            let expected = exhaustive_compound_top_k(&plan, &leaves, limit);
+            assert_eq!(
+                score_bits(&wide_rows),
+                score_bits(&expected),
+                "limit={limit}"
+            );
+            assert_eq!(score_bits(&wide_rows), score_bits(&plain_rows));
+            assert!(checks > 0, "limit={limit}: the wide check never ran");
+            assert_eq!(jumps, 0, "limit={limit}: a block was skipped");
+            assert!(
+                wide_advances <= plain_advances,
+                "limit={limit}: {wide_advances} required advances with the check, \
+                 {plain_advances} without"
+            );
+        }
+    }
+
+    #[test]
+    fn reqopt_wide_check_runs_once_per_optional_block() {
+        let corpus = decisive_cursor_corpus();
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let params = FtsSearchParams::default();
+        let distinct_blocks = corpus.terms[2].len().div_ceil(MAX_POSTING_BLOCK_SIZE);
+
+        for limit in [1, 3, 10] {
+            take_wide_block_checks();
+            let (required, _work) = instrumented(Box::new(and_cursor(
+                &documents,
+                and_postings(&corpus, 2),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::On,
+            )));
+            let optional = Box::new(WandCursor::new(
+                Operator::Or,
+                vec![impact_posting(
+                    2,
+                    &corpus.terms[2],
+                    &corpus.doc_lengths,
+                    &corpus.scorer,
+                )],
+                &documents,
+                corpus.scorer.clone(),
+                &params,
+                &metrics,
+            ));
+            let mut scorer = ReqOptScorer::new(required, optional);
+            TopKCollector::new(limit).collect(&mut scorer).unwrap();
+            let checks = take_wide_block_checks();
+            assert!(checks > 0, "limit={limit}: the wide check never ran");
+            assert!(
+                checks <= distinct_blocks,
+                "limit={limit}: {checks} checks for {distinct_blocks} optional blocks"
+            );
+        }
+    }
+
+    #[test]
+    fn reqopt_wide_check_matches_the_tree_when_both_sides_are_dense() {
+        let num_docs = 32_768_u32;
+        let doc_lengths = vec![12_u32; num_docs as usize];
+        let dense = (0..num_docs).map(|doc| (doc, 1_u32)).collect::<Vec<_>>();
+        let optional = (0..num_docs)
+            .map(|doc| (doc, 1 + (doc % 4)))
+            .collect::<Vec<_>>();
+        let corpus = Corpus::new(doc_lengths, vec![dense.clone(), dense, optional]);
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let params = FtsSearchParams::default();
+        let leaves = vec![
+            term_scores(&corpus, 0),
+            term_scores(&corpus, 1),
+            term_scores(&corpus, 2),
+        ];
+        let plan = must_should_plan(2, 1);
+
+        for limit in [1, 10, 100] {
+            let (required, _work) = instrumented(Box::new(and_cursor(
+                &documents,
+                and_postings(&corpus, 2),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::On,
+            )));
+            let optional = Box::new(WandCursor::new(
+                Operator::Or,
+                vec![impact_posting(
+                    2,
+                    &corpus.terms[2],
+                    &corpus.doc_lengths,
+                    &corpus.scorer,
+                )],
+                &documents,
+                corpus.scorer.clone(),
+                &params,
+                &metrics,
+            ));
+            let mut scorer = ReqOptScorer::new(required, optional);
+            let rows = TopKCollector::new(limit).collect(&mut scorer).unwrap();
+            let expected = exhaustive_compound_top_k(&plan, &leaves, limit);
+            assert_eq!(score_bits(&rows), score_bits(&expected), "limit={limit}");
         }
     }
 
