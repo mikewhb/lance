@@ -1386,6 +1386,17 @@ impl PostingIterator {
         self.current_doc.map(|doc| doc.doc_id())
     }
 
+    /// The current document with its frequency left undecoded.
+    ///
+    /// A disjunction hand-out only reports and compares document ids; `doc()`
+    /// would decode the frequency block for a score nobody asked for yet. The
+    /// result keeps the walk's stored placeholder frequency, so only callers
+    /// that read the id may use it.
+    #[inline]
+    fn current_doc_info(&self) -> Option<DocInfo> {
+        self.current_doc
+    }
+
     fn refresh_current_doc(&mut self) {
         if self.empty() {
             self.current_doc = None;
@@ -2675,10 +2686,9 @@ struct HeadPosting {
 
 impl HeadPosting {
     fn new(posting: Box<PostingIterator>) -> Self {
-        let doc_id = posting
-            .doc()
-            .map(|doc| doc.doc_id())
-            .unwrap_or(TERMINATED_DOC_ID);
+        // The heap key is the document id alone. `doc()` would also decode the
+        // frequency block, which no ordering comparison reads.
+        let doc_id = posting.current_doc_id().unwrap_or(TERMINATED_DOC_ID);
         Self { doc_id, posting }
     }
 
@@ -4610,7 +4620,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 continue;
             }
             if unfloored {
-                let Some(first_doc) = self.lead.first().and_then(|posting| posting.doc()) else {
+                // The hand-out is judged on its document id only, so this does
+                // not materialize the lead clause's frequency.
+                let Some(first_doc) = self
+                    .lead
+                    .first()
+                    .and_then(|posting| posting.current_doc_info())
+                else {
                     self.push_back_leads(target + 1);
                     continue;
                 };
@@ -5029,7 +5045,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     }
 
     fn push_head(&mut self, posting: Box<PostingIterator>) {
-        if posting.doc().is_some() {
+        // Exhaustion is a document-id question; the frequency stays undecoded
+        // until a scorer asks for it.
+        if posting.current_doc_id().is_some() {
             self.head.push(HeadPosting::new(posting));
         }
     }
