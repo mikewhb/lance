@@ -6157,17 +6157,32 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             self.wand_factor,
         ));
         // The walk's first window starts at the earliest clause document, so a
-        // jump into that window is not a far jump.
+        // jump into that window is not a far jump. Its end is the first clause
+        // block edge, which is the range `open_or_window` will bound, so plan it
+        // here: a jump inside `[first_doc, planned_end]` is then served by the
+        // walk, which opens that very window at the target, instead of a seek
+        // step. The anchors below are the ones `open_or_window` sets for itself,
+        // and `release_or_clauses` re-anchors every clause on its own document,
+        // so a seek step still starts from the same place.
         let first_doc = self
             .wand
             .lead
             .iter()
             .filter_map(|posting| posting.doc().map(|doc| doc.doc_id()))
             .min();
-        if let Some(first_doc) = first_doc
-            && let Some(state) = self.or_window.as_mut()
-        {
-            state.restart_at(first_doc);
+        if let Some(first_doc) = first_doc {
+            let mut up_to = TERMINATED_DOC_ID;
+            for posting in self.wand.lead.iter_mut() {
+                if posting.doc().is_none() {
+                    continue;
+                }
+                posting.seek_block_from_start(first_doc);
+                up_to = up_to.min(posting.block_end_doc());
+            }
+            if let Some(state) = self.or_window.as_mut() {
+                state.restart_at(first_doc);
+                state.plan_window_end(up_to);
+            }
         }
         // The walk built its state from the clauses it just took over, so the
         // layering already belongs to it.
@@ -6238,6 +6253,24 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         self.or_window
             .as_ref()
             .is_some_and(|state| state.window_is_open())
+    }
+
+    /// Test hook: the `[start, end]` range of the window bound the walk holds,
+    /// so a test can probe inside it and past it.
+    #[cfg(test)]
+    pub(super) fn or_window_bound_range(&self) -> Option<(u64, u64)> {
+        self.wand
+            .or_window_bound
+            .map(|(start, end, _)| (start, end))
+    }
+
+    /// Test hook: park the lagging clauses of a per-document disjunction at
+    /// `target`, which is the state `next` holds between two hand-outs (see the
+    /// `push_back_leads` call there), so a test can ask for a shallow bound from
+    /// a state with a parked `tail`.
+    #[cfg(test)]
+    pub(super) fn or_park_lagging_clauses(&mut self, target: u64) {
+        self.wand.push_back_leads(target);
     }
 
     /// Test hook: the route this cursor actually drives.
@@ -7200,16 +7233,29 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
     /// all widened rather than clamped, so `up_to` is never truncated:
     /// conjunction clauses and disjunction lead clauses fold every block up to
     /// `up_to`; disjunction head clauses fold from the block they are on, which
-    /// is the first block they can still emit from; tail clauses contribute
+    /// is the first block they can still emit from; tail clauses fall back to
     /// their list-wide bound.
     fn wide_block_bound(&mut self, target: u64, up_to: u64) -> f32 {
         if self.operator == Operator::Or {
             // The disjunction walk parks clauses at window anchors, so search
             // each lead block cursor from the first block instead of trusting
-            // that it still sits at `target`. Clauses in `tail` are behind the
-            // target; their list-wide bound covers the range. A posting in
-            // `head` already sits at or after the target, so the block it is
-            // on is the first it can still emit from.
+            // that it still sits at `target`. A posting in `head` already sits
+            // at or after the target, so the block it is on is the first it can
+            // still emit from.
+            //
+            // A parked `tail` clause answers from its list-wide bound instead of
+            // the bound it was parked with. That stored bound is
+            // `window_max_score(self.up_to)` (see `lead_to_tail_upper_bound`),
+            // which `wide_block_bound` cannot widen: it is only valid up to the
+            // window it was computed for, while `up_to` here may reach past that
+            // window. A document of the clause in a later block, still inside
+            // `[target, up_to]`, can score above it, so reusing it would let a
+            // caller skip work it must not skip. Keeping `up_to` wide and paying
+            // a list-wide bound for the lagging clauses prunes more than clamping
+            // the range to the window: the lead and head clauses -- which is
+            // where the bound is tight -- keep folding every block of the range,
+            // and a tail clause is by construction parked below the floor, so its
+            // looser bound rarely decides anything.
             let scorer = &self.scorer;
             return conservative_score_sum(
                 self.lead
@@ -7218,7 +7264,11 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
                     .chain(self.head.iter().map(|posting| {
                         posting_current_block_range_upper_bound(&posting.posting, up_to, scorer)
                     }))
-                    .chain(self.tail.iter().map(|posting| posting.upper_bound)),
+                    .chain(
+                        self.tail
+                            .iter()
+                            .map(|posting| posting.posting.global_upper_bound(scorer)),
+                    ),
             );
         }
 

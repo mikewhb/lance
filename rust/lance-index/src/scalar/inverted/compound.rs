@@ -11059,10 +11059,12 @@ mod tests {
             cursor_counters::take_or_cursor_batch_refills();
             cursor_counters::take_or_cursor_window_opens();
 
-            // Every target starts two blocks past the last handed-out document,
-            // so no jump fits the window the walk holds.
+            // Every target starts past the range the walk covers, so no jump
+            // fits it. The first one clears the window a fresh cursor plans: its
+            // end is one block edge away, at most a couple of blocks for the
+            // corpus, while a jump into it would be walked.
             let mut jumps = 0_usize;
-            let mut target = 2 * block;
+            let mut target = 4 * block;
             loop {
                 jumps += 1;
                 let a = batch.advance(target).unwrap();
@@ -11155,53 +11157,51 @@ mod tests {
     }
 
     /// The very first advance must not be mistaken for a jump past the walk: the
-    /// reach starts at the first window's start, not at zero, so the first step
-    /// into that window walks it instead of paying for a seek.
+    /// reach is seeded to the end of the first window, not to its start, so a
+    /// step into that window walks it instead of paying for a seek.
     #[test]
     fn or_cursor_first_advance_into_the_first_window_walks() {
-        // Both clauses start late, so the first window starts at a document an
-        // empty reach would have called a far jump.
-        let num_docs = 400_usize;
+        // The long clause spans three blocks, so the first window ends on a
+        // document an empty reach would have called a far jump. Both clauses
+        // start late, so its start is a document an empty reach would also have
+        // called far.
+        let num_docs = 700_usize;
         let doc_lengths = vec![8_u32; num_docs];
-        let term = |start: u32| (start..start + 40).map(|doc| (doc, 1)).collect::<Vec<_>>();
-        let corpus = Corpus::new(doc_lengths, vec![term(10), term(20)]);
+        let term = |start: u32, end: u32| (start..end).map(|doc| (doc, 1)).collect::<Vec<_>>();
+        let corpus = Corpus::new(doc_lengths, vec![term(10, 610), term(20, 60)]);
         let mask = RowAddrMask::all_rows();
         let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
         let metrics = NoOpMetricsCollector;
-        let mut batch = or_cursor(
-            &documents,
-            or_postings(&corpus, 2),
-            corpus.scorer.clone(),
-            &metrics,
-            true,
-        );
-        let mut classic = or_cursor(
-            &documents,
-            or_postings(&corpus, 2),
-            corpus.scorer.clone(),
-            &metrics,
-            false,
-        );
-        assert!(batch.or_window_active());
+        macro_rules! make {
+            ($windowed:expr) => {
+                or_cursor(
+                    &documents,
+                    or_postings(&corpus, 2),
+                    corpus.scorer.clone(),
+                    &metrics,
+                    $windowed,
+                )
+            };
+        }
 
-        // A disjunction's first window starts at its earliest clause document.
-        let first_window_start = corpus
-            .terms
-            .iter()
-            .map(|entries| entries[0].0)
-            .min()
-            .expect("two clauses");
+        // A disjunction's first window starts at its earliest clause document
+        // and ends at the first clause block edge: the long clause's first block
+        // holds `MAX_POSTING_BLOCK_SIZE` documents.
+        let first_window_start = u64::from(corpus.terms[0][0].0);
+        let first_window_end = u64::from(corpus.terms[0][MAX_POSTING_BLOCK_SIZE].0) - 1;
+        assert_eq!(first_window_start, 10);
+
+        let mut batch = make!(true);
+        let mut classic = make!(false);
+        assert!(batch.or_window_active());
         cursor_counters::take_or_cursor_seek_steps();
         cursor_counters::take_or_cursor_batch_refills();
 
         assert_eq!(
-            batch.advance(u64::from(first_window_start)).unwrap(),
-            Some(u64::from(first_window_start))
+            batch.advance(first_window_start).unwrap(),
+            Some(first_window_start)
         );
-        assert_eq!(
-            batch.doc(),
-            classic.advance(u64::from(first_window_start)).unwrap()
-        );
+        assert_eq!(batch.doc(), classic.advance(first_window_start).unwrap());
         assert_eq!(
             cursor_counters::take_or_cursor_seek_steps(),
             0,
@@ -11210,6 +11210,52 @@ mod tests {
         assert!(
             cursor_counters::take_or_cursor_batch_refills() > 0,
             "the first advance into the first window never walked it"
+        );
+
+        // One step past the window's first document still lies inside the
+        // window the walk plans, so a fresh cursor must walk that jump rather
+        // than seek it: the reach is the planned end, not the start.
+        let mut batch = make!(true);
+        let mut classic = make!(false);
+        cursor_counters::take_or_cursor_seek_steps();
+        cursor_counters::take_or_cursor_batch_refills();
+        let step = first_window_start + 1;
+        assert_eq!(
+            batch.advance(step).unwrap(),
+            classic.advance(step).unwrap(),
+            "advance({step}) inside the first window found another document"
+        );
+        assert_eq!(
+            cursor_counters::take_or_cursor_seek_steps(),
+            0,
+            "advance(first_doc + 1) inside the first window sought"
+        );
+        assert!(
+            cursor_counters::take_or_cursor_batch_refills() > 0,
+            "advance(first_doc + 1) inside the first window never walked it"
+        );
+
+        // Past that end the jump is a far one again: the plan only covers the
+        // window the walk would open, never the whole list.
+        let mut batch = make!(true);
+        let mut classic = make!(false);
+        cursor_counters::take_or_cursor_seek_steps();
+        cursor_counters::take_or_cursor_batch_refills();
+        let past = first_window_end + 1;
+        assert_eq!(
+            batch.advance(past).unwrap(),
+            classic.advance(past).unwrap(),
+            "advance({past}) past the first window found another document"
+        );
+        assert_eq!(
+            cursor_counters::take_or_cursor_seek_steps(),
+            1,
+            "advance past the first window did not seek"
+        );
+        assert_eq!(
+            cursor_counters::take_or_cursor_batch_refills(),
+            0,
+            "advance past the first window walked it"
         );
     }
 
@@ -11286,5 +11332,237 @@ mod tests {
                 "clauses={clauses}: a near advance never walked a window"
             );
         }
+    }
+
+    /// A shallow probe on a windowed disjunction must bound every document the
+    /// cursor hands out in `[target, up_to]`, both inside the open window and
+    /// past it. The per-document route answers the same probe over the same
+    /// range, so its bound is the second opinion on what the range holds: a
+    /// window-local bound reused for a wider range cannot pass both.
+    #[test]
+    fn or_cursor_shallow_bounds_cover_the_window() {
+        let mut rng = SmallRng::seed_from_u64(0x0000_D5EE_0005);
+        let block = MAX_POSTING_BLOCK_SIZE as u64;
+        let mut inside = 0_usize;
+        let mut beyond = 0_usize;
+        for clauses in 2..=4_usize {
+            let corpus = random_corpus(&mut rng, 4_000, &or_densities(clauses, 1));
+            let mask = RowAddrMask::all_rows();
+            let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+            let metrics = NoOpMetricsCollector;
+            let context = format!("clauses={clauses}");
+            macro_rules! make {
+                ($windowed:expr) => {
+                    or_cursor(
+                        &documents,
+                        or_postings(&corpus, clauses),
+                        corpus.scorer.clone(),
+                        &metrics,
+                        $windowed,
+                    )
+                };
+            }
+
+            // One `next` positions the walk, which opens a window and computes
+            // its bound; that window is the range a probe inside it answers for.
+            let mut positioned = make!(true);
+            assert!(positioned.or_window_active(), "{context}: route");
+            let first = positioned
+                .next()
+                .unwrap()
+                .unwrap_or_else(|| panic!("{context}: the window emitted nothing"));
+            let (window_start, window_end) = positioned
+                .or_window_bound_range()
+                .unwrap_or_else(|| panic!("{context}: the walk holds no window bound"));
+            assert!(
+                window_start <= first && first <= window_end,
+                "{context}: doc {first} outside its window [{window_start}, {window_end}]"
+            );
+
+            for target in [
+                first,
+                window_start + (window_end - window_start) / 2,
+                window_end,
+                window_end.saturating_add(1),
+                window_end.saturating_add(block),
+                window_end.saturating_add(3 * block),
+            ] {
+                if target < first {
+                    continue;
+                }
+                let inside_this = target <= window_end;
+                if inside_this {
+                    inside += 1;
+                } else {
+                    beyond += 1;
+                }
+                let up_to = target.saturating_add(2 * block);
+
+                // (a) The reported range starts at the probe target.
+                let mut probed = make!(true);
+                assert_eq!(
+                    probed.next().unwrap(),
+                    Some(first),
+                    "{context}: probed cursor started elsewhere"
+                );
+                let probed_up_to = probed.advance_shallow(target).unwrap();
+                assert!(
+                    probed_up_to >= target,
+                    "{context}: windowed advance_shallow({target}) reported {probed_up_to}"
+                );
+                if inside_this {
+                    // Inside its range the walk answers from the window bound it
+                    // computed, which is the answer a wider probe must widen.
+                    assert_eq!(
+                        probed_up_to, window_end,
+                        "{context}: the open window answered outside its range"
+                    );
+                }
+                let windowed = probed.score_bounds(up_to).unwrap().upper;
+
+                // (b) Every document the cursor later hands out in the probed
+                // range is covered. The reference is a twin that was never
+                // asked for a bound, so the answer comes from the same route.
+                let mut reference = make!(true);
+                assert_eq!(reference.next().unwrap(), Some(first), "{context}: twin");
+                let mut expected = 0.0_f32;
+                let mut doc = reference.advance(target).unwrap();
+                while let Some(found) = doc {
+                    if found > up_to {
+                        break;
+                    }
+                    expected = expected.max(reference.score().unwrap());
+                    doc = reference.next().unwrap();
+                }
+                assert!(
+                    windowed >= expected,
+                    "{context}: windowed bound {windowed} for [{target}, {up_to}] does not cover {expected}"
+                );
+
+                // (c) The per-document route answers the same range on its own,
+                // so its bound is the second opinion on what the range holds.
+                let mut per_document = make!(false);
+                assert_eq!(
+                    per_document.next().unwrap(),
+                    Some(first),
+                    "{context}: per-document twin"
+                );
+                per_document.advance_shallow(target).unwrap();
+                let plain = per_document.score_bounds(up_to).unwrap().upper;
+                assert!(
+                    plain >= expected,
+                    "{context}: per-document bound {plain} for [{target}, {up_to}] does not cover {expected}"
+                );
+            }
+        }
+        assert!(inside > 0, "no probe landed inside an open window");
+        assert!(beyond > 0, "no probe reached past an open window");
+    }
+
+    /// A disjunction too wide for the windowed route parks its lagging clauses
+    /// in `tail` with a bound that only covers the window it was computed for. A
+    /// wide probe has to cover a high-scoring document of such a clause that
+    /// sits in a later block, still inside the probed range.
+    ///
+    /// The per-document route drains `tail` on every hand-out, so the probe is
+    /// taken from the state `next` holds between two hand-outs (see
+    /// `or_park_lagging_clauses`), which is the only state that carries a parked
+    /// clause into a shallow probe.
+    #[test]
+    fn non_windowed_disjunction_wide_bound_covers_a_parked_tail_past_the_window() {
+        let num_docs = 6_000_u32;
+        let doc_lengths = vec![8_u32; num_docs as usize];
+        // Eight clauses match every fourth document with one occurrence each, so
+        // each contributes the same score to every document it matches and its
+        // block bounds equal that score. A bound that leaves one of them out is
+        // then exactly one contribution short.
+        let dense = (0..num_docs)
+            .step_by(4)
+            .map(|doc| (doc, 1))
+            .collect::<Vec<_>>();
+        let mut terms = vec![dense; 8];
+        // The ninth clause matches almost every document up to the probe window
+        // with one occurrence. Missing every seventh document keeps its document
+        // count below the other clauses', and so its bound below theirs, which
+        // parks it in `tail` and makes it lag most candidates. Its
+        // high-frequency document sits in a later block, past the window a probe
+        // at the target covers.
+        let mut tail = (0..2_100_u32)
+            .filter(|doc| doc % 7 != 0)
+            .map(|doc| (doc, 1))
+            .collect::<Vec<_>>();
+        tail.push((2_400, 60));
+        terms.push(tail);
+        let corpus = Corpus::new(doc_lengths, terms);
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+
+        // Above the tail's window bound and at or below every other clause's, so
+        // only the weak clause parks in `tail`.
+        let floor = 1.3_f32;
+        // A multiple of four and not of seven, so every clause matches it: the
+        // weak one then sits in `lead` and can be parked by `push_back_leads`.
+        let target = 1_040_u64;
+        let up_to = 4_000_u64;
+
+        let mut cursor = or_cursor(
+            &documents,
+            or_postings(&corpus, 9),
+            corpus.scorer.clone(),
+            &metrics,
+            false,
+        );
+        // Nine clauses are wider than the windowed route drives.
+        assert!(!cursor.or_window_active(), "nine clauses took the window");
+        cursor.set_min_competitive_score(floor).unwrap();
+        let mut doc = cursor.next().unwrap();
+        while let Some(found) = doc {
+            if found >= target {
+                break;
+            }
+            doc = cursor.next().unwrap();
+        }
+        let position = doc.unwrap_or_else(|| panic!("no document at or after {target}"));
+        assert_eq!(position, target);
+
+        // Park the lagging clause exactly where `next` does between two
+        // hand-outs: the weak ninth clause sits in `tail` with the bound of the
+        // window it was parked in.
+        cursor.or_park_lagging_clauses(target + 1);
+
+        // The probe. Its bound must cover what the cursor hands out in the range,
+        // including the tail clause's later document.
+        let probed_up_to = cursor.advance_shallow(position).unwrap();
+        assert!(
+            probed_up_to >= position,
+            "advance_shallow({position}) reported {probed_up_to}"
+        );
+        let bounds = cursor.score_bounds(up_to).unwrap();
+        let mut emitted_max = 0.0_f32;
+        let mut emitted_tail = None;
+        while let Some(found) = cursor.next().unwrap() {
+            if found > up_to {
+                break;
+            }
+            let score = cursor.current_score().unwrap();
+            emitted_max = emitted_max.max(score);
+            if found == 2_400 {
+                emitted_tail = Some(score);
+            }
+        }
+        let tail_score = emitted_tail.unwrap_or_else(|| {
+            panic!("the tail clause's high document was not handed out in [{position}, {up_to}]")
+        });
+        assert!(
+            bounds.upper >= tail_score,
+            "wide bound {} for [{position}, {up_to}] does not cover the tail document's {tail_score}",
+            bounds.upper
+        );
+        assert!(
+            bounds.upper >= emitted_max,
+            "wide bound {} for [{position}, {up_to}] does not cover {emitted_max}",
+            bounds.upper
+        );
     }
 }

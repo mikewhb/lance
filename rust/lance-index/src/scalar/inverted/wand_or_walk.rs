@@ -61,6 +61,10 @@ pub(super) struct BulkOrState {
     essential_start: usize,
     /// Sum of the non-essential clauses' window bounds.
     non_essential_bound: f64,
+    /// End of the window the walk will open at `next_min` while none is open
+    /// yet. `None` means the planner could not look that far, and only
+    /// `next_min` itself is reachable.
+    planned_up_to: Option<u64>,
     accumulator: WindowAccumulator,
     contributions: SmallVec<[ScoreContribution; 8]>,
     hit_freqs: SmallVec<[u32; 8]>,
@@ -82,6 +86,7 @@ impl BulkOrState {
             essential: vec![false; num_lists],
             essential_start: 0,
             non_essential_bound: 0.0,
+            planned_up_to: None,
             accumulator: WindowAccumulator::new(num_lists),
             contributions: SmallVec::new(),
             hit_freqs: SmallVec::new(),
@@ -93,6 +98,9 @@ impl BulkOrState {
     /// allowed to change which clauses are probed.
     pub(super) fn invalidate_window(&mut self) {
         self.up_to = None;
+        // The end planned for the window that is about to be reopened belongs
+        // to the anchors the refreshed clauses no longer have.
+        self.planned_up_to = None;
     }
 
     /// Restart the walk at `target`, inclusive. Documents below it are the
@@ -100,6 +108,18 @@ impl BulkOrState {
     pub(super) fn restart_at(&mut self, target: u64) {
         self.next_min = self.next_min.max(target);
         self.up_to = None;
+        self.planned_up_to = None;
+    }
+
+    /// Record the end of the window the walk will open at `next_min`.
+    ///
+    /// The planner computes it from the clauses' block anchors, which is where
+    /// `open_or_window` anchors them anyway, so a jump into that window can be
+    /// served by the walk instead of a seek step: the range it asks for is the
+    /// range the first window bounds. Cleared by every restart, because a
+    /// window opened at a different start does not have to end there.
+    pub(super) fn plan_window_end(&mut self, up_to: u64) {
+        self.planned_up_to = Some(up_to);
     }
 
     /// Move the next window's start forward inside the open window.
@@ -114,10 +134,11 @@ impl BulkOrState {
     /// The furthest document this walk can hand out without opening a window it
     /// has not planned to read.
     ///
-    /// That is the open window's end, or the start of the next window when none
-    /// is open (which is where a walk restarted by a seek step stands).
+    /// That is the open window's end, or, with none open, the end of the window
+    /// the walk will open at `next_min` -- the first window's end when the
+    /// planner seeded it, `next_min` itself after a seek step moved the start.
     pub(super) fn reach(&self) -> u64 {
-        self.up_to.unwrap_or(self.next_min)
+        self.up_to.or(self.planned_up_to).unwrap_or(self.next_min)
     }
 
     /// Whether a window bound is still open. Test hook: a floor rise must close
