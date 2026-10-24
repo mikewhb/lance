@@ -2774,6 +2774,9 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         /// One-step seeks a windowed disjunction cursor ran because the caller
         /// jumped past the window it held.
         static OR_CURSOR_SEEK_STEPS: Cell<usize> = const { Cell::new(0) };
+        /// Candidates a disjunction cursor scored on its per-document route,
+        /// since the previous reset.
+        static OR_CURSOR_CANDIDATE_SCORES: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn and_cursor_batched() {
@@ -2834,6 +2837,10 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         OR_CURSOR_SEEK_STEPS.with(|count| count.set(count.get() + 1));
     }
 
+    pub(super) fn or_cursor_candidate_score() {
+        OR_CURSOR_CANDIDATE_SCORES.with(|count| count.set(count.get() + 1));
+    }
+
     pub(in crate::scalar::inverted) fn take_batched() -> usize {
         AND_CURSORS_BATCHED.with(|count| count.replace(0))
     }
@@ -2884,6 +2891,10 @@ pub(in crate::scalar::inverted) mod cursor_counters {
 
     pub(in crate::scalar::inverted) fn take_or_cursor_seek_steps() -> usize {
         OR_CURSOR_SEEK_STEPS.with(|count| count.replace(0))
+    }
+
+    pub(in crate::scalar::inverted) fn take_or_cursor_candidate_scores() -> usize {
+        OR_CURSOR_CANDIDATE_SCORES.with(|count| count.replace(0))
     }
 }
 
@@ -5907,6 +5918,11 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     current_doc: Option<DocInfo>,
     current_document_key: Option<u64>,
     current_score: f32,
+    // The disjunction candidate this cursor sits on has not been scored yet.
+    // The per-document route positions on a candidate before knowing whether
+    // the caller wants its score, so the score is computed on the first request
+    // instead; the postings it is computed from cannot move in between.
+    score_pending: bool,
     confirmation: Option<bool>,
     shallow: Option<(u64, u64, f32)>,
     comparisons: usize,
@@ -6049,6 +6065,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             current_doc: None,
             current_document_key: None,
             current_score: 0.0,
+            score_pending: false,
             confirmation: None,
             shallow: None,
             comparisons: 0,
@@ -6334,6 +6351,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         self.current_doc = None;
         self.current_document_key = None;
         self.current_score = 0.0;
+        self.score_pending = false;
         self.confirmation = None;
         self.shallow = None;
         if let Some(single) = self.single.as_mut() {
@@ -6586,6 +6604,13 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         self.position_classic()
     }
 
+    /// Exact score of the disjunction candidate the cursor sits on.
+    fn score_or_candidate(&mut self, doc_length: u32) -> f32 {
+        #[cfg(test)]
+        cursor_counters::or_cursor_candidate_score();
+        self.wand.score_in_query_order(doc_length)
+    }
+
     /// Find the next document by driving the WAND heap one candidate at a time.
     fn position_classic(&mut self) -> Result<Option<u64>> {
         loop {
@@ -6602,16 +6627,33 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                 }
                 continue;
             };
-            let doc_length = self.wand.documents.doc_length(&doc);
-            self.wand.advance_all_tail(doc_id, None, None);
-            let score = if self.wand.and_candidate_score.is_some() {
-                and_score
+            // With no floor the caller may never ask for this candidate's score:
+            // a driver pushes the disjunction to its own candidates and reads
+            // only the ones it lands on. An empty `tail` means no clause still
+            // has to be advanced to this document, and a phrase is confirmed
+            // from positions, so nothing else needs the length now. The postings
+            // that stop on the document stay there until the next call, so a
+            // score computed later is the one this would have computed.
+            let deferred = self.wand.operator == Operator::Or
+                && self.wand.tail.is_empty()
+                && self.phrase_slop.is_none();
+            let score = if deferred {
+                0.0
             } else {
-                self.wand.score_in_query_order(doc_length)
+                let doc_length = self.wand.documents.doc_length(&doc);
+                self.wand.advance_all_tail(doc_id, None, None);
+                if self.wand.and_candidate_score.is_some() {
+                    and_score
+                } else if self.wand.operator == Operator::Or {
+                    self.score_or_candidate(doc_length)
+                } else {
+                    self.wand.score_in_query_order(doc_length)
+                }
             };
             self.current_doc = Some(doc);
             self.current_document_key = Some(document_key);
             self.current_score = score;
+            self.score_pending = deferred;
             self.confirmation = self.phrase_slop.is_none().then_some(true);
             self.shallow = None;
             return Ok(Some(doc_id));
@@ -6919,6 +6961,18 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     pub(super) fn current_score(&mut self) -> Result<f32> {
         if let Some(single) = self.single.as_mut() {
             return single.score(self.wand.documents, &self.wand.scorer);
+        }
+        if self.score_pending {
+            let doc = self.current_doc.ok_or_else(|| {
+                Error::internal("posting FTS scorer is not positioned on a document")
+            })?;
+            // The candidate was positioned with `tail` empty, and nothing has
+            // moved a clause since, so this is the score the per-document route
+            // computes at positioning time.
+            debug_assert!(self.wand.tail.is_empty());
+            let doc_length = self.wand.documents.doc_length(&doc);
+            self.current_score = self.score_or_candidate(doc_length);
+            self.score_pending = false;
         }
         self.current_doc
             .map(|_| self.current_score)

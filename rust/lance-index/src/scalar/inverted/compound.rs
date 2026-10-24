@@ -11140,6 +11140,102 @@ mod tests {
         assert!(above > 100, "too few documents above the floor: {above}");
     }
 
+    /// The per-document route positions on a candidate without scoring it, and
+    /// scores it only when the caller asks. A driver that pushes the
+    /// disjunction to a run of targets but reads a few of the scores must pay
+    /// for exactly those.
+    #[test]
+    fn or_cursor_scores_a_candidate_only_when_asked() {
+        let mut rng = SmallRng::seed_from_u64(0x0000_D5EE_0008);
+        let corpus = random_corpus(&mut rng, 2_000, &or_densities(4, 1));
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let mut cursor = WandCursor::new(
+            Operator::Or,
+            or_postings(&corpus, 4),
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::new(),
+            &metrics,
+        );
+        assert!(
+            !cursor.or_window_active(),
+            "no floor takes the window route"
+        );
+        cursor_counters::take_or_cursor_candidate_scores();
+
+        let mut positioned = 0_usize;
+        let mut scored = 0_usize;
+        let mut target = 0_u64;
+        while positioned < 120 {
+            let Some(doc) = cursor.advance(target).unwrap() else {
+                break;
+            };
+            positioned += 1;
+            if positioned.is_multiple_of(3) {
+                cursor.current_score().unwrap();
+                scored += 1;
+            }
+            // Sparse targets, as a driver that only sometimes lands on this
+            // side's documents would issue.
+            target = doc + 1 + (positioned as u64 % 7);
+        }
+        assert_eq!(
+            cursor_counters::take_or_cursor_candidate_scores(),
+            scored,
+            "scored {scored} candidates but the cursor scored more"
+        );
+        assert!(positioned > 100, "only {positioned} candidates positioned");
+        assert!(scored > 30, "only {scored} candidates scored");
+    }
+
+    /// A shallow probe between positioning and scoring must not change the
+    /// score: the probe may move block cursors, but the clauses stay on the
+    /// document they were positioned at.
+    #[test]
+    fn or_cursor_lazy_score_survives_shallow_probes() {
+        let mut rng = SmallRng::seed_from_u64(0x0000_D5EE_0009);
+        let mut compared = 0_usize;
+        for clauses in 2..=4_usize {
+            let corpus = random_corpus(&mut rng, 2_000, &or_densities(clauses, 1));
+            let mask = RowAddrMask::all_rows();
+            let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+            let metrics = NoOpMetricsCollector;
+            let make = || {
+                WandCursor::new(
+                    Operator::Or,
+                    or_postings(&corpus, clauses),
+                    &documents,
+                    corpus.scorer.clone(),
+                    &FtsSearchParams::new(),
+                    &metrics,
+                )
+            };
+            // `probed` is asked for a bound before its score; `plain` is not.
+            let mut probed = make();
+            let mut plain = make();
+            loop {
+                let a = probed.next().unwrap();
+                let b = plain.next().unwrap();
+                assert_eq!(a, b, "clauses={clauses}: next");
+                let Some(doc) = a else {
+                    break;
+                };
+                let up_to = probed.advance_shallow(doc).unwrap();
+                let _ = probed.score_bounds(up_to).unwrap();
+                let _ = probed.score_bounds(up_to.saturating_add(400)).unwrap();
+                assert_eq!(
+                    probed.current_score().unwrap().to_bits(),
+                    plain.current_score().unwrap().to_bits(),
+                    "clauses={clauses}: score at {doc}",
+                );
+                compared += 1;
+            }
+        }
+        assert!(compared > 200, "only {compared} candidates compared");
+    }
+
     /// A floor raised mid-walk must not skip a document above it: the open
     /// window is dropped, the next one recomputes its bound, and the sequence
     /// still matches the per-document route.
