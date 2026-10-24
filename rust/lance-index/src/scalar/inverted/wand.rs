@@ -2225,8 +2225,16 @@ struct MaxScoreClause {
 }
 
 /// Per-window score/frequency accumulator for the bulk MAXSCORE path. Slot i
-/// covers doc id `window_min + i`; `freqs` is laid out clause-major so accept
+/// covers doc id `window_min + i`; `freqs` is laid out doc-major so accept
 /// paths can recover (term, freq) pairs of the essential clauses.
+///
+/// The buffers start at one posting block and grow to the widest window they
+/// are asked to cover. Slot capacity is word aligned because the `words` mask
+/// addresses slots by `slot >> 6`; growth doubles, never shrinks and never
+/// passes `MAXSCORE_INNER_WINDOW`, which is the widest window any caller asks
+/// about. A route therefore reallocates O(log window) times over its whole
+/// life and keeps `slots * clauses` frequencies resident, where `slots` is the
+/// widest window it has walked.
 struct WindowAccumulator {
     scores: Vec<f32>,
     freqs: Vec<u32>,
@@ -2234,14 +2242,43 @@ struct WindowAccumulator {
     num_clauses: usize,
 }
 
+/// Slots a fresh accumulator covers: one posting block, the smallest window a
+/// bulk route opens.
+const WINDOW_ACCUMULATOR_MIN_SLOTS: usize = MAX_POSTING_BLOCK_SIZE;
+
 impl WindowAccumulator {
     fn new(num_clauses: usize) -> Self {
+        Self::with_slots(num_clauses, WINDOW_ACCUMULATOR_MIN_SLOTS)
+    }
+
+    fn with_slots(num_clauses: usize, slots: usize) -> Self {
+        debug_assert!(slots.is_multiple_of(64), "the slot mask is word aligned");
         Self {
-            scores: vec![0.0; MAXSCORE_INNER_WINDOW],
-            freqs: vec![0; num_clauses * MAXSCORE_INNER_WINDOW],
-            words: vec![0; MAXSCORE_INNER_WINDOW / 64],
+            scores: vec![0.0; slots],
+            freqs: vec![0; num_clauses * slots],
+            words: vec![0; slots / 64],
             num_clauses,
         }
+    }
+
+    /// Cover `slots` document slots before a window is collected into them.
+    ///
+    /// Callers cap the span at `MAXSCORE_INNER_WINDOW`, so a buffer that starts
+    /// at one block needs at most a handful of doublings before every later
+    /// window fits.
+    #[inline]
+    fn reserve_slots(&mut self, slots: usize) {
+        debug_assert!(slots <= MAXSCORE_INNER_WINDOW);
+        if slots <= self.scores.len() {
+            return;
+        }
+        let mut capacity = self.scores.len();
+        while capacity < slots {
+            capacity *= 2;
+        }
+        self.scores.resize(capacity, 0.0);
+        self.freqs.resize(capacity * self.num_clauses, 0);
+        self.words.resize(capacity / 64, 0);
     }
 
     #[inline]
@@ -3922,6 +3959,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 let inner_max =
                     window_max.min(inner_min.saturating_add(MAXSCORE_INNER_WINDOW as u64 - 1));
+                // Slots are addressed by `doc - inner_min`, so the buffer only
+                // has to cover this window, not the widest one this search can
+                // ever open.
+                acc.reserve_slots((inner_max - inner_min + 1) as usize);
 
                 for (clause_idx, clause) in clauses.iter_mut().enumerate().skip(first_essential) {
                     clause.posting.collect_window_scores(

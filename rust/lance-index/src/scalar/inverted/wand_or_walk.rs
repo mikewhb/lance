@@ -11,14 +11,28 @@
 //!
 //! Constraints this walk keeps:
 //!
-//! * A document whose exact score reaches the floor is always emitted, with the
-//!   query-order score the per-document route reports. Pruning only happens
-//!   under a positive floor and only when a clause bound proves the document
-//!   cannot reach it.
+//! * A document whose exact score reaches the floor is never skipped. Both
+//!   routes reject a candidate only when a conservative upper bound -- a
+//!   partial sum plus the remaining clauses' bounds, widened by
+//!   `score_sum_upper_bound_factor` -- falls below the floor, and the exact
+//!   score is at most that bound. The two routes differ in which partial sum
+//!   they compare: the per-document route folds in heap order, this walk folds
+//!   in query order. On three or more clauses the widening factor is above one,
+//!   so a document whose score sits inside that band can be rejected by one
+//!   route and emitted by the other. The band lies strictly below the floor, so
+//!   a collector that keeps `score >= floor` sees the same documents, in the
+//!   same order, with the same scores, and the top-k is unchanged.
 //! * The non-essential prefix is never enumerated away. Its bound sits below
 //!   the floor, so a document matched only by that prefix cannot compete.
 //! * Nothing here owns a window slice or a raw pointer: the state has to stay
 //!   `Send`, because the cursor is boxed and sent to a partition executor.
+//!
+//! Score bits are not merely bounded: for every document this walk hands out,
+//! the per-candidate contributions are summed by
+//! `score_contributions_in_query_order`, the same order and the same
+//! `query_weight * Scorer::doc_weight` terms the per-document route folds, so
+//! the two can only disagree about whether to hand the document out, never
+//! about what its score is.
 
 use super::and_walk::{BulkVisit, StepOutcome};
 use super::*;
@@ -134,6 +148,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let inner_min = state.next_min;
         let inner_max = up_to.min(inner_min.saturating_add(MAXSCORE_INNER_WINDOW as u64 - 1));
         state.next_min = inner_max.saturating_add(1);
+        // Slots are addressed by `doc - inner_min`, so the buffer only has to
+        // cover this window. It keeps the widest span it has walked, which
+        // bounds both the peak size and the number of reallocations.
+        state
+            .accumulator
+            .reserve_slots((inner_max - inner_min + 1) as usize);
         // Scores are computed from `query_weight * Scorer::doc_weight`, exactly
         // as the per-document route computes them, so the two routes cannot
         // disagree by rounding. The norm addend cache is deliberately unused.

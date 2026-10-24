@@ -9469,7 +9469,12 @@ mod tests {
     }
 
     /// The windowed disjunction must return exactly what the per-document route
-    /// returns, bit for bit, under the same probes from a compound collector.
+    /// returns, bit for bit. While no floor is in play both routes can only
+    /// hand out the same documents, so the whole sequence is compared. Once a
+    /// floor is raised the routes may disagree about documents inside the
+    /// bound-widening band, all of them below the floor (see the module docs of
+    /// `wand_or_walk`), so from there on only what a collector at that floor
+    /// keeps is compared, and that subsequence must still be bit-identical.
     #[test]
     fn or_cursor_batch_matches_the_per_document_cursor_bit_for_bit() {
         cursor_counters::take_or_cursors_batched();
@@ -9477,6 +9482,7 @@ mod tests {
         let mut compared = 0_usize;
         let mut drained = 0_usize;
         let mut walked = 0_usize;
+        let mut above_floor = 0_usize;
         for seed in 0..3_u64 {
             let mut rng = SmallRng::seed_from_u64(seed);
             let num_docs = rng.random_range(400..=900_usize);
@@ -9499,6 +9505,9 @@ mod tests {
                             "seed={seed} clauses={clauses} shape={shape} quantized={quantized}"
                         );
 
+                        // No floor: every document either route emits is
+                        // comparable, so both the interleaved probes and the
+                        // whole-corpus drain must match bit for bit.
                         let mut batch = or_cursor(
                             &documents,
                             or_postings(&corpus, clauses),
@@ -9516,10 +9525,9 @@ mod tests {
                         assert!(batch.or_window_active(), "{context}: route");
                         assert!(!classic.or_window_active(), "{context}: route");
 
-                        let mut floor = 0.0_f32;
                         for _ in 0..256 {
                             match rng.random_range(0..16_u32) {
-                                0..=5 => {
+                                0..=7 => {
                                     let a = batch.next().unwrap();
                                     let b = classic.next().unwrap();
                                     assert_eq!(a, b, "{context}: next");
@@ -9529,12 +9537,7 @@ mod tests {
                                     compared += 1;
                                     assert_same_candidate(&mut batch, &mut classic, &context);
                                 }
-                                6 => {
-                                    floor = floor.max(rng.random_range(0.0..2.0_f32));
-                                    batch.set_min_competitive_score(floor).unwrap();
-                                    classic.set_min_competitive_score(floor).unwrap();
-                                }
-                                7..=12 => {
+                                _ => {
                                     let target =
                                         batch.doc().unwrap_or(0) + rng.random_range(1..48_u64);
                                     let a = batch.advance(target).unwrap();
@@ -9546,18 +9549,10 @@ mod tests {
                                         assert_same_candidate(&mut batch, &mut classic, &context);
                                     }
                                 }
-                                _ => {
-                                    if batch.doc().is_some() {
-                                        assert_same_candidate(&mut batch, &mut classic, &context);
-                                    }
-                                }
                             }
                         }
                         walked += batch.or_window_compared();
 
-                        // The windowed cursor must agree with the per-document
-                        // route on the whole corpus, whatever the probes left
-                        // behind.
                         let batch_docs = drain_or(&mut or_cursor(
                             &documents,
                             or_postings(&corpus, clauses),
@@ -9574,6 +9569,62 @@ mod tests {
                             false,
                         ));
                         assert_eq!(batch_docs, classic_docs, "{context}: whole corpus");
+
+                        // A floor inside the score distribution. The per-document
+                        // route may now emit documents the window prunes and the
+                        // other way round, so compare what a collector at this
+                        // floor keeps.
+                        let mut scores = batch_docs
+                            .iter()
+                            .map(|&(_, bits)| f32::from_bits(bits))
+                            .collect::<Vec<_>>();
+                        scores.sort_by(f32::total_cmp);
+                        let floor = scores[scores.len() / 3];
+                        assert!(floor > 0.0, "{context}: floor {floor}");
+
+                        let mut batch = or_cursor(
+                            &documents,
+                            or_postings(&corpus, clauses),
+                            corpus.scorer.clone(),
+                            &metrics,
+                            true,
+                        );
+                        let mut classic = or_cursor(
+                            &documents,
+                            or_postings(&corpus, clauses),
+                            corpus.scorer.clone(),
+                            &metrics,
+                            false,
+                        );
+                        let mut rows_batch = Vec::new();
+                        let mut rows_classic = Vec::new();
+                        for step in 0..192 {
+                            if step == 96 {
+                                batch.set_min_competitive_score(floor).unwrap();
+                                classic.set_min_competitive_score(floor).unwrap();
+                            }
+                            for (cursor, rows) in [
+                                (&mut batch, &mut rows_batch),
+                                (&mut classic, &mut rows_classic),
+                            ] {
+                                if let Some(doc) = cursor.next().unwrap() {
+                                    rows.push((doc, cursor.current_score().unwrap().to_bits()));
+                                }
+                            }
+                        }
+                        let kept = |rows: &[(u64, u32)]| {
+                            rows.iter()
+                                .filter(|(_, bits)| f32::from_bits(*bits) >= floor)
+                                .copied()
+                                .collect::<Vec<_>>()
+                        };
+                        let batch_kept = kept(&rows_batch);
+                        above_floor += batch_kept.len();
+                        assert_eq!(
+                            batch_kept,
+                            kept(&rows_classic),
+                            "{context}: documents above floor {floor}"
+                        );
                     }
                 }
             }
@@ -9584,6 +9635,10 @@ mod tests {
         );
         assert!(drained > 2_000, "too few compared documents: {drained}");
         assert!(walked > 0, "the windowed route never compared a candidate");
+        assert!(
+            above_floor > 100,
+            "too few documents above the floor: {above_floor}"
+        );
         assert!(
             cursor_counters::take_or_cursors_batched() > 0,
             "the windowed route was never built"
