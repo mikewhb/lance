@@ -109,6 +109,39 @@ fn norm_addends<S: Scorer + ?Sized>(scorer: &S) -> Option<Arc<[f32; 256]>> {
     Some(Arc::new(addends))
 }
 
+/// One clause's contribution to a cursor candidate, through the norm addend
+/// cache when the partition provides one.
+///
+/// This is bit-identical to `posting.score(scorer, freq, doc_length)`:
+/// `PostingIterator::score` returns `query_weight * doc_weight(freq, length)`,
+/// `doc_weight` evaluates `bm25_doc_weight_with_norm(freq, bm25_doc_norm(length))`,
+/// and `addends[norms[doc_id]]` already holds `doc_norm` of the dequantized
+/// length that `documents.doc_length` would return for the same document. The
+/// quantized documents are the ones the cache is built from, so both paths
+/// perform the same multiply on the same addend.
+///
+/// `doc_length` is only called on the fallback path: reading a length the
+/// cached addend replaces is pure overhead.
+#[inline]
+pub(super) fn cursor_term_score<S: Scorer + ?Sized>(
+    posting: &PostingIterator,
+    scorer: &S,
+    freq: u32,
+    doc_id: u32,
+    doc_length: impl FnOnce() -> u32,
+    norm_k: Option<(&[u8], &[f32; 256])>,
+) -> f32 {
+    match norm_k {
+        // A grouped posting's score is a sum over its expansions, which the
+        // cache cannot express; it keeps the full `PostingIterator::score`.
+        Some((norms, addends)) if !posting.has_grouped_terms() => {
+            posting.query_weight
+                * bm25_doc_weight_with_norm(freq, addends[norms[doc_id as usize] as usize])
+        }
+        _ => posting.score(scorer, freq, doc_length()),
+    }
+}
+
 /// Reusable (term, freq) storage for live heap candidates. Replacing the k-th
 /// result reuses its slot and retained `Vec` capacity, so memory stays bounded
 /// by the live top-k rather than every historical heap admission.
@@ -3028,6 +3061,11 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // -- a lower bound on the global k-th, so it never drops a real top-k doc.
     shared_threshold: Option<Arc<AtomicU32>>,
     shared_norm_addends: Option<SharedNormAddends>,
+    // Resolved on the first cursor score or window, not at construction: most
+    // searches never touch it, and the table costs 256 `doc_norm` calls. The
+    // documents and the scorer are immutable for the walk, so one answer
+    // serves every later candidate.
+    norm_k: OnceCell<Option<NormKCache<'a>>>,
 }
 
 /// Monotonically raise an f32 stored in an `AtomicU32` to `val`. CAS loop (not a
@@ -3150,6 +3188,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             scorer,
             shared_threshold: None,
             shared_norm_addends: None,
+            norm_k: OnceCell::new(),
         }
     }
 
@@ -3204,6 +3243,21 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             None => norm_addends(&self.scorer)?,
         };
         Some((norms, addends))
+    }
+
+    /// [`Self::norm_k_cache`] resolved once per walk. The documents and the
+    /// scorer do not change, so the first candidate that scores pays for the
+    /// addend table and every later one reads it.
+    ///
+    /// The addend slice is borrowed from the stored table, so callers that
+    /// need to move the clause cursors must copy the table out instead (see the
+    /// disjunction window, which borrows it once per window).
+    #[inline]
+    fn cached_norm_k(&self) -> Option<(&[u8], &[f32; 256])> {
+        self.norm_k
+            .get_or_init(|| self.norm_k_cache())
+            .as_ref()
+            .map(|(norms, addends)| (*norms, addends.as_ref()))
     }
 
     /// Set the pruning threshold from this partition's k-th best, raised to the
@@ -4249,6 +4303,58 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     (
                         (posting.position, posting.token_id),
                         posting.score(&self.scorer, doc.frequency(), doc_length),
+                    )
+                })
+            })
+            .collect::<SmallVec<[ScoreContribution; 8]>>();
+        score_contributions_in_query_order(contributions)
+    }
+
+    /// Cursor-only counterpart of [`Self::score_in_query_order`].
+    ///
+    /// Same clauses, same order, same fold from `0.0`; each clause's
+    /// contribution goes through [`cursor_term_score`], so a quantized
+    /// partition reads the norm addend cache instead of recomputing the BM25
+    /// denominator. `score_in_query_order` itself is untouched because the
+    /// terminal calls it.
+    fn cursor_score_in_query_order(
+        &self,
+        norm_k: Option<(&[u8], &[f32; 256])>,
+        doc_length: impl Fn() -> u32,
+    ) -> f32 {
+        let ordered = self.lead.windows(2).all(|window| {
+            (window[0].position, window[0].token_id) <= (window[1].position, window[1].token_id)
+        });
+        if ordered {
+            return self.lead.iter().fold(0.0_f32, |score, posting| {
+                score
+                    + posting.doc().map_or(0.0, |doc| {
+                        cursor_term_score(
+                            posting,
+                            &self.scorer,
+                            doc.frequency(),
+                            doc.doc_id() as u32,
+                            &doc_length,
+                            norm_k,
+                        )
+                    })
+            });
+        }
+        let contributions = self
+            .lead
+            .iter()
+            .filter_map(|posting| {
+                posting.doc().map(|doc| {
+                    (
+                        (posting.position, posting.token_id),
+                        cursor_term_score(
+                            posting,
+                            &self.scorer,
+                            doc.frequency(),
+                            doc.doc_id() as u32,
+                            &doc_length,
+                            norm_k,
+                        ),
                     )
                 })
             })
@@ -6604,11 +6710,15 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         self.position_classic()
     }
 
-    /// Exact score of the disjunction candidate the cursor sits on.
-    fn score_or_candidate(&mut self, doc_length: u32) -> f32 {
+    /// Exact score of the disjunction candidate the cursor sits on, through the
+    /// norm addend cache when the partition provides one.
+    fn score_or_candidate(&self, doc: &DocInfo) -> f32 {
         #[cfg(test)]
         cursor_counters::or_cursor_candidate_score();
-        self.wand.score_in_query_order(doc_length)
+        self.wand
+            .cursor_score_in_query_order(self.wand.cached_norm_k(), || {
+                self.wand.documents.doc_length(doc)
+            })
     }
 
     /// Find the next document by driving the WAND heap one candidate at a time.
@@ -6640,13 +6750,13 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             let score = if deferred {
                 0.0
             } else {
-                let doc_length = self.wand.documents.doc_length(&doc);
                 self.wand.advance_all_tail(doc_id, None, None);
                 if self.wand.and_candidate_score.is_some() {
                     and_score
                 } else if self.wand.operator == Operator::Or {
-                    self.score_or_candidate(doc_length)
+                    self.score_or_candidate(&doc)
                 } else {
+                    let doc_length = self.wand.documents.doc_length(&doc);
                     self.wand.score_in_query_order(doc_length)
                 }
             };
@@ -6960,7 +7070,11 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
 
     pub(super) fn current_score(&mut self) -> Result<f32> {
         if let Some(single) = self.single.as_mut() {
-            return single.score(self.wand.documents, &self.wand.scorer);
+            return single.score(
+                self.wand.documents,
+                &self.wand.scorer,
+                self.wand.cached_norm_k(),
+            );
         }
         if self.score_pending {
             let doc = self.current_doc.ok_or_else(|| {
@@ -6970,8 +7084,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             // moved a clause since, so this is the score the per-document route
             // computes at positioning time.
             debug_assert!(self.wand.tail.is_empty());
-            let doc_length = self.wand.documents.doc_length(&doc);
-            self.current_score = self.score_or_candidate(doc_length);
+            self.current_score = self.score_or_candidate(&doc);
             self.score_pending = false;
         }
         self.current_doc
@@ -10686,6 +10799,93 @@ mod tests {
             "partitions of one query must share one table"
         );
         assert_eq!((*first).map(f32::to_bits), (*local).map(f32::to_bits));
+    }
+
+    #[test]
+    fn cursor_norm_cache_scores_match_doc_weight_bit_for_bit() {
+        // One document per quantized length code, so the comparison spans the
+        // whole addend table instead of the codes one corpus happens to use.
+        let num_docs = 256u32;
+        let mut docs = DocSet::default();
+        for code in 0..num_docs {
+            docs.append(u64::from(code), dequantize_doc_length(code as u8));
+        }
+        docs.set_quantized_scoring(true);
+        let total_tokens = (0..num_docs)
+            .map(|doc_id| u64::from(docs.scoring_num_tokens(doc_id)))
+            .sum();
+        let scorer = Arc::new(MemBM25Scorer::new(
+            total_tokens,
+            num_docs as usize,
+            std::collections::HashMap::new(),
+        ));
+        // The list contents never matter here: only `query_weight` and the
+        // absence of grouped terms feed the score.
+        let posting = PostingIterator::with_query_weight(
+            "t".to_owned(),
+            0,
+            0,
+            0.7,
+            generate_impact_posting_list_with_freqs_and_block_size(
+                (0..num_docs).collect(),
+                vec![1; num_docs as usize],
+                vec![1; num_docs as usize],
+                MAX_POSTING_BLOCK_SIZE,
+            ),
+            num_docs as usize,
+        );
+        let frequencies = (1..=64u32).chain([1_000, 100_000, u32::MAX]);
+
+        let norms = docs
+            .scoring_norms()
+            .expect("quantized documents expose the norm slab");
+        let addends = norm_addends(&scorer).expect("BM25 defines every addend");
+        let norm_k = Some((norms, addends.as_ref()));
+        for doc_id in 0..num_docs {
+            let doc_length = docs.scoring_num_tokens(doc_id);
+            for freq in frequencies.clone() {
+                let expected = posting.score(&scorer, freq, doc_length);
+                let cached = cursor_term_score(
+                    &posting,
+                    &scorer,
+                    freq,
+                    doc_id,
+                    || unreachable!("the cached path must not read the document length"),
+                    norm_k,
+                );
+                assert_eq!(
+                    cached.to_bits(),
+                    expected.to_bits(),
+                    "doc {doc_id} freq {freq}: cached {cached} vs doc_weight {expected}"
+                );
+            }
+        }
+
+        // An exact-length partition exposes no norm slab, so the cursor has to
+        // keep the path that reads the document length.
+        docs.set_quantized_scoring(false);
+        assert!(docs.scoring_norms().is_none());
+        let bare = Wand::new(Operator::Or, std::iter::empty(), &docs, scorer.clone());
+        assert!(bare.cached_norm_k().is_none());
+        for doc_id in 0..num_docs {
+            let doc_length = docs.scoring_num_tokens(doc_id);
+            for freq in frequencies.clone() {
+                let expected = posting.score(&scorer, freq, doc_length);
+                let uncached = cursor_term_score(
+                    &posting,
+                    &scorer,
+                    freq,
+                    doc_id,
+                    || doc_length,
+                    bare.cached_norm_k(),
+                );
+                assert_eq!(
+                    uncached.to_bits(),
+                    expected.to_bits(),
+                    "doc {doc_id} freq {freq}: uncached {uncached} vs doc_weight {expected}"
+                );
+            }
+        }
     }
 
     #[test]

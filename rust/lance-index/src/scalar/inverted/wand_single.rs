@@ -16,7 +16,7 @@ use super::super::scorer::Scorer;
 use super::and_kernel::{self, LeadBound};
 use super::{
     CompetitiveFloorMode, DocInfo, PostingIterator, RawDocInfo, TERMINATED_DOC_ID, WandDocuments,
-    conservative_score_sum, posting_range_upper_bound,
+    conservative_score_sum, cursor_term_score, posting_range_upper_bound,
 };
 
 /// Walk state of the single-posting route.
@@ -181,7 +181,12 @@ impl SinglePosting {
     }
 
     /// The current document's score, computed on first use.
-    pub(super) fn score<D, S>(&mut self, documents: &D, scorer: &S) -> Result<f32>
+    pub(super) fn score<D, S>(
+        &mut self,
+        documents: &D,
+        scorer: &S,
+        norm_k: Option<(&[u8], &[f32; 256])>,
+    ) -> Result<f32>
     where
         D: WandDocuments,
         S: Scorer + ?Sized,
@@ -198,13 +203,18 @@ impl SinglePosting {
             .posting
             .doc()
             .ok_or_else(|| Error::internal("posting FTS scorer is not positioned on a document"))?;
-        let doc_length = documents.doc_length(&doc);
         // Same fold-from-zero as the query-order sum of a one-clause cursor, so
-        // the bits match the heap route.
+        // the bits match the heap route. A cache hit reads the addend instead of
+        // the document length.
         let score = 0.0_f32
-            + self
-                .posting
-                .score(scorer, posting_doc.frequency(), doc_length);
+            + cursor_term_score(
+                &self.posting,
+                scorer,
+                posting_doc.frequency(),
+                posting_doc.doc_id() as u32,
+                || documents.doc_length(&doc),
+                norm_k,
+            );
         self.current_score = Some(score);
         Ok(score)
     }

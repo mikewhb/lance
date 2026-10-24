@@ -192,8 +192,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .reserve_slots((inner_max - inner_min + 1) as usize);
         // Scores are computed from `query_weight * Scorer::doc_weight`, exactly
         // as the per-document route computes them, so the two routes cannot
-        // disagree by rounding. The norm addend cache is deliberately unused.
-        let norm_k: Option<(&[u8], &[f32; 256])> = None;
+        // disagree by rounding. A quantized partition reads the same norm
+        // addend cache the per-document route reads. The table is copied out
+        // once per window because the clause cursors below have to be moved.
+        let norm_addends = self.norm_k.get_or_init(|| self.norm_k_cache()).clone();
+        let norm_k = norm_addends
+            .as_ref()
+            .map(|(norms, addends)| (*norms, addends.as_ref()));
         for slot in state.essential_start..state.order.len() {
             let index = state.order[slot];
             self.lead[index].collect_window_scores(
@@ -266,7 +271,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     if freq == 0 {
                         continue;
                     }
-                    score += self.lead[index].score(&self.scorer, freq, doc_length);
+                    score += cursor_term_score(
+                        &self.lead[index],
+                        &self.scorer,
+                        freq,
+                        doc as u32,
+                        || doc_length,
+                        norm_k,
+                    );
                     state.hit_freqs.push(freq);
                 }
                 state.accumulator.clear_slot(slot);
