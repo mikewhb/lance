@@ -28,11 +28,10 @@
 //!   `Send`, because the cursor is boxed and sent to a partition executor.
 //!
 //! Score bits are not merely bounded: for every document this walk hands out,
-//! the per-candidate contributions are summed by
-//! `score_contributions_in_query_order`, the same order and the same
-//! `query_weight * Scorer::doc_weight` terms the per-document route folds, so
-//! the two can only disagree about whether to hand the document out, never
-//! about what its score is.
+//! the per-candidate contributions are summed in `lead` order, which is query
+//! order, with the same `query_weight * Scorer::doc_weight` terms the
+//! per-document route folds, so the two can only disagree about whether to hand
+//! the document out, never about what its score is.
 
 use super::and_walk::{BulkVisit, StepOutcome};
 use super::*;
@@ -66,7 +65,6 @@ pub(super) struct BulkOrState {
     /// `next_min` itself is reachable.
     planned_up_to: Option<u64>,
     accumulator: WindowAccumulator,
-    contributions: SmallVec<[ScoreContribution; 8]>,
     hit_freqs: SmallVec<[u32; 8]>,
 }
 
@@ -88,7 +86,6 @@ impl BulkOrState {
             non_essential_bound: 0.0,
             planned_up_to: None,
             accumulator: WindowAccumulator::new(num_lists),
-            contributions: SmallVec::new(),
             hit_freqs: SmallVec::new(),
         }
     }
@@ -246,11 +243,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     continue;
                 };
                 let doc_length = self.documents.scoring_num_tokens(doc as u32);
-                state.contributions.clear();
                 state.hit_freqs.clear();
                 // Query order: the accumulator holds the essential clauses'
                 // frequencies, the non-essential ones are probed here, and both
-                // move forward only.
+                // move forward only. `lead` is sorted by `(position, token_id)`,
+                // so summing while walking it adds the same terms in the same
+                // order, from the same zero, as the per-document route does.
+                let mut score = 0.0_f32;
                 for index in 0..state.num_lists {
                     let freq = if state.essential[index] {
                         state.accumulator.clause_freq(index, slot)
@@ -267,14 +266,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     if freq == 0 {
                         continue;
                     }
-                    let posting = &self.lead[index];
-                    state.contributions.push((
-                        (posting.position, posting.token_id),
-                        posting.score(&self.scorer, freq, doc_length),
-                    ));
+                    score += self.lead[index].score(&self.scorer, freq, doc_length);
                     state.hit_freqs.push(freq);
                 }
-                let score = score_contributions_in_query_order(state.contributions.clone());
                 state.accumulator.clear_slot(slot);
                 if floor > 0.0 && score_sum_cannot_compete(score, 0.0, floor, factor, floor_mode) {
                     continue;
@@ -339,6 +333,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     fn open_or_window(&mut self, state: &mut BulkOrState) -> Option<u64> {
         #[cfg(test)]
         cursor_counters::or_cursor_window_open();
+        // The candidate loop sums clauses in `lead` order, which must be query
+        // order: the route build sorts the clauses once and no clause may leave
+        // `lead` while the walk runs.
+        debug_assert!(
+            self.lead
+                .windows(2)
+                .all(|window| (window[0].position, window[0].token_id)
+                    <= (window[1].position, window[1].token_id))
+        );
         let mut first_doc = TERMINATED_DOC_ID;
         for posting in &self.lead {
             if let Some(doc) = posting.doc() {

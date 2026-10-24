@@ -10911,6 +10911,85 @@ mod tests {
         );
     }
 
+    /// The window walk sums a candidate's contributions in `lead` order, which
+    /// is query order. A clause whose query position differs from its token id
+    /// puts `lead` in an order neither the token ids nor the heap order
+    /// describe, and the varied frequencies and lengths make the f32 sum
+    /// order-sensitive, so the score bits expose a sum that walked the clauses
+    /// in any other order.
+    #[test]
+    fn or_window_sums_candidates_in_query_order() {
+        let num_docs = 900_usize;
+        let doc_lengths = (0..num_docs)
+            .map(|doc| 4 + (doc % 13) as u32)
+            .collect::<Vec<_>>();
+        // Query positions are a permutation of the token ids: clause 0 is the
+        // third, clause 1 the first, and so on.
+        let positions = [2_usize, 0, 4, 1, 3];
+        let terms = (0..positions.len())
+            .map(|term| {
+                let step = 3 + term;
+                ((term as u32)..num_docs as u32)
+                    .step_by(step)
+                    .map(|doc| (doc, 1 + (doc + term as u32) % 7))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let corpus = Corpus::new(doc_lengths, terms);
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let postings = || {
+            (0..positions.len())
+                .map(|term| {
+                    impact_posting_at(
+                        term,
+                        positions[term] as u32,
+                        &corpus.terms[term],
+                        &corpus.doc_lengths,
+                        &corpus.scorer,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // No floor: both routes hand out the same documents, so the whole
+        // sequence and every score has to match bit for bit.
+        let mut windowed = or_cursor(
+            &documents,
+            postings(),
+            corpus.scorer.clone(),
+            &metrics,
+            true,
+        );
+        let mut per_document = or_cursor(
+            &documents,
+            postings(),
+            corpus.scorer.clone(),
+            &metrics,
+            false,
+        );
+        assert!(
+            windowed.or_window_active(),
+            "the window route is not active"
+        );
+        let expected = drain_or(&mut per_document);
+        let summed = drain_or(&mut windowed);
+        assert!(
+            summed.len() > 300,
+            "only {} documents compared",
+            summed.len()
+        );
+        assert_eq!(
+            summed, expected,
+            "the window summed a candidate outside query order"
+        );
+        assert!(
+            windowed.or_window_compared() > 0,
+            "the window never compared a candidate"
+        );
+    }
+
     /// A floor raised mid-walk must not skip a document above it: the open
     /// window is dropped, the next one recomputes its bound, and the sequence
     /// still matches the per-document route.
