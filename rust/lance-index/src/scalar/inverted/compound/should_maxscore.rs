@@ -492,11 +492,20 @@ impl ComposableScorer for ShouldMaxScoreScorer<'_> {
         let reported = self.reported_bounds.ok_or_else(|| {
             Error::internal("score_bounds requires advance_shallow on the FTS SHOULD scorer")
         })?;
-        if up_to < reported.target || up_to > reported.up_to {
+        if up_to < reported.target {
             return Err(Error::internal(format!(
-                "FTS SHOULD score bound up_to={up_to} is outside shallow range [{}, {}]",
-                reported.target, reported.up_to
+                "FTS SHOULD score bound up_to={up_to} ends before shallow range start {}",
+                reported.target
             )));
+        }
+        if up_to > reported.up_to {
+            // A wide range spans blocks the SHOULD window never combined; the
+            // list-wide bound covers all of them and leaves the window state
+            // untouched.
+            return Ok(ScoreBounds {
+                lower: 0.0,
+                upper: self.global_score_upper_bound,
+            });
         }
         Ok(reported.bounds)
     }

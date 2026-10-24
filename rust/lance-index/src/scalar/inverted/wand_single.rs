@@ -16,7 +16,7 @@ use super::super::scorer::Scorer;
 use super::and_kernel::{self, LeadBound};
 use super::{
     CompetitiveFloorMode, DocInfo, PostingIterator, RawDocInfo, TERMINATED_DOC_ID, WandDocuments,
-    conservative_score_sum,
+    conservative_score_sum, posting_range_upper_bound,
 };
 
 /// Walk state of the single-posting route.
@@ -243,16 +243,34 @@ impl SinglePosting {
         up_to
     }
 
-    pub(super) fn score_upper_bound(&self, up_to: u64) -> Result<f32> {
+    pub(super) fn score_upper_bound<S: Scorer + ?Sized>(
+        &mut self,
+        up_to: u64,
+        scorer: &S,
+    ) -> Result<f32> {
         let (target, shallow_up_to, upper) = self.shallow.ok_or_else(|| {
             Error::internal("score bound requires advance_shallow on the posting FTS scorer")
         })?;
-        if up_to < target || up_to > shallow_up_to {
+        if up_to < target {
             return Err(Error::internal(format!(
-                "posting FTS score bound up_to={up_to} is outside shallow range [{target}, {shallow_up_to}]"
+                "posting FTS score bound up_to={up_to} ends before its target {target}"
             )));
         }
-        Ok(upper)
+        // Inside the reported range the cached bound is returned unchanged. A
+        // wider request is widened, not clamped: the posting's block cursor
+        // never parks past the shallow target, so a forward step reaches the
+        // block holding `target` and the helper folds every block up to
+        // `up_to`.
+        if up_to <= shallow_up_to {
+            return Ok(upper);
+        }
+        Ok(posting_range_upper_bound(
+            &mut self.posting,
+            target,
+            up_to,
+            scorer,
+            false,
+        ))
     }
 
     pub(super) fn global_score_upper_bound<S: Scorer + ?Sized>(&self, scorer: &S) -> Option<f32> {

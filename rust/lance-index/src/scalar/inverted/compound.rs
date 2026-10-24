@@ -268,6 +268,15 @@ pub(super) trait ComposableScorer: Send {
     fn cost(&self) -> usize;
     fn score(&mut self) -> Result<f32>;
     fn advance_shallow(&mut self, target: u64) -> Result<u64>;
+    /// Conservative bounds for every document in `[target, up_to]` that this
+    /// scorer can still produce, where `target` is the last `advance_shallow`
+    /// target. `up_to` may exceed the value `advance_shallow` returned.
+    ///
+    /// A bound computed for a wider range than `advance_shallow` reported must
+    /// cover every block the range spans, and must not move the current
+    /// document or change later narrow answers. Answering a wide range is
+    /// read-only: it neither rewrites the cached shallow range nor the
+    /// iteration schedule.
     fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds>;
     /// Conservative list-wide score upper bound, independent of iterator
     /// position. `None` keeps the scorer on exact eager composition paths.
@@ -772,6 +781,21 @@ impl<D: WandDocuments + Sync> ComposableScorer for WandCursor<'_, D> {
     }
 
     fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        if self
+            .phrase_wide_fallback_after()
+            .is_some_and(|shallow_up_to| up_to > shallow_up_to)
+        {
+            // The phrase walk owns cursor anchors a read-only probe must not
+            // disturb, so a range that spans blocks is not widened by walking
+            // blocks and is not clamped either: it answers from the list-wide
+            // bound. The narrow answer below is untouched (W1).
+            return Ok(self
+                .global_score_upper_bound()
+                .map_or(ScoreBounds::UNBOUNDED, |upper| ScoreBounds {
+                    lower: 0.0,
+                    upper,
+                }));
+        }
         Ok(ScoreBounds {
             lower: 0.0,
             upper: self.score_upper_bound(up_to)?,
@@ -1008,11 +1032,19 @@ impl ComposableScorer for MaterializedScorer {
         let shallow = self.shallow.ok_or_else(|| {
             Error::internal("score_bounds requires advance_shallow on the FTS scorer")
         })?;
-        if up_to < shallow.target || up_to > shallow.up_to {
+        if up_to < shallow.target {
             return Err(Error::internal(format!(
-                "FTS score bound up_to={up_to} is outside shallow range [{}, {}]",
-                shallow.target, shallow.up_to
+                "FTS score bound up_to={up_to} ends before shallow range start {}",
+                shallow.target
             )));
+        }
+        if up_to > shallow.up_to {
+            // A wide range spans blocks this materialized scorer never indexed
+            // as one range; its list-wide bound covers all of them.
+            return Ok(ScoreBounds {
+                lower: 0.0,
+                upper: self.global_score_upper_bound,
+            });
         }
         shallow
             .block_index
@@ -1240,11 +1272,21 @@ impl ComposableScorer for RowAddressScorer<'_> {
         let shallow = self.shallow.ok_or_else(|| {
             Error::internal("score_bounds requires advance_shallow on the row-address FTS scorer")
         })?;
-        if up_to < shallow.target || up_to > shallow.up_to {
+        if up_to < shallow.target {
             return Err(Error::internal(format!(
-                "FTS row-address score bound up_to={up_to} is outside shallow range [{}, {}]",
-                shallow.target, shallow.up_to
+                "FTS row-address score bound up_to={up_to} ends before shallow range start {}",
+                shallow.target
             )));
+        }
+        if up_to > shallow.up_to {
+            // The projection only mapped the last shallow range; a wider one
+            // falls back to the source's list-wide bound.
+            return Ok(self
+                .global_score_upper_bound()
+                .map_or(ScoreBounds::UNBOUNDED, |upper| ScoreBounds {
+                    lower: 0.0,
+                    upper,
+                }));
         }
         if !shallow.has_source_docs {
             return Ok(ScoreBounds::ZERO);
@@ -1777,11 +1819,21 @@ impl ComposableScorer for RowAddressMergeScorer<'_> {
         let shallow = self.shallow.ok_or_else(|| {
             Error::internal("score_bounds requires advance_shallow on the row-address merge scorer")
         })?;
-        if up_to < shallow.target || up_to > shallow.up_to {
+        if up_to < shallow.target {
             return Err(Error::internal(format!(
-                "FTS row-address merge bound up_to={up_to} is outside shallow range [{}, {}]",
-                shallow.target, shallow.up_to
+                "FTS row-address merge bound up_to={up_to} ends before shallow range start {}",
+                shallow.target
             )));
+        }
+        if up_to > shallow.up_to {
+            // One source owned the last shallow range; a wider one can span
+            // several sources, so only their common list-wide bound is known.
+            return Ok(self
+                .global_score_upper_bound()
+                .map_or(ScoreBounds::UNBOUNDED, |upper| ScoreBounds {
+                    lower: 0.0,
+                    upper,
+                }));
         }
         match shallow.bounds {
             MergeShallowBounds::Current { source_index } => {
@@ -3054,6 +3106,9 @@ struct ReqOptScorer<'a> {
     confirmed: bool,
     min_competitive_score: f32,
     shallow_bounds: Option<ReqOptBounds>,
+    /// `(target, up_to)` the last `advance_shallow` published, so a wider
+    /// `score_bounds` query knows the range it may answer from the children.
+    shallow_reported: Option<(u64, u64)>,
     forwards_required_floor: bool,
     /// Bound of every required score, read once.
     required_global_upper: Option<f32>,
@@ -3077,6 +3132,7 @@ impl<'a> ReqOptScorer<'a> {
             confirmed: false,
             min_competitive_score: f32::NEG_INFINITY,
             shallow_bounds: None,
+            shallow_reported: None,
             forwards_required_floor: false,
             required_global_upper,
         }
@@ -3358,15 +3414,41 @@ impl ComposableScorer for ReqOptScorer<'_> {
 
     fn advance_shallow(&mut self, target: u64) -> Result<u64> {
         let target = self.current.map_or(target, |current| target.max(current));
-        if let Some(bounds) = self.shallow_bounds
+        let up_to = if let Some(bounds) = self.shallow_bounds
             && target <= bounds.up_to
         {
-            return Ok(bounds.up_to);
-        }
-        self.shallow_window(target)
+            bounds.up_to
+        } else {
+            self.shallow_window(target)?
+        };
+        self.shallow_reported = Some((target, up_to));
+        Ok(up_to)
     }
 
     fn score_bounds(&mut self, up_to: u64) -> Result<ScoreBounds> {
+        let (target, reported_up_to) = self.shallow_reported.ok_or_else(|| {
+            Error::internal(
+                "score_bounds requires advance_shallow on the required-plus-optional FTS scorer",
+            )
+        })?;
+        if up_to < target {
+            return Err(Error::internal(format!(
+                "required-plus-optional FTS score bound up_to={up_to} ends before its target {target}"
+            )));
+        }
+        if up_to > reported_up_to {
+            // A wide range can reach an optional the last anchor did not cover,
+            // so no child range is known to be valid. Answer from the
+            // list-wide bound and leave `shallow_bounds` alone: answering must
+            // not change which documents this scorer hands out.
+            let upper = self
+                .global_score_upper_bound()
+                .map_or(ScoreBounds::UNBOUNDED, |upper| ScoreBounds {
+                    lower: 0.0,
+                    upper,
+                });
+            return Ok(upper);
+        }
         Ok(self.bounds(up_to)?.combined)
     }
 
@@ -7349,6 +7431,47 @@ mod tests {
         )
     }
 
+    /// One compressed posting with no impact skip data, so its only block-level
+    /// bound is the list-wide maximum.
+    fn compressed_posting_without_impacts(
+        term: usize,
+        entries: &[(u32, u32)],
+        doc_lengths: &[u32],
+        scorer: &MemBM25Scorer,
+    ) -> PostingIterator {
+        let block_size = MAX_POSTING_BLOCK_SIZE;
+        let doc_ids = entries.iter().map(|&(doc, _)| doc).collect::<Vec<_>>();
+        let freqs = entries.iter().map(|&(_, freq)| freq).collect::<Vec<_>>();
+        let blocks = compress_posting_list_with_tail_codec_and_block_size(
+            doc_ids.len(),
+            doc_ids.iter(),
+            freqs.iter(),
+            vec![0.0; doc_ids.len().div_ceil(block_size)].into_iter(),
+            PostingTailCodec::VarintDelta,
+            block_size,
+        )
+        .unwrap();
+        let list = PostingList::Compressed(CompressedPostingList::new(
+            blocks,
+            0.0,
+            doc_ids.len() as u32,
+            PostingTailCodec::VarintDelta,
+            block_size,
+            None,
+            None,
+        ));
+        let token = format!("t{term}");
+        let query_weight = scorer.query_weight(&token);
+        PostingIterator::with_query_weight(
+            token,
+            term as u32,
+            0,
+            query_weight,
+            list,
+            doc_lengths.len(),
+        )
+    }
+
     struct Corpus {
         documents: DocSet,
         doc_lengths: Vec<u32>,
@@ -8848,6 +8971,7 @@ mod tests {
         // here.
         let mut handed_out: Vec<(u64, f32)> = Vec::new();
         let mut compared = 0_usize;
+        let mut cross_block_covered = 0_usize;
         for _ in 0..2_000 {
             match rng.random_range(0..7_u32) {
                 0..=2 => {
@@ -8898,6 +9022,10 @@ mod tests {
                     let target = doc + rng.random_range(0..32_u64);
                     let single_up_to = single.advance_shallow(target).unwrap();
                     let generic_up_to = generic.advance_shallow(target).unwrap();
+                    // A range that spans several blocks is answered by the wide
+                    // contract; it must cover every document the route emits
+                    // inside that interval, not just the ones handed out so far.
+                    let wide_up_to = single_up_to.saturating_add(3 * MAX_POSTING_BLOCK_SIZE as u64);
                     assert_eq!(single.doc(), generic.doc(), "probe doc");
                     for (route, cursor, up_to) in [
                         ("single", &mut single, single_up_to),
@@ -8917,11 +9045,38 @@ mod tests {
                                 );
                             }
                         }
+                        let wide_bound = cursor.score_upper_bound(wide_up_to).unwrap();
+                        let (mut reference, _) = fresh();
+                        let mut inside = 0_usize;
+                        let mut next = reference.advance(target).unwrap();
+                        while let Some(emitted) = next {
+                            if emitted > wide_up_to {
+                                break;
+                            }
+                            let score = reference.current_score().unwrap();
+                            assert!(
+                                wide_bound >= score,
+                                "{route}: wide bound {wide_bound} for [{target}, {wide_up_to}] \
+                                 does not cover doc {emitted} scored {score}"
+                            );
+                            inside += 1;
+                            next = reference.next().unwrap();
+                        }
+                        if inside > 0 {
+                            cross_block_covered += 1;
+                        }
                     }
                 }
             }
         }
         assert!(compared > 100, "only {compared} documents compared");
+        // The cross-block assertion must have seen real documents in the wider
+        // interval; otherwise the wide contract was only exercised on empty
+        // windows.
+        assert!(
+            cross_block_covered > 20,
+            "only {cross_block_covered} cross-block probes covered a document"
+        );
 
         // A posting that matches nothing ends on the first `next`, and a target
         // past the compressed doc-id domain ends instead of truncating. Both
@@ -9214,6 +9369,612 @@ mod tests {
         assert_eq!(score_bits(&single_rows), score_bits(&generic_rows));
         assert_eq!(single_rows.len(), 1);
         assert!(skipped > 0, "the floor skipped no block");
+    }
+
+    /// The wide contract: `score_bounds` answers a range that spans several
+    /// blocks, and that answer covers every document the node can still emit
+    /// inside the range.
+    #[test]
+    fn wide_score_bounds_cover_every_remaining_document() {
+        let mut rng = SmallRng::seed_from_u64(0xD37_0001);
+        let num_docs = 900_usize;
+        let corpus = random_corpus(&mut rng, num_docs, &[0.35, 0.3, 0.25]);
+        let mask = deletion_mask(&mut rng, num_docs, 0.05);
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let params = FtsSearchParams::default();
+        let block = MAX_POSTING_BLOCK_SIZE as u64;
+
+        // A skewed corpus drives the array lead; its three clauses are the
+        // shape the route is chosen for.
+        let array_num_docs = 32_768_u32;
+        let (array_doc_lengths, array_terms) = skewed_front_loaded_terms(array_num_docs);
+        let array_corpus = Corpus::new(array_doc_lengths, array_terms);
+        let array_mask = RowAddrMask::all_rows();
+        let array_documents = LegacyWandDocuments::new(&array_corpus.documents, &array_mask);
+
+        let phrase_params = FtsSearchParams {
+            phrase_slop: Some(0),
+            ..FtsSearchParams::default()
+        };
+
+        macro_rules! assert_wide_covers {
+            ($label:expr, $make:expr, $target:expr, $up_to:expr) => {{
+                let make = $make;
+                let target = $target;
+                let up_to = $up_to;
+                let mut probed = make();
+                // Position first, as a collector does: a composite scorer only
+                // anchors the children that have a document.
+                if let Some(positioned) = probed.advance(target).unwrap() {
+                    let up_to = up_to.max(positioned);
+                    probed.advance_shallow(positioned).unwrap();
+                    let bounds = probed.score_bounds(up_to).unwrap();
+                    let mut reference = make();
+                    let mut expected = 0.0_f32;
+                    let mut doc = reference.advance(positioned).unwrap();
+                    while let Some(found) = doc {
+                        if found > up_to {
+                            break;
+                        }
+                        expected = expected.max(reference.score().unwrap());
+                        doc = reference.next().unwrap();
+                    }
+                    assert!(
+                        bounds.upper.is_finite(),
+                        "{}: wide bound for [{positioned}, {up_to}] is not finite",
+                        $label
+                    );
+                    assert!(
+                        bounds.upper >= expected,
+                        "{}: wide bound {} for [{positioned}, {up_to}] does not cover {expected}",
+                        $label,
+                        bounds.upper
+                    );
+                }
+            }};
+        }
+
+        for _ in 0..8 {
+            let target = rng.random_range(0..num_docs as u64);
+            for span in [1_u64, 3, 17, 60] {
+                let up_to = target.saturating_add(span * block);
+
+                let single = || -> BoxScorer<'_> {
+                    Box::new(WandCursor::new(
+                        Operator::And,
+                        vec![impact_posting(
+                            0,
+                            &corpus.terms[0],
+                            &corpus.doc_lengths,
+                            &corpus.scorer,
+                        )],
+                        &documents,
+                        corpus.scorer.clone(),
+                        &params,
+                        &metrics,
+                    ))
+                };
+                assert_wide_covers!("single posting", single, target, up_to);
+
+                let single_plain = || -> BoxScorer<'_> {
+                    Box::new(WandCursor::new(
+                        Operator::And,
+                        vec![compressed_posting_without_impacts(
+                            0,
+                            &corpus.terms[0],
+                            &corpus.doc_lengths,
+                            &corpus.scorer,
+                        )],
+                        &documents,
+                        corpus.scorer.clone(),
+                        &params,
+                        &metrics,
+                    ))
+                };
+                assert_wide_covers!(
+                    "single posting without impacts",
+                    single_plain,
+                    target,
+                    up_to
+                );
+
+                let and_bulk = || -> BoxScorer<'_> {
+                    Box::new(and_cursor(
+                        &documents,
+                        and_postings(&corpus, 3),
+                        corpus.scorer.clone(),
+                        &metrics,
+                        BulkAndMode::On,
+                    ))
+                };
+                assert_wide_covers!("and bulk", and_bulk, target, up_to);
+
+                let and_classic = || -> BoxScorer<'_> {
+                    Box::new(and_cursor(
+                        &documents,
+                        and_postings(&corpus, 3),
+                        corpus.scorer.clone(),
+                        &metrics,
+                        BulkAndMode::Off,
+                    ))
+                };
+                assert_wide_covers!("and classic", and_classic, target, up_to);
+
+                let or = || -> BoxScorer<'_> {
+                    Box::new(WandCursor::new(
+                        Operator::Or,
+                        and_postings(&corpus, 2),
+                        &documents,
+                        corpus.scorer.clone(),
+                        &params,
+                        &metrics,
+                    ))
+                };
+                assert_wide_covers!("or", or, target, up_to);
+
+                let phrase = || -> BoxScorer<'_> {
+                    Box::new(WandCursor::new(
+                        Operator::And,
+                        vec![
+                            impact_posting(
+                                0,
+                                &corpus.terms[0],
+                                &corpus.doc_lengths,
+                                &corpus.scorer,
+                            ),
+                            impact_posting(
+                                1,
+                                &corpus.terms[1],
+                                &corpus.doc_lengths,
+                                &corpus.scorer,
+                            ),
+                        ],
+                        &documents,
+                        corpus.scorer.clone(),
+                        &phrase_params,
+                        &metrics,
+                    ))
+                };
+                assert_wide_covers!("phrase", phrase, target, up_to);
+
+                let required_conjunction = || -> BoxScorer<'_> {
+                    Box::new(
+                        RequiredConjunctionScorer::try_new(vec![
+                            Box::new(WandCursor::new(
+                                Operator::And,
+                                vec![impact_posting(
+                                    0,
+                                    &corpus.terms[0],
+                                    &corpus.doc_lengths,
+                                    &corpus.scorer,
+                                )],
+                                &documents,
+                                corpus.scorer.clone(),
+                                &params,
+                                &metrics,
+                            )),
+                            Box::new(WandCursor::new(
+                                Operator::And,
+                                vec![impact_posting(
+                                    1,
+                                    &corpus.terms[1],
+                                    &corpus.doc_lengths,
+                                    &corpus.scorer,
+                                )],
+                                &documents,
+                                corpus.scorer.clone(),
+                                &params,
+                                &metrics,
+                            )),
+                        ])
+                        .unwrap(),
+                    )
+                };
+                assert_wide_covers!("required conjunction", required_conjunction, target, up_to);
+
+                let disjunction = || -> BoxScorer<'_> {
+                    Box::new(
+                        DisjunctionScorer::try_new(
+                            vec![
+                                Box::new(WandCursor::new(
+                                    Operator::Or,
+                                    vec![impact_posting(
+                                        0,
+                                        &corpus.terms[0],
+                                        &corpus.doc_lengths,
+                                        &corpus.scorer,
+                                    )],
+                                    &documents,
+                                    corpus.scorer.clone(),
+                                    &params,
+                                    &metrics,
+                                )),
+                                Box::new(WandCursor::new(
+                                    Operator::Or,
+                                    vec![impact_posting(
+                                        1,
+                                        &corpus.terms[1],
+                                        &corpus.doc_lengths,
+                                        &corpus.scorer,
+                                    )],
+                                    &documents,
+                                    corpus.scorer.clone(),
+                                    &params,
+                                    &metrics,
+                                )),
+                            ],
+                            DisjunctionScore::Sum,
+                        )
+                        .unwrap(),
+                    )
+                };
+                assert_wide_covers!("disjunction sum", disjunction, target, up_to);
+
+                let scaled = || -> BoxScorer<'_> {
+                    Box::new(
+                        ScaleScorer::try_new(
+                            Box::new(WandCursor::new(
+                                Operator::And,
+                                vec![impact_posting(
+                                    0,
+                                    &corpus.terms[0],
+                                    &corpus.doc_lengths,
+                                    &corpus.scorer,
+                                )],
+                                &documents,
+                                corpus.scorer.clone(),
+                                &params,
+                                &metrics,
+                            )),
+                            1.5,
+                        )
+                        .unwrap(),
+                    )
+                };
+                assert_wide_covers!("scaled", scaled, target, up_to);
+
+                let reqopt = || -> BoxScorer<'_> {
+                    Box::new(ReqOptScorer::new(
+                        Box::new(and_cursor(
+                            &documents,
+                            and_postings(&corpus, 2),
+                            corpus.scorer.clone(),
+                            &metrics,
+                            BulkAndMode::Off,
+                        )),
+                        Box::new(WandCursor::new(
+                            Operator::Or,
+                            and_postings(&corpus, 2),
+                            &documents,
+                            corpus.scorer.clone(),
+                            &params,
+                            &metrics,
+                        )),
+                    ))
+                };
+                assert_wide_covers!("reqopt", reqopt, target, up_to);
+
+                let arrayed_target = target % u64::from(array_num_docs);
+                let arrayed_up_to = arrayed_target.saturating_add(span * block);
+                let and_arrayed = || -> BoxScorer<'_> {
+                    let cursor = and_cursor(
+                        &array_documents,
+                        and_postings(&array_corpus, 3),
+                        array_corpus.scorer.clone(),
+                        &metrics,
+                        BulkAndMode::Auto,
+                    );
+                    assert_eq!(cursor.and_route(), AndRoute::Arrayed);
+                    Box::new(cursor)
+                };
+                assert_wide_covers!("and arrayed", and_arrayed, arrayed_target, arrayed_up_to);
+            }
+        }
+    }
+
+    /// Asking a wide range must not change the narrow answers: a twin that is
+    /// never probed reports the same range and the same bound bits at every
+    /// `advance_shallow`.
+    #[test]
+    fn narrow_bounds_are_unchanged_after_wide_queries() {
+        let mut rng = SmallRng::seed_from_u64(0xD37_0002);
+        let num_docs = 1_200_usize;
+        let corpus = random_corpus(&mut rng, num_docs, &[0.4, 0.3, 0.2]);
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let params = FtsSearchParams::default();
+        let block = MAX_POSTING_BLOCK_SIZE as u64;
+
+        let array_num_docs = 32_768_u32;
+        let (array_doc_lengths, array_terms) = skewed_front_loaded_terms(array_num_docs);
+        let array_corpus = Corpus::new(array_doc_lengths, array_terms);
+        let array_mask = RowAddrMask::all_rows();
+        let array_documents = LegacyWandDocuments::new(&array_corpus.documents, &array_mask);
+
+        macro_rules! assert_narrow_unchanged {
+            ($label:expr, $make:expr, $limit:expr) => {{
+                let make = $make;
+                let mut plain = make();
+                let mut probed = make();
+                let mut target = 0_u64;
+                let mut step_rng = SmallRng::seed_from_u64(0xD37_0003);
+                for step in 0..32 {
+                    if step > 0 {
+                        let _ = probed
+                            .score_bounds(target.saturating_add(60 * block))
+                            .unwrap();
+                    }
+                    target = target.max(step_rng.random_range(0..$limit as u64));
+                    let plain_up_to = plain.advance_shallow(target).unwrap();
+                    let probed_up_to = probed.advance_shallow(target).unwrap();
+                    assert_eq!(
+                        plain_up_to, probed_up_to,
+                        "{}: reported range at {target}",
+                        $label
+                    );
+                    let plain_bounds = plain.score_bounds(plain_up_to).unwrap();
+                    let probed_bounds = probed.score_bounds(probed_up_to).unwrap();
+                    assert_eq!(
+                        plain_bounds.lower.to_bits(),
+                        probed_bounds.lower.to_bits(),
+                        "{}: lower bound at {target}",
+                        $label
+                    );
+                    assert_eq!(
+                        plain_bounds.upper.to_bits(),
+                        probed_bounds.upper.to_bits(),
+                        "{}: upper bound at {target}",
+                        $label
+                    );
+                    let _ = probed
+                        .score_bounds(target.saturating_add(60 * block))
+                        .unwrap();
+                }
+            }};
+        }
+
+        let single_impact = || -> BoxScorer<'_> {
+            Box::new(WandCursor::new(
+                Operator::And,
+                vec![impact_posting(
+                    0,
+                    &corpus.terms[0],
+                    &corpus.doc_lengths,
+                    &corpus.scorer,
+                )],
+                &documents,
+                corpus.scorer.clone(),
+                &params,
+                &metrics,
+            ))
+        };
+        assert_narrow_unchanged!("single posting", single_impact, num_docs);
+
+        let single_plain = || -> BoxScorer<'_> {
+            Box::new(WandCursor::new(
+                Operator::And,
+                vec![compressed_posting_without_impacts(
+                    0,
+                    &corpus.terms[0],
+                    &corpus.doc_lengths,
+                    &corpus.scorer,
+                )],
+                &documents,
+                corpus.scorer.clone(),
+                &params,
+                &metrics,
+            ))
+        };
+        assert_narrow_unchanged!("single posting without impacts", single_plain, num_docs);
+
+        let and_bulk = || -> BoxScorer<'_> {
+            Box::new(and_cursor(
+                &documents,
+                and_postings(&corpus, 3),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::On,
+            ))
+        };
+        assert_narrow_unchanged!("and bulk", and_bulk, num_docs);
+
+        let and_classic = || -> BoxScorer<'_> {
+            Box::new(and_cursor(
+                &documents,
+                and_postings(&corpus, 3),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::Off,
+            ))
+        };
+        assert_narrow_unchanged!("and classic", and_classic, num_docs);
+
+        let or = || -> BoxScorer<'_> {
+            Box::new(WandCursor::new(
+                Operator::Or,
+                and_postings(&corpus, 2),
+                &documents,
+                corpus.scorer.clone(),
+                &params,
+                &metrics,
+            ))
+        };
+        assert_narrow_unchanged!("or", or, num_docs);
+
+        let and_arrayed = || -> BoxScorer<'_> {
+            let cursor = and_cursor(
+                &array_documents,
+                and_postings(&array_corpus, 3),
+                array_corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::Auto,
+            );
+            assert_eq!(cursor.and_route(), AndRoute::Arrayed);
+            Box::new(cursor)
+        };
+        assert_narrow_unchanged!("and arrayed", and_arrayed, array_num_docs as usize);
+    }
+
+    /// Wide queries interleaved with the exact iterator must not change which
+    /// documents it hands out or how it scores them.
+    #[test]
+    fn wide_queries_do_not_change_handed_out_documents() {
+        let mut rng = SmallRng::seed_from_u64(0xD37_0004);
+        let num_docs = 1_000_usize;
+        let corpus = random_corpus(&mut rng, num_docs, &[0.4, 0.35, 0.2]);
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let params = FtsSearchParams::default();
+        let block = MAX_POSTING_BLOCK_SIZE as u64;
+
+        macro_rules! assert_same_emission {
+            ($label:expr, $make:expr) => {{
+                let make = $make;
+                let mut plain = make();
+                let mut probed = make();
+                let mut step_rng = SmallRng::seed_from_u64(0xD37_0005);
+                let mut compared = 0_usize;
+                for _ in 0..400 {
+                    if let Some(doc) = probed.doc() {
+                        let _ = probed.advance_shallow(doc).unwrap();
+                        let _ = probed.score_bounds(doc.saturating_add(60 * block)).unwrap();
+                    }
+                    let go_next = step_rng.random_bool(0.7);
+                    let target =
+                        plain.doc().map_or(0, |doc| doc + 1) + step_rng.random_range(0..32_u64);
+                    let plain_doc = if go_next {
+                        plain.next().unwrap()
+                    } else {
+                        plain.advance(target).unwrap()
+                    };
+                    let probed_doc = if go_next {
+                        probed.next().unwrap()
+                    } else {
+                        probed.advance(target).unwrap()
+                    };
+                    assert_eq!(
+                        plain_doc, probed_doc,
+                        "{}: document after a wide query",
+                        $label
+                    );
+                    let Some(doc) = plain_doc else {
+                        break;
+                    };
+                    assert_eq!(
+                        plain.score().unwrap().to_bits(),
+                        probed.score().unwrap().to_bits(),
+                        "{}: score bits for doc {doc}",
+                        $label
+                    );
+                    compared += 1;
+                }
+                assert!(compared > 10, "{}: too few compared documents", $label);
+            }};
+        }
+
+        let single = || -> BoxScorer<'_> {
+            Box::new(WandCursor::new(
+                Operator::And,
+                vec![impact_posting(
+                    0,
+                    &corpus.terms[0],
+                    &corpus.doc_lengths,
+                    &corpus.scorer,
+                )],
+                &documents,
+                corpus.scorer.clone(),
+                &params,
+                &metrics,
+            ))
+        };
+        assert_same_emission!("single posting", single);
+
+        let and_bulk = || -> BoxScorer<'_> {
+            Box::new(and_cursor(
+                &documents,
+                and_postings(&corpus, 3),
+                corpus.scorer.clone(),
+                &metrics,
+                BulkAndMode::On,
+            ))
+        };
+        assert_same_emission!("and bulk", and_bulk);
+
+        let or = || -> BoxScorer<'_> {
+            Box::new(WandCursor::new(
+                Operator::Or,
+                and_postings(&corpus, 2),
+                &documents,
+                corpus.scorer.clone(),
+                &params,
+                &metrics,
+            ))
+        };
+        assert_same_emission!("or", or);
+    }
+
+    /// A wide query can reach an optional the last `advance_shallow` did not
+    /// anchor. The answer must be sound, and asking must not change what the
+    /// scorer hands out afterwards.
+    #[test]
+    fn reqopt_answers_a_wide_query_past_an_unanchored_optional() {
+        let required = (0..200_u64).map(|doc| (doc, 0.5)).collect::<Vec<_>>();
+        // The next optional row after the target is 10: a target of 3 leaves
+        // the optional unanchored.
+        let optional = (0..200_u64)
+            .filter(|doc| doc % 10 == 0)
+            .map(|doc| (doc, 3.0))
+            .collect::<Vec<_>>();
+        let make = || -> BoxScorer<'_> {
+            Box::new(ReqOptScorer::new(
+                materialized(&required),
+                materialized(&optional),
+            ))
+        };
+        let target = 3_u64;
+        let up_to = 40_u64;
+
+        let mut probed = make();
+        let probed_up_to = probed.advance_shallow(target).unwrap();
+        assert!(probed_up_to >= target);
+        let bounds = probed.score_bounds(up_to).unwrap();
+        assert!(bounds.upper.is_finite());
+
+        let mut reference = make();
+        let mut expected = 0.0_f32;
+        let mut doc = reference.advance(target).unwrap();
+        while let Some(found) = doc {
+            if found > up_to {
+                break;
+            }
+            expected = expected.max(reference.score().unwrap());
+            doc = reference.next().unwrap();
+        }
+        assert!(
+            bounds.upper >= expected,
+            "wide bound {} does not cover {expected}",
+            bounds.upper
+        );
+
+        // The probed twin must emit exactly what a twin that was never asked
+        // emits from the same position.
+        let mut plain = make();
+        plain.advance_shallow(target).unwrap();
+        loop {
+            let (plain_doc, probed_doc) = (plain.next().unwrap(), probed.next().unwrap());
+            assert_eq!(plain_doc, probed_doc, "reqopt document after a wide query");
+            let Some(doc) = plain_doc else {
+                break;
+            };
+            assert_eq!(
+                plain.score().unwrap().to_bits(),
+                probed.score().unwrap().to_bits(),
+                "reqopt score bits for doc {doc}"
+            );
+        }
     }
 
     /// Two or more one-term SHOULD clauses are summed by a single disjunction

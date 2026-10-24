@@ -6902,19 +6902,35 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         Ok(up_to)
     }
 
-    pub(super) fn score_upper_bound(&self, up_to: u64) -> Result<f32> {
-        if let Some(single) = self.single.as_ref() {
-            return single.score_upper_bound(up_to);
+    /// End of the last `advance_shallow` range when the cursor is a phrase.
+    /// A phrase's block bound covers raw term scores, so it is sound, but its
+    /// walk owns cursor anchors a read-only probe must not move; a wider
+    /// range therefore answers from the list-wide bound instead.
+    pub(super) fn phrase_wide_fallback_after(&self) -> Option<u64> {
+        self.phrase_slop
+            .is_some()
+            .then(|| self.shallow.map(|(_, up_to, _)| up_to))
+            .flatten()
+    }
+
+    pub(super) fn score_upper_bound(&mut self, up_to: u64) -> Result<f32> {
+        if let Some(single) = self.single.as_mut() {
+            return single.score_upper_bound(up_to, &self.wand.scorer);
         }
         let (target, shallow_up_to, upper) = self.shallow.ok_or_else(|| {
             Error::internal("score bound requires advance_shallow on the posting FTS scorer")
         })?;
-        if up_to < target || up_to > shallow_up_to {
+        if up_to < target {
             return Err(Error::internal(format!(
-                "posting FTS score bound up_to={up_to} is outside shallow range [{target}, {shallow_up_to}]"
+                "posting FTS score bound up_to={up_to} ends before its target {target}"
             )));
         }
-        Ok(upper)
+        // Answering inside the reported range keeps the old bits; a wider
+        // request spans blocks and is computed from the anchored cursors.
+        if up_to <= shallow_up_to {
+            return Ok(upper);
+        }
+        Ok(self.wand.wide_block_bound(target, up_to))
     }
 
     /// Test hook: blocks whose decoded frequencies the single-posting route has
@@ -7169,6 +7185,122 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
         }
         (up_to, upper)
     }
+
+    /// Conservative bound for `[target, up_to]` on the route the cursor is
+    /// driving, where `up_to` may span several blocks.
+    ///
+    /// Read-only: the shared posting helper puts every block cursor back, the
+    /// sliding block-max window is never touched, and neither
+    /// `compound_shallow_bound` nor `update_max_scores` runs. The bound stays
+    /// conservative whatever the exact walk has handed out, because every
+    /// clause either contributes a bound over the whole range or its list-wide
+    /// bound.
+    ///
+    /// The narrow producers assume a single block. On a wider request they are
+    /// all widened rather than clamped, so `up_to` is never truncated:
+    /// conjunction clauses and disjunction lead clauses fold every block up to
+    /// `up_to`; disjunction head clauses fold from the block they are on, which
+    /// is the first block they can still emit from; tail clauses contribute
+    /// their list-wide bound.
+    fn wide_block_bound(&mut self, target: u64, up_to: u64) -> f32 {
+        if self.operator == Operator::Or {
+            // The disjunction walk parks clauses at window anchors, so search
+            // each lead block cursor from the first block instead of trusting
+            // that it still sits at `target`. Clauses in `tail` are behind the
+            // target; their list-wide bound covers the range. A posting in
+            // `head` already sits at or after the target, so the block it is
+            // on is the first it can still emit from.
+            let scorer = &self.scorer;
+            return conservative_score_sum(
+                self.lead
+                    .iter_mut()
+                    .map(|posting| posting_range_upper_bound(posting, target, up_to, scorer, true))
+                    .chain(self.head.iter().map(|posting| {
+                        posting_current_block_range_upper_bound(&posting.posting, up_to, scorer)
+                    }))
+                    .chain(self.tail.iter().map(|posting| posting.upper_bound)),
+            );
+        }
+
+        // Conjunction clauses all live in `lead`. The array lead parks its
+        // cursors at candidates, so it searches from the first block; the bulk
+        // walk keeps them at or behind the probe target, so a forward step is
+        // enough.
+        let from_start = self.and_lead_arrayed;
+        let scorer = &self.scorer;
+        conservative_score_sum(
+            self.lead.iter_mut().map(|posting| {
+                posting_range_upper_bound(posting, target, up_to, scorer, from_start)
+            }),
+        )
+    }
+}
+
+/// Conservative score bound for one posting over `[target, up_to]`.
+///
+/// The narrow callers anchored a single block. This widens the answer to every
+/// block in the range instead of clamping `up_to`. A compressed posting without
+/// impact skip data only knows its list-wide bound, so it answers with that
+/// instead of walking blocks (which would fall back to the sliding block-max
+/// window). Every other posting anchors its block cursor at `target` - from the
+/// first block when `from_start` is set, because a route may have parked the
+/// cursor past the target - folds the impact hierarchy up to `up_to`, and
+/// restores the cursor. The current document is never moved and the sliding
+/// window cache is never touched.
+fn posting_range_upper_bound<S: Scorer + ?Sized>(
+    posting: &mut PostingIterator,
+    target: u64,
+    up_to: u64,
+    scorer: &S,
+    from_start: bool,
+) -> f32 {
+    // Compressed postings store u32 doc ids, so a target past that domain has
+    // no document left inside the range.
+    if posting.is_compressed() && target > u64::from(u32::MAX) {
+        return 0.0;
+    }
+    let no_impacts = match posting.list {
+        PostingList::Compressed(ref list) => list.impacts.is_none(),
+        PostingList::Plain(_) => false,
+    };
+    if posting.is_compressed() && no_impacts {
+        return posting.global_upper_bound(scorer);
+    }
+    let saved_block_idx = posting.block_idx;
+    if from_start {
+        posting.seek_block_from_start(target);
+    } else {
+        posting.shallow_next(target);
+    }
+    let score = posting
+        .block_max_score_up_to_with_stats(up_to, scorer)
+        .score;
+    posting.block_idx = saved_block_idx;
+    score
+}
+
+/// Conservative score bound over `[current block, up_to]` for a posting that
+/// is already positioned at or after the probe target.
+///
+/// A posting never moves backwards, so every document it can still emit in
+/// the range lies at or after its current block. The bound only writes
+/// block-keyed caches, so it takes the posting immutably and leaves the block
+/// cursor alone.
+fn posting_current_block_range_upper_bound<S: Scorer + ?Sized>(
+    posting: &PostingIterator,
+    up_to: u64,
+    scorer: &S,
+) -> f32 {
+    let no_impacts = match posting.list {
+        PostingList::Compressed(ref list) => list.impacts.is_none(),
+        PostingList::Plain(_) => false,
+    };
+    if posting.is_compressed() && no_impacts {
+        return posting.global_upper_bound(scorer);
+    }
+    posting
+        .block_max_score_up_to_with_stats(up_to, scorer)
+        .score
 }
 
 fn conservative_score_sum(scores: impl Iterator<Item = f32>) -> f32 {
