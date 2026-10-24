@@ -5829,10 +5829,10 @@ const OR_WINDOW_MAX_CLAUSES: usize = 8;
 /// take over, and that is what lets a jump hand them back to the per-document
 /// route.
 ///
-/// This is the precondition of the route, not the per-call decision. A
-/// streamable disjunction starts on the window, the only route that reuses one
-/// bound across a block of candidates, and a jump that leaves the window it
-/// holds takes one seek step on the per-document route (see
+/// This is the precondition of the route, not the decision to take it. The
+/// cursor records it and opens the walk when the first positive floor arrives
+/// (see `WandCursor::set_min_competitive_score`); a jump that leaves the window
+/// it holds takes one seek step on the per-document route (see
 /// `WandCursor::advance_or_window`).
 fn or_window_route_accepts<S: Scorer, D: WandDocuments>(
     wand: &Wand<'_, S, D>,
@@ -5930,6 +5930,12 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     or_window: Option<or_walk::BulkOrState>,
     or_cands: Vec<(u64, f32, u32)>,
     or_next: usize,
+    // Whether this disjunction may take the windowed route at all: it says the
+    // clauses could be handed to the walk, not that they have been. The walk is
+    // opened by the first positive floor, because a window bound only prunes
+    // whole clause combinations above one, and a driven disjunction whose floor
+    // stays zero would only pay for windows its caller barely reads.
+    or_window_eligible: bool,
     // Whether the clauses are layered for the walk: all of them in `lead`, in
     // query order, positioned by the window. A seek step clears this, because
     // it hands the clauses back to the heap for the per-document route; the next
@@ -6054,6 +6060,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             or_window: None,
             or_cands: Vec::new(),
             or_next: 0,
+            or_window_eligible: false,
             or_sequential: false,
             batch_frontier: 0,
             seeking: false,
@@ -6130,14 +6137,14 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         }
     }
 
-    /// Pick the stride for a disjunction cursor.
+    /// Record whether this disjunction may take the windowed route.
     ///
-    /// A streamable disjunction starts on the window: it is the only route that
-    /// reuses one block bound across a whole window of candidates, and it is
-    /// what a caller that keeps calling `next` wants. Nothing here decides for
-    /// good: a jump that leaves the window the walk holds takes one seek step on
-    /// the per-document route, and the next sequential call resumes the walk
-    /// (see `advance_or_window`).
+    /// A streamable disjunction stays on the per-document route until it
+    /// receives a positive floor; only then does a window bound prune whole
+    /// clause combinations, and only then is the walk worth its windows. The
+    /// decision is not final: `set_min_competitive_score` opens the walk on the
+    /// first positive floor, and a jump that leaves an open window takes one
+    /// seek step on the per-document route (see `advance_or_window`).
     fn select_or_route(&mut self) {
         // Test hook: the per-document route can be pinned even when the
         // disjunction qualifies for the window.
@@ -6150,20 +6157,31 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         if !or_window_route_accepts(&self.wand, self.phrase_slop) {
             return;
         }
+        self.or_window_eligible = true;
+    }
+
+    /// Hand the clauses to the disjunction walk and open its state.
+    ///
+    /// The walk's first window starts at the earliest clause document, so a
+    /// jump into that window is not a far jump. Its end is the first clause
+    /// block edge, which is the range `open_or_window` will bound, so plan it
+    /// here: a jump inside `[first_doc, planned_end]` is then served by the
+    /// walk, which opens that very window at the target, instead of a seek
+    /// step. The anchors below are the ones `open_or_window` sets for itself,
+    /// and `release_or_clauses` re-anchors every clause on its own document,
+    /// so a seek step still starts from the same place.
+    ///
+    /// A cursor that has not handed a document out yet owns the clauses right
+    /// away; one that already sits on a document resumes the walk after it,
+    /// which is the state a seek step leaves, so the existing resume path
+    /// applies and the document is not handed out twice.
+    fn open_or_window_route(&mut self) {
         self.wand.adopt_or_clauses();
         self.wand.or_windowed = true;
         self.or_window = Some(or_walk::BulkOrState::new(
             self.wand.lead.len(),
             self.wand_factor,
         ));
-        // The walk's first window starts at the earliest clause document, so a
-        // jump into that window is not a far jump. Its end is the first clause
-        // block edge, which is the range `open_or_window` will bound, so plan it
-        // here: a jump inside `[first_doc, planned_end]` is then served by the
-        // walk, which opens that very window at the target, instead of a seek
-        // step. The anchors below are the ones `open_or_window` sets for itself,
-        // and `release_or_clauses` re-anchors every clause on its own document,
-        // so a seek step still starts from the same place.
         let first_doc = self
             .wand
             .lead
@@ -6184,9 +6202,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
                 state.plan_window_end(up_to);
             }
         }
-        // The walk built its state from the clauses it just took over, so the
-        // layering already belongs to it.
-        self.or_sequential = true;
+        self.or_sequential = self.current_doc.is_none();
         self.or_cands.reserve(MAX_POSTING_BLOCK_SIZE);
         #[cfg(test)]
         cursor_counters::or_cursor_batched();
@@ -6208,13 +6224,18 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     }
 
     /// Test hook: force the windowed disjunction through the same selection the
-    /// constructor runs, so one process can drive both routes.
+    /// constructor runs, so one process can drive both routes. The walk is
+    /// opened without waiting for a floor: the hook compares the two routes over
+    /// the same documents, and both have to agree while no floor is in play.
     #[cfg(test)]
     pub(super) fn with_or_window_route(mut self) -> Self {
         self.or_route_override = Some(true);
         self.or_cands.clear();
         self.or_next = 0;
         self.select_or_route();
+        if self.or_window.is_none() && self.or_window_eligible {
+            self.open_or_window_route();
+        }
         self
     }
 
@@ -6224,6 +6245,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     pub(super) fn with_or_per_document_route(mut self) -> Self {
         self.or_route_override = Some(false);
         self.or_window = None;
+        self.or_window_eligible = false;
         self.wand.release_or_clauses();
         self.wand.or_windowed = false;
         self.or_cands.clear();
@@ -6995,6 +7017,11 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             self.wand.threshold = floor;
             if self.or_window.is_some() {
                 self.invalidate_or_window();
+            } else if self.or_window_eligible && floor > 0.0 {
+                // A floor above zero is what makes the clause split worth
+                // computing: below it every clause is essential, so a window
+                // only re-reads documents the caller skips.
+                self.open_or_window_route();
             }
         }
         Ok(())
@@ -7168,6 +7195,17 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
                 return (TERMINATED_DOC_ID, upper);
             }
             self.update_max_scores(target);
+            if self.up_to.is_some_and(|up_to| up_to < target) {
+                // Every clause sits on a block that ends before the probe
+                // target, which a cursor probed before it is positioned can
+                // do. The block window then says nothing about `target`, so
+                // answer for the rest of the domain from the list-wide bound
+                // instead of reporting a range that ends before it starts.
+                let upper = self
+                    .compound_global_score_upper_bound()
+                    .unwrap_or(f32::INFINITY);
+                return (TERMINATED_DOC_ID, upper);
+            }
             return (
                 self.up_to.unwrap_or(TERMINATED_DOC_ID),
                 conservative_score_sum(

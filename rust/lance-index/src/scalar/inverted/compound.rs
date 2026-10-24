@@ -10990,6 +10990,156 @@ mod tests {
         );
     }
 
+    /// A disjunction cursor that qualifies for the window stays on the
+    /// per-document route until it receives a positive floor, and opens the walk
+    /// as soon as it does.
+    #[test]
+    fn or_cursor_opens_the_window_only_after_a_floor() {
+        let mut rng = SmallRng::seed_from_u64(0x0000_D5EE_0006);
+        let corpus = random_corpus(&mut rng, 2_000, &or_densities(4, 1));
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        // The route a flat query builds for its SHOULD side: able to walk, but
+        // no floor to prune with.
+        let mut cursor = WandCursor::new(
+            Operator::Or,
+            or_postings(&corpus, 4),
+            &documents,
+            corpus.scorer.clone(),
+            &FtsSearchParams::new(),
+            &metrics,
+        );
+        assert!(
+            !cursor.or_window_active(),
+            "the walk was opened before a floor"
+        );
+        cursor_counters::take_or_cursor_window_opens();
+        let mut handed_out = 0_usize;
+        while handed_out < 200 {
+            if cursor.next().unwrap().is_none() {
+                break;
+            }
+            handed_out += 1;
+        }
+        assert_eq!(handed_out, 200, "the corpus ended too early");
+        assert_eq!(
+            cursor_counters::take_or_cursor_window_opens(),
+            0,
+            "a window was opened without a floor"
+        );
+        assert!(!cursor.or_window_active());
+
+        cursor.set_min_competitive_score(f32::MIN_POSITIVE).unwrap();
+        assert!(cursor.or_window_active(), "the floor did not open the walk");
+        assert!(cursor.next().unwrap().is_some());
+        assert!(
+            cursor_counters::take_or_cursor_window_opens() > 0,
+            "the walk never opened a window above a floor"
+        );
+    }
+
+    /// A floor raised mid-stream opens the walk, and from then on the walk hands
+    /// out what the per-document route hands out: every document above the floor
+    /// appears in the same order with the same score bits. Documents below it may
+    /// differ between the routes, which is why only that subsequence is compared.
+    #[test]
+    fn or_cursor_floor_rise_mid_stream_matches_the_per_document_route() {
+        let mut rng = SmallRng::seed_from_u64(0x0000_D5EE_0007);
+        let mut rises = 0_usize;
+        let mut above = 0_usize;
+        for clauses in 2..=5_usize {
+            let corpus = random_corpus(&mut rng, 2_000, &or_densities(clauses, 1));
+            let mask = RowAddrMask::all_rows();
+            let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+            let metrics = NoOpMetricsCollector;
+            let context = format!("clauses={clauses}");
+
+            // Scores without a floor, so the rise lands inside the distribution.
+            let reference = drain_or(&mut or_cursor(
+                &documents,
+                or_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                false,
+            ));
+            let mut scores = reference
+                .iter()
+                .map(|&(_, bits)| f32::from_bits(bits))
+                .collect::<Vec<_>>();
+            scores.sort_by(f32::total_cmp);
+            let floor = scores[scores.len() / 3];
+            if !floor.is_finite() || floor <= 0.0 {
+                continue;
+            }
+            rises += 1;
+
+            // One operation sequence, replayed on both routes, so the floor
+            // rises at the same point of the same walk. Every fifth step jumps
+            // forward a little, which is the pattern a driven disjunction sees;
+            // the steps stay inside the corpus so the walk outlives the rise.
+            let ops = (0..300_usize)
+                .map(|step| {
+                    if step % 5 == 0 {
+                        Some(step as u64 * 6)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            let rise_at = ops.len() / 2;
+            let run = |windowed: bool| -> Vec<(u64, u32)> {
+                let mut cursor = WandCursor::new(
+                    Operator::Or,
+                    or_postings(&corpus, clauses),
+                    &documents,
+                    corpus.scorer.clone(),
+                    &FtsSearchParams::new(),
+                    &metrics,
+                );
+                if !windowed {
+                    cursor = cursor.with_or_per_document_route();
+                }
+                let mut rows = Vec::new();
+                for (step, op) in ops.iter().enumerate() {
+                    if step == rise_at {
+                        cursor.set_min_competitive_score(floor).unwrap();
+                    }
+                    let found = match op {
+                        None => cursor.next().unwrap(),
+                        Some(target) => cursor.advance(*target).unwrap(),
+                    };
+                    if let Some(doc) = found {
+                        rows.push((doc, cursor.current_score().unwrap().to_bits()));
+                    }
+                }
+                rows
+            };
+
+            cursor_counters::take_or_cursor_window_opens();
+            let windowed_rows = run(true);
+            let opens = cursor_counters::take_or_cursor_window_opens();
+            let per_document_rows = run(false);
+            assert!(opens > 0, "{context}: the rise never opened the walk");
+
+            let kept = |rows: &[(u64, u32)]| {
+                rows.iter()
+                    .filter(|(_, bits)| f32::from_bits(*bits) >= floor)
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
+            let windowed_kept = kept(&windowed_rows);
+            above += windowed_kept.len();
+            assert_eq!(
+                windowed_kept,
+                kept(&per_document_rows),
+                "{context}: documents above floor {floor}"
+            );
+        }
+        assert!(rises > 0, "no floor rise was exercised");
+        assert!(above > 100, "too few documents above the floor: {above}");
+    }
+
     /// A floor raised mid-walk must not skip a document above it: the open
     /// window is dropped, the next one recomputes its bound, and the sequence
     /// still matches the per-document route.
