@@ -141,9 +141,7 @@ impl SinglePosting {
             // `next_doc_id` materializes the doc id only; the frequency stays
             // undecoded until `score`.
             self.posting.next_doc_id(target, false);
-            let Some(doc_id) = self.posting.current_doc_id() else {
-                return None;
-            };
+            let doc_id = self.posting.current_doc_id()?;
             if floor > 0.0 && doc_id > up_to {
                 // The anchored block ends before this document: bound the
                 // block that holds it before deciding anything.

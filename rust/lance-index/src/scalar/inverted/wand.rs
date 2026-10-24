@@ -2940,6 +2940,12 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // a shallow probe cannot reuse without moving them away from their own
     // documents.
     or_windowed: bool,
+    // `(start, end, bound)` of the window the disjunction walk opened last:
+    // every document this disjunction can hand out in `[start, end]` is at most
+    // `bound`, and no document below `start` is still reachable. Valid only
+    // while `or_windowed` is set and the walk's block anchors have not moved
+    // since it was computed; the routes that move them clear it.
+    or_window_bound: Option<(u64, u64, f32)>,
     // Set by `WandCursor` for a disjunction: the cursor recomputes every
     // candidate's score in query order, so `next` may skip the per-candidate
     // score and window bookkeeping while there is no floor to compare against.
@@ -3079,6 +3085,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             array_lead: ArrayLead::new(),
             and_batched: false,
             or_windowed: false,
+            or_window_bound: None,
             or_score_recomputed: false,
             score_first_and_enabled,
             #[cfg(test)]
@@ -5835,6 +5842,8 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
         self.tail_max_score = 0.0;
         self.lead
             .sort_unstable_by_key(|posting| (posting.position, posting.token_id));
+        // The window the old bound described is gone with the previous walk.
+        self.or_window_bound = None;
     }
 
     /// Hand every clause back to the heap: `lead` and `tail` empty, `head`
@@ -5849,13 +5858,15 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
     fn release_or_clauses(&mut self) {
         while let Some(mut posting) = self.lead.pop() {
             if let Some(doc) = posting.doc() {
-                posting.seek_block_from_start(u64::from(doc.doc_id()));
+                posting.seek_block_from_start(doc.doc_id());
             }
             self.push_head(posting);
         }
         self.tail.clear();
         self.tail_max_score = 0.0;
         self.up_to = None;
+        // The anchors the window bound was computed from have moved.
+        self.or_window_bound = None;
     }
 }
 
@@ -6122,6 +6133,19 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             self.wand.lead.len(),
             self.wand_factor,
         ));
+        // The walk's first window starts at the earliest clause document, so a
+        // jump into that window is not a far jump.
+        let first_doc = self
+            .wand
+            .lead
+            .iter()
+            .filter_map(|posting| posting.doc().map(|doc| doc.doc_id()))
+            .min();
+        if let Some(first_doc) = first_doc
+            && let Some(state) = self.or_window.as_mut()
+        {
+            state.restart_at(first_doc);
+        }
         // The walk built its state from the clauses it just took over, so the
         // layering already belongs to it.
         self.or_sequential = true;
@@ -6263,13 +6287,10 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
 
     /// `next` on the single-posting route.
     fn single_next(&mut self) -> Option<u64> {
-        let Some(target) = self
+        let target = self
             .single
             .as_ref()
-            .and_then(single::SinglePosting::next_target)
-        else {
-            return None;
-        };
+            .and_then(single::SinglePosting::next_target)?;
         self.single_position(target)
     }
 
@@ -6283,9 +6304,7 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
 
     /// Repositions the single posting; `None` once it is exhausted.
     fn single_position(&mut self, target: u64) -> Option<u64> {
-        let Some(single) = self.single.as_mut() else {
-            return None;
-        };
+        let single = self.single.as_mut()?;
         single.position(
             target,
             self.wand.documents,
@@ -6925,6 +6944,9 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         if let Some(state) = self.or_window.as_mut() {
             state.invalidate_window();
         }
+        // The walk no longer holds a window, so a shallow probe must not answer
+        // from the one it dropped.
+        self.wand.or_window_bound = None;
         let floor = self.wand.threshold;
         if floor <= 0.0 {
             return;
@@ -7051,9 +7073,23 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
                 // The walk anchors each clause's block cursor at the window it
                 // bounds rather than at the clause's own document, so a
                 // forward-only probe cannot reuse those anchors without moving
-                // them off the blocks the walk still needs. Bound the whole
-                // disjunction instead: it holds for every document at or after
-                // `target`, and the walk prunes its own windows.
+                // them off the blocks the walk still needs. The bound the window
+                // was opened with answers the probe instead, and no cursor moves.
+                //
+                // Invariant: the returned `up_to` is the end of the window the
+                // bound was computed for, so it never exceeds that window's end,
+                // and the bound covers every document in `[target, up_to]` this
+                // disjunction can still hand out. Documents below the window's
+                // start are behind the walk and cannot be handed out, so a probe
+                // that lands there is still answered from the window. With no
+                // window open -- nothing walked yet, or a raised floor cleared
+                // it -- there is no structure left, so the whole disjunction is
+                // bounded instead.
+                if let Some((_, end, bound)) = self.or_window_bound
+                    && target <= end
+                {
+                    return (end, bound);
+                }
                 let upper = self
                     .compound_global_score_upper_bound()
                     .unwrap_or(f32::INFINITY);

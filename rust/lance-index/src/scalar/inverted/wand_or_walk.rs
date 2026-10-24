@@ -272,6 +272,38 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
         }
 
+        // No later window can hold a candidate the walk would keep. Two cases:
+        // every clause is exhausted, or the window already covers every block
+        // the clauses have left (`up_to` is the end of the doc-id domain), no
+        // essential clause can produce another document, and the non-essential
+        // prefix is rejected by the same bound every candidate in this window
+        // went through -- so only documents it prunes are left. Ending here also
+        // keeps the walk from sweeping empty inner windows to the end of the
+        // doc-id domain when no block edge is left to close the window.
+        let no_essential_left = self
+            .lead
+            .iter()
+            .enumerate()
+            .all(|(index, posting)| !state.essential[index] || posting.doc().is_none());
+        let exhausted = self.lead.iter().all(|posting| posting.doc().is_none())
+            || (up_to == TERMINATED_DOC_ID
+                && no_essential_left
+                && score_sum_cannot_compete(
+                    0.0,
+                    state.non_essential_bound,
+                    self.threshold,
+                    score_sum_upper_bound_factor(state.num_lists),
+                    self.floor_mode,
+                ));
+        if exhausted {
+            state.next_min = up_to.saturating_add(1);
+            state.invalidate_window();
+            // A finished walk answers no shallow probe.
+            self.or_window_bound = None;
+            state.done = true;
+            return Ok(StepOutcome::Done);
+        }
+
         if inner_max >= up_to {
             state.invalidate_window();
         }
@@ -289,7 +321,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut first_doc = TERMINATED_DOC_ID;
         for posting in &self.lead {
             if let Some(doc) = posting.doc() {
-                first_doc = first_doc.min(u64::from(doc.doc_id()));
+                first_doc = first_doc.min(doc.doc_id());
             }
         }
         if first_doc == TERMINATED_DOC_ID {
@@ -318,7 +350,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         for (index, posting) in self.lead.iter().enumerate() {
             state.bounds[index] = match posting.doc() {
-                Some(doc) if u64::from(doc.doc_id()) <= up_to => {
+                Some(doc) if doc.doc_id() <= up_to => {
                     posting
                         .block_max_score_up_to_with_stats(up_to, &self.scorer)
                         .score
@@ -328,6 +360,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 _ => 0.0,
             };
         }
+        // No clause can contribute more than its block bound inside this window,
+        // and the conservative sum covers the f32 rounding of adding them in any
+        // order, so it bounds every document the disjunction can hand out in
+        // `[window_min, up_to]`. Shallow probes read it instead of moving block
+        // cursors the walk still needs.
+        self.or_window_bound = Some((
+            window_min,
+            up_to,
+            conservative_score_sum(state.bounds.iter().copied()),
+        ));
 
         if self.threshold <= 0.0 {
             state.essential.fill(true);

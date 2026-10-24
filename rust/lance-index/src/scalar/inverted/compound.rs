@@ -8171,7 +8171,8 @@ mod tests {
                             // last handed-out document.
                             0 => Some(batch.doc().map_or(2 * block, |doc| doc + 2 * block)),
                             // Twenty sequential calls, then one far jump.
-                            1 => (steps % 21 == 0)
+                            1 => steps
+                                .is_multiple_of(21)
                                 .then(|| batch.doc().map_or(2 * block, |doc| doc + 2 * block)),
                             // Random mix.
                             _ => (rng.random_range(0..8_u32) == 0)
@@ -8685,7 +8686,7 @@ mod tests {
     /// has already handed out.
     #[test]
     fn single_posting_cursor_matches_the_wand_route_bit_for_bit() {
-        let mut rng = SmallRng::seed_from_u64(0xC0FF_EE);
+        let mut rng = SmallRng::seed_from_u64(0x00C0_FFEE);
         let num_docs = 900_usize;
         let corpus = random_corpus(&mut rng, num_docs, &[0.25]);
         let mask = deletion_mask(&mut rng, num_docs, 0.1);
@@ -9779,7 +9780,7 @@ mod tests {
     /// not by decoding a window the caller will not read.
     #[test]
     fn or_cursor_far_advances_do_not_refill_windows() {
-        let mut rng = SmallRng::seed_from_u64(0x0D_5EE_0002);
+        let mut rng = SmallRng::seed_from_u64(0x0000_D5EE_0002);
         let block = MAX_POSTING_BLOCK_SIZE as u64;
         let mut total_seeks = 0_usize;
         for clauses in 2..=5_usize {
@@ -9845,7 +9846,7 @@ mod tests {
     /// found, with the same results as the per-document route.
     #[test]
     fn or_cursor_returns_to_batch_after_a_seek() {
-        let mut rng = SmallRng::seed_from_u64(0x0D_5EE_0003);
+        let mut rng = SmallRng::seed_from_u64(0x0000_D5EE_0003);
         let block = MAX_POSTING_BLOCK_SIZE as u64;
         for clauses in 2..=5_usize {
             let corpus = random_corpus(&mut rng, 6_000, &or_densities(clauses, 1));
@@ -9901,11 +9902,70 @@ mod tests {
         }
     }
 
+    /// The very first advance must not be mistaken for a jump past the walk: the
+    /// reach starts at the first window's start, not at zero, so the first step
+    /// into that window walks it instead of paying for a seek.
+    #[test]
+    fn or_cursor_first_advance_into_the_first_window_walks() {
+        // Both clauses start late, so the first window starts at a document an
+        // empty reach would have called a far jump.
+        let num_docs = 400_usize;
+        let doc_lengths = vec![8_u32; num_docs];
+        let term = |start: u32| (start..start + 40).map(|doc| (doc, 1)).collect::<Vec<_>>();
+        let corpus = Corpus::new(doc_lengths, vec![term(10), term(20)]);
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let mut batch = or_cursor(
+            &documents,
+            or_postings(&corpus, 2),
+            corpus.scorer.clone(),
+            &metrics,
+            true,
+        );
+        let mut classic = or_cursor(
+            &documents,
+            or_postings(&corpus, 2),
+            corpus.scorer.clone(),
+            &metrics,
+            false,
+        );
+        assert!(batch.or_window_active());
+
+        // A disjunction's first window starts at its earliest clause document.
+        let first_window_start = corpus
+            .terms
+            .iter()
+            .map(|entries| entries[0].0)
+            .min()
+            .expect("two clauses");
+        cursor_counters::take_or_cursor_seek_steps();
+        cursor_counters::take_or_cursor_batch_refills();
+
+        assert_eq!(
+            batch.advance(u64::from(first_window_start)).unwrap(),
+            Some(u64::from(first_window_start))
+        );
+        assert_eq!(
+            batch.doc(),
+            classic.advance(u64::from(first_window_start)).unwrap()
+        );
+        assert_eq!(
+            cursor_counters::take_or_cursor_seek_steps(),
+            0,
+            "the first advance into the first window sought"
+        );
+        assert!(
+            cursor_counters::take_or_cursor_batch_refills() > 0,
+            "the first advance into the first window never walked it"
+        );
+    }
+
     /// A jump that stays inside the block window the walk holds must be served
     /// by walking it: only a jump past that window may cost a seek step.
     #[test]
     fn or_cursor_near_advances_stay_on_the_walk() {
-        let mut rng = SmallRng::seed_from_u64(0x0D_5EE_0004);
+        let mut rng = SmallRng::seed_from_u64(0x0000_D5EE_0004);
         for clauses in 2..=3_usize {
             let corpus = random_corpus(&mut rng, 6_000, &or_densities(clauses, 1));
             let mask = RowAddrMask::all_rows();
@@ -9941,10 +10001,11 @@ mod tests {
             cursor_counters::take_or_cursor_batch_refills();
 
             // `doc + 1` always lies inside the window that produced `doc`, or
-            // inside the one the walk opened right after it. Going 200 steps
-            // empties the buffer, so at least one advance has to walk a window.
+            // inside the one the walk opened right after it. A window buffers
+            // every candidate up to its block edge, so the steps have to cross
+            // that edge before an advance can walk the next window.
             let mut advances = 0_usize;
-            for _ in 0..200 {
+            for _ in 0..1_000 {
                 let Some(doc) = batch.doc() else {
                     break;
                 };
