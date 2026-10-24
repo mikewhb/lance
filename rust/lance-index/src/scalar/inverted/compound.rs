@@ -9405,4 +9405,309 @@ mod tests {
         assert!(after > 0, "the floor never refreshed a window");
         assert_eq!(floored, unfloored);
     }
+
+    /// Densities of one disjunction arrangement. `0` puts a dense clause next
+    /// to sparse ones, `1` spreads every clause evenly, `2` orders them so the
+    /// densest one comes last.
+    fn or_densities(clauses: usize, shape: usize) -> Vec<f64> {
+        const MIXED: [f64; 6] = [0.9, 0.04, 0.02, 0.3, 0.55, 0.12];
+        const EVEN: [f64; 6] = [0.3, 0.42, 0.25, 0.5, 0.2, 0.36];
+        const ORDERED: [f64; 6] = [0.06, 0.14, 0.28, 0.4, 0.55, 0.7];
+        match shape {
+            0 => MIXED[..clauses].to_vec(),
+            1 => EVEN[..clauses].to_vec(),
+            _ => ORDERED[..clauses].to_vec(),
+        }
+    }
+
+    /// `clauses` disjunction postings, one per term, in query order.
+    fn or_postings(corpus: &Corpus, clauses: usize) -> Vec<PostingIterator> {
+        (0..clauses)
+            .map(|term| {
+                impact_posting_at(
+                    term,
+                    term as u32,
+                    &corpus.terms[term],
+                    &corpus.doc_lengths,
+                    &corpus.scorer,
+                )
+            })
+            .collect()
+    }
+
+    /// One disjunction cursor over `postings`. `windowed` forces the batched
+    /// route through the same selection `WandCursor::new` runs.
+    fn or_cursor<'a, 'd: 'a>(
+        documents: &'a LegacyWandDocuments<'d>,
+        postings: Vec<PostingIterator>,
+        scorer: Arc<MemBM25Scorer>,
+        metrics: &'a dyn MetricsCollector,
+        windowed: bool,
+    ) -> WandCursor<'a, LegacyWandDocuments<'d>> {
+        let cursor = WandCursor::new(
+            Operator::Or,
+            postings,
+            documents,
+            scorer,
+            &FtsSearchParams::new(),
+            metrics,
+        );
+        if windowed {
+            cursor.with_or_window_route()
+        } else {
+            cursor
+        }
+    }
+
+    /// Every document a disjunction cursor hands out, with its score bits.
+    fn drain_or<D: WandDocuments>(cursor: &mut WandCursor<'_, D>) -> Vec<(u64, u32)> {
+        let mut out = Vec::new();
+        while let Some(doc) = cursor.next().unwrap() {
+            out.push((doc, cursor.current_score().unwrap().to_bits()));
+        }
+        out
+    }
+
+    /// The windowed disjunction must return exactly what the per-document route
+    /// returns, bit for bit, under the same probes from a compound collector.
+    #[test]
+    fn or_cursor_batch_matches_the_per_document_cursor_bit_for_bit() {
+        cursor_counters::take_or_cursors_batched();
+        cursor_counters::take_or_cursor_batch_refills();
+        let mut compared = 0_usize;
+        let mut drained = 0_usize;
+        let mut walked = 0_usize;
+        for seed in 0..3_u64 {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let num_docs = rng.random_range(400..=900_usize);
+            for clauses in 2..=6_usize {
+                for shape in 0..3_usize {
+                    // Both scoring paths must agree: exact doc lengths, and the
+                    // quantized norm codes that score through the addend cache.
+                    for quantized in [false, true] {
+                        let corpus =
+                            random_corpus(&mut rng, num_docs, &or_densities(clauses, shape));
+                        let corpus = if quantized {
+                            corpus.quantized()
+                        } else {
+                            corpus
+                        };
+                        let mask = RowAddrMask::all_rows();
+                        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+                        let metrics = NoOpMetricsCollector;
+                        let context = format!(
+                            "seed={seed} clauses={clauses} shape={shape} quantized={quantized}"
+                        );
+
+                        let mut batch = or_cursor(
+                            &documents,
+                            or_postings(&corpus, clauses),
+                            corpus.scorer.clone(),
+                            &metrics,
+                            true,
+                        );
+                        let mut classic = or_cursor(
+                            &documents,
+                            or_postings(&corpus, clauses),
+                            corpus.scorer.clone(),
+                            &metrics,
+                            false,
+                        );
+                        assert!(batch.or_window_active(), "{context}: route");
+                        assert!(!classic.or_window_active(), "{context}: route");
+
+                        let mut floor = 0.0_f32;
+                        for _ in 0..256 {
+                            match rng.random_range(0..16_u32) {
+                                0..=5 => {
+                                    let a = batch.next().unwrap();
+                                    let b = classic.next().unwrap();
+                                    assert_eq!(a, b, "{context}: next");
+                                    if a.is_none() {
+                                        break;
+                                    }
+                                    compared += 1;
+                                    assert_same_candidate(&mut batch, &mut classic, &context);
+                                }
+                                6 => {
+                                    floor = floor.max(rng.random_range(0.0..2.0_f32));
+                                    batch.set_min_competitive_score(floor).unwrap();
+                                    classic.set_min_competitive_score(floor).unwrap();
+                                }
+                                7..=12 => {
+                                    let target =
+                                        batch.doc().unwrap_or(0) + rng.random_range(1..48_u64);
+                                    let a = batch.advance(target).unwrap();
+                                    let b = classic.advance(target).unwrap();
+                                    assert_eq!(a, b, "{context}: advance({target})");
+                                    if let Some(doc) = a {
+                                        assert!(doc >= target, "{context}: advance went backwards");
+                                        compared += 1;
+                                        assert_same_candidate(&mut batch, &mut classic, &context);
+                                    }
+                                }
+                                _ => {
+                                    if batch.doc().is_some() {
+                                        assert_same_candidate(&mut batch, &mut classic, &context);
+                                    }
+                                }
+                            }
+                        }
+                        walked += batch.or_window_compared();
+
+                        // The windowed cursor must agree with the per-document
+                        // route on the whole corpus, whatever the probes left
+                        // behind.
+                        let batch_docs = drain_or(&mut or_cursor(
+                            &documents,
+                            or_postings(&corpus, clauses),
+                            corpus.scorer.clone(),
+                            &metrics,
+                            true,
+                        ));
+                        drained += batch_docs.len();
+                        let classic_docs = drain_or(&mut or_cursor(
+                            &documents,
+                            or_postings(&corpus, clauses),
+                            corpus.scorer.clone(),
+                            &metrics,
+                            false,
+                        ));
+                        assert_eq!(batch_docs, classic_docs, "{context}: whole corpus");
+                    }
+                }
+            }
+        }
+        assert!(
+            compared > 200,
+            "too few interleaved comparisons: {compared}"
+        );
+        assert!(drained > 2_000, "too few compared documents: {drained}");
+        assert!(walked > 0, "the windowed route never compared a candidate");
+        assert!(
+            cursor_counters::take_or_cursors_batched() > 0,
+            "the windowed route was never built"
+        );
+        assert!(
+            cursor_counters::take_or_cursor_batch_refills() > 0,
+            "the windowed route never walked a window"
+        );
+    }
+
+    /// A floor raised mid-walk must not skip a document above it: the open
+    /// window is dropped, the next one recomputes its bound, and the sequence
+    /// still matches the per-document route.
+    #[test]
+    fn or_cursor_batch_recomputes_the_window_after_a_floor_rise() {
+        let mut rng = SmallRng::seed_from_u64(0x0D_5EED);
+        let mut rises = 0_usize;
+        let mut suppressed = 0_usize;
+        let mut refills_after_rise = 0_usize;
+        for clauses in 2..=6_usize {
+            for shape in 0..3_usize {
+                let corpus = random_corpus(&mut rng, 2_000, &or_densities(clauses, shape));
+                let mask = RowAddrMask::all_rows();
+                let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+                let metrics = NoOpMetricsCollector;
+                let context = format!("clauses={clauses} shape={shape}");
+
+                // The whole disjunction without a floor: every document it can
+                // hand out, with the score bits the per-document route reports.
+                let reference = drain_or(&mut or_cursor(
+                    &documents,
+                    or_postings(&corpus, clauses),
+                    corpus.scorer.clone(),
+                    &metrics,
+                    false,
+                ));
+                assert!(
+                    reference.len() > 100,
+                    "{context}: only {} documents",
+                    reference.len()
+                );
+
+                for (numerator, denominator) in [(1_usize, 4_usize), (1, 2), (3, 4)] {
+                    let rise_after = reference.len() * numerator / denominator;
+                    if rise_after == 0 || rise_after >= reference.len() {
+                        continue;
+                    }
+                    // The floor that arrives is the score of the last document
+                    // handed out, so everything weaker than it must go.
+                    let floor = f32::from_bits(reference[rise_after - 1].1);
+                    if !floor.is_finite() || floor <= 0.0 {
+                        continue;
+                    }
+                    rises += 1;
+
+                    let mut batch = or_cursor(
+                        &documents,
+                        or_postings(&corpus, clauses),
+                        corpus.scorer.clone(),
+                        &metrics,
+                        true,
+                    );
+                    let mut classic = or_cursor(
+                        &documents,
+                        or_postings(&corpus, clauses),
+                        corpus.scorer.clone(),
+                        &metrics,
+                        false,
+                    );
+                    assert!(batch.or_window_active(), "{context}: route");
+
+                    let mut handed_out = Vec::new();
+                    loop {
+                        let a = batch.next().unwrap();
+                        let b = classic.next().unwrap();
+                        assert_eq!(a, b, "{context}: step after rise {rises}");
+                        let Some(doc) = a else {
+                            break;
+                        };
+                        assert_same_candidate(&mut batch, &mut classic, &context);
+                        handed_out.push((doc, batch.current_score().unwrap().to_bits()));
+                        if handed_out.len() == rise_after {
+                            batch.set_min_competitive_score(floor).unwrap();
+                            classic.set_min_competitive_score(floor).unwrap();
+                            // The window bound was computed under the old floor,
+                            // so it must be gone before the next refill.
+                            assert!(
+                                !batch.or_window_open(),
+                                "{context}: rise {rises} kept the old window bound"
+                            );
+                            cursor_counters::take_or_cursor_batch_refills();
+                        }
+                    }
+                    refills_after_rise += cursor_counters::take_or_cursor_batch_refills();
+
+                    // Nothing above the floor is skipped: every reference
+                    // document after the rise point whose score reaches the
+                    // floor still appears, in order.
+                    let tail = &handed_out[rise_after..];
+                    let mut index = 0;
+                    for &(doc, bits) in &reference[rise_after..] {
+                        let score = f32::from_bits(bits);
+                        if score < floor {
+                            suppressed += 1;
+                            continue;
+                        }
+                        while index < tail.len() && tail[index].0 < doc {
+                            index += 1;
+                        }
+                        assert_eq!(
+                            tail.get(index),
+                            Some(&(doc, bits)),
+                            "{context}: rise {rises} skipped doc {doc} at {score} >= {floor}"
+                        );
+                        index += 1;
+                    }
+                }
+            }
+        }
+        assert!(rises > 0, "no floor rise was exercised");
+        assert!(suppressed > 0, "the raised floor never pruned a document");
+        assert!(
+            refills_after_rise > 0,
+            "the window was never recomputed after a rise"
+        );
+    }
 }
