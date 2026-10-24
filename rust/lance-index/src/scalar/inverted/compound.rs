@@ -9247,14 +9247,19 @@ mod tests {
                     .with_query_position(rank as u32)
             })
             .collect::<Vec<_>>();
-        let mut cursor: BoxScorer<'_> = Box::new(WandCursor::new(
-            Operator::Or,
-            postings,
-            &documents,
-            corpus.scorer.clone(),
-            &FtsSearchParams::default(),
-            &metrics,
-        ));
+        // The subject is the per-document route's seek; the windowed route has
+        // its own seek test.
+        let mut cursor: BoxScorer<'_> = Box::new(
+            WandCursor::new(
+                Operator::Or,
+                postings,
+                &documents,
+                corpus.scorer.clone(),
+                &FtsSearchParams::default(),
+                &metrics,
+            )
+            .with_or_per_document_route(),
+        );
         let leaves = corpus
             .leaves(&all)
             .into_iter()
@@ -9361,7 +9366,9 @@ mod tests {
             Box::new(DisjunctionScorer::try_new(leaves, DisjunctionScore::Sum).unwrap())
         };
         // Hand out `floor_after` documents, raise the floor, keep going, and
-        // report the window refreshes seen before the floor.
+        // report the window refreshes seen before the floor. The subject is the
+        // per-document route's block-max bookkeeping, so the windowed route is
+        // pinned off.
         let drain = |floor_after: Option<usize>| -> (Vec<(u64, u32)>, usize, usize) {
             let mut cursor = WandCursor::new(
                 Operator::Or,
@@ -9370,7 +9377,8 @@ mod tests {
                 corpus.scorer.clone(),
                 &FtsSearchParams::default(),
                 &metrics,
-            );
+            )
+            .with_or_per_document_route();
             let mut reference = reference();
             cursor_counters::take_or_window_refreshes();
             let mut before_floor = 0;
@@ -9435,8 +9443,9 @@ mod tests {
             .collect()
     }
 
-    /// One disjunction cursor over `postings`. `windowed` forces the batched
-    /// route through the same selection `WandCursor::new` runs.
+    /// One disjunction cursor over `postings`. `windowed` selects the batched
+    /// window through the same decision `WandCursor::new` makes; the reference
+    /// cursor pins the per-document route instead.
     fn or_cursor<'a, 'd: 'a>(
         documents: &'a LegacyWandDocuments<'d>,
         postings: Vec<PostingIterator>,
@@ -9455,7 +9464,7 @@ mod tests {
         if windowed {
             cursor.with_or_window_route()
         } else {
-            cursor
+            cursor.with_or_per_document_route()
         }
     }
 
@@ -9764,5 +9773,205 @@ mod tests {
             refills_after_rise > 0,
             "the window was never recomputed after a rise"
         );
+    }
+
+    /// A jump past the window the walk holds must be served by one seek step,
+    /// not by decoding a window the caller will not read.
+    #[test]
+    fn or_cursor_far_advances_do_not_refill_windows() {
+        let mut rng = SmallRng::seed_from_u64(0x0D_5EE_0002);
+        let block = MAX_POSTING_BLOCK_SIZE as u64;
+        let mut total_seeks = 0_usize;
+        for clauses in 2..=5_usize {
+            let corpus = random_corpus(&mut rng, 6_000, &or_densities(clauses, 1));
+            let mask = RowAddrMask::all_rows();
+            let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+            let metrics = NoOpMetricsCollector;
+            let mut batch = or_cursor(
+                &documents,
+                or_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                true,
+            );
+            let mut classic = or_cursor(
+                &documents,
+                or_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                false,
+            );
+            assert!(batch.or_window_active(), "clauses={clauses}");
+            cursor_counters::take_or_cursor_seek_steps();
+            cursor_counters::take_or_cursor_batch_refills();
+            cursor_counters::take_or_cursor_window_opens();
+
+            // Every target starts two blocks past the last handed-out document,
+            // so no jump fits the window the walk holds.
+            let mut jumps = 0_usize;
+            let mut target = 2 * block;
+            loop {
+                jumps += 1;
+                let a = batch.advance(target).unwrap();
+                let b = classic.advance(target).unwrap();
+                assert_eq!(a, b, "clauses={clauses} advance({target})");
+                let Some(doc) = a else {
+                    break;
+                };
+                assert_same_candidate(&mut batch, &mut classic, "far advance");
+                target = doc + 2 * block;
+            }
+            assert_eq!(
+                cursor_counters::take_or_cursor_seek_steps(),
+                jumps,
+                "clauses={clauses}: one seek per jump"
+            );
+            assert_eq!(
+                cursor_counters::take_or_cursor_batch_refills(),
+                0,
+                "clauses={clauses}: a jump refilled a window"
+            );
+            assert_eq!(
+                cursor_counters::take_or_cursor_window_opens(),
+                0,
+                "clauses={clauses}: a jump opened a window"
+            );
+            total_seeks += jumps;
+        }
+        assert!(total_seeks > 20, "only {total_seeks} seeks");
+    }
+
+    /// After a seek step the walk must resume right after the document the seek
+    /// found, with the same results as the per-document route.
+    #[test]
+    fn or_cursor_returns_to_batch_after_a_seek() {
+        let mut rng = SmallRng::seed_from_u64(0x0D_5EE_0003);
+        let block = MAX_POSTING_BLOCK_SIZE as u64;
+        for clauses in 2..=5_usize {
+            let corpus = random_corpus(&mut rng, 6_000, &or_densities(clauses, 1));
+            let mask = RowAddrMask::all_rows();
+            let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+            let metrics = NoOpMetricsCollector;
+            let mut batch = or_cursor(
+                &documents,
+                or_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                true,
+            );
+            let mut classic = or_cursor(
+                &documents,
+                or_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                false,
+            );
+            cursor_counters::take_or_cursor_seek_steps();
+            cursor_counters::take_or_cursor_batch_refills();
+
+            let start = 4 * block;
+            let a = batch.advance(start).unwrap();
+            let b = classic.advance(start).unwrap();
+            assert_eq!(a, b, "clauses={clauses}: advance({start})");
+            let Some(_) = a else {
+                continue;
+            };
+            assert_eq!(
+                cursor_counters::take_or_cursor_seek_steps(),
+                1,
+                "clauses={clauses}: the first jump was not a seek"
+            );
+
+            let mut followed = 0_usize;
+            for _ in 0..100 {
+                let a = batch.next().unwrap();
+                let b = classic.next().unwrap();
+                assert_eq!(a, b, "clauses={clauses}: next after the seek");
+                let Some(_) = a else {
+                    break;
+                };
+                followed += 1;
+                assert_same_candidate(&mut batch, &mut classic, "after a seek");
+            }
+            assert!(followed > 0, "clauses={clauses}: nothing followed the seek");
+            assert!(
+                cursor_counters::take_or_cursor_batch_refills() > 0,
+                "clauses={clauses}: the walk never resumed"
+            );
+        }
+    }
+
+    /// A jump that stays inside the block window the walk holds must be served
+    /// by walking it: only a jump past that window may cost a seek step.
+    #[test]
+    fn or_cursor_near_advances_stay_on_the_walk() {
+        let mut rng = SmallRng::seed_from_u64(0x0D_5EE_0004);
+        for clauses in 2..=3_usize {
+            let corpus = random_corpus(&mut rng, 6_000, &or_densities(clauses, 1));
+            let mask = RowAddrMask::all_rows();
+            let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+            let metrics = NoOpMetricsCollector;
+            let mut batch = or_cursor(
+                &documents,
+                or_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                true,
+            );
+            let mut classic = or_cursor(
+                &documents,
+                or_postings(&corpus, clauses),
+                corpus.scorer.clone(),
+                &metrics,
+                false,
+            );
+            assert!(batch.or_window_active(), "clauses={clauses}");
+
+            let first = batch.next().unwrap();
+            assert_eq!(
+                first,
+                classic.next().unwrap(),
+                "clauses={clauses}: first next"
+            );
+            assert!(
+                first.is_some(),
+                "clauses={clauses}: nothing to advance from"
+            );
+            cursor_counters::take_or_cursor_seek_steps();
+            cursor_counters::take_or_cursor_batch_refills();
+
+            // `doc + 1` always lies inside the window that produced `doc`, or
+            // inside the one the walk opened right after it. Going 200 steps
+            // empties the buffer, so at least one advance has to walk a window.
+            let mut advances = 0_usize;
+            for _ in 0..200 {
+                let Some(doc) = batch.doc() else {
+                    break;
+                };
+                let target = doc + 1;
+                let a = batch.advance(target).unwrap();
+                let b = classic.advance(target).unwrap();
+                assert_eq!(a, b, "clauses={clauses}: advance({target})");
+                let Some(found) = a else {
+                    break;
+                };
+                assert!(
+                    found >= target,
+                    "clauses={clauses}: advance({target}) went backwards to {found}"
+                );
+                advances += 1;
+                assert_same_candidate(&mut batch, &mut classic, "near advance");
+            }
+            assert!(advances > 0, "clauses={clauses}: no near advance ran");
+            assert_eq!(
+                cursor_counters::take_or_cursor_seek_steps(),
+                0,
+                "clauses={clauses}: a near advance sought instead of walking"
+            );
+            assert!(
+                cursor_counters::take_or_cursor_batch_refills() > 0,
+                "clauses={clauses}: a near advance never walked a window"
+            );
+        }
     }
 }

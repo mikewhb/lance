@@ -2751,6 +2751,12 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         /// Windows a windowed disjunction cursor walked, since the previous
         /// reset.
         static OR_CURSOR_BATCH_REFILLS: Cell<usize> = const { Cell::new(0) };
+        /// Block windows a windowed disjunction cursor opened, since the
+        /// previous reset.
+        static OR_CURSOR_WINDOW_OPENS: Cell<usize> = const { Cell::new(0) };
+        /// One-step seeks a windowed disjunction cursor ran because the caller
+        /// jumped past the window it held.
+        static OR_CURSOR_SEEK_STEPS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn and_cursor_batched() {
@@ -2803,6 +2809,14 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         OR_CURSOR_BATCH_REFILLS.with(|count| count.set(count.get() + 1));
     }
 
+    pub(super) fn or_cursor_window_open() {
+        OR_CURSOR_WINDOW_OPENS.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn or_cursor_seek_step() {
+        OR_CURSOR_SEEK_STEPS.with(|count| count.set(count.get() + 1));
+    }
+
     pub(in crate::scalar::inverted) fn take_batched() -> usize {
         AND_CURSORS_BATCHED.with(|count| count.replace(0))
     }
@@ -2845,6 +2859,14 @@ pub(in crate::scalar::inverted) mod cursor_counters {
 
     pub(in crate::scalar::inverted) fn take_or_cursor_batch_refills() -> usize {
         OR_CURSOR_BATCH_REFILLS.with(|count| count.replace(0))
+    }
+
+    pub(in crate::scalar::inverted) fn take_or_cursor_window_opens() -> usize {
+        OR_CURSOR_WINDOW_OPENS.with(|count| count.replace(0))
+    }
+
+    pub(in crate::scalar::inverted) fn take_or_cursor_seek_steps() -> usize {
+        OR_CURSOR_SEEK_STEPS.with(|count| count.replace(0))
     }
 }
 
@@ -2913,6 +2935,11 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // cursor of `lead` then belongs to the window walk, so a shallow probe must
     // not steer it: `compound_shallow_bound` restores the anchors afterwards.
     and_batched: bool,
+    // Set by `WandCursor` while it drives the disjunction walk. All clauses then
+    // sit in `lead` with block cursors anchored at the window they bound, which
+    // a shallow probe cannot reuse without moving them away from their own
+    // documents.
+    or_windowed: bool,
     // Set by `WandCursor` for a disjunction: the cursor recomputes every
     // candidate's score in query order, so `next` may skip the per-candidate
     // score and window bookkeeping while there is no floor to compare against.
@@ -3051,6 +3078,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             and_lead_arrayed: false,
             array_lead: ArrayLead::new(),
             and_batched: false,
+            or_windowed: false,
             or_score_recomputed: false,
             score_first_and_enabled,
             #[cfg(test)]
@@ -5763,37 +5791,35 @@ const OR_WINDOW_MAX_CLAUSES: usize = 8;
 
 /// Whether a disjunction cursor may take the windowed route.
 ///
-/// The window streams whole posting blocks and scores through
-/// `Scorer::doc_weight` only, so every clause must be a compressed, ungrouped
-/// posting and the query must not need positions. Selection itself stays off:
-/// the per-document route is the default until a drive-mode decision exists, so
-/// a window is only ever walked when a caller asks for it explicitly.
+/// The window streams whole posting blocks, scores per candidate in query order
+/// and anchors each clause's block cursor at the window it bounds, so every
+/// clause must be a compressed, ungrouped posting, the query must not need
+/// positions, and the clause count has to fit the walk's inline buffers. Only a
+/// fresh disjunction qualifies: its clauses all live in a heap the route can
+/// take over, and that is what lets a jump hand them back to the per-document
+/// route.
+///
+/// This is the precondition of the route, not the per-call decision. A
+/// streamable disjunction starts on the window, the only route that reuses one
+/// bound across a block of candidates, and a jump that leaves the window it
+/// holds takes one seek step on the per-document route (see
+/// `WandCursor::advance_or_window`).
 fn or_window_route_accepts<S: Scorer, D: WandDocuments>(
-    _wand: &Wand<'_, S, D>,
-    _phrase_slop: Option<u32>,
+    wand: &Wand<'_, S, D>,
+    phrase_slop: Option<u32>,
 ) -> bool {
-    false
+    phrase_slop.is_none()
+        && wand.operator == Operator::Or
+        && wand.lead.is_empty()
+        && wand.tail.is_empty()
+        && (2..=OR_WINDOW_MAX_CLAUSES).contains(&wand.head.len())
+        && wand
+            .head
+            .iter()
+            .all(|head| head.posting.is_compressed() && !head.posting.has_grouped_terms())
 }
 
 impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
-    /// Preconditions of the windowed disjunction, independent of selection.
-    ///
-    /// Only a fresh disjunction qualifies: its clauses all live in the heap,
-    /// they are all compressed and ungrouped, there is more than one of them,
-    /// and there are at most `OR_WINDOW_MAX_CLAUSES`, which is what the walk's
-    /// inline per-candidate buffers hold.
-    fn or_window_route_ready(&self, phrase_slop: Option<u32>) -> bool {
-        phrase_slop.is_none()
-            && self.operator == Operator::Or
-            && self.lead.is_empty()
-            && self.tail.is_empty()
-            && (2..=OR_WINDOW_MAX_CLAUSES).contains(&self.head.len())
-            && self
-                .head
-                .iter()
-                .all(|head| head.posting.is_compressed() && !head.posting.has_grouped_terms())
-    }
-
     /// Move every clause into `lead`, in query order, so a windowed
     /// disjunction drives them as one slice.
     ///
@@ -5809,6 +5835,27 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
         self.tail_max_score = 0.0;
         self.lead
             .sort_unstable_by_key(|posting| (posting.position, posting.token_id));
+    }
+
+    /// Hand every clause back to the heap: `lead` and `tail` empty, `head`
+    /// ordered by document, no block window left over.
+    ///
+    /// Every clause's block cursor is first put back on the block that holds its
+    /// own document. The window walk anchors blocks at the window it bounds,
+    /// which sits ahead of a clause that trails the window, while every
+    /// per-document path assumes the anchor tracks the document. Crossing back
+    /// is only valid from the window route, the only route that keeps all
+    /// clauses in `lead`.
+    fn release_or_clauses(&mut self) {
+        while let Some(mut posting) = self.lead.pop() {
+            if let Some(doc) = posting.doc() {
+                posting.seek_block_from_start(u64::from(doc.doc_id()));
+            }
+            self.push_head(posting);
+        }
+        self.tail.clear();
+        self.tail_max_score = 0.0;
+        self.up_to = None;
     }
 }
 
@@ -5849,6 +5896,11 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     or_window: Option<or_walk::BulkOrState>,
     or_cands: Vec<(u64, f32, u32)>,
     or_next: usize,
+    // Whether the clauses are layered for the walk: all of them in `lead`, in
+    // query order, positioned by the window. A seek step clears this, because
+    // it hands the clauses back to the heap for the per-document route; the next
+    // sequential call rebuilds the walk right after the document it found.
+    or_sequential: bool,
     // Highest document the window walk has covered, until a seek step moves
     // past it. A jump beyond `frontier + 1` cannot be served by the walk.
     // Seeded with the first window's start minus one when the walk is built,
@@ -5867,10 +5919,10 @@ pub(super) struct WandCursor<'a, D: WandDocuments> {
     // intersection. `Wand::new` would drop that clause and hand out documents
     // missing a required term, so the cursor stays empty instead.
     exhausted: bool,
-    // Test-only switch that forces the windowed disjunction through the same
-    // selection `select_and_route` runs, so one process can drive both routes.
+    // Test-only switch that forces the disjunction route the same way
+    // `select_and_route` decides it, so one process can drive both routes.
     #[cfg(test)]
-    or_window_override: bool,
+    or_route_override: Option<bool>,
 }
 
 impl<'a, D: WandDocuments> WandCursor<'a, D> {
@@ -5968,12 +6020,13 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             or_window: None,
             or_cands: Vec::new(),
             or_next: 0,
+            or_sequential: false,
             batch_frontier: 0,
             seeking: false,
             single,
             exhausted: empty_intersection,
             #[cfg(test)]
-            or_window_override: false,
+            or_route_override: None,
         };
         cursor.select_and_route();
         cursor
@@ -6045,23 +6098,33 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
 
     /// Pick the stride for a disjunction cursor.
     ///
-    /// The window is taken only when `or_window_route_accepts` says so, which it
-    /// never does yet: the per-document route stays the default until a
-    /// drive-mode decision exists.
+    /// A streamable disjunction starts on the window: it is the only route that
+    /// reuses one block bound across a whole window of candidates, and it is
+    /// what a caller that keeps calling `next` wants. Nothing here decides for
+    /// good: a jump that leaves the window the walk holds takes one seek step on
+    /// the per-document route, and the next sequential call resumes the walk
+    /// (see `advance_or_window`).
     fn select_or_route(&mut self) {
+        // Test hook: the per-document route can be pinned even when the
+        // disjunction qualifies for the window.
         #[cfg(test)]
-        let accepted =
-            self.or_window_override || or_window_route_accepts(&self.wand, self.phrase_slop);
-        #[cfg(not(test))]
-        let accepted = or_window_route_accepts(&self.wand, self.phrase_slop);
-        if !accepted || !self.wand.or_window_route_ready(self.phrase_slop) {
+        {
+            if self.or_route_override == Some(false) {
+                return;
+            }
+        }
+        if !or_window_route_accepts(&self.wand, self.phrase_slop) {
             return;
         }
         self.wand.adopt_or_clauses();
+        self.wand.or_windowed = true;
         self.or_window = Some(or_walk::BulkOrState::new(
             self.wand.lead.len(),
             self.wand_factor,
         ));
+        // The walk built its state from the clauses it just took over, so the
+        // layering already belongs to it.
+        self.or_sequential = true;
         self.or_cands.reserve(MAX_POSTING_BLOCK_SIZE);
         #[cfg(test)]
         cursor_counters::or_cursor_batched();
@@ -6086,11 +6149,24 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
     /// constructor runs, so one process can drive both routes.
     #[cfg(test)]
     pub(super) fn with_or_window_route(mut self) -> Self {
-        self.or_window_override = true;
-        self.or_window = None;
+        self.or_route_override = Some(true);
         self.or_cands.clear();
         self.or_next = 0;
         self.select_or_route();
+        self
+    }
+
+    /// Test hook: pin the per-document route, undoing a window the constructor
+    /// may already have built.
+    #[cfg(test)]
+    pub(super) fn with_or_per_document_route(mut self) -> Self {
+        self.or_route_override = Some(false);
+        self.or_window = None;
+        self.wand.release_or_clauses();
+        self.wand.or_windowed = false;
+        self.or_cands.clear();
+        self.or_next = 0;
+        self.or_sequential = false;
         self
     }
 
@@ -6368,6 +6444,9 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             }));
             self.current_document_key = Some(document_key);
             self.current_score = score;
+            // The clauses are still layered for the walk, and the window has
+            // advanced past this document.
+            self.or_sequential = true;
             // The windowed route never carries a phrase, so the document is
             // confirmed.
             self.confirmation = Some(true);
@@ -6454,13 +6533,20 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             let from = self.doc().map_or(0, |doc| doc.saturating_add(1));
             self.resume_batch(from);
         }
-        if let Some(doc) = self.current_doc
+        if self.or_window.is_some() && !self.or_sequential {
+            // The previous hand-out came from a seek step, so the clauses sit in
+            // the heap and the walk holds nothing. A sequential call is the
+            // signal to rebuild the walk right after the document the seek
+            // found.
+            let from = self.doc().map_or(0, |doc| doc.saturating_add(1));
+            self.resume_or_window(from);
+        } else if let Some(doc) = self.current_doc
             && self.wand.operator == Operator::Or
-            && self.or_window.is_none()
+            && !self.or_sequential
         {
-            // The windowed route keeps every clause in `lead` and advances the
-            // window instead, so only the per-document route moves the clauses
-            // back into the heap.
+            // Only the per-document route leaves clauses behind the current
+            // document; on the walk every clause stays in `lead` and the window
+            // advances instead.
             self.wand.push_back_leads(doc.doc_id().saturating_add(1));
         }
         self.clear_current();
@@ -6493,18 +6579,26 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         self.position_next()
     }
 
-    /// `advance` on the windowed disjunction: a buffered candidate covers the
-    /// target when one of them sits at or after it, and otherwise the walk
-    /// restarts at the target, which re-anchors every clause block on the way
-    /// in instead of decoding a window the caller will not read.
+    /// `advance` on the windowed disjunction.
+    ///
+    /// A buffered candidate covers the target when one of them sits at or after
+    /// it. Otherwise the walk serves the jump itself while it lands inside the
+    /// block window the walk already holds bounds for, because those bounds are
+    /// exactly what the jump needs and reopening the window at the target cannot
+    /// cost less. Anything further would make the walk decode a window the
+    /// caller will not read, so it takes one seek step on the per-document route
+    /// instead; the walk keeps no window from then on until a sequential call
+    /// rebuilds it.
     fn advance_or_window(&mut self, target: u64) -> Result<Option<u64>> {
         // No posting doc id can reach a target past the u32 doc-id domain.
         if target > u32::MAX as u64 {
             if let Some(state) = self.or_window.as_mut() {
                 state.done = true;
             }
-            // Nothing buffered may surface after this jump either.
+            // Nothing buffered may surface after this jump either, and no later
+            // call can produce a document, so the cursor is over.
             self.or_next = self.or_cands.len();
+            self.exhausted = true;
             self.clear_current();
             self.record_metrics();
             return Ok(None);
@@ -6515,10 +6609,105 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
         if self.or_next < self.or_cands.len() {
             return self.position_next();
         }
+        let reach = self.or_window.as_ref().map_or(0, |state| state.reach());
+        if target > reach {
+            return self.or_seek_one(target);
+        }
+        if !self.or_sequential {
+            // The last hand-out came from a seek step, so the clauses are
+            // layered for the per-document route. Take them back before the
+            // window can be walked again; the walk restarts at the target or
+            // right after the document the seek found, whichever is further.
+            let from = self
+                .doc()
+                .map_or(target, |doc| doc.saturating_add(1).max(target));
+            self.resume_or_window(from);
+        }
         if let Some(state) = self.or_window.as_mut() {
-            state.restart_at(target);
+            // Inside the window the bound and the clause split stay valid, so
+            // only the next window's start moves.
+            state.advance_within(target);
         }
         self.position_next()
+    }
+
+    /// Serves one `advance` with a seek on the per-document route.
+    ///
+    /// The clauses go back to the heap with their block cursors on their own
+    /// documents, `lead` and `tail` empty and `head` ordered by document, which
+    /// is the layering `position_classic` (and `seek` itself) assumes. The walk
+    /// keeps its state but no window: `restart_at` puts its next start right
+    /// after the document the seek found, which is where a later sequential call
+    /// resumes it.
+    fn or_seek_one(&mut self, target: u64) -> Result<Option<u64>> {
+        // Everything buffered lies below the target.
+        self.or_next = self.or_cands.len();
+        #[cfg(test)]
+        cursor_counters::or_cursor_seek_step();
+        self.wand.release_or_clauses();
+        self.wand.or_windowed = false;
+        self.or_sequential = false;
+        self.wand.seek(target);
+        let found = self.position_classic()?;
+        match found {
+            Some(doc) => {
+                if let Some(state) = self.or_window.as_mut() {
+                    state.restart_at(doc.saturating_add(1));
+                }
+            }
+            // Nothing at or after the target: the disjunction is over.
+            None => self.exhausted = true,
+        }
+        Ok(found)
+    }
+
+    /// Take the clauses back from the per-document route and restart the walk at
+    /// `from`.
+    ///
+    /// The walk needs every clause in `lead`, in query order, because its clause
+    /// split is indexed by position; the seek step left them in the heap. The
+    /// buffered candidates belong to the abandoned walk and are dropped.
+    ///
+    /// A seek drops clauses that ran out, so the clause count can be smaller
+    /// than the one the walk was built with. The split is indexed by position,
+    /// so the state is rebuilt for the surviving clauses rather than indexed
+    /// with a stale width.
+    fn resume_or_window(&mut self, from: u64) {
+        if from > u64::from(u32::MAX) {
+            // No posting holds a document past the doc-id domain.
+            if let Some(state) = self.or_window.as_mut() {
+                state.done = true;
+            }
+            self.exhausted = true;
+            self.or_cands.clear();
+            self.or_next = 0;
+            self.or_sequential = false;
+            return;
+        }
+        self.wand.adopt_or_clauses();
+        self.wand.or_windowed = true;
+        let num_lists = self.wand.lead.len();
+        let same_shape = self
+            .or_window
+            .as_ref()
+            .is_some_and(|state| state.num_lists == num_lists);
+        if same_shape {
+            if let Some(state) = self.or_window.as_mut() {
+                state.restart_at(from);
+            }
+        } else {
+            let compared = self
+                .or_window
+                .as_ref()
+                .map_or(0, |state| state.num_comparisons);
+            let mut state = or_walk::BulkOrState::new(num_lists, self.wand_factor);
+            state.num_comparisons = compared;
+            state.restart_at(from);
+            self.or_window = Some(state);
+        }
+        self.or_cands.clear();
+        self.or_next = 0;
+        self.or_sequential = true;
     }
 
     /// `advance` on the bulk route: a jump either keeps the window walk going
@@ -6858,6 +7047,18 @@ impl<S: Scorer, D: WandDocuments> Wand<'_, S, D> {
 
     fn compound_shallow_bound(&mut self, target: u64) -> (u64, f32) {
         if self.operator == Operator::Or {
+            if self.or_windowed {
+                // The walk anchors each clause's block cursor at the window it
+                // bounds rather than at the clause's own document, so a
+                // forward-only probe cannot reuse those anchors without moving
+                // them off the blocks the walk still needs. Bound the whole
+                // disjunction instead: it holds for every document at or after
+                // `target`, and the walk prunes its own windows.
+                let upper = self
+                    .compound_global_score_upper_bound()
+                    .unwrap_or(f32::INFINITY);
+                return (TERMINATED_DOC_ID, upper);
+            }
             self.update_max_scores(target);
             return (
                 self.up_to.unwrap_or(TERMINATED_DOC_ID),

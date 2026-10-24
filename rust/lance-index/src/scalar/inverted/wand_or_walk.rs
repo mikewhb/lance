@@ -102,6 +102,24 @@ impl BulkOrState {
         self.up_to = None;
     }
 
+    /// Move the next window's start forward inside the open window.
+    ///
+    /// The bounds and the clause split were computed for `[window_min, up_to]`
+    /// and stay valid for the range that remains, so a jump inside the window
+    /// must not reopen it.
+    pub(super) fn advance_within(&mut self, target: u64) {
+        self.next_min = self.next_min.max(target);
+    }
+
+    /// The furthest document this walk can hand out without opening a window it
+    /// has not planned to read.
+    ///
+    /// That is the open window's end, or the start of the next window when none
+    /// is open (which is where a walk restarted by a seek step stands).
+    pub(super) fn reach(&self) -> u64 {
+        self.up_to.unwrap_or(self.next_min)
+    }
+
     /// Whether a window bound is still open. Test hook: a floor rise must close
     /// it, so the next window recomputes the bound and the clause split.
     #[cfg(test)]
@@ -267,7 +285,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     /// has to clear the window to get fresh bounds.
     fn open_or_window(&mut self, state: &mut BulkOrState) -> Option<u64> {
         #[cfg(test)]
-        cursor_counters::or_window_refresh();
+        cursor_counters::or_cursor_window_open();
         let mut first_doc = TERMINATED_DOC_ID;
         for posting in &self.lead {
             if let Some(doc) = posting.doc() {
