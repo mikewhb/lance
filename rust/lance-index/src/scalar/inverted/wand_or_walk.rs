@@ -33,8 +33,30 @@
 //! per-document route folds, so the two can only disagree about whether to hand
 //! the document out, never about what its score is.
 
-use super::and_walk::{BulkVisit, StepOutcome};
+use super::and_walk::StepOutcome;
 use super::*;
+
+/// Candidate callback of the disjunction walk.
+///
+/// Unlike the conjunction's [`BulkVisit`], it carries no document length. The
+/// walk only admits compressed, ungrouped clauses, so a partition with a norm
+/// addend table scores a candidate without the length, and the uncached
+/// fallback reads the length itself.
+///
+/// [`BulkVisit`]: super::and_walk::BulkVisit
+pub(super) trait OrBulkVisit {
+    fn visit(&mut self, doc: u32, key: u64, score: f32, freqs: &[u32]) -> Result<Option<f32>>;
+}
+
+impl<F> OrBulkVisit for F
+where
+    F: FnMut(u32, u64, f32, &[u32]) -> Result<Option<f32>>,
+{
+    #[inline]
+    fn visit(&mut self, doc: u32, key: u64, score: f32, freqs: &[u32]) -> Result<Option<f32>> {
+        self(doc, key, score, freqs)
+    }
+}
 
 /// State a windowed disjunction keeps across windows.
 ///
@@ -158,7 +180,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     ///
     /// The clauses must all sit in `lead`, in query order; the cursor's route
     /// build puts them there and no other route may drive this state.
-    pub(super) fn bulk_or_step<V: BulkVisit>(
+    pub(super) fn bulk_or_step<V: OrBulkVisit>(
         &mut self,
         state: &mut BulkOrState,
         visit: &mut V,
@@ -247,7 +269,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     state.accumulator.clear_slot(slot);
                     continue;
                 };
-                let doc_length = self.documents.scoring_num_tokens(doc as u32);
+                // When the partition has a norm addend table the score reads the
+                // quantized norm instead of the length, so the length is only
+                // resolved for the uncached branch.
+                let doc_length = norm_k
+                    .is_none()
+                    .then(|| self.documents.scoring_num_tokens(doc as u32));
                 state.hit_freqs.clear();
                 // Query order: the accumulator holds the essential clauses'
                 // frequencies, the non-essential ones are probed here, and both
@@ -276,7 +303,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         &self.scorer,
                         freq,
                         doc as u32,
-                        || doc_length,
+                        || {
+                            doc_length
+                                .unwrap_or_else(|| self.documents.scoring_num_tokens(doc as u32))
+                        },
                         norm_k,
                     );
                     state.hit_freqs.push(freq);
@@ -285,13 +315,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 if floor > 0.0 && score_sum_cannot_compete(score, 0.0, floor, factor, floor_mode) {
                     continue;
                 }
-                if let Some(kth) = visit.visit(
-                    doc as u32,
-                    document_key,
-                    score,
-                    doc_length,
-                    &state.hit_freqs,
-                )? {
+                if let Some(kth) = visit.visit(doc as u32, document_key, score, &state.hit_freqs)? {
                     self.update_threshold(kth, state.wand_factor);
                     // The end and the split were computed under the old floor.
                     state.invalidate_window();

@@ -749,6 +749,7 @@ impl CompressedState {
         #[cfg(test)]
         {
             self.frequency_blocks_decoded += 1;
+            cursor_counters::frequency_block_decoded();
         }
     }
 }
@@ -1350,6 +1351,8 @@ impl PostingIterator {
                 }
                 let block_idx = self.index >> list.block_shift();
                 let block_offset = self.index & list.block_mask();
+                #[cfg(test)]
+                cursor_counters::frequency_materialized();
                 let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
                 Some(DocInfo::Raw(RawDocInfo {
                     doc_id: current_doc.doc_id() as u32,
@@ -2820,6 +2823,12 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         /// Candidates a disjunction cursor scored on its per-document route,
         /// since the previous reset.
         static OR_CURSOR_CANDIDATE_SCORES: Cell<usize> = const { Cell::new(0) };
+        /// Frequency blocks decompressed, over every posting, since the
+        /// previous reset.
+        static FREQUENCY_BLOCKS_DECODED: Cell<usize> = const { Cell::new(0) };
+        /// Times a compressed posting materialized a document's frequency by
+        /// reading its block, since the previous reset.
+        static FREQUENCY_MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn and_cursor_batched() {
@@ -2884,6 +2893,14 @@ pub(in crate::scalar::inverted) mod cursor_counters {
         OR_CURSOR_CANDIDATE_SCORES.with(|count| count.set(count.get() + 1));
     }
 
+    pub(super) fn frequency_block_decoded() {
+        FREQUENCY_BLOCKS_DECODED.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(super) fn frequency_materialized() {
+        FREQUENCY_MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
+    }
+
     pub(in crate::scalar::inverted) fn take_batched() -> usize {
         AND_CURSORS_BATCHED.with(|count| count.replace(0))
     }
@@ -2938,6 +2955,14 @@ pub(in crate::scalar::inverted) mod cursor_counters {
 
     pub(in crate::scalar::inverted) fn take_or_cursor_candidate_scores() -> usize {
         OR_CURSOR_CANDIDATE_SCORES.with(|count| count.replace(0))
+    }
+
+    pub(in crate::scalar::inverted) fn take_frequency_blocks_decoded() -> usize {
+        FREQUENCY_BLOCKS_DECODED.with(|count| count.replace(0))
+    }
+
+    pub(in crate::scalar::inverted) fn take_frequency_materializations() -> usize {
+        FREQUENCY_MATERIALIZATIONS.with(|count| count.replace(0))
     }
 }
 
@@ -6651,7 +6676,6 @@ impl<'a, D: WandDocuments> WandCursor<'a, D> {
             let mut visit = |doc: u32,
                              _key: u64,
                              score: f32,
-                             _length: u32,
                              freqs: &[u32]|
              -> Result<Option<f32>> {
                 // The first matching clause's frequency is what the

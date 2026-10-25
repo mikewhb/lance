@@ -11190,6 +11190,75 @@ mod tests {
         assert!(scored > 30, "only {scored} candidates scored");
     }
 
+    /// The disjunction heap is keyed on document ids and its hand-out reports a
+    /// candidate whose frequency is still the walk's placeholder, so neither
+    /// route materializes a frequency to decide what to hand out. A block
+    /// covers many candidates and is decoded at most once, so draining either
+    /// route stays far below one frequency block per handed-out candidate; the
+    /// per-document route materializes none at all.
+    #[test]
+    fn or_cursor_decodes_fewer_frequency_blocks_than_it_hands_out() {
+        let mut rng = SmallRng::seed_from_u64(0x0000_D5EE_000A);
+        let corpus = random_corpus(&mut rng, 4_000, &or_densities(4, 1));
+        let mask = RowAddrMask::all_rows();
+        let documents = LegacyWandDocuments::new(&corpus.documents, &mask);
+        let metrics = NoOpMetricsCollector;
+        let mut per_route = Vec::new();
+        for windowed in [false, true] {
+            let mut cursor = or_cursor(
+                &documents,
+                or_postings(&corpus, 4),
+                corpus.scorer.clone(),
+                &metrics,
+                windowed,
+            );
+            assert_eq!(
+                cursor.or_window_active(),
+                windowed,
+                "windowed={windowed}: wrong route"
+            );
+            // Only the drain counts: building the cursor may anchor the clauses.
+            cursor_counters::take_frequency_blocks_decoded();
+            cursor_counters::take_frequency_materializations();
+            let mut handed_out = 0_usize;
+            while cursor.next().unwrap().is_some() {
+                handed_out += 1;
+            }
+            let decoded = cursor_counters::take_frequency_blocks_decoded();
+            let materialized = cursor_counters::take_frequency_materializations();
+            assert!(
+                handed_out > 1_000,
+                "windowed={windowed}: only {handed_out} candidates handed out"
+            );
+            assert!(
+                decoded > 0,
+                "windowed={windowed}: no frequency block decoded, the corpus never crossed one"
+            );
+            assert!(
+                decoded < handed_out,
+                "windowed={windowed}: {decoded} frequency blocks decoded for {handed_out} candidates"
+            );
+            assert!(
+                materialized < handed_out,
+                "windowed={windowed}: {materialized} frequencies materialized for {handed_out} candidates"
+            );
+            if !windowed {
+                // Positioning on a candidate and handing it out read only its
+                // document id; a frequency read here would be the decode the
+                // heap key and the hand-out must not do.
+                assert_eq!(
+                    materialized, 0,
+                    "the per-document route materialized {materialized} frequencies while handing out"
+                );
+            }
+            per_route.push(handed_out);
+        }
+        assert_eq!(
+            per_route[0], per_route[1],
+            "the two routes handed out different documents"
+        );
+    }
+
     /// A shallow probe between positioning and scoring must not change the
     /// score: the probe may move block cursors, but the clauses stay on the
     /// document they were positioned at.
