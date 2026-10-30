@@ -530,7 +530,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::super::append::select_segments_to_merge;
-    use super::super::optimize::plan_optimize_indices;
+    use super::super::optimize::{commit_optimize_indices, plan_optimize_indices};
     use super::super::{DatasetIndexExt, DatasetIndexInternalExt, load_all_indices};
     use super::{floor_log2, opened_for_test, select_class_group};
     use crate::Dataset;
@@ -1427,5 +1427,230 @@ mod tests {
     async fn merge_and_commit_failures_leave_the_dataset_unchanged() {
         assert_failure_keeps_the_dataset("_indices/").await;
         assert_failure_keeps_the_dataset("_versions").await;
+    }
+
+    const BATCH_ROWS: u64 = 1_000;
+    const BATCHES: usize = 64;
+
+    fn fragment_rows(dataset: &Dataset, id: u32) -> u64 {
+        dataset
+            .get_fragment(id as usize)
+            .unwrap_or_else(|| panic!("fragment {id} is missing"))
+            .metadata()
+            .num_rows()
+            .unwrap_or_else(|| panic!("fragment {id} has no visible row count")) as u64
+    }
+
+    fn coverage_rows(dataset: &Dataset, segment: &IndexMetadata) -> u64 {
+        segment
+            .fragment_bitmap
+            .as_ref()
+            .into_iter()
+            .flat_map(|bitmap| bitmap.iter())
+            .map(|id| fragment_rows(dataset, id))
+            .sum()
+    }
+
+    async fn committed_index_bytes(dataset: &Dataset, uuid: Uuid) -> u64 {
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
+        lance_table::format::list_index_files_with_sizes(dataset.object_store.as_ref(), &index_dir)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|file| !lance_index::scalar::inverted::builder::is_staged_path(&file.path))
+            .map(|file| file.size_bytes)
+            .sum()
+    }
+
+    async fn append_batch(dataset: &mut Dataset, start: i32) {
+        let schema = Arc::new(arrow_schema::Schema::from(dataset.schema()));
+        let end = start + BATCH_ROWS as i32;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(start..end)),
+                Arc::new(StringArray::from_iter_values(
+                    (start..end).map(|id| format!("row{id}")),
+                )),
+            ],
+        )
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                Some(WriteParams {
+                    max_rows_per_file: BATCH_ROWS as usize,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Plan, merge, and commit one group. Returns its input live rows.
+    async fn merge_one(dataset: &mut Dataset, options: &OptimizeOptions) -> Option<u64> {
+        let plan = plan_optimize_indices(dataset, options).await.unwrap();
+        if plan.tasks.is_empty() {
+            assert!(plan.merges.is_empty());
+            return None;
+        }
+        assert_eq!(plan.tasks.len(), 1);
+        let task = &plan.tasks[0];
+        let input_rows = task
+            .old_segments
+            .iter()
+            .map(|segment| coverage_rows(dataset, segment))
+            .sum::<u64>()
+            + task
+                .fragments
+                .iter()
+                .map(|id| fragment_rows(dataset, *id))
+                .sum::<u64>();
+        let old_bytes = {
+            let mut bytes = 0u128;
+            for segment in &task.old_segments {
+                bytes += committed_index_bytes(dataset, segment.uuid).await as u128;
+            }
+            bytes
+        };
+        let mut built = Vec::new();
+        for task in &plan.tasks {
+            if let Some(result) = task.execute(dataset).await.unwrap() {
+                built.push(result);
+            }
+        }
+        let mut merged = Vec::new();
+        for merge in &plan.merges {
+            if let Some(result) = merge.execute(dataset, &built).await.unwrap() {
+                merged.push(result);
+            }
+        }
+        assert_eq!(merged.len(), 1);
+        let new_uuid = merged[0].segment.uuid;
+        commit_optimize_indices(dataset, merged, options)
+            .await
+            .unwrap();
+        let new_bytes = committed_index_bytes(dataset, new_uuid).await as u128;
+        assert!(old_bytes > 0 && new_bytes > 0);
+        assert!(
+            new_bytes * 4 <= old_bytes * 5,
+            "merged index bytes {new_bytes} exceed 1.25x the input bytes {old_bytes}"
+        );
+        Some(input_rows)
+    }
+
+    async fn drain_merges(dataset: &mut Dataset, options: &OptimizeOptions) -> Vec<u64> {
+        let mut inputs = Vec::new();
+        while let Some(rows) = merge_one(dataset, options).await {
+            inputs.push(rows);
+        }
+        inputs
+    }
+
+    fn expected_inputs(max_rows: u64) -> Vec<u64> {
+        let mut inputs = vec![8 * BATCH_ROWS; 8];
+        if max_rows == 64 * BATCH_ROWS {
+            inputs.push(64 * BATCH_ROWS);
+        }
+        inputs
+    }
+
+    async fn run_sixty_four_batches(incremental: bool, max_rows: u64) -> (Vec<u64>, usize) {
+        let dir = TempStrDir::default();
+        let mut dataset = write_text(
+            dir.as_str(),
+            BATCH_ROWS as usize,
+            BATCH_ROWS as usize,
+            false,
+            |id| format!("row{id}"),
+        )
+        .await;
+        let parameters = params();
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_idx".into()),
+                &parameters,
+                false,
+            )
+            .await
+            .unwrap();
+        let options = tiered(8, BATCH_ROWS, max_rows);
+        let started = std::time::Instant::now();
+        let mut inputs = Vec::new();
+        let mut peak = text_segments(&dataset).await.len();
+        if incremental {
+            inputs.extend(drain_merges(&mut dataset, &options).await);
+        }
+        for batch in 1..BATCHES {
+            append_batch(&mut dataset, (batch as i32) * BATCH_ROWS as i32).await;
+            dataset
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+            peak = peak.max(text_segments(&dataset).await.len());
+            if incremental {
+                inputs.extend(drain_merges(&mut dataset, &options).await);
+                peak = peak.max(text_segments(&dataset).await.len());
+            }
+        }
+        if !incremental {
+            inputs.extend(drain_merges(&mut dataset, &options).await);
+        }
+        let record = format!(
+            "fts tiered write-amp incremental={incremental} max_rows={max_rows} elapsed_ms={} \
+             merges={} peak={}",
+            started.elapsed().as_millis(),
+            inputs.len(),
+            peak
+        );
+        log::info!("{record}");
+        let mut record_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../target/fts-tiered-write-amp.log"
+            ))
+            .unwrap();
+        use std::io::Write;
+        writeln!(record_file, "{record}").unwrap();
+        let expected = expected_inputs(max_rows);
+        assert_eq!(inputs, expected);
+        let segments = text_segments(&dataset).await;
+        if max_rows == 64 * BATCH_ROWS {
+            assert_eq!(segments.len(), 1);
+        } else {
+            assert_eq!(segments.len(), 8);
+            for segment in &segments {
+                assert_eq!(coverage_rows(&dataset, segment), 8 * BATCH_ROWS);
+            }
+        }
+        assert!(
+            plan_optimize_indices(&dataset, &options)
+                .await
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
+        let written: u64 = inputs.iter().copied().sum();
+        let amplification = written / (BATCHES as u64 * BATCH_ROWS);
+        assert_eq!(written % (BATCHES as u64 * BATCH_ROWS), 0);
+        assert_eq!(
+            amplification,
+            if max_rows == 64 * BATCH_ROWS { 2 } else { 1 }
+        );
+        (inputs, peak)
+    }
+
+    #[tokio::test]
+    async fn sixty_four_batches_pin_write_amplification_and_peak() {
+        let (_, _) = run_sixty_four_batches(false, 64 * BATCH_ROWS).await;
+        let (_, peak) = run_sixty_four_batches(true, 64 * BATCH_ROWS).await;
+        assert!(peak <= 15, "incremental peak {peak}");
+        let (_, _) = run_sixty_four_batches(false, 8 * BATCH_ROWS).await;
+        let (_, peak) = run_sixty_four_batches(true, 8 * BATCH_ROWS).await;
+        assert!(peak <= 15, "incremental ceiling peak {peak}");
     }
 }
