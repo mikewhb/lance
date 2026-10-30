@@ -4131,6 +4131,118 @@ async fn inverted_merge_keeps_translated_coverage_on_tagged_tables() {
     assert_eq!(hits(&dataset).await, 12);
 }
 
+// Tiered compaction on the same tagged table. The merged segment still
+// publishes the retired source ids, and the reader's derived coverage still
+// contains the destination fragments.
+#[tokio::test]
+async fn tiered_inverted_merge_keeps_translated_coverage_on_tagged_tables() {
+    use arrow_array::{ArrayRef, Int32Array, StringArray};
+    use lance_index::optimize::{FtsTieredMergeOptions, OptimizeOptions};
+
+    let mut dataset = lance_datagen::gen_batch()
+        .col("i", lance_datagen::array::step::<Int32Type>())
+        .col("text", lance_datagen::array::fill_utf8("hit".to_string()))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(4))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            Some("text_idx".into()),
+            &lance_index::scalar::InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+    let indices = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .as_ref()
+        .clone();
+    persist_fixture(&mut dataset, indices).await;
+    let appended = RecordBatch::try_from_iter(vec![
+        (
+            "i",
+            Arc::new(Int32Array::from(vec![8, 9, 10, 11])) as ArrayRef,
+        ),
+        (
+            "text",
+            Arc::new(StringArray::from(vec!["hit"; 4])) as ArrayRef,
+        ),
+    ])
+    .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    let derived = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        async move {
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|index| index.name == "text_idx")
+                .filter_map(|index| index.fragment_bitmap.clone())
+                .fold(RoaringBitmap::new(), |acc, b| acc | b)
+        }
+    };
+    let hits = |dataset: &Dataset| {
+        let dataset = dataset.clone();
+        async move {
+            let mut scan = dataset.scan();
+            scan.full_text_search(lance_index::scalar::FullTextSearchQuery::new("hit".into()))
+                .unwrap();
+            scan.try_into_batch().await.unwrap().num_rows()
+        }
+    };
+
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    assert_eq!(hits(&dataset).await, 12);
+    dataset
+        .optimize_indices(&OptimizeOptions::default().fts_tiered(
+            // Both segments are below this floor, so they share one tier.
+            // Two segments fill that tier, and their live rows fit the ceiling.
+            FtsTieredMergeOptions::new(16, 32).segments_per_tier(2),
+        ))
+        .await
+        .unwrap();
+    let stored: Vec<_> = crate::index::load_all_indices(&dataset)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|index| index.name == "text_idx")
+        .cloned()
+        .collect();
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    let provenance = stored[0].fragment_bitmap.clone().unwrap();
+    assert!(
+        provenance.contains(0) && provenance.contains(1),
+        "the merge keeps the provenance: {provenance:?}"
+    );
+    assert_eq!(
+        derived(&dataset).await,
+        dataset.fragment_bitmap.as_ref().clone(),
+        "the merge keeps the translated coverage"
+    );
+    assert_eq!(hits(&dataset).await, 12);
+}
+
 // Under a history this build cannot interpret the reader lists no user
 // segment, so every fragment looks unindexed; optimize must not rebuild the
 // table over and over (each result would be excluded again) but leave it
