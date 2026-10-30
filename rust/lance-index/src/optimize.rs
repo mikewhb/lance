@@ -91,6 +91,59 @@ pub struct OptimizeOptions {
     /// merge count, or `max_rows_per_segment`. `max_rows_per_task` may bound the
     /// re-encoding tasks, but fragments are indivisible and must fit that bound.
     pub max_rows_to_consolidate: Option<u64>,
+
+    /// Explicit tiered merge for disk FTS segments. Default: disabled.
+    ///
+    /// This is not [`Self::max_rows_per_segment`]. That bound still drives the
+    /// split optimize plan, including the stable-row-id inverted path that
+    /// falls back because of issue #8085. Tiered compaction reads only this
+    /// field and leaves the existing one untouched.
+    ///
+    /// When set, each logical inverted index merges at most one group per
+    /// `optimize_indices` call. Other indexes in the same call keep the
+    /// existing selection. `num_indices_to_merge`, `max_rows_per_task`,
+    /// `max_rows_per_segment`, `max_rows_to_consolidate`, and `retrain` must
+    /// stay unset.
+    pub fts_tiered: Option<FtsTieredMergeOptions>,
+}
+
+/// Row-count tiers for one inverted FTS index.
+///
+/// Lucene buckets segments by size and merges a full tier. Disk FTS uses the
+/// same shape with live fragment rows instead of byte size: the smallest
+/// eligible tier is considered first, and one call emits at most one group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsTieredMergeOptions {
+    /// How many below-ceiling segments a tier must hold before a normal
+    /// window can open, and the most segments a deletion group takes.
+    /// Default: 8. Must be at least 2.
+    pub segments_per_tier: usize,
+
+    /// Segments with fewer live rows than this share the tier of this floor.
+    /// Must be at least 1.
+    pub min_rows_per_segment: u64,
+
+    /// Segments with at least this many live rows stay out of normal tiers.
+    /// Must be greater than `min_rows_per_segment`. Distinct from
+    /// [`OptimizeOptions::max_rows_per_segment`].
+    pub max_rows_per_segment: u64,
+}
+
+impl FtsTieredMergeOptions {
+    /// Tier factor 8, with the caller's row floor and ceiling.
+    pub fn new(min_rows_per_segment: u64, max_rows_per_segment: u64) -> Self {
+        Self {
+            segments_per_tier: 8,
+            min_rows_per_segment,
+            max_rows_per_segment,
+        }
+    }
+
+    /// Replace the default tier factor.
+    pub fn segments_per_tier(mut self, segments_per_tier: usize) -> Self {
+        self.segments_per_tier = segments_per_tier;
+        self
+    }
 }
 
 impl Default for OptimizeOptions {
@@ -105,6 +158,7 @@ impl Default for OptimizeOptions {
             max_rows_per_task: None,
             max_rows_per_segment: None,
             max_rows_to_consolidate: None,
+            fts_tiered: None,
         }
     }
 }
@@ -191,6 +245,14 @@ impl OptimizeOptions {
     /// Bound the rows one committed segment holds.
     pub fn max_rows_per_segment(mut self, rows: Option<u64>) -> Self {
         self.max_rows_per_segment = rows;
+        self
+    }
+
+    /// Merge inverted FTS segments by explicit row-count tiers.
+    ///
+    /// Does not read or write [`Self::max_rows_per_segment`].
+    pub fn fts_tiered(mut self, options: FtsTieredMergeOptions) -> Self {
+        self.fts_tiered = Some(options);
         self
     }
 }
