@@ -511,13 +511,20 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::sync::{Arc, Mutex};
 
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::UInt64Type;
     use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+    use lance_core::ROW_ID;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
+    use lance_datafusion::exec::ExecutionStatsCallback;
+    use lance_datafusion::utils::{INDEX_SEGMENTS_SKIPPED_METRIC, PARTITIONS_SEARCHED_METRIC};
     use lance_index::IndexType;
+    use lance_index::metrics::NoOpMetricsCollector;
     use lance_index::optimize::{FtsTieredMergeOptions, OptimizeOptions};
     use lance_index::pbold::InvertedIndexDetails;
+    use lance_index::scalar::inverted::InvertedIndex;
     use lance_index::scalar::inverted::builder::InvertedIndexBuilder;
     use lance_index::scalar::inverted::{
         InvertedIndexParams, InvertedListFormatVersion, TokenSetFormat,
@@ -1652,5 +1659,289 @@ mod tests {
         let (_, _) = run_sixty_four_batches(false, 8 * BATCH_ROWS).await;
         let (_, peak) = run_sixty_four_batches(true, 8 * BATCH_ROWS).await;
         assert!(peak <= 15, "incremental ceiling peak {peak}");
+    }
+
+    fn whitespace_params() -> InvertedIndexParams {
+        InvertedIndexParams::default()
+            .base_tokenizer("whitespace".to_string())
+            .lower_case(false)
+            .stem(false)
+            .remove_stop_words(false)
+    }
+
+    fn copy_tree(from: &str, to: &str) {
+        fn copy(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let dest = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy(&entry.path(), &dest);
+                } else {
+                    std::fs::copy(entry.path(), dest).unwrap();
+                }
+            }
+        }
+        copy(std::path::Path::new(from), std::path::Path::new(to));
+    }
+
+    async fn append_labeled_batch(dataset: &mut Dataset, start: i32) {
+        let schema = Arc::new(arrow_schema::Schema::from(dataset.schema()));
+        let end = start + BATCH_ROWS as i32;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(start..end)),
+                Arc::new(StringArray::from_iter_values(
+                    (start..end).map(|id| format!("common u{id}")),
+                )),
+            ],
+        )
+        .unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                Some(WriteParams {
+                    max_rows_per_file: BATCH_ROWS as usize,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    struct QueryHit {
+        ids: Vec<u64>,
+        texts: Vec<String>,
+        partitions: usize,
+        skipped: usize,
+    }
+
+    async fn search_token(dataset: &Dataset, token: &str) -> QueryHit {
+        search_token_limit(dataset, token, 10).await
+    }
+
+    async fn search_token_limit(dataset: &Dataset, token: &str, limit: i64) -> QueryHit {
+        let collected = Arc::new(Mutex::new(None));
+        let slot = collected.clone();
+        let callback: ExecutionStatsCallback = Arc::new(move |stats| {
+            *slot.lock().unwrap() = Some(stats.clone());
+        });
+        let mut scan = dataset.scan();
+        scan.project(&["text"])
+            .unwrap()
+            .with_row_id()
+            .full_text_search(FullTextSearchQuery::new(token.to_string()).limit(Some(limit)))
+            .unwrap()
+            .limit(Some(limit), None)
+            .unwrap()
+            .scan_stats_callback(callback);
+        let batch = scan.try_into_batch().await.unwrap();
+        let ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
+        let texts = batch["text"]
+            .as_string::<i32>()
+            .iter()
+            .map(|value| value.unwrap_or("").to_string())
+            .collect();
+        let stats = collected.lock().unwrap().take().unwrap();
+        QueryHit {
+            ids,
+            texts,
+            partitions: stats
+                .all_counts
+                .get(PARTITIONS_SEARCHED_METRIC)
+                .copied()
+                .unwrap_or(0),
+            skipped: stats
+                .all_counts
+                .get(INDEX_SEGMENTS_SKIPPED_METRIC)
+                .copied()
+                .unwrap_or(0),
+        }
+    }
+
+    async fn partition_total(dataset: &Dataset) -> usize {
+        let mut total = 0;
+        for segment in text_segments(dataset).await {
+            let index = dataset
+                .open_generic_index("text", &segment.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            let inverted = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+            total += inverted.partition_count();
+        }
+        total
+    }
+
+    async fn smallest_row_ids(dataset: &Dataset) -> Vec<u64> {
+        let batch = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        let mut ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec();
+        ids.sort_unstable();
+        ids.truncate(10);
+        ids
+    }
+
+    async fn row_id_of_column_id(dataset: &Dataset, id: i32) -> u64 {
+        let batch = dataset
+            .scan()
+            .with_row_id()
+            .filter(&format!("id = {id}"))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        batch[ROW_ID].as_primitive::<UInt64Type>().value(0)
+    }
+
+    fn sorted_ids(ids: &[u64]) -> Vec<u64> {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Warm up three times, then the mean of sorted samples 9 and 10.
+    async fn query_median(
+        dataset: &Dataset,
+        token: &str,
+        expected: &[u64],
+        partitions: usize,
+    ) -> u128 {
+        for _ in 0..3 {
+            let hit = search_token(dataset, token).await;
+            // Segment collectors keep the smallest row ids on a score tie, but
+            // they do not emit one global row-id order. The contract checks
+            // that set.
+            assert_eq!(
+                sorted_ids(&hit.ids),
+                expected,
+                "ids {:?} texts {:?}",
+                hit.ids,
+                hit.texts
+            );
+            assert_eq!(hit.skipped, 0);
+            assert_eq!(hit.partitions, partitions);
+        }
+        let mut samples = Vec::with_capacity(20);
+        for _ in 0..20 {
+            let started = std::time::Instant::now();
+            let hit = search_token(dataset, token).await;
+            let elapsed = started.elapsed().as_nanos();
+            assert_eq!(
+                sorted_ids(&hit.ids),
+                expected,
+                "ids {:?} texts {:?}",
+                hit.ids,
+                hit.texts
+            );
+            assert_eq!(hit.skipped, 0);
+            assert_eq!(hit.partitions, partitions);
+            samples.push(elapsed);
+        }
+        samples.sort_unstable();
+        (samples[9] + samples[10]) / 2
+    }
+
+    fn within_one_point_two_five(candidate: u128, baseline: u128) -> bool {
+        candidate.saturating_mul(4) <= baseline.saturating_mul(5)
+    }
+
+    /// Release comparison of 64, 1, and 8 segment layouts.
+    ///
+    /// `common` is recorded and not gated. `u0` and `absent` must stay within
+    /// 1.25x of the unmerged median.
+    #[ignore = "release FTS tiered query comparison"]
+    #[tokio::test]
+    async fn fts_tiered_query_comparison() {
+        let source_dir = TempStrDir::default();
+        let mut source = write_text(
+            source_dir.as_str(),
+            BATCH_ROWS as usize,
+            BATCH_ROWS as usize,
+            false,
+            |id| format!("common u{id}"),
+        )
+        .await;
+        let parameters = whitespace_params();
+        source
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                Some("text_idx".into()),
+                &parameters,
+                false,
+            )
+            .await
+            .unwrap();
+        for batch in 1..BATCHES {
+            append_labeled_batch(&mut source, (batch as i32) * BATCH_ROWS as i32).await;
+            source
+                .optimize_indices(&OptimizeOptions::append())
+                .await
+                .unwrap();
+        }
+        assert_eq!(text_segments(&source).await.len(), 64);
+
+        let merged_dir = TempStrDir::default();
+        let ceiling_dir = TempStrDir::default();
+        copy_tree(source_dir.as_str(), merged_dir.as_str());
+        copy_tree(source_dir.as_str(), ceiling_dir.as_str());
+        let mut merged = Dataset::open(merged_dir.as_str()).await.unwrap();
+        let mut ceiling = Dataset::open(ceiling_dir.as_str()).await.unwrap();
+        drain_merges(&mut merged, &tiered(8, BATCH_ROWS, 64 * BATCH_ROWS)).await;
+        drain_merges(&mut ceiling, &tiered(8, BATCH_ROWS, 8 * BATCH_ROWS)).await;
+        assert_eq!(text_segments(&merged).await.len(), 1);
+        assert_eq!(text_segments(&ceiling).await.len(), 8);
+
+        let common = smallest_row_ids(&source).await;
+        let u0 = vec![row_id_of_column_id(&source, 0).await];
+        assert_eq!(u0, vec![0]);
+        let absent: Vec<u64> = Vec::new();
+        let parts = [
+            partition_total(&source).await,
+            partition_total(&merged).await,
+            partition_total(&ceiling).await,
+        ];
+        assert!(parts[1] <= parts[0] && parts[2] <= parts[0]);
+
+        let arms = [&source, &merged, &ceiling];
+        let mut lines = Vec::new();
+        for (token, expected) in [("common", &common), ("u0", &u0), ("absent", &absent)] {
+            let mut medians = Vec::new();
+            for (arm, partitions) in arms.iter().zip(parts) {
+                medians.push(query_median(arm, token, expected, partitions).await);
+            }
+            if token != "common" {
+                assert!(
+                    within_one_point_two_five(medians[1], medians[0]),
+                    "{token} merged median {} exceeds 1.25x unmerged {}",
+                    medians[1],
+                    medians[0]
+                );
+                assert!(
+                    within_one_point_two_five(medians[2], medians[0]),
+                    "{token} ceiling median {} exceeds 1.25x unmerged {}",
+                    medians[2],
+                    medians[0]
+                );
+            }
+            lines.push(format!(
+                "token={token} segments=64/1/8 partitions={}/{}/{} median_ns={}/{}/{}",
+                parts[0], parts[1], parts[2], medians[0], medians[1], medians[2]
+            ));
+        }
+        for line in &lines {
+            log::info!("{line}");
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../target/fts-tiered-query.log"
+                ))
+                .unwrap();
+            use std::io::Write;
+            writeln!(file, "{line}").unwrap();
+        }
     }
 }
