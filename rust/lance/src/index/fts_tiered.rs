@@ -30,7 +30,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::{Error, Result};
 
 /// Reject a tiered call that would also change the existing optimize plan.
-pub(crate) fn validate_options(options: &OptimizeOptions) -> Result<()> {
+pub fn validate_options(options: &OptimizeOptions) -> Result<()> {
     let Some(tiered) = &options.fts_tiered else {
         return Ok(());
     };
@@ -70,7 +70,7 @@ pub(crate) fn validate_options(options: &OptimizeOptions) -> Result<()> {
 ///
 /// An empty plan leaves unindexed fragments alone. Creating a segment for
 /// new rows stays on [`OptimizeOptions::append`].
-pub(crate) async fn plan_index(
+pub async fn plan_index(
     plan: &mut OptimizeIndicesPlan,
     dataset: &Dataset,
     segments: &[&IndexMetadata],
@@ -80,7 +80,7 @@ pub(crate) async fn plan_index(
     let Some(tiered) = options.fts_tiered.as_ref() else {
         return Ok(());
     };
-    let Some(group) = select_index_group(dataset, segments, unindexed, &tiered)
+    let Some(group) = select_index_group(dataset, segments, unindexed, tiered)
         .boxed()
         .await?
     else {
@@ -172,7 +172,7 @@ async fn select_index_group(
             classes.push(vec![segment]);
         }
     }
-    classes.sort_by(|left, right| min_uuid(left).cmp(&min_uuid(right)));
+    classes.sort_by_key(|class| min_uuid(class));
 
     let unindexed_rows = visible_rows_of_fragments(dataset, unindexed)
         .boxed()
@@ -377,7 +377,7 @@ fn deletion_group(
     if deletion.is_empty() {
         return None;
     }
-    deletion.sort_by(|left, right| left.uuid.cmp(&right.uuid));
+    deletion.sort_by_key(|segment| segment.uuid);
     if deletion.len() >= 2 {
         let take = deletion.len().min(segments_per_tier);
         return Some(
