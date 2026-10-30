@@ -58,6 +58,18 @@ impl DeepSizeOf for InvertedIndex {
     }
 }
 
+/// What [`InvertedIndex::merge_segments`] refuses to mix.
+///
+/// Different compatibility values never enter one merge. `params` includes
+/// `with_position`, `block_size`, and `document_granularity`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InvertedMergeCompatibility {
+    pub params: InvertedIndexParams,
+    pub token_set_format: TokenSetFormat,
+    pub format_version: InvertedListFormatVersion,
+    pub posting_tail_codec: PostingTailCodec,
+}
+
 impl InvertedIndex {
     pub(super) fn format_version(&self) -> InvertedListFormatVersion {
         self.format_version
@@ -135,6 +147,21 @@ impl InvertedIndex {
 
     pub fn params(&self) -> &InvertedIndexParams {
         &self.params
+    }
+
+    /// The four values [`Self::merge_segments`] compares on an opened segment.
+    ///
+    /// `params.document_granularity` here is the value load stored from the
+    /// partition coordinate rank. A planner that groups segments replaces it
+    /// with the manifest `InvertedIndexDetails` value before comparing,
+    /// because that field is not written into the segment file.
+    pub fn merge_compatibility(&self) -> InvertedMergeCompatibility {
+        InvertedMergeCompatibility {
+            params: self.params.clone(),
+            token_set_format: self.token_set_format,
+            format_version: self.format_version(),
+            posting_tail_codec: self.posting_tail_codec(),
+        }
     }
 
     /// Returns the number of partitions in this inverted index.
