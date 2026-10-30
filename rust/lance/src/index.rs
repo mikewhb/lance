@@ -87,6 +87,7 @@ pub mod frag_reuse;
 pub mod frag_reuse_reader;
 mod frag_reuse_remapping;
 pub(crate) mod frag_reuse_with_stable_row_ids;
+mod fts_tiered;
 pub mod mem_wal;
 pub mod optimize;
 pub mod prefilter;
@@ -3542,7 +3543,16 @@ pub(crate) fn optimizable_indices<'a>(
         // asked for retrain or an explicit delta merge. Vector indices
         // fall through and use a rebalance-aware no-op check inside
         // merge_indices_with_unindexed_frags.
-        if !options.retrain
+        //
+        // Tiered FTS is the exception: a fully indexed inverted index still
+        // has small segments to merge, and `num_indices_to_merge` must stay
+        // unset while that option is on.
+        let tiered_inverted = options.fts_tiered.is_some()
+            && deltas
+                .iter()
+                .any(|index| segment_has_inverted_details(index));
+        if !tiered_inverted
+            && !options.retrain
             && options.num_indices_to_merge.is_none_or(|n| n == 0)
             && index_group_is_scalar(dataset, &deltas)
             && index_group_has_no_unindexed(dataset, &deltas)

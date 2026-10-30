@@ -396,6 +396,7 @@ pub(crate) async fn plan_optimize_indices_or_skip(
 ) -> Result<Option<OptimizeIndicesPlan>> {
     validate_partition_rebalancing_options(options)?;
     consolidate::validate_options(options)?;
+    super::fts_tiered::validate_options(options)?;
     if has_unsupported_frag_reuse_history(dataset, indices).await? {
         log::warn!(
             "Skipping index optimization: the tagged fragment reuse history carries \
@@ -421,6 +422,15 @@ pub(crate) async fn plan_optimize_indices_or_skip(
             continue;
         }
         let unindexed = dataset.unindexed_fragments(&name).await?;
+        if options.fts_tiered.is_some()
+            && segments
+                .iter()
+                .all(|segment| segment_has_inverted_details(segment))
+        {
+            super::fts_tiered::plan_index(&mut plan, dataset, &segments, &unindexed, options)
+                .await?;
+            continue;
+        }
         // Without an N:1 merge the single-process optimize rebuilds the
         // absorbed segments from scratch, and the only split that reproduces
         // it is none. Inverted stays unsplit under stable row ids until its
