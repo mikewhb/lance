@@ -1618,6 +1618,204 @@ async fn exact_prepared_match_fallback(
     }
 }
 
+async fn boosted_prepared_documents(
+    indices: &[Arc<InvertedIndex>],
+    boost: f32,
+    prepared: Arc<PreparedMatch>,
+    pre_filter: Arc<dyn PreFilter>,
+    metrics: Arc<FtsIndexMetrics>,
+    initial_score_floor: Option<f32>,
+) -> Result<Vec<ScoredDoc>> {
+    let mut documents =
+        search_prepared_segments(indices, prepared, pre_filter, metrics, initial_score_floor)
+            .await?;
+    documents.iter_mut().for_each(|document| {
+        document.score.0 *= boost;
+    });
+    Ok(documents)
+}
+
+fn take_wand_documents(mut documents: Vec<ScoredDoc>, limit: usize) -> Vec<ScoredDoc> {
+    documents.truncate(limit);
+    documents
+}
+
+/// Bounded match search with the same exactness certificate as compound FTS.
+///
+/// A full probe that is still tied at result `k` is not a proof that score-only
+/// WAND kept the smallest row ids. Those queries replay through the exact
+/// collector, which orders ties by row id. The partition metric is recorded by
+/// the caller once, before this search, so a replay does not count again.
+fn search_certified_match_documents<'a>(
+    indices: &'a [Arc<InvertedIndex>],
+    query: &'a MatchQuery,
+    prepared: Arc<PreparedMatch>,
+    pre_filter: Arc<dyn PreFilter>,
+    metrics: Arc<FtsIndexMetrics>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ScoredDoc>>> + Send + 'a>> {
+    async move {
+        let plain = |prepared: Arc<PreparedMatch>,
+                     pre_filter: Arc<dyn PreFilter>,
+                     metrics: Arc<FtsIndexMetrics>| {
+            boosted_prepared_documents(indices, query.boost, prepared, pre_filter, metrics, None)
+        };
+        let Some(limit) = prepared.params.limit else {
+            return plain(prepared, pre_filter, metrics).await;
+        };
+        let Some(wand_limit) = limit.checked_add(1) else {
+            return plain(prepared, pre_filter, metrics).await;
+        };
+        if limit == 0
+            || prepared.params.wand_factor != 1.0
+            || !query.boost.is_finite()
+            || query.boost <= 0.0
+            || indices
+                .iter()
+                .any(|index| !index.supports_wand_exactness_certificate())
+        {
+            return plain(prepared, pre_filter, metrics).await;
+        }
+
+        let user_params = Arc::clone(&prepared.params);
+        let wand_prepared = Arc::new(PreparedMatch {
+            query: Arc::clone(&prepared.query),
+            params: Arc::new(user_params.as_ref().clone().with_limit(Some(wand_limit))),
+            operator: prepared.operator,
+        });
+        let has_non_positive_weight = {
+            let scorer = wand_prepared.query.scorer();
+            scorer.token_docs.keys().any(|token| {
+                let weight = scorer.query_weight(token);
+                !weight.is_finite() || weight <= 0.0
+            })
+        };
+        if has_non_positive_weight {
+            return exact_match_documents(
+                indices,
+                query,
+                user_params.as_ref(),
+                pre_filter,
+                metrics,
+                wand_prepared.query.clone(),
+                None,
+            )
+            .await;
+        }
+
+        let mut documents = boosted_prepared_documents(
+            indices,
+            query.boost,
+            wand_prepared.clone(),
+            pre_filter.clone(),
+            metrics.clone(),
+            None,
+        )
+        .await?;
+        match classify_wand_exactness_certificate(&mut documents, limit, wand_limit) {
+            WandExactnessCertificate::Exhaustive | WandExactnessCertificate::Strict => {
+                Ok(take_wand_documents(documents, limit))
+            }
+            WandExactnessCertificate::Ambiguous => {
+                let score_floor = documents
+                    .get(limit - 1)
+                    .map(|document| document.score.0)
+                    .filter(|score| score.is_finite());
+                let completion_limit = limit
+                    .checked_add(WAND_TIE_COMPLETION_BUDGET)
+                    .and_then(|limit| limit.checked_add(1));
+                if let (Some(score_floor), Some(completion_limit)) = (score_floor, completion_limit)
+                {
+                    let completion_prepared = Arc::new(PreparedMatch {
+                        query: Arc::clone(&wand_prepared.query),
+                        params: Arc::new(
+                            wand_prepared
+                                .params
+                                .as_ref()
+                                .clone()
+                                .with_limit(Some(completion_limit)),
+                        ),
+                        operator: wand_prepared.operator,
+                    });
+                    let raw_score_floor = exclusive_scaled_score_floor(score_floor, query.boost);
+                    let mut completion = boosted_prepared_documents(
+                        indices,
+                        query.boost,
+                        completion_prepared,
+                        pre_filter.clone(),
+                        metrics.clone(),
+                        raw_score_floor,
+                    )
+                    .await?;
+                    match classify_wand_exactness_certificate(
+                        &mut completion,
+                        limit,
+                        completion_limit,
+                    ) {
+                        WandExactnessCertificate::Exhaustive | WandExactnessCertificate::Strict => {
+                            Ok(take_wand_documents(completion, limit))
+                        }
+                        WandExactnessCertificate::Ambiguous => {
+                            let seeded_floor = completion
+                                .iter()
+                                .all(|document| document.score.0.is_finite())
+                                .then_some(score_floor);
+                            exact_match_documents(
+                                indices,
+                                query,
+                                user_params.as_ref(),
+                                pre_filter,
+                                metrics,
+                                Arc::clone(&wand_prepared.query),
+                                seeded_floor,
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    exact_match_documents(
+                        indices,
+                        query,
+                        user_params.as_ref(),
+                        pre_filter,
+                        metrics,
+                        Arc::clone(&wand_prepared.query),
+                        score_floor,
+                    )
+                    .await
+                }
+            }
+        }
+    }
+    .boxed()
+}
+
+async fn exact_match_documents(
+    indices: &[Arc<InvertedIndex>],
+    query: &MatchQuery,
+    params: &FtsSearchParams,
+    pre_filter: Arc<dyn PreFilter>,
+    metrics: Arc<FtsIndexMetrics>,
+    prepared_match: Arc<PreparedBm25Query>,
+    score_floor: Option<f32>,
+) -> Result<Vec<ScoredDoc>> {
+    let fts_query = FtsQuery::Match(query.clone());
+    let (row_ids, scores) = exact_prepared_match_fallback(
+        indices,
+        &fts_query,
+        params,
+        pre_filter,
+        metrics,
+        prepared_match,
+        score_floor,
+    )
+    .await?;
+    Ok(row_ids
+        .into_iter()
+        .zip(scores)
+        .map(|(row_id, score)| ScoredDoc::new(row_id, score))
+        .collect())
+}
+
 impl DisplayAs for CompoundQueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
@@ -3689,10 +3887,13 @@ impl ExecutionPlan for MatchQueryExec {
         let schema = self.schema.clone();
         let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
-        let column = query.column.ok_or(DataFusionError::Execution(format!(
-            "column not set for MatchQuery {}",
-            query.terms
-        )))?;
+        let column = query
+            .column
+            .clone()
+            .ok_or(DataFusionError::Execution(format!(
+                "column not set for MatchQuery {}",
+                query.terms
+            )))?;
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let segments = segment_selection
@@ -3752,6 +3953,11 @@ impl ExecutionPlan for MatchQueryExec {
             let mut tokenizer = tokenizer_for_match_query(first_index, query.fuzziness);
             let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
             record_tokenized_query(&tokenized_query, &tokens);
+            // Caller-supplied scorers keep their existing search. List-element
+            // hits also carry a document index the exact replay does not rebuild.
+            let allow_wand_certificate = !document_granularity.is_list_element()
+                && preset_base_scorer.is_none()
+                && shared_scorer.is_none();
             let prepared = if let Some(prepared_query) = preset_prepared_query {
                 Arc::new(PreparedMatch {
                     query: prepared_query,
@@ -3799,12 +4005,26 @@ impl ExecutionPlan for MatchQueryExec {
                 &metrics,
             )
             .await;
-            let mut documents =
-                search_prepared_segments(&indices, prepared, pre_filter, metrics.clone(), None)
-                    .await?;
-            documents.iter_mut().for_each(|document| {
-                document.score.0 *= query.boost;
-            });
+            let documents = if allow_wand_certificate {
+                search_certified_match_documents(
+                    &indices,
+                    &query,
+                    prepared,
+                    pre_filter,
+                    metrics.clone(),
+                )
+                .await?
+            } else {
+                boosted_prepared_documents(
+                    &indices,
+                    query.boost,
+                    prepared,
+                    pre_filter,
+                    metrics.clone(),
+                    None,
+                )
+                .await?
+            };
             metrics.baseline_metrics.record_output(documents.len());
 
             let batch = scored_documents_batch(schema, documents)?;
