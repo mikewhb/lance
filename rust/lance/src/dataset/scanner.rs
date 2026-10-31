@@ -76,11 +76,14 @@ use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::expression::create_filter_plan;
-use lance_index::scalar::inverted::normalize::normalize_fts_query;
+use lance_index::scalar::inverted::normalize::{
+    FtsQueryAnalyzers, merge_candidate_columns, normalize_fts_query_with_analyzers,
+};
 use lance_index::scalar::inverted::query::{
     CombinedFieldsQuery, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator,
     PhraseQuery, fill_fts_query_column,
 };
+use lance_index::scalar::inverted::tokenizer::document_tokenizer::{DocType, LanceTokenizer};
 use lance_index::scalar::inverted::{
     CombinedFieldsBM25Scorer, DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity,
     INVERTED_INDEX_VERSION_V2, INVERTED_INDEX_VERSION_V3, SCORE_COL, SCORE_FIELD, fts_schema,
@@ -5443,9 +5446,65 @@ impl Scanner {
             && resolved.params().phrase_slop.is_none()
             && validate_fts_query_contract(&resolved.query).is_ok()
         {
-            resolved.query = normalize_fts_query(resolved.query);
+            let mut analyzers = FtsQueryAnalyzers::new();
+            for column in merge_candidate_columns(&resolved.query) {
+                if let Some(tokenizer) = self.fts_query_analyzer(&column).await? {
+                    analyzers.insert(column, tokenizer);
+                }
+            }
+            resolved.query = normalize_fts_query_with_analyzers(resolved.query, &mut analyzers);
         }
         Ok(resolved)
+    }
+
+    /// Query analyzer of the row-granularity text FTS index on `column`.
+    ///
+    /// Uses the first segment's tokenizer, as execution does, so merge
+    /// decisions see exactly the terms the merged leaf will search for.
+    /// Returns `None` when there is nothing safe to merge with: no index, a
+    /// list or non-string field, or a JSON tokenizer.
+    async fn fts_query_analyzer(&self, column: &str) -> Result<Option<Box<dyn LanceTokenizer>>> {
+        let Ok(resolved) =
+            resolve_fts_field(self.dataset.schema(), column, DocumentGranularity::Row)
+        else {
+            return Ok(None);
+        };
+        let is_text = !resolved.has_lists()
+            && self
+                .dataset
+                .schema()
+                .field_by_id(resolved.final_field_id)
+                .is_some_and(|field| {
+                    matches!(
+                        field.data_type(),
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                    )
+                });
+        if !is_text {
+            return Ok(None);
+        }
+        let Some(segments) = load_segments(&self.dataset, column, DocumentGranularity::Row).await?
+        else {
+            return Ok(None);
+        };
+        let Some(segment) = segments.first() else {
+            return Ok(None);
+        };
+        // Planning has no request-level collector.
+        let index = self
+            .dataset
+            .open_scalar_index(column, &segment.uuid, &NoOpMetricsCollector)
+            .await?;
+        let Some(inverted) = lance_index::Index::as_any(index.as_ref())
+            .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+        else {
+            return Ok(None);
+        };
+        let tokenizer = inverted.tokenizer();
+        if !matches!(tokenizer.doc_type(), DocType::Text) {
+            return Ok(None);
+        }
+        Ok(Some(tokenizer))
     }
 
     // Create an execution plan to do full text search
