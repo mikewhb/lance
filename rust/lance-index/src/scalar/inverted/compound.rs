@@ -35,7 +35,10 @@ use super::{
         WandCursor, WandDocuments, score_sum_upper_bound_factor,
     },
 };
-use crate::{metrics::MetricsCollector, prefilter::PreFilter};
+use crate::{
+    metrics::{FtsCompoundDriver, MetricsCollector, NoOpMetricsCollector},
+    prefilter::PreFilter,
+};
 
 use self::should_maxscore::ShouldMaxScoreScorer;
 
@@ -691,7 +694,11 @@ impl CompoundScorerPlan {
         }
     }
 
-    pub(super) fn build<'a>(&self, leaves: &mut [Option<BoxScorer<'a>>]) -> Result<BoxScorer<'a>> {
+    pub(super) fn build<'a>(
+        &self,
+        leaves: &mut [Option<BoxScorer<'a>>],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<BoxScorer<'a>> {
         match self {
             Self::Leaf { index, boost } => {
                 let leaf = leaves
@@ -709,14 +716,14 @@ impl CompoundScorerPlan {
                 negative,
                 negative_boost,
             } => Ok(Box::new(BoostScorer::try_new(
-                positive.build(leaves)?,
-                negative.build(leaves)?,
+                positive.build(leaves, metrics)?,
+                negative.build(leaves, metrics)?,
                 *negative_boost,
             )?)),
             Self::MultiMatch(children) => Ok(Box::new(DisjunctionScorer::try_new(
                 children
                     .iter()
-                    .map(|child| child.build(leaves))
+                    .map(|child| child.build(leaves, metrics))
                     .collect::<Result<Vec<_>>>()?,
                 DisjunctionScore::Max,
             )?)),
@@ -724,19 +731,24 @@ impl CompoundScorerPlan {
                 should,
                 must,
                 must_not,
-            } => Ok(Box::new(BooleanScorer::try_new(
-                should
-                    .iter()
-                    .map(|child| child.build(leaves))
-                    .collect::<Result<Vec<_>>>()?,
-                must.iter()
-                    .map(|child| child.build(leaves))
-                    .collect::<Result<Vec<_>>>()?,
-                must_not
-                    .iter()
-                    .map(|child| child.build(leaves))
-                    .collect::<Result<Vec<_>>>()?,
-            )?)),
+            } => {
+                let scorer = BooleanScorer::try_new(
+                    should
+                        .iter()
+                        .map(|child| child.build(leaves, metrics))
+                        .collect::<Result<Vec<_>>>()?,
+                    must.iter()
+                        .map(|child| child.build(leaves, metrics))
+                        .collect::<Result<Vec<_>>>()?,
+                    must_not
+                        .iter()
+                        .map(|child| child.build(leaves, metrics))
+                        .collect::<Result<Vec<_>>>()?,
+                )?;
+                let (driver, num_clauses) = scorer.driver_kind();
+                metrics.record_fts_compound_driver(driver, num_clauses);
+                Ok(Box::new(scorer))
+            }
         }
     }
 }
@@ -2193,7 +2205,8 @@ pub fn materialized_compound_top_k(
             MaterializedScorer::try_new(rows).map(|scorer| Some(Box::new(scorer) as BoxScorer<'_>))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut scorer = plan.build(&mut scorers)?;
+    // The materialized path has no execution metrics in scope.
+    let mut scorer = plan.build(&mut scorers, &NoOpMetricsCollector)?;
     let rows = TopKCollector::new(limit).collect(scorer.as_mut())?;
     Ok(rows.into_iter().map(|row| (row.row_id, row.score)).unzip())
 }
@@ -3414,6 +3427,10 @@ pub(super) struct BooleanScorer<'a> {
     confirmed: bool,
     optional_matches: bool,
     defer_confirmation: bool,
+    /// Combinator selected for the scoring clauses, reported through metrics.
+    driver_kind: FtsCompoundDriver,
+    /// Number of MUST plus SHOULD clauses.
+    num_clauses: usize,
 }
 
 impl<'a> BooleanScorer<'a> {
@@ -3422,19 +3439,27 @@ impl<'a> BooleanScorer<'a> {
         must: Vec<BoxScorer<'a>>,
         must_not: Vec<BoxScorer<'a>>,
     ) -> Result<Self> {
-        let (driver, optional) = if must.is_empty() {
+        let num_clauses = should.len() + must.len();
+        let (driver, optional, driver_kind) = if must.is_empty() {
             if should.is_empty() {
                 return Err(Error::invalid_input(
                     "boolean query must have at least one should/must query",
                 ));
             }
-            let driver = if let Some(global_bounds) = ShouldMaxScoreScorer::global_bounds(&should) {
-                Box::new(ShouldMaxScoreScorer::new(should, global_bounds)) as BoxScorer<'a>
-            } else {
-                Box::new(DisjunctionScorer::try_new(should, DisjunctionScore::Sum)?)
-                    as BoxScorer<'a>
-            };
-            (driver, None)
+            let (driver, kind) =
+                if let Some(global_bounds) = ShouldMaxScoreScorer::global_bounds(&should) {
+                    (
+                        Box::new(ShouldMaxScoreScorer::new(should, global_bounds)) as BoxScorer<'a>,
+                        FtsCompoundDriver::ShouldMaxScore,
+                    )
+                } else {
+                    (
+                        Box::new(DisjunctionScorer::try_new(should, DisjunctionScore::Sum)?)
+                            as BoxScorer<'a>,
+                        FtsCompoundDriver::DisjunctionSum,
+                    )
+                };
+            (driver, None, kind)
         } else {
             let mut optional = if should.is_empty() {
                 None
@@ -3445,21 +3470,24 @@ impl<'a> BooleanScorer<'a> {
                 )
             };
             let required = Box::new(RequiredConjunctionScorer::try_new(must)?) as BoxScorer<'a>;
-            let driver = if required.scores_non_negative()
+            let (driver, kind) = if required.scores_non_negative()
                 && optional
                     .as_ref()
                     .is_some_and(|optional| optional.scores_non_negative())
             {
-                Box::new(ReqOptScorer::new(
-                    required,
-                    optional
-                        .take()
-                        .expect("checked that the optional scorer is present"),
-                )) as BoxScorer<'a>
+                (
+                    Box::new(ReqOptScorer::new(
+                        required,
+                        optional
+                            .take()
+                            .expect("checked that the optional scorer is present"),
+                    )) as BoxScorer<'a>,
+                    FtsCompoundDriver::ReqOpt,
+                )
             } else {
-                required
+                (required, FtsCompoundDriver::Conjunction)
             };
-            (driver, optional)
+            (driver, optional, kind)
         };
         let prohibited = if must_not.is_empty() {
             None
@@ -3489,7 +3517,14 @@ impl<'a> BooleanScorer<'a> {
             confirmed: false,
             optional_matches: false,
             defer_confirmation: scores_non_negative && has_doc_local_confirmation,
+            driver_kind,
+            num_clauses,
         })
+    }
+
+    /// Combinator selected for this node and its MUST plus SHOULD clause count.
+    pub(super) fn driver_kind(&self) -> (FtsCompoundDriver, usize) {
+        (self.driver_kind, self.num_clauses)
     }
 
     fn set_current(&mut self, current: Option<u64>) -> Option<u64> {
@@ -4022,6 +4057,7 @@ where
     let mut leaf_scorers = leaves
         .into_iter()
         .map(|leaf| {
+            metrics.record_fts_compound_leaf(leaf.postings.len());
             let scorer: BoxScorer<'_> = if leaf.postings.is_empty() {
                 Box::new(EmptyScorer)
             } else {
@@ -4037,7 +4073,7 @@ where
             Some(scorer)
         })
         .collect::<Vec<_>>();
-    let mut scorer = plan.build(&mut leaf_scorers)?;
+    let mut scorer = plan.build(&mut leaf_scorers, metrics)?;
     if leaf_scorers.iter().any(Option::is_some) {
         return Err(Error::internal(
             "compound FTS scorer did not consume every prepared leaf",
@@ -6389,7 +6425,7 @@ mod tests {
                     (4, 1.0),
                 ])),
             ];
-            let mut scorer = plan.build(&mut leaves).unwrap();
+            let mut scorer = plan.build(&mut leaves, &NoOpMetricsCollector).unwrap();
             let competitive_score = Arc::new(CompetitiveScore::default());
             competitive_score.raise(floor);
             let actual = TopKCollector::with_competitive_score(2, competitive_score)
@@ -6778,7 +6814,9 @@ mod tests {
                             ))
                         })
                         .collect::<Vec<_>>();
-                    let mut scorer = plan.build(&mut mapped_leaves).unwrap();
+                    let mut scorer = plan
+                        .build(&mut mapped_leaves, &NoOpMetricsCollector)
+                        .unwrap();
                     assert!(mapped_leaves.iter().all(Option::is_none));
                     let actual = TopKCollector::new(limit).collect(scorer.as_mut()).unwrap();
                     assert_eq!(actual, expected, "seed={seed} shape={shape} limit={limit}");

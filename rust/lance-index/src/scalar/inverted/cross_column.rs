@@ -1319,7 +1319,8 @@ fn score_cross_column_sources(
         debug_assert!(slot.is_none());
         *slot = Some(Box::new(MaterializedScorer::try_new(rows)?));
     }
-    let mut scorer = plan.build(&mut leaf_scorers)?;
+    // Cross-column trees are not counted by the compound driver metrics.
+    let mut scorer = plan.build(&mut leaf_scorers, &crate::metrics::NoOpMetricsCollector)?;
     if leaf_scorers.iter().any(Option::is_some) {
         return Err(Error::internal(
             "cross-column compound FTS scorer did not consume every prepared leaf",

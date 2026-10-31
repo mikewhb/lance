@@ -59,6 +59,31 @@ impl IndexTiming {
     }
 }
 
+/// Boolean combinator the compound FTS scorer selected for one `Boolean` node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FtsCompoundDriver {
+    /// MUST clauses only, intersected by a conjunction.
+    Conjunction,
+    /// MUST clauses with optional SHOULD clauses.
+    ReqOpt,
+    /// SHOULD clauses only, summed document at a time.
+    DisjunctionSum,
+    /// SHOULD clauses only, driven by windowed MAXSCORE.
+    ShouldMaxScore,
+}
+
+impl FtsCompoundDriver {
+    /// Metric name used by execution-plan collectors.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Conjunction => "fts_compound_conj",
+            Self::ReqOpt => "fts_compound_reqopt",
+            Self::DisjunctionSum => "fts_compound_disj_sum",
+            Self::ShouldMaxScore => "fts_compound_should_maxscore",
+        }
+    }
+}
+
 /// Records one partition/batch stage, never one candidate or distance evaluation.
 pub struct IndexTimer<'a> {
     metrics: &'a dyn MetricsCollector,
@@ -92,6 +117,15 @@ impl Drop for IndexTimer<'_> {
 pub trait MetricsCollector: Send + Sync {
     /// Record a coarse stage duration; existing collectors may ignore timings.
     fn record_timing(&self, _stage: IndexTiming, _duration: Duration) {}
+
+    /// Record the combinator chosen for one compound FTS `Boolean` node.
+    ///
+    /// Called once per node each time a partition's scorer tree is built, so
+    /// counts are per partition and per build attempt, not per query.
+    fn record_fts_compound_driver(&self, _driver: FtsCompoundDriver, _num_clauses: usize) {}
+
+    /// Record one compound FTS leaf cursor and the number of query terms it reads.
+    fn record_fts_compound_leaf(&self, _num_terms: usize) {}
 
     /// Record partition loads
     ///

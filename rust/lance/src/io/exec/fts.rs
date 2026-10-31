@@ -59,7 +59,7 @@ use crate::index::scalar::inverted::{
 };
 use crate::index::segment_coverage::{SegmentCoverage, SegmentRowDomain};
 use crate::{Dataset, index::DatasetIndexInternalExt};
-use lance_index::metrics::MetricsCollector;
+use lance_index::metrics::{FtsCompoundDriver, MetricsCollector};
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::document_tokenizer::{DocType, JsonTokenizer, LanceTokenizer};
@@ -3016,6 +3016,17 @@ pub struct FtsIndexMetrics {
     scorer_build_ms: Gauge,
     segment_bind_duration: Time,
     baseline_metrics: BaselineMetrics,
+    /// Compound Boolean nodes built per combinator; one count per node per
+    /// partition build, so these show which combinators appear, not query totals.
+    compound_conj: Count,
+    compound_reqopt: Count,
+    compound_disj_sum: Count,
+    compound_should_maxscore: Count,
+    /// Largest MUST plus SHOULD clause count seen on one compound Boolean node.
+    compound_max_clauses: Gauge,
+    /// Compound leaf cursors built, and the query terms they read in total.
+    compound_leaves: Count,
+    compound_leaf_terms: Count,
 }
 
 impl FtsIndexMetrics {
@@ -3026,6 +3037,15 @@ impl FtsIndexMetrics {
             scorer_build_ms: metrics.new_gauge("scorer_build_ms", partition),
             segment_bind_duration: metrics.new_time(FTS_SEGMENT_BIND_DURATION_METRIC, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
+            compound_conj: metrics.new_count(FtsCompoundDriver::Conjunction.name(), partition),
+            compound_reqopt: metrics.new_count(FtsCompoundDriver::ReqOpt.name(), partition),
+            compound_disj_sum: metrics
+                .new_count(FtsCompoundDriver::DisjunctionSum.name(), partition),
+            compound_should_maxscore: metrics
+                .new_count(FtsCompoundDriver::ShouldMaxScore.name(), partition),
+            compound_max_clauses: metrics.new_gauge("fts_compound_max_clauses", partition),
+            compound_leaves: metrics.new_count("fts_compound_leaves", partition),
+            compound_leaf_terms: metrics.new_count("fts_compound_leaf_terms", partition),
         }
     }
 
@@ -3057,6 +3077,21 @@ impl MetricsCollector for FtsIndexMetrics {
 
     fn record_index_cache_misses(&self, num_misses: usize) {
         self.index_metrics.record_index_cache_misses(num_misses);
+    }
+
+    fn record_fts_compound_driver(&self, driver: FtsCompoundDriver, num_clauses: usize) {
+        match driver {
+            FtsCompoundDriver::Conjunction => self.compound_conj.add(1),
+            FtsCompoundDriver::ReqOpt => self.compound_reqopt.add(1),
+            FtsCompoundDriver::DisjunctionSum => self.compound_disj_sum.add(1),
+            FtsCompoundDriver::ShouldMaxScore => self.compound_should_maxscore.add(1),
+        }
+        self.compound_max_clauses.set_max(num_clauses);
+    }
+
+    fn record_fts_compound_leaf(&self, num_terms: usize) {
+        self.compound_leaves.add(1);
+        self.compound_leaf_terms.add(num_terms);
     }
 }
 
