@@ -76,6 +76,7 @@ use lance_index::pbold::InvertedIndexDetails;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::expression::create_filter_plan;
+use lance_index::scalar::inverted::normalize::normalize_fts_query;
 use lance_index::scalar::inverted::query::{
     CombinedFieldsQuery, FtsQuery, FtsQueryNode, FtsSearchParams, MatchQuery, Operator,
     PhraseQuery, fill_fts_query_column,
@@ -400,6 +401,14 @@ fn has_complete_hybrid_fts_coverage(
         return false;
     }
     indexed | residual == target
+}
+
+/// `LANCE_FTS_NORMALIZE=0` disables FTS query normalization for A/B runs.
+/// Read once per process.
+fn fts_query_normalization_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("LANCE_FTS_NORMALIZE").as_deref() != Ok("0"));
+    *ENABLED
 }
 
 fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
@@ -5427,6 +5436,15 @@ impl Scanner {
             .resolve_fts_query_document_granularity(resolved.query)
             .await?;
         self.fts_document_granularity(&resolved.query)?;
+        // Rewrite equivalent query forms into one canonical tree before any
+        // consumer (refine columns, coverage, planning) reads it. Invalid trees
+        // are left untouched so they fail later with their original error.
+        if fts_query_normalization_enabled()
+            && resolved.params().phrase_slop.is_none()
+            && validate_fts_query_contract(&resolved.query).is_ok()
+        {
+            resolved.query = normalize_fts_query(resolved.query);
+        }
         Ok(resolved)
     }
 
@@ -5865,8 +5883,6 @@ impl Scanner {
                     .await?
             }
             FtsQuery::Boolean(query) => {
-                // TODO: rewrite the query for better performance
-
                 // we need to remove the limit from the params,
                 // so that we won't miss possible matches
                 let unlimited_params = params.clone().with_limit(None);

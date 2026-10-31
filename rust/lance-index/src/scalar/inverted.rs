@@ -12,6 +12,7 @@ mod impact;
 mod index;
 mod iter;
 pub mod json;
+pub mod normalize;
 /// Brute-force scoring reference for tests and benches. Never built normally; see
 /// the module docs for the gating.
 #[cfg(any(test, feature = "test-oracle"))]
