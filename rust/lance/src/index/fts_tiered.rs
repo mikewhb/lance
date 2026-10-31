@@ -1309,6 +1309,250 @@ mod tests {
         assert_one_class_merges(&mut dataset, [fst_uuids, arrow_uuids]).await;
     }
 
+    /// One final inverted segment. `arrow_tokens` writes the Arrow token file
+    /// the legacy loader can read after the root-name rewrite.
+    async fn segment_with_uuid(
+        dataset: &Dataset,
+        fragment_id: u32,
+        parameters: &InvertedIndexParams,
+        uuid: Uuid,
+        arrow_tokens: bool,
+    ) -> IndexMetadata {
+        let store = LanceIndexStore::from_dataset_for_new(dataset, &uuid).unwrap();
+        let resolved = crate::index::scalar::inverted::resolve_fts_field(
+            dataset.schema(),
+            "text",
+            parameters.get_document_granularity(),
+        )
+        .unwrap();
+        let criteria = TrainingCriteria::new(TrainingOrdering::None).with_row_id();
+        let stream = crate::index::scalar::load_fts_training_data(
+            dataset,
+            &resolved,
+            &criteria,
+            None,
+            true,
+            Some(vec![fragment_id]),
+        )
+        .await
+        .unwrap();
+        let mut builder = InvertedIndexBuilder::new(parameters.clone());
+        if arrow_tokens {
+            builder = builder.with_token_set_format(TokenSetFormat::Arrow);
+        }
+        let files = builder.update(stream, &store, None).await.unwrap();
+        let details = InvertedIndexDetails::try_from(parameters).unwrap();
+        IndexMetadata {
+            uuid,
+            name: "text_idx".to_string(),
+            fields: vec![dataset.schema().field("text").unwrap().id],
+            covering_fields: vec![],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(std::iter::once(fragment_id).collect()),
+            index_details: Some(Arc::new(prost_types::Any::from_msg(&details).unwrap())),
+            index_version: parameters.resolved_format_version().index_version() as i32,
+            created_at: Some(chrono::Utc::now()),
+            base_id: None,
+            files: Some(index_files_to_table(files)),
+            clustering_id: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Move one partition's files to the legacy root names and drop metadata,
+    /// which is how [`InvertedIndex::is_legacy`] becomes true.
+    async fn rewrite_segment_as_legacy(dataset: &Dataset, uuid: Uuid) {
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
+        let names: Vec<String> = lance_table::format::list_index_files_with_sizes(
+            dataset.object_store.as_ref(),
+            &index_dir,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|file| file.path)
+        .collect();
+        for suffix in ["tokens.lance", "invert.lance", "docs.lance"] {
+            let sources: Vec<_> = names
+                .iter()
+                .filter(|name| {
+                    !name.contains('/')
+                        && name.as_str() != suffix
+                        && name.starts_with("part_")
+                        && name.ends_with(suffix)
+                })
+                .collect();
+            assert_eq!(
+                sources.len(),
+                1,
+                "segment {uuid} needs one {suffix} partition file, found {names:?}"
+            );
+            dataset
+                .object_store
+                .copy(
+                    &index_dir.clone().join(sources[0].as_str()),
+                    &index_dir.clone().join(suffix),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            names.iter().any(|name| name == "metadata.lance"),
+            "segment {uuid} has no metadata.lance in {names:?}"
+        );
+        dataset
+            .object_store
+            .delete(&index_dir.join("metadata.lance"))
+            .await
+            .unwrap();
+    }
+
+    async fn assert_segment_legacy(dataset: &Dataset, uuid: Uuid, legacy: bool) {
+        let index = dataset
+            .open_generic_index("text", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let inverted = index.as_any().downcast_ref::<InvertedIndex>().unwrap();
+        assert_eq!(inverted.is_legacy(), legacy, "{uuid}");
+    }
+
+    fn selected_uuids(segments: &[IndexMetadata], group: &super::PlannedGroup) -> BTreeSet<Uuid> {
+        group
+            .segment_indexes
+            .iter()
+            .map(|&index| segments[index].uuid)
+            .collect()
+    }
+
+    async fn legacy_and_modern_classes(
+        dataset: &mut Dataset,
+        legacy_fragments: &[u32],
+        modern_fragments: &[u32],
+    ) -> (BTreeSet<Uuid>, BTreeSet<Uuid>) {
+        let legacy_params = params().num_workers(1);
+        let modern_params = params();
+        let mut segments = Vec::new();
+        let mut legacy_uuids = BTreeSet::new();
+        let mut modern_uuids = BTreeSet::new();
+        for (offset, fragment_id) in legacy_fragments.iter().enumerate() {
+            let uuid = Uuid::from_u128(offset as u128 + 1);
+            legacy_uuids.insert(uuid);
+            segments
+                .push(segment_with_uuid(dataset, *fragment_id, &legacy_params, uuid, true).await);
+        }
+        for (offset, fragment_id) in modern_fragments.iter().enumerate() {
+            let uuid = Uuid::from_u128(100 + offset as u128);
+            modern_uuids.insert(uuid);
+            segments
+                .push(segment_with_uuid(dataset, *fragment_id, &modern_params, uuid, false).await);
+        }
+        commit_mixed_segments(dataset, segments).await;
+        for uuid in &legacy_uuids {
+            rewrite_segment_as_legacy(dataset, *uuid).await;
+            assert_segment_legacy(dataset, *uuid, true).await;
+        }
+        for uuid in &modern_uuids {
+            assert_segment_legacy(dataset, *uuid, false).await;
+        }
+        (legacy_uuids, modern_uuids)
+    }
+
+    #[tokio::test]
+    async fn smallest_uuid_legacy_class_is_selected_and_blocks_the_modern_class() {
+        let dir = TempStrDir::default();
+        let mut dataset = write_text(dir.as_str(), 8, 2, false, |id| format!("tok{id}")).await;
+        let ids: Vec<u32> = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect();
+        let (legacy_uuids, modern_uuids) =
+            legacy_and_modern_classes(&mut dataset, &ids[..2], &ids[2..4]).await;
+        assert!(legacy_uuids.iter().next().unwrap() < modern_uuids.iter().next().unwrap());
+
+        let options = tiered(2, 1, 1_000_000);
+        let tiered_options = options.fts_tiered.clone().unwrap();
+        let segments = text_segments(&dataset).await;
+        let refs: Vec<&IndexMetadata> = segments.iter().collect();
+        let group = super::select_index_group(&dataset, &refs, &[], &tiered_options)
+            .await
+            .unwrap()
+            .expect("the legacy class forms a group");
+        assert!(group.legacy);
+        assert_eq!(selected_uuids(&segments, &group), legacy_uuids);
+
+        let version = dataset.version().version;
+        let before = text_uuids(&dataset).await;
+        let hits = fts_hits(&dataset, "tok0").await;
+        let plan_error = plan_optimize_indices(&dataset, &options).await.unwrap_err();
+        assert!(
+            plan_error.to_string().contains("merge_segments"),
+            "{plan_error}"
+        );
+        assert!(
+            plan_error
+                .to_string()
+                .contains(&Uuid::from_u128(1).to_string()),
+            "{plan_error}"
+        );
+        let optimize_error = dataset.optimize_indices(&options).await.unwrap_err();
+        assert!(
+            optimize_error.to_string().contains("merge_segments"),
+            "{optimize_error}"
+        );
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(text_uuids(&dataset).await, before);
+        assert_eq!(fts_hits(&dataset, "tok0").await, hits);
+        assert!(modern_uuids.is_subset(&before));
+
+        let again = super::select_index_group(&dataset, &refs, &[], &tiered_options)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected_uuids(&segments, &again), legacy_uuids);
+    }
+
+    #[tokio::test]
+    async fn only_legacy_class_is_selected_instead_of_an_empty_plan() {
+        let dir = TempStrDir::default();
+        let mut dataset = write_text(dir.as_str(), 4, 2, false, |id| format!("tok{id}")).await;
+        let ids: Vec<u32> = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id() as u32)
+            .collect();
+        let (legacy_uuids, modern_uuids) = legacy_and_modern_classes(&mut dataset, &ids, &[]).await;
+        assert!(modern_uuids.is_empty());
+
+        let options = tiered(2, 1, 1_000_000);
+        let tiered_options = options.fts_tiered.clone().unwrap();
+        let segments = text_segments(&dataset).await;
+        let refs: Vec<&IndexMetadata> = segments.iter().collect();
+        let group = super::select_index_group(&dataset, &refs, &[], &tiered_options)
+            .await
+            .unwrap()
+            .expect("a lone legacy class is a plan, not an empty one");
+        assert!(group.legacy);
+        assert_eq!(selected_uuids(&segments, &group), legacy_uuids);
+
+        let version = dataset.version().version;
+        let before = text_uuids(&dataset).await;
+        let hits = fts_hits(&dataset, "tok0").await;
+        let plan = plan_optimize_indices(&dataset, &options).await;
+        assert!(
+            plan.is_err(),
+            "only a legacy class must not return an empty plan: {plan:?}"
+        );
+        let optimize_error = dataset.optimize_indices(&options).await.unwrap_err();
+        assert!(
+            optimize_error.to_string().contains("merge_segments"),
+            "{optimize_error}"
+        );
+        assert_eq!(dataset.version().version, version);
+        assert_eq!(text_uuids(&dataset).await, before);
+        assert_eq!(fts_hits(&dataset, "tok0").await, hits);
+    }
+
     #[tokio::test]
     async fn non_tagged_bitmap_is_the_selected_coverage_and_plans_are_stable() {
         let dir = TempStrDir::default();
