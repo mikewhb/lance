@@ -551,7 +551,9 @@ mod tests {
     };
     use lance_index::scalar::lance_format::LanceIndexStore;
     use lance_index::scalar::registry::{TrainingCriteria, TrainingOrdering};
-    use lance_index::scalar::{FullTextSearchQuery, index_files_to_table};
+    use lance_index::scalar::{
+        index_files_to_table, FullTextSearchQuery, SearchResult, TokenQuery,
+    };
     use lance_io::object_store::WrappingObjectStore;
     use lance_table::format::IndexMetadata;
     use uuid::Uuid;
@@ -993,6 +995,101 @@ mod tests {
             .unwrap();
         assert_eq!(dataset.version().version, version);
         assert_eq!(text_uuids(&dataset).await, uuids);
+    }
+
+    async fn posted_ids(dataset: &Dataset, uuid: Uuid, token: &str) -> BTreeSet<u64> {
+        let index = dataset
+            .open_scalar_index("text", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let result = index
+            .search(
+                &TokenQuery::TokensContains(token.to_string()),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let SearchResult::AtMost(rows) = result else {
+            panic!("inverted search did not return an at-most set");
+        };
+        let rows = rows.true_rows();
+        rows.row_addrs()
+            .expect("postings name individual row ids")
+            .map(u64::from)
+            .collect()
+    }
+
+    /// The old token stays in segment A while the same stable row id already
+    /// lives in segment B. A union of the two allow-lists would keep that
+    /// posting, so `tok0` would still hit. Each segment's own list drops it.
+    #[tokio::test]
+    async fn updated_row_in_the_other_segment_drops_the_old_token() {
+        let dir = TempStrDir::default();
+        let mut dataset = write_text(dir.as_str(), 2, 2, true, |id| format!("tok{id}")).await;
+        let parameters = params();
+        index_every_fragment(&mut dataset, &parameters).await;
+        let row_id = row_id_of_column_id(&dataset, 0).await;
+        let segment_a = text_segments(&dataset).await;
+        assert_eq!(segment_a.len(), 1);
+        let uuid_a = segment_a[0].uuid;
+        let old_fragments: BTreeSet<usize> =
+            dataset.get_fragments().iter().map(|f| f.id()).collect();
+
+        let updated = UpdateBuilder::new(Arc::new(dataset.clone()))
+            .update_where("id = 0")
+            .unwrap()
+            .set("text", "'new0'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        dataset = updated.new_dataset.as_ref().clone();
+        assert_eq!(row_id_of_column_id(&dataset, 0).await, row_id);
+        let new_fragments: Vec<u32> = dataset
+            .get_fragments()
+            .iter()
+            .map(|fragment| fragment.id())
+            .filter(|id| !old_fragments.contains(id))
+            .map(|id| id as u32)
+            .collect();
+        assert_eq!(new_fragments.len(), 1);
+        index_fragments(&mut dataset, &new_fragments, &parameters, true).await;
+
+        let segments = text_segments(&dataset).await;
+        assert_eq!(segments.len(), 2);
+        let segment_b = segments
+            .iter()
+            .find(|segment| segment.uuid != uuid_a)
+            .unwrap();
+        assert!(segment_b
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .contains(new_fragments[0]));
+        assert!(posted_ids(&dataset, uuid_a, "tok0").await.contains(&row_id));
+        assert!(posted_ids(&dataset, segment_b.uuid, "new0")
+            .await
+            .contains(&row_id));
+        assert!(!posted_ids(&dataset, segment_b.uuid, "tok0")
+            .await
+            .contains(&row_id));
+
+        let options = tiered(2, 1, 1_000);
+        let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+        let (selected, unindexed) = planned_group(&plan);
+        assert!(unindexed.is_empty());
+        assert_eq!(selected, text_uuids(&dataset).await);
+        dataset.optimize_indices(&options).await.unwrap();
+        assert_eq!(fts_hits(&dataset, "tok0").await, 0);
+        assert_eq!(fts_hits(&dataset, "new0").await, 1);
+        assert_eq!(fts_hits(&dataset, "tok1").await, 1);
+        assert!(plan_optimize_indices(&dataset, &options)
+            .await
+            .unwrap()
+            .tasks
+            .is_empty());
     }
 
     #[tokio::test]
