@@ -89,6 +89,18 @@ pub async fn plan_index(
     if group.segment_indexes.is_empty() {
         return Ok(());
     }
+    if group.legacy {
+        let selected: Vec<_> = group
+            .segment_indexes
+            .iter()
+            .map(|&index| segments[index].uuid.to_string())
+            .collect();
+        return Err(Error::index(format!(
+            "FTS tiered compaction selected legacy inverted segments [{}], which cannot enter \
+             merge_segments; this optimize_indices call fails instead of merging a different class",
+            selected.join(", ")
+        )));
+    }
 
     let (plan_id, read_version) = (plan.plan_id, plan.read_version);
     let merge_group = plan.merges.len() as u32;
@@ -136,6 +148,10 @@ pub async fn plan_index(
 struct PlannedGroup {
     segment_indexes: Vec<usize>,
     absorb_unindexed: bool,
+    /// A selected segment uses the legacy inverted layout. That layout does not
+    /// enter `merge_segments` on the optimize path, so this call fails instead
+    /// of committing another class.
+    legacy: bool,
 }
 
 struct OpenedSegment {
@@ -178,15 +194,17 @@ async fn select_index_group(
         .boxed()
         .await?;
     let has_unindexed = !unindexed.is_empty();
+    // First class, by minimum UUID, that can form a group. A legacy segment
+    // stays in that class. The caller fails the call when those segments
+    // cannot enter `merge_segments`, and does not try the next class.
     for class in classes {
-        if class.iter().any(|segment| segment.legacy) {
-            log::warn!(
-                "Skipping an FTS compatibility class during tiered compaction because it contains \
-                 a legacy segment; legacy inverted indexes are still optimized without fts_tiered"
-            );
-            continue;
-        }
-        if let Some(group) = select_class_group(&class, unindexed_rows, has_unindexed, options) {
+        if let Some(mut group) = select_class_group(&class, unindexed_rows, has_unindexed, options)
+        {
+            group.legacy = group.segment_indexes.iter().any(|&index| {
+                class
+                    .iter()
+                    .any(|segment| segment.index == index && segment.legacy)
+            });
             return Ok(Some(group));
         }
     }
@@ -353,11 +371,13 @@ fn select_class_group(
         return Some(PlannedGroup {
             segment_indexes: group,
             absorb_unindexed: true,
+            legacy: false,
         });
     }
     normal_group(class, unindexed_rows, options).map(|group| PlannedGroup {
         segment_indexes: group.indexes,
         absorb_unindexed: group.absorb_unindexed,
+        legacy: false,
     })
 }
 
