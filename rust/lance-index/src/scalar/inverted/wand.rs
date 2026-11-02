@@ -5212,24 +5212,27 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // is re-positioned first: the range-bound helper answers from the
             // block the cursor currently sits on.
             let mut lead_block = 0usize;
+            let mut lead_block_is_last = false;
             let mut window_end = TERMINATED_DOC_ID;
             for j in 0..num_lists {
-                let (block, block_last) = {
+                let (block, block_last, is_last) = {
                     let posting = &self.lead[j];
                     let PostingList::Compressed(ref list) = posting.list else {
                         unreachable!("bulk AND requires compressed postings");
                     };
                     let block = posting.block_idx_for_doc(list, posting.block_idx, target32);
-                    let block_last = if block + 1 < list.blocks.len() {
-                        u64::from(list.block_least_doc_id(block + 1)) - 1
-                    } else {
+                    let is_last = block + 1 >= list.blocks.len();
+                    let block_last = if is_last {
                         TERMINATED_DOC_ID
+                    } else {
+                        u64::from(list.block_least_doc_id(block + 1)).saturating_sub(1)
                     };
-                    (block, block_last)
+                    (block, block_last, is_last)
                 };
                 self.lead[j].block_idx = block;
                 if j == 0 {
                     lead_block = block;
+                    lead_block_is_last = is_last;
                     window_end = block_last.min(target.saturating_add(LEAD_WINDOW_MAX_SPAN - 1));
                 }
             }
@@ -5237,10 +5240,19 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // (b) Whole-window bound. A non-finite or negative clause bound
             // disables pruning for this window instead of risking a wrong skip.
             if has_floor {
+                // On the lead's last block the 65536 cap would end the window
+                // before the remaining documents, so the skip decision has to
+                // cover everything left; otherwise advancing by one window
+                // could re-evaluate the same decision forever.
+                let bound_end = if lead_block_is_last {
+                    TERMINATED_DOC_ID
+                } else {
+                    window_end
+                };
                 let mut degraded = false;
                 for (j, slot) in suffix.iter_mut().take(num_lists).enumerate() {
                     let bound = self.lead[j]
-                        .block_max_score_up_to_with_stats(window_end, &self.scorer)
+                        .block_max_score_up_to_with_stats(bound_end, &self.scorer)
                         .score;
                     if !bound.is_finite() || bound < 0.0 {
                         degraded = true;
@@ -5270,7 +5282,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         {
                             self.and_window_stats.lead_windows_skipped += 1;
                         }
-                        if window_end == TERMINATED_DOC_ID {
+                        if lead_block_is_last || window_end == TERMINATED_DOC_ID {
                             break;
                         }
                         target = window_end + 1;
@@ -8751,6 +8763,50 @@ mod tests {
         assert!(
             windows >= 2,
             "a lead block spanning more than 65536 documents must split"
+        );
+    }
+
+    /// T11: a floor above every remaining bound must skip the whole window and
+    /// still terminate, including when the anchor is the lead's last block.
+    #[test]
+    fn lead_bulk_and_whole_window_skip_terminates() {
+        let num_docs = 2000u32;
+        let lead = (0..num_docs)
+            .filter(|doc| doc % 13 == 0)
+            .collect::<Vec<_>>();
+        let dense = (0..num_docs).collect::<Vec<_>>();
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 20 + doc_id % 11);
+        }
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let postings = [lead, dense]
+            .iter()
+            .enumerate()
+            .map(|(position, doc_ids)| {
+                PostingIterator::with_query_weight(
+                    format!("t{position}"),
+                    position as u32,
+                    position as u32,
+                    1.0,
+                    generate_posting_list(doc_ids.clone(), 8.0, None, true),
+                    docs.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // A floor no BM25 total in this corpus can reach.
+        let floor = Arc::new(AtomicU32::new(1.0e30_f32.to_bits()));
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+            .with_bulk_and_mode(BulkAndMode::On)
+            .with_bulk_and_kernel(BulkAndKernel::Lead)
+            .with_shared_threshold(floor);
+        let rows = wand
+            .search(&params, &NoOpMetricsCollector)
+            .expect("the skip path must terminate");
+        assert!(rows.is_empty(), "no document can beat the floor");
+        assert!(
+            wand.and_window_stats.lead_windows_skipped > 0,
+            "the whole-window skip must be exercised"
         );
     }
 
