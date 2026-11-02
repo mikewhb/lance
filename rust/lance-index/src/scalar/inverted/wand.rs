@@ -5233,7 +5233,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 if j == 0 {
                     lead_block = block;
                     lead_block_is_last = is_last;
-                    window_end = block_last.min(target.saturating_add(LEAD_WINDOW_MAX_SPAN - 1));
+                    // The clamp keeps the window non-empty for the caller even
+                    // if a block cursor ever overshot the target.
+                    window_end = block_last
+                        .min(target.saturating_add(LEAD_WINDOW_MAX_SPAN - 1))
+                        .max(target);
                 }
             }
 
@@ -5387,11 +5391,17 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         // The suffix bound covers exactly the clauses that have
                         // not been applied yet.
                         let bound = suffix[j];
+                        #[cfg(test)]
+                        let before_prune = alive.len();
                         alive.retain(|&i| {
                             !score_sum_cannot_compete(
                                 partial[i], bound, threshold, factor, floor_mode,
                             )
                         });
+                        #[cfg(test)]
+                        {
+                            self.and_window_stats.lead_alive_pruned += before_prune - alive.len();
+                        }
                         if alive.is_empty() {
                             break;
                         }
@@ -8694,9 +8704,8 @@ mod tests {
         let params = FtsSearchParams::default().with_limit(Some(limit));
         let (_, _, hits, pruned) = lead_kernel_parity(&[lead, dense], num_docs, &params);
         assert!(hits > 0);
-        // The prune counter is diagnostic: it may stay at zero when the
-        // window bound degrades to the scorer ceiling, but it can never exceed
-        // the number of scored candidates.
+        // Diagnostic only: with the scorer ceiling as the window bound the
+        // per-clause prune can legitimately reject nothing.
         assert!(pruned <= num_docs as usize, "prune count out of range");
     }
 
@@ -8810,6 +8819,82 @@ mod tests {
         );
     }
 
+    /// T12: impacted 256-document blocks (the shape the benchmark index has),
+    /// a sparse lead spanning many follower blocks, and a floor that carries
+    /// across windows. The published k-th score bits and the rows must match.
+    #[rstest]
+    fn lead_bulk_and_impacted_blocks_match_classic(#[values(1, 10)] limit: usize) {
+        let num_docs = 20_000u32;
+        let lead_docs = (0..num_docs)
+            .filter(|doc| doc % 53 == 0)
+            .collect::<Vec<_>>();
+        let dense_docs = (0..num_docs).filter(|doc| doc % 3 != 0).collect::<Vec<_>>();
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 30 + doc_id % 71);
+        }
+        let build = || {
+            [(lead_docs.clone(), 1u32), (dense_docs.clone(), 2u32)]
+                .iter()
+                .enumerate()
+                .map(|(position, (doc_ids, freq))| {
+                    let freqs = vec![*freq; doc_ids.len()];
+                    let lengths = doc_ids.iter().map(|&doc| 30 + doc % 71).collect::<Vec<_>>();
+                    PostingIterator::with_query_weight(
+                        format!("t{position}"),
+                        position as u32,
+                        position as u32,
+                        1.0 + position as f32 * 0.5,
+                        generate_impact_posting_list_with_freqs_and_block_size(
+                            doc_ids.clone(),
+                            freqs,
+                            lengths,
+                            MAX_POSTING_BLOCK_SIZE,
+                        ),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let params = FtsSearchParams::default().with_limit(Some(limit));
+        let run = |mode, kernel| {
+            let floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+            let mut wand = Wand::new(
+                Operator::And,
+                build().into_iter(),
+                &docs,
+                InverseDocLengthScorer,
+            )
+            .with_bulk_and_mode(mode)
+            .with_bulk_and_kernel(kernel)
+            .with_shared_threshold(floor.clone());
+            let mut rows = wand
+                .search(&params, &NoOpMetricsCollector)
+                .unwrap()
+                .into_iter()
+                .map(|candidate| {
+                    (
+                        candidate.posting_doc_id,
+                        candidate.doc_length,
+                        candidate.freqs,
+                        candidate.document,
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            (rows, floor.load(Ordering::Relaxed))
+        };
+        let (classic, classic_floor) = run(BulkAndMode::Off, BulkAndKernel::Merge);
+        let (merge, merge_floor) = run(BulkAndMode::On, BulkAndKernel::Merge);
+        let (lead, lead_floor) = run(BulkAndMode::On, BulkAndKernel::Lead);
+        assert_eq!(classic, merge, "merge kernel diverged on impacted blocks");
+        assert_eq!(classic, lead, "lead kernel diverged on impacted blocks");
+        assert_eq!(
+            classic_floor, lead_floor,
+            "the k-th score bits must match on impacted blocks"
+        );
+        assert_eq!(classic_floor, merge_floor);
+    }
     #[rstest]
     fn bulk_and_and_classic_publish_identical_query_order_score_bits(
         #[values(3, 4, 5, 8, 16)] num_clauses: usize,
