@@ -273,12 +273,19 @@ impl CompetitiveFloorMode {
         }
     }
 }
-/// Minimum `max_cost / min_cost` for an `Auto` conjunction to stay on the
-/// leapfrog with lead windows (see `and_move_to_next_block`) instead of the
-/// bulk merge. Calibrated on three-clause queries; two-clause conjunctions use
-/// the same ratio because the bulk merge's window count follows the densest
-/// clause there as well.
-const AND_SKEW_RATIO: usize = 32;
+/// Minimum `densest / rarest` cost ratio for an `Auto` conjunction to stay on
+/// the leapfrog with lead windows (see `and_move_to_next_block`) instead of the
+/// bulk merge.
+///
+/// The break-even ratio falls with the clause count: the merge pays one slice
+/// per clause per window, while the lead window pays one probe per follower per
+/// lead document, so a two-clause conjunction needs a much larger skew before
+/// the saved windows pay for the probes. Measured on the same corpus, two
+/// clauses are a wash between 32x and 64x and only pay off above ~64x, while
+/// three or more pay off from ~16x.
+const fn lead_min_skew(num_clauses: usize) -> usize {
+    if num_clauses <= 2 { 64 } else { 16 }
+}
 
 /// Frequency buckets of the lead clause's length-independent score bound;
 /// the last bucket clamps every higher frequency.
@@ -2836,7 +2843,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         if has_window_bounds
             && bulk_and_mode == BulkAndMode::Auto
             && self.lead.len() >= 2
-            && self.lead[0].cost().saturating_mul(AND_SKEW_RATIO)
+            && self.lead[0]
+                .cost()
+                .saturating_mul(lead_min_skew(self.lead.len()))
                 <= self.lead[self.lead.len() - 1].cost()
         {
             self.invalidate_score_first_and_window();
@@ -13369,6 +13378,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clause_count_decides_the_skew_gate() {
+        // At the same 32x skew the merge keeps a pair (its two-way kernel is
+        // cheap per window) while a triple moves to the lead window.
+        const NUM_DOCS: u32 = 20_000;
+        let docs = conj_docs(NUM_DOCS, |_| 40);
+        let run = |densities: &[(u32, u32)]| {
+            let clauses = density_clauses(NUM_DOCS, densities, |_| 1, |_| 40);
+            let scorer = conj_scorer(u64::from(NUM_DOCS) * 40, NUM_DOCS, &clauses);
+            let postings = conj_postings(&docs, &clauses, |_, token| scorer.query_weight(token));
+            run_conj(&docs, postings, scorer, BulkAndMode::Auto)
+        };
+
+        assert!(
+            !run(&[(1, 128), (1, 4)]).lead_window,
+            "two clauses at 32x must keep the merge"
+        );
+        assert!(
+            run(&[(1, 128), (1, 8), (1, 4)]).lead_window,
+            "three clauses at 32x must take the lead window"
+        );
+    }
+
+    #[test]
+    fn heavily_skewed_pair_matches_classic() {
+        // The pair route still exists above 64x; it must agree with the merge
+        // and the classic loop.
+        const NUM_DOCS: u32 = 20_000;
+        let docs = conj_docs(NUM_DOCS, |_| 40);
+        let clauses = density_clauses(NUM_DOCS, &[(1, 2000), (9, 10)], |doc| 1 + doc % 3, |_| 40);
+        let scorer = conj_scorer(u64::from(NUM_DOCS) * 40, NUM_DOCS, &clauses);
+        let run = |mode| {
+            let postings = conj_postings(&docs, &clauses, |_, token| scorer.query_weight(token));
+            run_conj(&docs, postings, scorer.clone(), mode)
+        };
+
+        let auto = run(BulkAndMode::Auto);
+        assert!(auto.lead_window, "a 1800x pair must take the lead window");
+        assert_eq!(auto.hits, run(BulkAndMode::On).hits);
+        assert_eq!(auto.hits, run(BulkAndMode::Off).hits);
+    }
+
     #[rstest]
     #[case::two_clauses(2)]
     #[case::five_clauses(5)]
@@ -13427,7 +13478,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case::two_clauses(2)]
     #[case::three_clauses(3)]
     #[case::four_clauses(4)]
     #[case::five_clauses(5)]
