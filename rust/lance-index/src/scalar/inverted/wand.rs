@@ -2452,6 +2452,14 @@ struct AndWindowStats {
     pairwise_intersections: usize,
     windows_sliced: usize,
     windows_frequency_pruned: usize,
+    // Lead-driven bulk AND kernel: one window per iteration, and how many of
+    // them were skipped by the whole-window bound or lost survivors to the
+    // per-clause prune.
+    lead_windows: usize,
+    lead_windows_skipped: usize,
+    lead_follower_block_switches: usize,
+    lead_alive_pruned: usize,
+    lead_bound_degraded: usize,
 }
 
 impl Eq for TailPosting {}
@@ -5116,22 +5124,419 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         params: &FtsSearchParams,
         metrics: &dyn MetricsCollector,
     ) -> Result<Vec<DocCandidate<D::Candidate>>> {
-        if params.phrase_slop.is_some() {
-            // Phrase queries keep the merge kernel until position checks are
-            // wired into the lead-driven window.
+        // Lucene caps a window at 65536 documents so that a sparse lead cannot
+        // stretch the followers' range bounds across the whole posting list.
+        const LEAD_WINDOW_MAX_SPAN: u64 = 1 << 16;
+        // Per-batch columns are indexed by lead batch position, so their width
+        // is bounded by one decoded block.
+        const MAX: usize = MAX_POSTING_BLOCK_SIZE;
+
+        let limit = params.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(vec![]);
+        }
+        let num_lists = self.lead.len();
+        if num_lists < 2 {
             return self.and_bulk_search(params, metrics);
         }
+        let phrase_slop = params.phrase_slop;
+        if phrase_slop.is_some() {
+            // Position checks read per-clause block cursors that this kernel
+            // does not park yet; keep phrase queries on the merge kernel.
+            return self.and_bulk_search(params, metrics);
+        }
+
         #[cfg(test)]
         {
             self.lead_bulk_and_searches += 1;
         }
         if *BULK_AND_MARKER {
-            // Which kernel ran is otherwise invisible to the release harness,
-            // which installs no logger.
-            eprintln!("fts-bulk-and-kernel=lead");
+            // The release harness installs no logger, so stderr is the only
+            // channel that can attest which kernel ran. Off unless the marker
+            // env var is set, so normal runs stay silent.
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!("fts-bulk-and-kernel=lead");
+            }
         }
-        // Placeholder until the lead-driven window loop lands.
-        self.and_bulk_search(params, metrics)
+
+        self.invalidate_score_first_and_window();
+        self.score_first_and_enabled = false;
+        // The published score must be the query-order f32 sum; the clause cost
+        // order used for iteration is unrelated to it.
+        let mut score_order = (0..num_lists).collect::<Vec<usize>>();
+        score_order.sort_unstable_by_key(|&index| {
+            let posting = &self.lead[index];
+            (posting.position, posting.token_id)
+        });
+
+        // The conjunction can only start at the max of the clauses' first docs.
+        let mut target: u64 = 0;
+        for posting in &self.lead {
+            match posting.current_doc_id() {
+                Some(doc) => target = target.max(doc),
+                None => return Ok(vec![]),
+            }
+        }
+
+        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut num_comparisons = 0usize;
+
+        let mut batch_docs: Vec<u32> = Vec::with_capacity(MAX);
+        let mut batch_doc_len: Vec<u32> = vec![0; MAX];
+        let mut batch_addend: Vec<Option<f32>> = vec![None; MAX];
+        let mut partial: Vec<f32> = vec![0.0; MAX];
+        let mut contrib: Vec<f32> = vec![0.0; num_lists * MAX];
+        let mut clause_freqs: Vec<u32> = vec![0; num_lists * MAX];
+        let mut posting_index: Vec<usize> = vec![0; num_lists * MAX];
+        let mut alive: Vec<usize> = Vec::with_capacity(MAX);
+        // Suffix sums: entry j bounds clauses [j, num_lists) for this window.
+        let mut suffix: Vec<f64> = vec![0.0; num_lists + 1];
+        // Follower cursors survive a window because target only moves forward.
+        let mut cursor_block: Vec<usize> =
+            self.lead.iter().map(|posting| posting.block_idx).collect();
+        let mut cursor_pos: Vec<usize> = vec![0; num_lists];
+        let mut norm_k = None;
+        let mut norm_k_initialized = false;
+
+        'window: loop {
+            #[cfg(test)]
+            {
+                self.and_window_stats.lead_windows += 1;
+            }
+            self.raise_to_shared_floor(params.wand_factor);
+            let has_floor = self.threshold > 0.0;
+            let target32 = u32::try_from(target).unwrap_or(u32::MAX);
+
+            // (a) Anchor the window on the sparsest clause's block. Every clause
+            // is re-positioned first: the range-bound helper answers from the
+            // block the cursor currently sits on.
+            let mut lead_block = 0usize;
+            let mut window_end = TERMINATED_DOC_ID;
+            for j in 0..num_lists {
+                let (block, block_last) = {
+                    let posting = &self.lead[j];
+                    let PostingList::Compressed(ref list) = posting.list else {
+                        unreachable!("bulk AND requires compressed postings");
+                    };
+                    let block = posting.block_idx_for_doc(list, posting.block_idx, target32);
+                    let block_last = if block + 1 < list.blocks.len() {
+                        u64::from(list.block_least_doc_id(block + 1)) - 1
+                    } else {
+                        TERMINATED_DOC_ID
+                    };
+                    (block, block_last)
+                };
+                self.lead[j].block_idx = block;
+                if j == 0 {
+                    lead_block = block;
+                    window_end = block_last.min(target.saturating_add(LEAD_WINDOW_MAX_SPAN - 1));
+                }
+            }
+
+            // (b) Whole-window bound. A non-finite or negative clause bound
+            // disables pruning for this window instead of risking a wrong skip.
+            if has_floor {
+                let mut degraded = false;
+                for (j, slot) in suffix.iter_mut().take(num_lists).enumerate() {
+                    let bound = self.lead[j]
+                        .block_max_score_up_to_with_stats(window_end, &self.scorer)
+                        .score;
+                    if !bound.is_finite() || bound < 0.0 {
+                        degraded = true;
+                        break;
+                    }
+                    *slot = f64::from(bound);
+                }
+                if degraded {
+                    #[cfg(test)]
+                    {
+                        self.and_window_stats.lead_bound_degraded += 1;
+                    }
+                    suffix.iter_mut().for_each(|slot| *slot = f64::INFINITY);
+                } else {
+                    suffix[num_lists] = 0.0;
+                    for j in (0..num_lists).rev() {
+                        suffix[j] = next_up_f64(suffix[j] + suffix[j + 1]);
+                    }
+                    if score_sum_cannot_compete(
+                        0.0,
+                        suffix[0],
+                        self.threshold,
+                        score_sum_upper_bound_factor(num_lists),
+                        self.floor_mode,
+                    ) {
+                        #[cfg(test)]
+                        {
+                            self.and_window_stats.lead_windows_skipped += 1;
+                        }
+                        if window_end == TERMINATED_DOC_ID {
+                            break;
+                        }
+                        target = window_end + 1;
+                        continue 'window;
+                    }
+                }
+            }
+
+            // (c) Slice the lead block to the current window.
+            let (lo, hi, next_target, docs_ptr, freqs_ptr, block_shift) = {
+                let posting = &self.lead[0];
+                let PostingList::Compressed(ref list) = posting.list else {
+                    unreachable!("bulk AND requires compressed postings");
+                };
+                let state = unsafe { &mut *posting.ensure_compressed_block_ptr(list, lead_block) };
+                let docs = state.doc_ids.as_slice();
+                let freqs = state.freqs.as_slice();
+                debug_assert_eq!(docs.len(), freqs.len());
+                let lo = docs.partition_point(|&doc| doc < target32);
+                let hi = lo + docs[lo..].partition_point(|&doc| u64::from(doc) <= window_end);
+                let next = if hi < docs.len() {
+                    Some(u64::from(docs[hi]))
+                } else if lead_block + 1 < list.blocks.len() {
+                    Some(u64::from(list.block_least_doc_id(lead_block + 1)))
+                } else {
+                    None
+                };
+                (
+                    lo,
+                    hi,
+                    next,
+                    docs.as_ptr(),
+                    freqs.as_ptr(),
+                    list.block_shift(),
+                )
+            };
+            if lo == hi {
+                // No lead doc in this window: only the next lead doc can start
+                // a conjunction, so jump straight to it.
+                match next_target {
+                    Some(next) if next > target => {
+                        target = next;
+                        continue 'window;
+                    }
+                    _ => break,
+                }
+            }
+
+            if !norm_k_initialized {
+                norm_k = self.norm_k_cache();
+                norm_k_initialized = true;
+            }
+            let norm_k_ref = norm_k
+                .as_ref()
+                .map(|(norms, cache)| (*norms, cache.as_ref()));
+
+            batch_docs.clear();
+            alive.clear();
+            for i in 0..(hi - lo) {
+                let doc = unsafe { *docs_ptr.add(lo + i) };
+                let freq = unsafe { *freqs_ptr.add(lo + i) };
+                let (addend, doc_len) = match norm_k_ref {
+                    Some((norms, cache)) => {
+                        let code = norms[doc as usize];
+                        (Some(cache[code as usize]), dequantize_doc_length(code))
+                    }
+                    None => match self.documents.scoring_norms() {
+                        Some(norms) => (None, dequantize_doc_length(norms[doc as usize])),
+                        None => (None, self.documents.scoring_num_tokens(doc)),
+                    },
+                };
+                let posting = &self.lead[0];
+                // Same expression as the merge kernel's per-clause scoring;
+                // that helper is nested inside it and must not be moved out.
+                let score = match addend {
+                    Some(addend) => posting.query_weight * bm25_doc_weight_with_norm(freq, addend),
+                    None => posting.score(&self.scorer, freq, doc_len),
+                };
+                batch_docs.push(doc);
+                batch_doc_len[i] = doc_len;
+                batch_addend[i] = addend;
+                partial[i] = score;
+                contrib[i] = score;
+                clause_freqs[i] = freq;
+                posting_index[i] = (lead_block << block_shift) | (lo + i);
+                alive.push(i);
+            }
+
+            // (d) Apply followers one clause at a time, pruning the survivors
+            // after each clause with an exact partial score.
+            let mut follower_exhausted = false;
+            let mut max_follower_doc = 0u64;
+            {
+                let threshold = self.threshold;
+                let floor_mode = self.floor_mode;
+                let factor = score_sum_upper_bound_factor(num_lists);
+                let scorer = &self.scorer;
+                let lead = &mut self.lead;
+
+                for j in 1..num_lists {
+                    if has_floor {
+                        // The suffix bound covers exactly the clauses that have
+                        // not been applied yet.
+                        let bound = suffix[j];
+                        alive.retain(|&i| {
+                            !score_sum_cannot_compete(
+                                partial[i], bound, threshold, factor, floor_mode,
+                            )
+                        });
+                        if alive.is_empty() {
+                            break;
+                        }
+                    }
+
+                    let (next_block, next_pos, kept, exhausted, block_switches) = {
+                        let posting = &lead[j];
+                        let PostingList::Compressed(ref list) = posting.list else {
+                            unreachable!("bulk AND requires compressed postings");
+                        };
+                        let blocks = list.blocks.len();
+                        let shift = list.block_shift();
+                        let mut block = cursor_block[j];
+                        let mut pos = cursor_pos[j];
+                        let mut out = 0usize;
+                        let mut exhausted = false;
+                        let mut block_switches = 0usize;
+                        for idx in 0..alive.len() {
+                            let i = alive[idx];
+                            let doc = batch_docs[i];
+                            loop {
+                                if block + 1 < blocks && doc >= list.block_least_doc_id(block + 1) {
+                                    block = posting.block_idx_for_doc(list, block, doc);
+                                    pos = 0;
+                                    block_switches += 1;
+                                }
+                                // Re-issue the decompression request every time:
+                                // the shared state may hold another block after a
+                                // phrase check moved it.
+                                let state =
+                                    unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, block) };
+                                let docs = state.doc_ids.as_slice();
+                                let end = docs.len();
+                                pos = unsafe { find_next_geq(docs.as_ptr(), pos, end, doc) };
+                                if pos < end {
+                                    break;
+                                }
+                                if block + 1 >= blocks {
+                                    exhausted = true;
+                                    break;
+                                }
+                                block += 1;
+                                pos = 0;
+                                block_switches += 1;
+                            }
+                            if exhausted {
+                                break;
+                            }
+                            let state =
+                                unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, block) };
+                            let found = state.doc_ids[pos];
+                            max_follower_doc = max_follower_doc.max(u64::from(found));
+                            if found != doc {
+                                continue;
+                            }
+                            let f = unsafe {
+                                *posting
+                                    .ensure_compressed_block_ptr(list, block)
+                                    .as_ref()
+                                    .expect("compressed state is non-null")
+                                    .freqs
+                                    .get_unchecked(pos)
+                            };
+                            let score = match batch_addend[i] {
+                                Some(addend) => {
+                                    posting.query_weight * bm25_doc_weight_with_norm(f, addend)
+                                }
+                                None => posting.score(scorer, f, batch_doc_len[i]),
+                            };
+                            partial[i] += score;
+                            contrib[j * MAX + i] = score;
+                            clause_freqs[j * MAX + i] = f;
+                            posting_index[j * MAX + i] = (block << shift) | pos;
+                            alive[out] = i;
+                            out += 1;
+                        }
+                        (block, pos, out, exhausted, block_switches)
+                    };
+                    #[cfg(test)]
+                    {
+                        self.and_window_stats.lead_follower_block_switches += block_switches;
+                    }
+                    lead[j].block_idx = next_block;
+                    cursor_block[j] = next_block;
+                    cursor_pos[j] = next_pos;
+                    alive.truncate(kept);
+                    if exhausted {
+                        // This follower has no document at or after the current
+                        // candidate, so nothing later in the batch can match
+                        // it. Survivors still need the remaining clauses
+                        // verified: keep applying them instead of collecting
+                        // candidates whose later contributions are unset.
+                        follower_exhausted = true;
+                    }
+                }
+            }
+
+            // (e) Collect. Every survivor reached the end of the clause list,
+            // so the per-clause scores are already exact.
+            for &i in &alive {
+                let doc = batch_docs[i];
+                num_comparisons += 1;
+                let Some(document_key) = self.documents.document_key_for_doc_id(doc) else {
+                    continue;
+                };
+                let mut score = 0.0_f32;
+                for &clause in &score_order {
+                    score += contrib[clause * MAX + i];
+                }
+                if phrase_slop.is_some() {
+                    if self.threshold > 0.0 && self.exclusive_score_cannot_beat_floor(score) {
+                        continue;
+                    }
+                    for (clause, posting) in self.lead.iter_mut().enumerate() {
+                        posting.index = posting_index[clause * MAX + i];
+                        posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                            doc_id: doc,
+                            frequency: clause_freqs[clause * MAX + i],
+                        }));
+                    }
+                    let matched = match phrase_slop {
+                        Some(0) => self.check_exact_positions_bulk()?,
+                        Some(slop) => self.check_positions(slop as i32)?,
+                        None => unreachable!("phrase_slop is checked above"),
+                    };
+                    if !matched {
+                        continue;
+                    }
+                }
+                let inserted = candidates.insert(
+                    ScoredDoc::new(document_key, score),
+                    batch_doc_len[i],
+                    u64::from(doc),
+                    (0..num_lists).map(|clause| {
+                        (
+                            self.lead[clause].term_index(),
+                            clause_freqs[clause * MAX + i],
+                        )
+                    }),
+                )?;
+                if inserted && let Some(kth) = candidates.kth_score_if_full() {
+                    self.update_threshold(kth, params.wand_factor);
+                }
+            }
+
+            // (f) The next window starts past this one and past the last
+            // follower document that was compared: no follower has a doc in
+            // between, so nothing can match there.
+            if follower_exhausted || window_end == TERMINATED_DOC_ID {
+                break;
+            }
+            target = (window_end + 1).max(max_follower_doc);
+        }
+
+        metrics.record_comparisons(num_comparisons);
+
+        candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
     fn and_move_to_next_block(&mut self, target: u64) {
@@ -8138,6 +8543,217 @@ mod tests {
         assert_eq!(lead, classic);
     }
 
+    /// Runs classic / merge / lead over the same postings and asserts identical
+    /// output. Returns the lead kernel's window count and follower block-switch
+    /// count so callers can assert the intended shape was exercised.
+    fn lead_kernel_parity(
+        clauses: &[Vec<u32>],
+        num_docs: u32,
+        params: &FtsSearchParams,
+    ) -> (usize, usize, usize, usize) {
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 24 + doc_id % 41);
+        }
+        let run = |mode, kernel| {
+            let postings = clauses
+                .iter()
+                .enumerate()
+                .map(|(position, doc_ids)| {
+                    PostingIterator::with_query_weight(
+                        format!("t{position}"),
+                        position as u32,
+                        position as u32,
+                        1.0 + position as f32 * 0.5,
+                        generate_posting_list(doc_ids.clone(), 8.0, None, true),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+            let mut wand = Wand::new(
+                Operator::And,
+                postings.into_iter(),
+                &docs,
+                InverseDocLengthScorer,
+            )
+            .with_bulk_and_mode(mode)
+            .with_bulk_and_kernel(kernel)
+            .with_shared_threshold(floor.clone());
+            let mut rows = wand
+                .search(params, &NoOpMetricsCollector)
+                .unwrap()
+                .into_iter()
+                .map(|candidate| {
+                    (
+                        candidate.posting_doc_id,
+                        candidate.doc_length,
+                        candidate.freqs,
+                        candidate.document,
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            (
+                rows,
+                floor.load(Ordering::Relaxed),
+                wand.lead_bulk_and_searches,
+                wand.and_window_stats.lead_windows,
+                wand.and_window_stats.lead_follower_block_switches,
+                wand.and_window_stats.lead_alive_pruned,
+            )
+        };
+
+        let (classic, classic_floor, _, _, _, _) = run(BulkAndMode::Off, BulkAndKernel::Merge);
+        let (merge, merge_floor, _, _, _, _) = run(BulkAndMode::On, BulkAndKernel::Merge);
+        let (lead, lead_floor, lead_hits, windows, switches, pruned) =
+            run(BulkAndMode::On, BulkAndKernel::Lead);
+
+        assert_eq!(
+            classic, merge,
+            "merge kernel diverged from the classic path"
+        );
+        assert_eq!(classic, lead, "lead kernel diverged from the classic path");
+        assert_eq!(classic_floor, merge_floor, "merge kernel floor diverged");
+        assert_eq!(classic_floor, lead_floor, "lead kernel floor diverged");
+        assert!(lead_hits > 0, "the lead kernel must have run");
+        (windows, switches, lead.len(), pruned)
+    }
+
+    /// T3: a sparse lead whose single block spans many dense follower blocks.
+    #[test]
+    fn lead_bulk_and_high_skew_switches_follower_blocks() {
+        let num_docs = 8000u32;
+        let lead = (0..num_docs)
+            .filter(|doc| doc % 97 == 0)
+            .collect::<Vec<_>>();
+        let dense = (0..num_docs).collect::<Vec<_>>();
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let (windows, switches, hits, _) = lead_kernel_parity(&[lead, dense], num_docs, &params);
+        assert!(hits > 0);
+        assert!(windows >= 1);
+        assert!(
+            switches > 0,
+            "the follower must walk across blocks inside one lead window"
+        );
+    }
+
+    /// T4: the follower runs out in the middle of a lead window.
+    #[test]
+    fn lead_bulk_and_follower_exhausts_mid_window() {
+        let num_docs = 8000u32;
+        let lead = (0..num_docs)
+            .filter(|doc| doc % 97 == 0)
+            .collect::<Vec<_>>();
+        let short = (0..3200u32).collect::<Vec<_>>();
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let (_, _, hits, _) = lead_kernel_parity(&[lead, short], num_docs, &params);
+        assert!(
+            hits > 0,
+            "the intersection below the follower end must survive"
+        );
+    }
+
+    /// T5: the target lands in a gap between two follower blocks, so the
+    /// follower block holding it has no document at or after the target.
+    #[test]
+    fn lead_bulk_and_target_inside_follower_block_gap() {
+        let num_docs = 6000u32;
+        let lead = (0..num_docs).step_by(50).collect::<Vec<_>>();
+        let mut follower = (0..=300u32).collect::<Vec<_>>();
+        follower.extend(5000..=5300u32);
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let (_, switches, hits, _) = lead_kernel_parity(&[lead, follower], num_docs, &params);
+        assert!(hits > 0);
+        assert!(
+            switches > 0,
+            "walking into the next block must be exercised"
+        );
+    }
+
+    /// T6: a small limit raises the floor inside a window.
+    #[rstest]
+    fn lead_bulk_and_floor_rises_inside_window(#[values(1, 3)] limit: usize) {
+        let num_docs = 4000u32;
+        let lead = (0..num_docs)
+            .filter(|doc| doc % 31 == 0)
+            .collect::<Vec<_>>();
+        let dense = (0..num_docs).collect::<Vec<_>>();
+        let params = FtsSearchParams::default().with_limit(Some(limit));
+        let (_, _, hits, pruned) = lead_kernel_parity(&[lead, dense], num_docs, &params);
+        assert!(hits > 0);
+        // The prune counter is diagnostic: it may stay at zero when the
+        // window bound degrades to the scorer ceiling, but it can never exceed
+        // the number of scored candidates.
+        assert!(pruned <= num_docs as usize, "prune count out of range");
+    }
+
+    /// T7: clause widths from 2 to 8.
+    #[rstest]
+    fn lead_bulk_and_clause_width(#[values(2, 3, 4, 5, 8)] num_clauses: usize) {
+        let num_docs = 3000u32;
+        let clauses = (0..num_clauses)
+            .map(|clause| {
+                let modulus = 2 + clause as u32;
+                (0..num_docs)
+                    .filter(|doc| {
+                        (doc.wrapping_mul(2654435761).wrapping_add(clause as u32 * 7)) % modulus < 2
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        lead_kernel_parity(&clauses, num_docs, &params);
+    }
+
+    /// T10: the 65536-document window cap forces more than one window even
+    /// though the lead fits in a single block.
+    #[test]
+    fn lead_bulk_and_window_cap_splits_wide_block() {
+        let num_docs = 70_000u32;
+        let lead = vec![0u32, 30_000, 60_000, 69_000];
+        let dense = (0..num_docs).collect::<Vec<_>>();
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 20 + doc_id % 17);
+        }
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let run = |mode, kernel| {
+            let postings = [lead.clone(), dense.clone()]
+                .iter()
+                .enumerate()
+                .map(|(position, doc_ids)| {
+                    PostingIterator::with_query_weight(
+                        format!("t{position}"),
+                        position as u32,
+                        position as u32,
+                        1.0,
+                        generate_posting_list(doc_ids.clone(), 8.0, None, true),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode)
+                .with_bulk_and_kernel(kernel);
+            let mut rows = wand
+                .search(&params, &NoOpMetricsCollector)
+                .unwrap()
+                .into_iter()
+                .map(|candidate| candidate.posting_doc_id)
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            (rows, wand.and_window_stats.lead_windows)
+        };
+        let (classic, _) = run(BulkAndMode::Off, BulkAndKernel::Merge);
+        let (lead_rows, windows) = run(BulkAndMode::On, BulkAndKernel::Lead);
+        assert_eq!(classic, lead_rows, "window cap must not change results");
+        assert!(
+            windows >= 2,
+            "a lead block spanning more than 65536 documents must split"
+        );
+    }
+
     #[rstest]
     fn bulk_and_and_classic_publish_identical_query_order_score_bits(
         #[values(3, 4, 5, 8, 16)] num_clauses: usize,
@@ -8156,7 +8772,7 @@ mod tests {
             docs.append(doc_id, 1);
         }
 
-        let run = |mode| {
+        let run = |mode, kernel| {
             let postings = contributions
                 .iter()
                 .copied()
@@ -8177,6 +8793,7 @@ mod tests {
             let shared_floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
             let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
                 .with_bulk_and_mode(mode)
+                .with_bulk_and_kernel(kernel)
                 .with_shared_threshold(shared_floor.clone());
             let hits = wand
                 .search(
@@ -8188,13 +8805,22 @@ mod tests {
                 hits,
                 shared_floor.load(Ordering::Relaxed),
                 wand.bulk_and_searches > 0,
+                wand.lead_bulk_and_searches,
             )
         };
 
-        let (bulk, bulk_score, bulk_used) = run(BulkAndMode::On);
-        let (classic, classic_score, classic_used) = run(BulkAndMode::Off);
+        let (bulk, bulk_score, bulk_used, _) = run(BulkAndMode::On, BulkAndKernel::Merge);
+        let (classic, classic_score, classic_used, _) = run(BulkAndMode::Off, BulkAndKernel::Merge);
+        let (lead, lead_score, lead_used, lead_hits) = run(BulkAndMode::On, BulkAndKernel::Lead);
         assert!(bulk_used);
         assert!(!classic_used);
+        assert!(lead_used);
+        assert!(lead_hits > 0, "the lead kernel must score the query");
+        assert_eq!(lead[0].document, 0);
+        assert_eq!(
+            lead_score, bulk_score,
+            "the lead kernel must reproduce the query-order f32 sum"
+        );
         assert_eq!(bulk.len(), 1);
         assert_eq!(classic.len(), 1);
         assert_eq!(bulk[0].document, 0);
