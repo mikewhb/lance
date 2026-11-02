@@ -331,6 +331,59 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
 
+// Which bulk AND kernel runs once the routing below has decided a query is a
+// bulk conjunction. `Merge` is the shipped slice-merge kernel; `Lead` anchors
+// each window on the sparsest clause's block instead (Lucene
+// BlockMaxConjunctionBulkScorer). Both must return identical top-k, so the
+// default stays `Merge` until measurements justify switching.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BulkAndKernel {
+    #[default]
+    Merge,
+    Lead,
+}
+
+impl BulkAndKernel {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("merge") {
+            Some(Self::Merge)
+        } else if value.eq_ignore_ascii_case("lead") {
+            Some(Self::Lead)
+        } else {
+            None
+        }
+    }
+}
+
+fn bulk_and_kernel_from_env() -> BulkAndKernel {
+    match std::env::var("LANCE_FTS_BULK_AND_KERNEL") {
+        Ok(value) => BulkAndKernel::parse(&value).unwrap_or_else(|| {
+            log::warn!(
+                "Invalid LANCE_FTS_BULK_AND_KERNEL value {value:?}; expected merge or lead; \
+                 falling back to merge"
+            );
+            BulkAndKernel::Merge
+        }),
+        Err(std::env::VarError::NotPresent) => BulkAndKernel::Merge,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            log::warn!(
+                "Invalid non-Unicode LANCE_FTS_BULK_AND_KERNEL value {value:?}; expected merge \
+                 or lead; falling back to merge"
+            );
+            BulkAndKernel::Merge
+        }
+    }
+}
+
+static BULK_AND_KERNEL: LazyLock<BulkAndKernel> = LazyLock::new(bulk_and_kernel_from_env);
+
+// The release harness (`do_query`) installs no logger, so `log` output never
+// reaches it and cannot attest which kernel ran. This stderr marker is inert
+// unless its own env var is set, which keeps default runs silent.
+static BULK_AND_MARKER: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("LANCE_FTS_BULK_AND_MARKER").is_some());
+
 #[cfg(target_arch = "x86_64")]
 static HAS_AVX2: LazyLock<bool> = LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
 
@@ -2476,8 +2529,11 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Test-only override for comparing bulk and classic conjunctions without
     // mutating the process-wide environment.
     bulk_and_mode_override: Option<BulkAndMode>,
+    bulk_and_kernel_override: Option<BulkAndKernel>,
     #[cfg(test)]
     bulk_and_searches: usize,
+    #[cfg(test)]
+    lead_bulk_and_searches: usize,
     #[cfg(test)]
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
@@ -2597,8 +2653,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             #[cfg(test)]
             and_window_stats: AndWindowStats::default(),
             bulk_and_mode_override: None,
+            bulk_and_kernel_override: None,
             #[cfg(test)]
             bulk_and_searches: 0,
+            #[cfg(test)]
+            lead_bulk_and_searches: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
@@ -2623,6 +2682,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     #[cfg(test)]
     fn with_bulk_and_mode(mut self, mode: BulkAndMode) -> Self {
         self.bulk_and_mode_override = Some(mode);
+        self
+    }
+
+    /// Test hook for A/B-ing the two bulk AND kernels in one process.
+    #[cfg(test)]
+    fn with_bulk_and_kernel(mut self, kernel: BulkAndKernel) -> Self {
+        self.bulk_and_kernel_override = Some(kernel);
         self
     }
 
@@ -2771,6 +2837,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             #[cfg(test)]
             {
                 self.bulk_and_searches += 1;
+            }
+            // Which kernel runs is a separate decision from "is this a bulk
+            // conjunction": the routing condition above must stay identical to
+            // the pre-switch behaviour, so the choice is made inside the block.
+            let kernel = self
+                .bulk_and_kernel_override
+                .unwrap_or_else(|| *BULK_AND_KERNEL);
+            if kernel == BulkAndKernel::Lead && self.lead.len() >= 2 {
+                return self.and_lead_bulk_search(params, metrics);
             }
             return self.and_bulk_search(params, metrics);
         }
@@ -5031,6 +5106,32 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         metrics.record_comparisons(num_comparisons);
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
+    }
+
+    /// Bulk AND kernel that anchors each window on the sparsest clause's block
+    /// and applies followers clause by clause, instead of terminating windows
+    /// at the nearest next-block boundary of any clause.
+    fn and_lead_bulk_search(
+        &mut self,
+        params: &FtsSearchParams,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<DocCandidate<D::Candidate>>> {
+        if params.phrase_slop.is_some() {
+            // Phrase queries keep the merge kernel until position checks are
+            // wired into the lead-driven window.
+            return self.and_bulk_search(params, metrics);
+        }
+        #[cfg(test)]
+        {
+            self.lead_bulk_and_searches += 1;
+        }
+        if *BULK_AND_MARKER {
+            // Which kernel ran is otherwise invisible to the release harness,
+            // which installs no logger.
+            eprintln!("fts-bulk-and-kernel=lead");
+        }
+        // Placeholder until the lead-driven window loop lands.
+        self.and_bulk_search(params, metrics)
     }
 
     fn and_move_to_next_block(&mut self, target: u64) {
@@ -7954,6 +8055,87 @@ mod tests {
                 "gap {gap} must stay on the general window path"
             );
         }
+    }
+
+    #[test]
+    fn bulk_and_kernel_parses_env_values() {
+        assert_eq!(BulkAndKernel::parse("lead"), Some(BulkAndKernel::Lead));
+        assert_eq!(BulkAndKernel::parse("  LEAD "), Some(BulkAndKernel::Lead));
+        assert_eq!(BulkAndKernel::parse("merge"), Some(BulkAndKernel::Merge));
+        assert_eq!(BulkAndKernel::parse("Merge"), Some(BulkAndKernel::Merge));
+        assert_eq!(BulkAndKernel::parse(""), None);
+        assert_eq!(BulkAndKernel::parse("leading"), None);
+    }
+
+    /// The kernel switch must not change results: whichever kernel runs, the
+    /// published documents match the classic path, and a single clause never
+    /// takes the lead kernel.
+    #[rstest]
+    fn bulk_and_kernel_switch_keeps_results(#[values(2, 3, 4)] num_clauses: usize) {
+        let num_docs = (BLOCK_SIZE * 6 + 11) as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 16 + doc_id % 37);
+        }
+        let clause_docs = (0..num_clauses)
+            .map(|clause| {
+                let modulus = 3 + clause as u32;
+                (0..num_docs)
+                    .filter(|doc| {
+                        (doc.wrapping_mul(2654435761)
+                            .wrapping_add(clause as u32 * 11))
+                            % modulus
+                            < 2
+                    })
+                    .collect::<Vec<u32>>()
+            })
+            .collect::<Vec<_>>();
+
+        let run = |mode, kernel| {
+            let postings = clause_docs
+                .iter()
+                .enumerate()
+                .map(|(position, doc_ids)| {
+                    PostingIterator::with_query_weight(
+                        format!("t{position}"),
+                        position as u32,
+                        position as u32,
+                        1.0 + position as f32 * 0.5,
+                        generate_posting_list(doc_ids.clone(), 8.0, None, true),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut wand = Wand::new(
+                Operator::And,
+                postings.into_iter(),
+                &docs,
+                InverseDocLengthScorer,
+            )
+            .with_bulk_and_mode(mode)
+            .with_bulk_and_kernel(kernel);
+            let mut documents = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(10)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|candidate| candidate.document)
+                .collect::<Vec<_>>();
+            documents.sort_unstable();
+            (documents, wand.lead_bulk_and_searches)
+        };
+
+        let (merge, merge_lead_hits) = run(BulkAndMode::On, BulkAndKernel::Merge);
+        let (lead, lead_hits) = run(BulkAndMode::On, BulkAndKernel::Lead);
+        let (classic, classic_lead_hits) = run(BulkAndMode::Off, BulkAndKernel::Lead);
+
+        assert_eq!(merge_lead_hits, 0);
+        assert_eq!(classic_lead_hits, 0);
+        assert!(lead_hits > 0, "the lead kernel must be reachable for AND");
+        assert_eq!(lead, merge);
+        assert_eq!(lead, classic);
     }
 
     #[rstest]
@@ -12278,7 +12460,7 @@ mod tests {
             rows
         };
 
-        let run = |mode| {
+        let run = |mode, kernel| {
             let shared_floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
             let mut wand = Wand::new(
                 Operator::And,
@@ -12287,21 +12469,42 @@ mod tests {
                 UnitScorer,
             )
             .with_bulk_and_mode(mode)
+            .with_bulk_and_kernel(kernel)
             .with_shared_threshold(shared_floor.clone());
             let rows = normalize(wand.search(&params, &NoOpMetricsCollector).unwrap());
             let used_bulk = wand.bulk_and_searches > 0;
-            ((rows, shared_floor.load(Ordering::Relaxed)), used_bulk)
+            (
+                (rows, shared_floor.load(Ordering::Relaxed)),
+                used_bulk,
+                wand.lead_bulk_and_searches,
+            )
         };
 
-        let (bulk, bulk_used) = run(BulkAndMode::On);
-        let (classic, classic_used) = run(BulkAndMode::Off);
-        let (auto, auto_used) = run(BulkAndMode::Auto);
+        let (bulk, bulk_used, _) = run(BulkAndMode::On, BulkAndKernel::Merge);
+        let (classic, classic_used, _) = run(BulkAndMode::Off, BulkAndKernel::Merge);
+        let (auto, auto_used, _) = run(BulkAndMode::Auto, BulkAndKernel::Merge);
+        let (lead, lead_used, lead_kernel_hits) = run(BulkAndMode::On, BulkAndKernel::Lead);
         assert!(bulk_used, "on should use bulk conjunction search");
         assert!(!classic_used, "off should use classic conjunction search");
         assert_eq!(auto_used, matches!(num_clauses, 2 | 3));
         assert!(!bulk.0.is_empty(), "test corpus should produce matches");
         assert_eq!(bulk, classic);
         assert_eq!(auto, classic);
+        assert!(
+            lead_used,
+            "the lead kernel still runs through the bulk route"
+        );
+        // Phrase queries fall back to the merge kernel until positions are
+        // verified there, and a single clause never takes the lead kernel.
+        assert_eq!(
+            lead_kernel_hits,
+            usize::from(num_clauses >= 2 && !phrase),
+            "lead kernel dispatch count"
+        );
+        assert_eq!(
+            lead, classic,
+            "lead-driven bulk AND must match the classic path"
+        );
     }
 
     #[rstest]
