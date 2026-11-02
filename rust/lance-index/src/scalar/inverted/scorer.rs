@@ -33,6 +33,10 @@ pub trait Scorer: Send + Sync {
     /// without that shape. Scoring hot loops use this to bake a per-norm-code
     /// addend cache (Lucene's norm cache), which is bit-identical to calling
     /// `doc_weight` because both paths evaluate the same expressions.
+    ///
+    /// Implementing this also promises that `doc_weight` does not grow with the
+    /// document and does not shrink as the frequency rises: conjunction pruning
+    /// samples it at a zero-length document to bound a whole frequency bucket.
     fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
         let _ = doc_tokens;
         None

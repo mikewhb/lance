@@ -512,6 +512,46 @@ async fn test_no_impact_search_rejects_injected_negative_query_weight() {
 }
 
 #[tokio::test]
+async fn test_impact_search_rejects_injected_negative_query_weight() {
+    // The weight scales the per-block impact bounds as well, so the same
+    // rejection must apply when every posting carries impact data.
+    let mut builder = InnerBuilder::new_with_format_version(
+        0,
+        false,
+        TokenSetFormat::default(),
+        InvertedListFormatVersion::V1,
+    );
+    builder.tokens.get_or_add("alpha");
+    builder
+        .posting_lists
+        .push(PostingListBuilder::new_with_posting_tail_codec(
+            false,
+            InvertedListFormatVersion::V1.posting_tail_codec(),
+        ));
+    builder.posting_lists[0].add(0, PositionRecorder::Count(1));
+    builder.docs.append(0, 1);
+    let (_tmpdir, _cache, index) = load_single_partition_test_index(builder, true).await;
+    let scorer = MemBM25Scorer::new(1, 1, HashMap::from([("alpha".to_owned(), 10)]));
+    let error = index
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text)),
+            Arc::new(FtsSearchParams::new().with_limit(Some(1))),
+            Operator::Or,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            Some(&scorer),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(
+        error.to_string().contains(
+            "global BM25 query weight for token \"alpha\" must be finite and non-negative"
+        )
+    );
+}
+
+#[tokio::test]
 async fn test_chunked_modern_search_preserves_cold_and_prewarmed_results() {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(

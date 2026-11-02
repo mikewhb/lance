@@ -519,16 +519,26 @@ fn summarize_position_matches(mut positions: SmallVec<[(u32, bool); 8]>) -> Posi
     }
 }
 
-pub(super) fn validate_no_impact_scorer_upper_bound(
-    token: &str,
-    scorer: &MemBM25Scorer,
-) -> Result<()> {
+/// Rejects a query weight that would flip or break every bound derived from it.
+///
+/// The weight multiplies both the scorer-wide cap and the per-block impact
+/// bounds, so a negative or non-finite value turns upper bounds into lower
+/// bounds on every path, with or without impact data.
+pub(super) fn validate_scorer_query_weight(token: &str, scorer: &MemBM25Scorer) -> Result<f32> {
     let query_weight = scorer.query_weight(token);
     if !query_weight.is_finite() || query_weight < 0.0 {
         return Err(Error::invalid_input(format!(
             "global BM25 query weight for token {token:?} must be finite and non-negative, got {query_weight}"
         )));
     }
+    Ok(query_weight)
+}
+
+pub(super) fn validate_no_impact_scorer_upper_bound(
+    token: &str,
+    scorer: &MemBM25Scorer,
+) -> Result<()> {
+    let query_weight = validate_scorer_query_weight(token, scorer)?;
     let has_finite_bound = scorer.doc_weight_upper_bound().is_some_and(|bound| {
         bound.is_finite() && bound >= 0.0 && (query_weight * bound).is_finite()
     });
@@ -1718,6 +1728,11 @@ impl FetchedPostings {
             docs_for_union,
         } = self;
         if docs_for_union.is_none() {
+            // The weight scales the impact bounds too, so it must be valid on
+            // every posting, not only on the ones that need a scorer-wide cap.
+            for (_, token_index, _, _) in &loaded_postings {
+                validate_scorer_query_weight(tokens.get_token(*token_index), impact_scorer)?;
+            }
             let impact_safe = loaded_postings
                 .iter()
                 .all(|(_, _, _, posting)| posting.has_impacts());
@@ -1768,6 +1783,11 @@ impl FetchedPostings {
             });
         }
 
+        // The weight scales the impact bounds too, so it must be valid on
+        // every posting, not only on the ones that need a scorer-wide cap.
+        for (_, token_index, _, _) in &loaded_postings {
+            validate_scorer_query_weight(tokens.get_token(*token_index), impact_scorer)?;
+        }
         let no_impact_fallback = loaded_postings
             .iter()
             .any(|(_, _, _, posting)| !posting.has_impacts());
