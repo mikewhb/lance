@@ -5140,11 +5140,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             return self.and_bulk_search(params, metrics);
         }
         let phrase_slop = params.phrase_slop;
-        if phrase_slop.is_some() {
-            // Position checks read per-clause block cursors that this kernel
-            // does not park yet; keep phrase queries on the merge kernel.
-            return self.and_bulk_search(params, metrics);
-        }
 
         #[cfg(test)]
         {
@@ -5407,7 +5402,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         }
                     }
 
-                    let (next_block, next_pos, kept, exhausted, block_switches) = {
+                    let (next_block, next_pos, kept, exhausted, _block_switches) = {
                         let posting = &lead[j];
                         let PostingList::Compressed(ref list) = posting.list else {
                             unreachable!("bulk AND requires compressed postings");
@@ -5482,7 +5477,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     };
                     #[cfg(test)]
                     {
-                        self.and_window_stats.lead_follower_block_switches += block_switches;
+                        self.and_window_stats.lead_follower_block_switches += _block_switches;
                     }
                     lead[j].block_idx = next_block;
                     cursor_block[j] = next_block;
@@ -8895,6 +8890,106 @@ mod tests {
         );
         assert_eq!(classic_floor, merge_floor);
     }
+    /// Phrase variant of lead_kernel_parity: each clause gets token positions
+    /// so that roughly half of the candidates pass the position check.
+    fn lead_kernel_phrase_parity(clauses: &[Vec<u32>], num_docs: u32, slop: u32) -> usize {
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 20 + doc_id % 29);
+        }
+        let build = || {
+            clauses
+                .iter()
+                .enumerate()
+                .map(|(term_pos, doc_ids)| {
+                    let positions = doc_ids
+                        .iter()
+                        .map(|&doc| {
+                            if doc % 3 == 0 {
+                                vec![10 + term_pos as u32, 60 + (doc % 5)]
+                            } else {
+                                vec![30 + (term_pos as u32) * 7 + (doc % 4)]
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    PostingIterator::with_query_weight(
+                        format!("t{term_pos}"),
+                        term_pos as u32,
+                        term_pos as u32,
+                        1.0 + term_pos as f32 * 0.5,
+                        generate_posting_list_with_positions(doc_ids.clone(), positions, 8.0, true),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut params = FtsSearchParams::default().with_limit(Some(10));
+        params.phrase_slop = Some(slop);
+        let run = |mode, kernel| {
+            let mut wand = Wand::new(
+                Operator::And,
+                build().into_iter(),
+                &docs,
+                InverseDocLengthScorer,
+            )
+            .with_bulk_and_mode(mode)
+            .with_bulk_and_kernel(kernel);
+            let mut rows = wand
+                .search(&params, &NoOpMetricsCollector)
+                .unwrap()
+                .into_iter()
+                .map(|candidate| {
+                    (
+                        candidate.posting_doc_id,
+                        candidate.doc_length,
+                        candidate.freqs,
+                        candidate.document,
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            (rows, wand.lead_bulk_and_searches)
+        };
+        let (classic, _) = run(BulkAndMode::Off, BulkAndKernel::Merge);
+        let (merge, _) = run(BulkAndMode::On, BulkAndKernel::Merge);
+        let (lead, lead_hits) = run(BulkAndMode::On, BulkAndKernel::Lead);
+        assert_eq!(classic, merge, "merge kernel diverged on a phrase query");
+        assert_eq!(classic, lead, "lead kernel diverged on a phrase query");
+        assert!(lead_hits > 0, "the lead kernel must handle phrase queries");
+        lead.len()
+    }
+
+    /// T8: phrase candidates whose clause positions straddle follower blocks,
+    /// for both exact (slop 0) and sloppy matching.
+    #[rstest]
+    fn lead_bulk_and_phrase_across_follower_blocks(#[values(0, 2)] slop: u32) {
+        let num_docs = 4000u32;
+        let lead = (0..num_docs)
+            .filter(|doc| doc % 41 == 0)
+            .collect::<Vec<_>>();
+        let dense = (0..num_docs).collect::<Vec<_>>();
+        let third = (0..num_docs).filter(|doc| doc % 2 == 0).collect::<Vec<_>>();
+        let hits = lead_kernel_phrase_parity(&[lead, dense, third], num_docs, slop);
+        assert!(hits > 0);
+    }
+
+    /// T9: a window where several phrase candidates fail the position check.
+    /// Those failures park each clause's iterator on a different block, so a
+    /// cursor that caches a decoded pointer across the check would regress.
+    #[test]
+    fn lead_bulk_and_phrase_position_failures_keep_cursors_valid() {
+        let num_docs = 3000u32;
+        let lead = (0..num_docs)
+            .filter(|doc| doc % 37 == 0)
+            .collect::<Vec<_>>();
+        let follower = (0..num_docs)
+            .filter(|doc| doc % 2 == 1 || doc % 5 == 0)
+            .collect::<Vec<_>>();
+        let hits = lead_kernel_phrase_parity(&[lead, follower], num_docs, 0);
+        // The fixture must exercise both matching and failing candidates.
+        assert!(hits > 0);
+    }
+
     #[rstest]
     fn bulk_and_and_classic_publish_identical_query_order_score_bits(
         #[values(3, 4, 5, 8, 16)] num_clauses: usize,
@@ -13261,11 +13356,11 @@ mod tests {
             lead_used,
             "the lead kernel still runs through the bulk route"
         );
-        // Phrase queries fall back to the merge kernel until positions are
-        // verified there, and a single clause never takes the lead kernel.
+        // A single clause never takes the lead kernel; phrase queries now run
+        // through it as well.
         assert_eq!(
             lead_kernel_hits,
-            usize::from(num_clauses >= 2 && !phrase),
+            usize::from(num_clauses >= 2),
             "lead kernel dispatch count"
         );
         assert_eq!(
