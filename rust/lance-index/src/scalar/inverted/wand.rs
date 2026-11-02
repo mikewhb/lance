@@ -8990,6 +8990,70 @@ mod tests {
         assert!(hits > 0);
     }
 
+    /// T13: quantized document-length scoring, i.e. the norm-cache addend
+    /// branch of the per-clause score. The published k-th score bits must match.
+    #[rstest]
+    fn lead_bulk_and_quantized_norms_match_classic(#[values(1, 10)] limit: usize) {
+        let num_docs = 6000u32;
+        let lead = (0..num_docs)
+            .filter(|doc| doc % 29 == 0)
+            .collect::<Vec<_>>();
+        let dense = (0..num_docs).collect::<Vec<_>>();
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 20 + doc_id % 53);
+        }
+        docs.set_quantized_scoring(true);
+        let params = FtsSearchParams::default().with_limit(Some(limit));
+        let run = |mode, kernel| {
+            let postings = [lead.clone(), dense.clone()]
+                .iter()
+                .enumerate()
+                .map(|(position, doc_ids)| {
+                    PostingIterator::with_query_weight(
+                        format!("t{position}"),
+                        position as u32,
+                        position as u32,
+                        1.0 + position as f32 * 0.5,
+                        generate_posting_list(doc_ids.clone(), 8.0, None, true),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+            // This scorer exposes doc_norm for every length, so the norm-cache
+            // addend branch is the one under test here.
+            let scorer = CountingBm25ShapeScorer {
+                scored: Arc::new(AtomicUsize::new(0)),
+            };
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, scorer)
+                .with_bulk_and_mode(mode)
+                .with_bulk_and_kernel(kernel)
+                .with_shared_threshold(floor.clone());
+            let mut rows = wand
+                .search(&params, &NoOpMetricsCollector)
+                .unwrap()
+                .into_iter()
+                .map(|candidate| {
+                    (
+                        candidate.posting_doc_id,
+                        candidate.doc_length,
+                        candidate.freqs,
+                        candidate.document,
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            (rows, floor.load(Ordering::Relaxed))
+        };
+        let (classic, classic_floor) = run(BulkAndMode::Off, BulkAndKernel::Merge);
+        let (lead, lead_floor) = run(BulkAndMode::On, BulkAndKernel::Lead);
+        assert_eq!(classic, lead, "lead kernel diverged with quantized norms");
+        assert_eq!(
+            classic_floor, lead_floor,
+            "the k-th score bits must match with quantized norms"
+        );
+    }
     #[rstest]
     fn bulk_and_and_classic_publish_identical_query_order_score_bits(
         #[values(3, 4, 5, 8, 16)] num_clauses: usize,
