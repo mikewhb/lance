@@ -2542,6 +2542,10 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     bulk_and_searches: usize,
     #[cfg(test)]
     lead_bulk_and_searches: usize,
+    // How many lead batch entries took the norm-cache addend branch. Only a
+    // scorer that exposes doc_norm for every length reaches it.
+    #[cfg(test)]
+    lead_norm_cache_hits: usize,
     #[cfg(test)]
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
@@ -2666,6 +2670,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             bulk_and_searches: 0,
             #[cfg(test)]
             lead_bulk_and_searches: 0,
+            #[cfg(test)]
+            lead_norm_cache_hits: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
@@ -5353,6 +5359,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         None => (None, self.documents.scoring_num_tokens(doc)),
                     },
                 };
+                #[cfg(test)]
+                if addend.is_some() {
+                    self.lead_norm_cache_hits += 1;
+                }
                 let posting = &self.lead[0];
                 // Same expression as the merge kernel's per-clause scoring;
                 // that helper is nested inside it and must not be moved out.
@@ -8876,14 +8886,20 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>();
+            let published = rows.clone();
             rows.sort_unstable();
-            (rows, floor.load(Ordering::Relaxed))
+            (rows, published, floor.load(Ordering::Relaxed))
         };
-        let (classic, classic_floor) = run(BulkAndMode::Off, BulkAndKernel::Merge);
-        let (merge, merge_floor) = run(BulkAndMode::On, BulkAndKernel::Merge);
-        let (lead, lead_floor) = run(BulkAndMode::On, BulkAndKernel::Lead);
+        let (classic, classic_published, classic_floor) =
+            run(BulkAndMode::Off, BulkAndKernel::Merge);
+        let (merge, _, merge_floor) = run(BulkAndMode::On, BulkAndKernel::Merge);
+        let (lead, lead_published, lead_floor) = run(BulkAndMode::On, BulkAndKernel::Lead);
         assert_eq!(classic, merge, "merge kernel diverged on impacted blocks");
         assert_eq!(classic, lead, "lead kernel diverged on impacted blocks");
+        assert_eq!(
+            classic_published, lead_published,
+            "the published order must match the classic path"
+        );
         assert_eq!(
             classic_floor, lead_floor,
             "the k-th score bits must match on impacted blocks"
@@ -9021,11 +9037,26 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
-            // This scorer exposes doc_norm for every length, so the norm-cache
-            // addend branch is the one under test here.
-            let scorer = CountingBm25ShapeScorer {
-                scored: Arc::new(AtomicUsize::new(0)),
-            };
+            // This scorer exposes a length-dependent doc_norm for every code,
+            // so the norm-cache addend branch is under test and the addend table
+            // cannot be constant.
+            #[derive(Clone, Copy)]
+            struct LengthVaryingNormScorer;
+            impl Scorer for LengthVaryingNormScorer {
+                fn query_weight(&self, _token: &str) -> f32 {
+                    1.0
+                }
+                fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+                    bm25_doc_weight_with_norm(freq, 0.4 + doc_tokens as f32 * 0.01)
+                }
+                fn doc_weight_upper_bound(&self) -> Option<f32> {
+                    Some(BM25_DOC_WEIGHT_UPPER_BOUND)
+                }
+                fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+                    Some(0.4 + doc_tokens as f32 * 0.01)
+                }
+            }
+            let scorer = LengthVaryingNormScorer;
             let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, scorer)
                 .with_bulk_and_mode(mode)
                 .with_bulk_and_kernel(kernel)
@@ -9044,14 +9075,102 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             rows.sort_unstable();
-            (rows, floor.load(Ordering::Relaxed))
+            (
+                rows,
+                floor.load(Ordering::Relaxed),
+                wand.lead_norm_cache_hits,
+            )
         };
-        let (classic, classic_floor) = run(BulkAndMode::Off, BulkAndKernel::Merge);
-        let (lead, lead_floor) = run(BulkAndMode::On, BulkAndKernel::Lead);
+        let (classic, classic_floor, _) = run(BulkAndMode::Off, BulkAndKernel::Merge);
+        let (lead, lead_floor, norm_hits) = run(BulkAndMode::On, BulkAndKernel::Lead);
         assert_eq!(classic, lead, "lead kernel diverged with quantized norms");
         assert_eq!(
             classic_floor, lead_floor,
             "the k-th score bits must match with quantized norms"
+        );
+        assert!(
+            norm_hits > 0,
+            "the fixture must reach the norm-cache addend branch"
+        );
+    }
+
+    /// T14: a scorer whose weight ceiling is not finite makes every clause
+    /// bound degrade; the kernel must then disable pruning and still match.
+    #[test]
+    fn lead_bulk_and_unbounded_clause_bounds_match_classic() {
+        #[derive(Clone, Copy)]
+        struct UnboundedScorer;
+        impl Scorer for UnboundedScorer {
+            fn query_weight(&self, _token: &str) -> f32 {
+                1.0
+            }
+            fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+                bm25_doc_weight_with_norm(freq, 0.5 + doc_tokens as f32 * 0.01)
+            }
+            fn doc_weight_upper_bound(&self) -> Option<f32> {
+                Some(f32::INFINITY)
+            }
+            fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+                Some(0.5 + doc_tokens as f32 * 0.01)
+            }
+        }
+
+        let num_docs = 4000u32;
+        let lead = (0..num_docs)
+            .filter(|doc| doc % 23 == 0)
+            .collect::<Vec<_>>();
+        let dense = (0..num_docs).collect::<Vec<_>>();
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 20 + doc_id % 37);
+        }
+        let mut params = FtsSearchParams::default().with_limit(Some(10));
+        params.phrase_slop = None;
+        let run = |mode, kernel| {
+            let postings = [lead.clone(), dense.clone()]
+                .iter()
+                .enumerate()
+                .map(|(position, doc_ids)| {
+                    let freqs = vec![1u32; doc_ids.len()];
+                    let lengths = doc_ids.iter().map(|&doc| 20 + doc % 37).collect::<Vec<_>>();
+                    PostingIterator::with_query_weight(
+                        format!("t{position}"),
+                        position as u32,
+                        position as u32,
+                        1.0,
+                        generate_impact_posting_list_with_freqs_and_block_size(
+                            doc_ids.clone(),
+                            freqs,
+                            lengths,
+                            MAX_POSTING_BLOCK_SIZE,
+                        ),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnboundedScorer)
+                .with_bulk_and_mode(mode)
+                .with_bulk_and_kernel(kernel)
+                .with_shared_threshold(floor);
+            let mut rows = wand
+                .search(&params, &NoOpMetricsCollector)
+                .unwrap()
+                .into_iter()
+                .map(|candidate| candidate.posting_doc_id)
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            (rows, wand.and_window_stats.lead_bound_degraded)
+        };
+        let (classic, _) = run(BulkAndMode::Off, BulkAndKernel::Merge);
+        let (lead_rows, degraded) = run(BulkAndMode::On, BulkAndKernel::Lead);
+        assert_eq!(
+            classic, lead_rows,
+            "unbounded bounds must not change results"
+        );
+        assert!(
+            degraded > 0,
+            "an infinite weight ceiling must take the degraded-bound path"
         );
     }
     #[rstest]
