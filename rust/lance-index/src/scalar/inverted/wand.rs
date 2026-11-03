@@ -2543,6 +2543,10 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // kernel itself keeps two-clause coverage.
     #[cfg(test)]
     lead_kernel_min_clauses: usize,
+    // Tests force the kernel to keep covering shapes production routes to the
+    // merge kernel (two clauses, balanced clause costs).
+    #[cfg(test)]
+    force_lead_kernel: bool,
     #[cfg(test)]
     bulk_and_searches: usize,
     #[cfg(test)]
@@ -2674,6 +2678,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             #[cfg(test)]
             lead_kernel_min_clauses: 3,
             #[cfg(test)]
+            force_lead_kernel: false,
+            #[cfg(test)]
             bulk_and_searches: 0,
             #[cfg(test)]
             lead_bulk_and_searches: 0,
@@ -2712,16 +2718,19 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         self.bulk_and_kernel_override = Some(kernel);
         if kernel == BulkAndKernel::Lead {
             // Forcing the kernel in a test also bypasses the production
-            // two-clause gate, so fixtures do not need a third clause.
+            // clause-count and clause-skew gates, so fixtures do not need to
+            // look like the shapes production routes here.
             self.lead_kernel_min_clauses = 2;
+            self.force_lead_kernel = true;
         }
         self
     }
 
-    /// Test hook to assert the production clause gate explicitly.
+    /// Test hook to assert the production gates explicitly: selects the kernel
+    /// without the force switch, so the clause-count and skew gates decide.
     #[cfg(test)]
-    fn with_lead_kernel_min_clauses(mut self, min_clauses: usize) -> Self {
-        self.lead_kernel_min_clauses = min_clauses;
+    fn with_bulk_and_kernel_gated(mut self, kernel: BulkAndKernel) -> Self {
+        self.bulk_and_kernel_override = Some(kernel);
         self
     }
 
@@ -2886,7 +2895,17 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let min_clauses = 3;
             #[cfg(test)]
             let min_clauses = self.lead_kernel_min_clauses;
-            if kernel == BulkAndKernel::Lead && self.lead.len() >= min_clauses {
+            // Balanced clause costs mean a dense intersection, where the
+            // per-candidate advance measured 1.2-1.8x slower than the merge
+            // kernel's slice merge; the lead kernel only pays off when the
+            // rarest clause is far sparser than the widest one.
+            let mut skewed = self.lead.len() >= 2
+                && self.lead[self.lead.len() - 1].cost() >= 4 * self.lead[0].cost();
+            #[cfg(test)]
+            {
+                skewed |= self.force_lead_kernel;
+            }
+            if kernel == BulkAndKernel::Lead && self.lead.len() >= min_clauses && skewed {
                 return self.and_lead_bulk_search(params, metrics);
             }
             return self.and_bulk_search(params, metrics);
@@ -9234,10 +9253,14 @@ mod tests {
         );
     }
 
-    /// The production gate: two-clause conjunctions stay on the merge kernel,
-    /// three clauses take the lead kernel.
+    /// The production gates: two clauses, or three balanced clauses, stay on
+    /// the merge kernel; a three-clause conjunction whose rarest clause is far
+    /// sparser than the widest one takes the lead kernel.
     #[rstest]
-    fn lead_bulk_kernel_two_clause_gate(#[values(2, 3)] num_clauses: usize) {
+    fn lead_bulk_kernel_routing_gates(
+        #[values(2, 3)] num_clauses: usize,
+        #[values(false, true)] sparse_lead: bool,
+    ) {
         let num_docs = 1200u32;
         let mut docs = DocSet::default();
         for doc_id in 0..num_docs {
@@ -9245,8 +9268,16 @@ mod tests {
         }
         let clauses = (0..num_clauses)
             .map(|clause| {
+                let sparse = sparse_lead && clause == 0;
+                let modulus = if sparse { 41 } else { 3 + clause as u32 };
                 (0..num_docs)
-                    .filter(|doc| doc % (3 + clause as u32) != 0)
+                    .filter(|doc| {
+                        if sparse {
+                            doc % modulus == 0
+                        } else {
+                            doc % modulus != 0
+                        }
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -9266,9 +9297,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
             .with_bulk_and_mode(BulkAndMode::On)
-            .with_bulk_and_kernel(BulkAndKernel::Lead)
-            // The hook above lowers the gate to two; restore the production one.
-            .with_lead_kernel_min_clauses(3);
+            .with_bulk_and_kernel_gated(BulkAndKernel::Lead);
         wand.search(
             &FtsSearchParams::default().with_limit(Some(10)),
             &NoOpMetricsCollector,
@@ -9276,8 +9305,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             wand.lead_bulk_and_searches,
-            usize::from(num_clauses >= 3),
-            "clause gate"
+            usize::from(num_clauses >= 3 && sparse_lead),
+            "clause-count and skew gates"
         );
     }
     #[rstest]
