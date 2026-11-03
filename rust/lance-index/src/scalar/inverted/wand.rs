@@ -1701,6 +1701,24 @@ impl PostingIterator {
         matches!(self.list, PostingList::Compressed(_))
     }
 
+    /// Whether a window over this posting can be answered from stored
+    /// per-block data. A posting that falls back to the scorer-wide ceiling
+    /// answers every window with the same constant, which cannot prune, so it
+    /// must not take the lead-window route: that route replaces the bulk
+    /// merge and would then only add cost.
+    ///
+    /// The block-size arm is the legacy 128-document layout, whose stored
+    /// per-block maxima stay usable. It is dead today: producers set
+    /// `use_scorer_upper_bound` exactly when the posting has no impacts, so
+    /// the first conjunct already excludes every impact-less list. Keep the
+    /// two spellings in sync by routing through this method.
+    #[inline]
+    fn has_window_bounds(&self) -> bool {
+        !self.use_scorer_upper_bound
+            && matches!(&self.list, PostingList::Compressed(list)
+                if list.impacts.is_some() || list.block_size != MAX_POSTING_BLOCK_SIZE)
+    }
+
     #[inline]
     fn has_next_compressed_block(&self) -> bool {
         match self.list {
@@ -2905,10 +2923,26 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             {
                 skewed |= self.force_lead_kernel;
             }
-            if kernel == BulkAndKernel::Lead && self.lead.len() >= min_clauses && skewed {
+            // Without a usable per-window bound the lead kernel cannot prune
+            // any better than the merge kernel and only adds per-candidate
+            // cost, so such conjunctions stay on merge.
+            let window_bounds = self.lead.iter().all(|posting| posting.has_window_bounds());
+            if kernel == BulkAndKernel::Lead
+                && self.lead.len() >= min_clauses
+                && skewed
+                && window_bounds
+            {
+                self.report_kernel_marker("lead");
                 return self.and_lead_bulk_search(params, metrics);
             }
+            self.report_kernel_marker("merge");
             return self.and_bulk_search(params, metrics);
+        }
+
+        if self.operator == Operator::And {
+            // Text-free diagnostic: which executor handled this conjunction.
+            // Off unless the marker env var is set, so timed runs stay silent.
+            self.report_kernel_marker("classic");
         }
 
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
@@ -5169,6 +5203,19 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
+    /// Emits one line per conjunction naming the executor that handled it.
+    /// The release harness installs no logger, so stderr is the only channel an
+    /// external attribution pass can read. Inert unless the marker env var is
+    /// set, and never enabled during timing runs.
+    fn report_kernel_marker(&self, kernel: &str) {
+        if *BULK_AND_MARKER {
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!("fts-bulk-and-kernel={kernel} k={}", self.lead.len());
+            }
+        }
+    }
+
     /// Bulk AND kernel that anchors each window on the sparsest clause's block
     /// and applies followers clause by clause, instead of terminating windows
     /// at the nearest next-block boundary of any clause.
@@ -5197,15 +5244,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         #[cfg(test)]
         {
             self.lead_bulk_and_searches += 1;
-        }
-        if *BULK_AND_MARKER {
-            // The release harness installs no logger, so stderr is the only
-            // channel that can attest which kernel ran. Off unless the marker
-            // env var is set, so normal runs stay silent.
-            #[allow(clippy::print_stderr)]
-            {
-                eprintln!("fts-bulk-and-kernel=lead");
-            }
         }
 
         self.invalidate_score_first_and_window();
@@ -9307,6 +9345,61 @@ mod tests {
             wand.lead_bulk_and_searches,
             usize::from(num_clauses >= 3 && sparse_lead),
             "clause-count and skew gates"
+        );
+    }
+
+    /// A clause that answers every window with the scorer-wide ceiling cannot
+    /// prune, so the lead kernel must not take the conjunction: it stays on
+    /// the merge kernel. Pins the structural gate.
+    #[rstest]
+    fn lead_bulk_kernel_skips_conjunctions_without_window_bounds(
+        #[values(false, true)] no_window_bounds: bool,
+    ) {
+        let num_docs = 1200u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 20 + doc_id % 31);
+        }
+        let postings = (0..3)
+            .map(|clause| {
+                let sparse = clause == 0;
+                let modulus = if sparse { 41 } else { 3 + clause as u32 };
+                let doc_ids = (0..num_docs)
+                    .filter(|doc| {
+                        if sparse {
+                            doc % modulus == 0
+                        } else {
+                            doc % modulus != 0
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let posting = PostingIterator::with_query_weight(
+                    format!("t{clause}"),
+                    clause as u32,
+                    clause as u32,
+                    1.0,
+                    generate_posting_list(doc_ids, 8.0, None, true),
+                    docs.len(),
+                );
+                if no_window_bounds && clause == 1 {
+                    posting.with_scorer_upper_bound()
+                } else {
+                    posting
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+            .with_bulk_and_mode(BulkAndMode::On)
+            .with_bulk_and_kernel_gated(BulkAndKernel::Lead);
+        wand.search(
+            &FtsSearchParams::default().with_limit(Some(10)),
+            &NoOpMetricsCollector,
+        )
+        .unwrap();
+        assert_eq!(
+            wand.lead_bulk_and_searches,
+            usize::from(!no_window_bounds),
+            "a clause without per-window bounds must keep the conjunction on merge"
         );
     }
     #[rstest]
