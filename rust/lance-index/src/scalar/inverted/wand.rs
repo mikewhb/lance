@@ -5391,24 +5391,43 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let scorer = &self.scorer;
                 let lead = &mut self.lead;
 
+                // The exclusive floor is the only mode where the rejection
+                // predicate inverts to a single f32 comparison, and the bulk
+                // route uses it; keep the general path for inclusive floors.
+                let exclusive = floor_mode == CompetitiveFloorMode::Exclusive;
+
                 for j in 1..num_lists {
                     if has_floor {
                         // The suffix bound covers exactly the clauses that have
                         // not been applied yet.
                         let bound = suffix[j];
-                        #[cfg(test)]
-                        let before_prune = alive.len();
-                        alive.retain(|&i| {
-                            !score_sum_cannot_compete(
-                                partial[i], bound, threshold, factor, floor_mode,
-                            )
-                        });
-                        #[cfg(test)]
-                        {
-                            self.and_window_stats.lead_alive_pruned += before_prune - alive.len();
-                        }
-                        if alive.is_empty() {
-                            break;
+                        // Lucene skips this filter entirely when it cannot
+                        // reject anything; a per-candidate f64 predicate over a
+                        // bound that never rejects is pure overhead.
+                        let limit = exclusive
+                            .then(|| exclusive_partial_score_limit(bound, threshold, factor))
+                            .flatten();
+                        if exclusive && limit.is_none() {
+                            // Nothing is rejected: skip the pass.
+                        } else {
+                            #[cfg(test)]
+                            let before_prune = alive.len();
+                            match limit {
+                                Some(limit) => alive.retain(|&i| partial[i] > limit),
+                                None => alive.retain(|&i| {
+                                    !score_sum_cannot_compete(
+                                        partial[i], bound, threshold, factor, floor_mode,
+                                    )
+                                }),
+                            }
+                            #[cfg(test)]
+                            {
+                                self.and_window_stats.lead_alive_pruned +=
+                                    before_prune - alive.len();
+                            }
+                            if alive.is_empty() {
+                                break;
+                            }
                         }
                     }
 
@@ -5424,6 +5443,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         let mut out = 0usize;
                         let mut exhausted = false;
                         let mut block_switches = 0usize;
+                        // Decoded pointers stay valid for as long as the cursor
+                        // stays on this block: nothing else touches this
+                        // clause's shared state inside the loop (phrase checks
+                        // run later, in the collect phase).
+                        let mut docs_block = usize::MAX;
+                        let mut docs_ptr: *const u32 = std::ptr::null();
+                        let mut docs_len = 0usize;
+                        let mut freqs_block = usize::MAX;
+                        let mut freqs_ptr: *const u32 = std::ptr::null();
                         for idx in 0..alive.len() {
                             let i = alive[idx];
                             let doc = batch_docs[i];
@@ -5433,15 +5461,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                     pos = 0;
                                     block_switches += 1;
                                 }
-                                // Re-issue the decompression request every time:
-                                // the shared state may hold another block after a
-                                // phrase check moved it.
-                                let state =
-                                    unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, block) };
-                                let docs = state.doc_ids.as_slice();
-                                let end = docs.len();
-                                pos = unsafe { find_next_geq(docs.as_ptr(), pos, end, doc) };
-                                if pos < end {
+                                if docs_block != block {
+                                    let state = unsafe {
+                                        &*posting.ensure_compressed_doc_ids_ptr(list, block)
+                                    };
+                                    docs_ptr = state.doc_ids.as_ptr();
+                                    docs_len = state.doc_ids.len();
+                                    docs_block = block;
+                                }
+                                pos = unsafe { find_next_geq(docs_ptr, pos, docs_len, doc) };
+                                if pos < docs_len {
                                     break;
                                 }
                                 if block + 1 >= blocks {
@@ -5455,21 +5484,24 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             if exhausted {
                                 break;
                             }
-                            let state =
-                                unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, block) };
-                            let found = state.doc_ids[pos];
+                            debug_assert_eq!(docs_block, block);
+                            let found = unsafe { *docs_ptr.add(pos) };
                             max_follower_doc = max_follower_doc.max(u64::from(found));
                             if found != doc {
                                 continue;
                             }
-                            let f = unsafe {
-                                *posting
-                                    .ensure_compressed_block_ptr(list, block)
-                                    .as_ref()
-                                    .expect("compressed state is non-null")
-                                    .freqs
-                                    .get_unchecked(pos)
-                            };
+                            if freqs_block != block {
+                                freqs_ptr = unsafe {
+                                    posting
+                                        .ensure_compressed_block_ptr(list, block)
+                                        .as_ref()
+                                        .expect("compressed state is non-null")
+                                        .freqs
+                                        .as_ptr()
+                                };
+                                freqs_block = block;
+                            }
+                            let f = unsafe { *freqs_ptr.add(pos) };
                             let score = match batch_addend[i] {
                                 Some(addend) => {
                                     posting.query_weight * bm25_doc_weight_with_norm(f, addend)
