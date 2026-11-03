@@ -2875,6 +2875,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // bulk path: the same block-max window pruning, but candidates come
         // from a slice-level merge over decompressed blocks instead of per-doc
         // `next()` leapfrogging through boxed iterators.
+        let kernel = self
+            .bulk_and_kernel_override
+            .unwrap_or_else(|| *BULK_AND_KERNEL);
         if self.operator == Operator::And
             && !self.lead.is_empty()
             && self
@@ -2885,6 +2888,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let mode = self
                     .bulk_and_mode_override
                     .unwrap_or_else(|| *BULK_AND_MODE);
+                // Wide conjunctions normally stay on the classic loop unless
+                // every clause is a 256-document impact list. An explicit lead
+                // request only needs per-window bounds, since the lead kernel
+                // reads windows from block metadata. Mode Off still means off.
+                let lead_wide = mode != BulkAndMode::Off
+                    && kernel == BulkAndKernel::Lead
+                    && self.lead.len() >= 4
+                    && self.lead.iter().all(|posting| posting.has_window_bounds());
                 mode.enabled_for(self.lead.len())
                     || (mode == BulkAndMode::Auto
                         && self.lead.len() >= 4
@@ -2892,6 +2903,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             matches!(&posting.list, PostingList::Compressed(list)
                                 if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
                         }))
+                    || lead_wide
             }
         {
             #[cfg(test)]
@@ -2901,9 +2913,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // Which kernel runs is a separate decision from "is this a bulk
             // conjunction": the routing condition above must stay identical to
             // the pre-switch behaviour, so the choice is made inside the block.
-            let kernel = self
-                .bulk_and_kernel_override
-                .unwrap_or_else(|| *BULK_AND_KERNEL);
             // Two clauses keep the merge kernel: with only one follower the
             // per-window bound is that follower's whole-window max, which
             // degrades to its global ceiling, so the lead kernel prunes nothing
@@ -9401,6 +9410,63 @@ mod tests {
             usize::from(!no_window_bounds),
             "a clause without per-window bounds must keep the conjunction on merge"
         );
+    }
+
+    /// P1: a wide conjunction over 128-document impact lists reaches the lead
+    /// kernel only when the switch asks for it; without the switch it keeps the
+    /// classic loop, exactly like main.
+    #[rstest]
+    fn lead_bulk_kernel_wide_conjunction_routing(#[values(false, true)] lead_kernel: bool) {
+        let num_docs = 1200u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 20 + doc_id % 31);
+        }
+        let postings = (0..4)
+            .map(|clause| {
+                let sparse = clause == 0;
+                let modulus = if sparse { 41 } else { 3 + clause as u32 };
+                let doc_ids = (0..num_docs)
+                    .filter(|doc| {
+                        if sparse {
+                            doc % modulus == 0
+                        } else {
+                            doc % modulus != 0
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let freqs = vec![1u32; doc_ids.len()];
+                let lengths = doc_ids.iter().map(|&doc| 20 + doc % 31).collect::<Vec<_>>();
+                PostingIterator::with_query_weight(
+                    format!("t{clause}"),
+                    clause as u32,
+                    clause as u32,
+                    1.0,
+                    generate_impact_posting_list_with_freqs_and_block_size(
+                        doc_ids, freqs, lengths, 128,
+                    ),
+                    docs.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+            .with_bulk_and_mode(BulkAndMode::Auto);
+        if lead_kernel {
+            wand = wand.with_bulk_and_kernel_gated(BulkAndKernel::Lead);
+        }
+        wand.search(
+            &FtsSearchParams::default().with_limit(Some(10)),
+            &NoOpMetricsCollector,
+        )
+        .unwrap();
+        if lead_kernel {
+            assert_eq!(
+                wand.lead_bulk_and_searches, 1,
+                "wide conjunction takes lead"
+            );
+        } else {
+            assert_eq!(wand.bulk_and_searches, 0, "default routing keeps classic");
+        }
     }
     #[rstest]
     fn bulk_and_and_classic_publish_identical_query_order_score_bits(
