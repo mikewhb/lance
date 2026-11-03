@@ -2538,6 +2538,11 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // mutating the process-wide environment.
     bulk_and_mode_override: Option<BulkAndMode>,
     bulk_and_kernel_override: Option<BulkAndKernel>,
+    // Minimum clause count for the lead kernel. Production keeps two-clause
+    // conjunctions on the merge kernel; tests force the kernel directly so the
+    // kernel itself keeps two-clause coverage.
+    #[cfg(test)]
+    lead_kernel_min_clauses: usize,
     #[cfg(test)]
     bulk_and_searches: usize,
     #[cfg(test)]
@@ -2667,6 +2672,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             bulk_and_mode_override: None,
             bulk_and_kernel_override: None,
             #[cfg(test)]
+            lead_kernel_min_clauses: 3,
+            #[cfg(test)]
             bulk_and_searches: 0,
             #[cfg(test)]
             lead_bulk_and_searches: 0,
@@ -2703,6 +2710,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     #[cfg(test)]
     fn with_bulk_and_kernel(mut self, kernel: BulkAndKernel) -> Self {
         self.bulk_and_kernel_override = Some(kernel);
+        if kernel == BulkAndKernel::Lead {
+            // Forcing the kernel in a test also bypasses the production
+            // two-clause gate, so fixtures do not need a third clause.
+            self.lead_kernel_min_clauses = 2;
+        }
+        self
+    }
+
+    /// Test hook to assert the production clause gate explicitly.
+    #[cfg(test)]
+    fn with_lead_kernel_min_clauses(mut self, min_clauses: usize) -> Self {
+        self.lead_kernel_min_clauses = min_clauses;
         self
     }
 
@@ -2858,7 +2877,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let kernel = self
                 .bulk_and_kernel_override
                 .unwrap_or_else(|| *BULK_AND_KERNEL);
-            if kernel == BulkAndKernel::Lead && self.lead.len() >= 2 {
+            // Two clauses keep the merge kernel: with only one follower the
+            // per-window bound is that follower's whole-window max, which
+            // degrades to its global ceiling, so the lead kernel prunes nothing
+            // and measured 1.46x slower on the 943-query benchmark while the
+            // AVX2 slice intersection stays fast for dense conjunctions.
+            #[cfg(not(test))]
+            let min_clauses = 3;
+            #[cfg(test)]
+            let min_clauses = self.lead_kernel_min_clauses;
+            if kernel == BulkAndKernel::Lead && self.lead.len() >= min_clauses {
                 return self.and_lead_bulk_search(params, metrics);
             }
             return self.and_bulk_search(params, metrics);
@@ -9203,6 +9231,53 @@ mod tests {
         assert!(
             degraded > 0,
             "an infinite weight ceiling must take the degraded-bound path"
+        );
+    }
+
+    /// The production gate: two-clause conjunctions stay on the merge kernel,
+    /// three clauses take the lead kernel.
+    #[rstest]
+    fn lead_bulk_kernel_two_clause_gate(#[values(2, 3)] num_clauses: usize) {
+        let num_docs = 1200u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 20 + doc_id % 31);
+        }
+        let clauses = (0..num_clauses)
+            .map(|clause| {
+                (0..num_docs)
+                    .filter(|doc| doc % (3 + clause as u32) != 0)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let postings = clauses
+            .iter()
+            .enumerate()
+            .map(|(position, doc_ids)| {
+                PostingIterator::with_query_weight(
+                    format!("t{position}"),
+                    position as u32,
+                    position as u32,
+                    1.0,
+                    generate_posting_list(doc_ids.clone(), 8.0, None, true),
+                    docs.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+            .with_bulk_and_mode(BulkAndMode::On)
+            .with_bulk_and_kernel(BulkAndKernel::Lead)
+            // The hook above lowers the gate to two; restore the production one.
+            .with_lead_kernel_min_clauses(3);
+        wand.search(
+            &FtsSearchParams::default().with_limit(Some(10)),
+            &NoOpMetricsCollector,
+        )
+        .unwrap();
+        assert_eq!(
+            wand.lead_bulk_and_searches,
+            usize::from(num_clauses >= 3),
+            "clause gate"
         );
     }
     #[rstest]
