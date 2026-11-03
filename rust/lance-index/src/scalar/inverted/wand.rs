@@ -2555,9 +2555,6 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // scorer that exposes doc_norm for every length reaches it.
     #[cfg(test)]
     lead_norm_cache_hits: usize,
-    // Windows that fell back to the merge kernel after the density probe.
-    #[cfg(test)]
-    lead_kernel_fallbacks: usize,
     #[cfg(test)]
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
@@ -2688,8 +2685,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             lead_bulk_and_searches: 0,
             #[cfg(test)]
             lead_norm_cache_hits: 0,
-            #[cfg(test)]
-            lead_kernel_fallbacks: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
@@ -5259,7 +5254,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
             self.raise_to_shared_floor(params.wand_factor);
             let has_floor = self.threshold > 0.0;
-            let mut degraded_window = false;
             let target32 = u32::try_from(target).unwrap_or(u32::MAX);
 
             // (a) Anchor the window on the sparsest clause's block. Every clause
@@ -5319,7 +5313,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     *slot = f64::from(bound);
                 }
                 if degraded {
-                    degraded_window = true;
                     #[cfg(test)]
                     {
                         self.and_window_stats.lead_bound_degraded += 1;
@@ -5588,23 +5581,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         follower_exhausted = true;
                     }
                 }
-            }
-
-            // (e0) Density probe. When the window bound could not reject
-            // anything and most of the batch survived every clause, the
-            // intersection is dense: the merge kernel's slice intersection is
-            // then cheaper per document than this per-candidate advance.
-            // Nothing has been collected yet, so the query can restart on the
-            // merge kernel from a clean cursor state.
-            if has_floor && degraded_window && alive.len() * 2 >= batch_docs.len() {
-                #[cfg(test)]
-                {
-                    self.lead_kernel_fallbacks += 1;
-                }
-                for posting in self.lead.iter_mut() {
-                    posting.block_idx = 0;
-                }
-                return self.and_bulk_search(params, metrics);
             }
 
             // (e) Collect. Every survivor reached the end of the clause list,
@@ -8993,14 +8969,16 @@ mod tests {
             rows.sort_unstable();
             (rows, published, floor.load(Ordering::Relaxed))
         };
-        let (classic, _classic_published, classic_floor) =
+        let (classic, classic_published, classic_floor) =
             run(BulkAndMode::Off, BulkAndKernel::Merge);
-        let (merge, _merge_published, merge_floor) = run(BulkAndMode::On, BulkAndKernel::Merge);
-        let (lead, _lead_published, lead_floor) = run(BulkAndMode::On, BulkAndKernel::Lead);
+        let (merge, _, merge_floor) = run(BulkAndMode::On, BulkAndKernel::Merge);
+        let (lead, lead_published, lead_floor) = run(BulkAndMode::On, BulkAndKernel::Lead);
         assert_eq!(classic, merge, "merge kernel diverged on impacted blocks");
         assert_eq!(classic, lead, "lead kernel diverged on impacted blocks");
-        // Published heap order among equal scores is not part of the contract;
-        // the dump gate compares the real query output byte for byte.
+        assert_eq!(
+            classic_published, lead_published,
+            "the published order must match the classic path"
+        );
         assert_eq!(
             classic_floor, lead_floor,
             "the k-th score bits must match on impacted blocks"
