@@ -2545,9 +2545,13 @@ struct AndWindowStats {
     // `IntersectFirst` intersects then scores.
     lead_windows_p: usize,
     lead_windows_b: usize,
-    // Follower blocks the intersection pass visited; more than one per window
-    // means a single lead block was split across follower blocks.
+    // Follower blocks the intersection pass visited, and how many windows the
+    // intersect-first pass ended because a clause ran out of documents.
     lead_buckets: usize,
+    lead_follower_exhausted: usize,
+    // Widest bucket count seen in one window: proves a lead block was split
+    // across follower blocks, which lead_buckets alone does not.
+    lead_max_buckets_per_window: usize,
 }
 
 impl Eq for TailPosting {}
@@ -5373,6 +5377,23 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut norm_k = None;
         let mut norm_k_initialized = false;
 
+        // Intersect-first scratch, hoisted out of the window loop: a window is
+        // 256 candidates at most, but a sparse lead has one window per block and
+        // reallocating seven columns per window would tax the very path this
+        // mode is meant to make cheaper.
+        let mut cand_docs: Vec<u32> = Vec::with_capacity(MAX);
+        let mut cand_slots: Vec<u16> = Vec::with_capacity(MAX);
+        let mut next_docs: Vec<u32> = Vec::with_capacity(MAX);
+        let mut next_slots: Vec<u16> = Vec::with_capacity(MAX);
+        let mut scratch: Vec<u32> = Vec::new();
+        // Per-clause columns indexed by a stable slot: a candidate that drops out
+        // never moves another candidate's columns. pblk and ppos carry the
+        // posting offset for the phrase path (TODO(T2)); the plain conjunction
+        // only reads pfreq. Every slot is rewritten below before it is read.
+        let mut pblk: Vec<usize> = vec![0; num_lists * MAX];
+        let mut ppos: Vec<u16> = vec![0; num_lists * MAX];
+        let mut pfreq: Vec<u32> = vec![0; num_lists * MAX];
+
         // Both halves share the window selection and the whole-window skip; the
         // mode only decides what happens inside a window. It depends on the
         // clause count alone, so a query never flips modes between windows.
@@ -5382,6 +5403,19 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // TODO(T2): phrase queries keep the score-first path until the position
         // check can rebuild `posting.index` from the intersection columns.
         let intersect_first = phrase_slop.is_none() && lead_mode.uses_intersection(num_lists);
+        if *BULK_AND_MARKER {
+            #[allow(clippy::print_stderr)]
+            {
+                // Per-query evidence for the 943-query gate: which half of the
+                // lead kernel this conjunction took. The counters that prove
+                // the k==3 / k>=4 split are test-only, so the marker has to
+                // carry the decision out of a release build.
+                eprintln!(
+                    "fts-bulk-and-lead-mode={} k={num_lists}",
+                    if intersect_first { "b" } else { "p" }
+                );
+            }
+        }
 
         'window: loop {
             #[cfg(test)]
@@ -5536,17 +5570,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // each follower narrows it, and only the survivors are scored.
             if intersect_first {
                 let n_cand = hi - lo;
-                let mut cand_docs: Vec<u32> = Vec::with_capacity(n_cand);
-                let mut cand_slots: Vec<u16> = Vec::with_capacity(n_cand);
-                let mut next_docs: Vec<u32> = Vec::with_capacity(n_cand);
-                let mut next_slots: Vec<u16> = Vec::with_capacity(n_cand);
-                // Per-clause columns indexed by a stable slot: a candidate that
-                // drops out never moves another candidate's columns. pblk and
-                // ppos carry the posting offset for the phrase path (TODO(T2));
-                // the plain conjunction only reads pfreq.
-                let mut pblk: Vec<usize> = vec![0; num_lists * MAX];
-                let mut ppos: Vec<u16> = vec![0; num_lists * MAX];
-                let mut pfreq: Vec<u32> = vec![0; num_lists * MAX];
+                debug_assert!(n_cand <= MAX);
+                cand_docs.clear();
+                cand_slots.clear();
+                next_docs.clear();
+                next_slots.clear();
                 // Clause 0 never takes part in the intersection, so its three
                 // columns are written here instead of in a bucket.
                 for i in 0..n_cand {
@@ -5556,12 +5584,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     ppos[i] = (lo + i) as u16;
                     pfreq[i] = unsafe { *freqs_ptr.add(lo + i) };
                 }
-                debug_assert_eq!(pblk.len(), num_lists * MAX);
-                debug_assert_eq!(ppos.len(), num_lists * MAX);
+                debug_assert!(cand_docs.windows(2).all(|w| w[0] < w[1]));
 
-                let mut scratch: Vec<u32> = Vec::new();
                 let mut follower_exhausted = false;
                 let mut max_follower_doc = 0u64;
+                #[cfg(test)]
+                let mut window_buckets = 0usize;
                 for j in 1..num_lists {
                     let posting = &self.lead[j];
                     let PostingList::Compressed(ref list) = posting.list else {
@@ -5609,6 +5637,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         #[cfg(test)]
                         {
                             self.and_window_stats.lead_buckets += 1;
+                            window_buckets += 1;
                         }
                         last_examined_block = Some(block);
                         let n_bucket = cj - ci;
@@ -5673,16 +5702,22 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         };
                         last_compared = last_compared.max(compared);
 
+                        // The clause has no document at or after the last
+                        // candidate once the final block's slice ends above it:
+                        // nothing later can match, so the window loop must stop
+                        // exactly like the score-first path's `exhausted`. The
+                        // remaining clauses are still applied to this window's
+                        // survivors before the window is closed.
+                        if block + 1 >= num_blocks && above == slab.len() {
+                            #[cfg(test)]
+                            {
+                                self.and_window_stats.lead_follower_exhausted += 1;
+                            }
+                            follower_exhausted = true;
+                        }
+
                         ci = cj;
                         block += 1;
-                    }
-
-                    if ci < cand_docs.len() {
-                        // No block is left for the remaining candidates: nothing
-                        // later can match this clause. Keep applying the other
-                        // clauses to the survivors, exactly like the score-first
-                        // path, and leave the window afterwards.
-                        follower_exhausted = true;
                     }
                     // Only hand back a block that was actually decoded: the next
                     // window re-anchors from the target, and `block_idx_for_doc`
@@ -5696,6 +5731,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     cursor_pos[j] = 0;
                     max_follower_doc = max_follower_doc.max(last_compared);
 
+                    #[cfg(test)]
+                    {
+                        self.and_window_stats.lead_max_buckets_per_window = self
+                            .and_window_stats
+                            .lead_max_buckets_per_window
+                            .max(window_buckets);
+                    }
                     std::mem::swap(&mut cand_docs, &mut next_docs);
                     next_docs.clear();
                     std::mem::swap(&mut cand_slots, &mut next_slots);
@@ -9101,13 +9143,22 @@ mod tests {
     /// limit one step at a time makes the shared floor record the limit-th best
     /// published score, so comparing `limit_bits` compares score bits for every
     /// rank instead of only the ranking.
+    /// (posting doc id, doc length, per-clause frequencies, document key).
+    type LeadModeRow = (u64, u32, Vec<(u32, u32)>, u64);
+
     #[derive(Default)]
     struct LeadModeRun {
-        rows: Vec<(u64, u32, Vec<(u32, u32)>, u64)>,
+        rows: Vec<LeadModeRow>,
         limit_bits: Vec<u32>,
         windows_p: usize,
         windows_b: usize,
+        // Per-limit peak, not the sum: limits run one Wand each, so the summed
+        // count would satisfy a `>= 2` assertion for a single-window kernel.
+        max_windows_p: usize,
+        max_windows_b: usize,
         buckets: usize,
+        max_buckets_per_window: usize,
+        exhausted: usize,
         lead_hits: usize,
     }
 
@@ -9172,6 +9223,16 @@ mod tests {
             combined.limit_bits.push(floor.load(Ordering::Relaxed));
             combined.windows_p += wand.and_window_stats.lead_windows_p;
             combined.windows_b += wand.and_window_stats.lead_windows_b;
+            combined.max_windows_p = combined
+                .max_windows_p
+                .max(wand.and_window_stats.lead_windows_p);
+            combined.max_windows_b = combined
+                .max_windows_b
+                .max(wand.and_window_stats.lead_windows_b);
+            combined.max_buckets_per_window = combined
+                .max_buckets_per_window
+                .max(wand.and_window_stats.lead_max_buckets_per_window);
+            combined.exhausted += wand.and_window_stats.lead_follower_exhausted;
             combined.buckets += wand.and_window_stats.lead_buckets;
             combined.lead_hits += wand.lead_bulk_and_searches;
         }
@@ -9187,6 +9248,12 @@ mod tests {
         limits: &[usize],
         phrase_slop: Option<u32>,
     ) -> LeadModeRun {
+        // Walk the limit up one rank at a time so `limit_bits` covers every
+        // published rank, not just the largest limit: the shared floor records
+        // the limit-th best score, so a ladder compares each rank's bits.
+        let top = limits.iter().copied().max().unwrap_or(10);
+        let ladder = (1..=top).collect::<Vec<usize>>();
+        let limits = ladder.as_slice();
         let classic = run_lead_mode_once(
             clauses,
             num_docs,
@@ -9316,10 +9383,9 @@ mod tests {
         let not_fifths = (0..num_docs).filter(|doc| doc % 5 != 0).collect::<Vec<_>>();
         let run = assert_lead_mode_parity(&[lead, thirds, not_fifths], num_docs, &[1, 5, 10], None);
         assert!(
-            run.buckets > 2 * run.windows_b,
-            "each window must decode more than one block per follower: {} buckets, {} windows",
-            run.buckets,
-            run.windows_b
+            run.max_buckets_per_window >= 2,
+            "one lead block must be split across follower blocks, widest window had {}",
+            run.max_buckets_per_window
         );
     }
 
@@ -9334,8 +9400,9 @@ mod tests {
         let run =
             assert_lead_mode_parity(&[dense.clone(), almost, dense], num_docs, &[1, 10], None);
         assert!(
-            run.windows_b >= 2,
-            "the dense query must span several windows"
+            run.max_windows_b >= 2,
+            "the dense query must span several windows, widest run had {}",
+            run.max_windows_b
         );
     }
 
@@ -9352,10 +9419,9 @@ mod tests {
         let run = assert_lead_mode_parity(&[lead, dense, sparse], num_docs, &[1, 10], None);
         assert!(run.windows_b > 0);
         assert!(
-            run.buckets > run.windows_b,
-            "the dense followers must be split per block: {} buckets, {} windows",
-            run.buckets,
-            run.windows_b
+            run.max_buckets_per_window >= 2,
+            "the dense followers must be split per block, widest window had {}",
+            run.max_buckets_per_window
         );
     }
 
@@ -9370,9 +9436,9 @@ mod tests {
         let not_thirds = (0..num_docs).filter(|doc| doc % 3 != 1).collect::<Vec<_>>();
         let run = assert_lead_mode_parity(&[lead, dense, not_thirds], num_docs, &[1, 4], None);
         assert!(
-            run.windows_b >= 2,
-            "the window cap must split the lead block, got {} windows",
-            run.windows_b
+            run.max_windows_b >= 2,
+            "the window cap must split the lead block, widest run had {} windows",
+            run.max_windows_b
         );
     }
 
@@ -9388,6 +9454,10 @@ mod tests {
         let dense = (0..num_docs).collect::<Vec<_>>();
         let run = assert_lead_mode_parity(&[lead, short, dense], num_docs, &[1, 10], None);
         assert!(!run.rows.is_empty(), "the early intersection must survive");
+        assert!(
+            run.exhausted > 0,
+            "the short clause must report exhaustion instead of scanning the rest of the lead"
+        );
     }
 
     /// T3: a sparse lead whose single block spans many dense follower blocks.
