@@ -5418,20 +5418,22 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .unwrap_or_else(|| *LEAD_BULK_MODE);
         // TODO(T2): phrase queries keep the score-first path until the position
         // check can rebuild `posting.index` from the intersection columns.
-        let intersect_first = phrase_slop.is_none() && lead_mode.uses_intersection(num_lists);
-        if *BULK_AND_MARKER {
-            #[allow(clippy::print_stderr)]
-            {
-                // Per-query evidence for the 943-query gate: which half of the
-                // lead kernel this conjunction took. The counters that prove
-                // the k==3 / k>=4 split are test-only, so the marker has to
-                // carry the decision out of a release build.
-                eprintln!(
-                    "fts-bulk-and-lead-mode={} k={num_lists}",
-                    if intersect_first { "b" } else { "p" }
-                );
-            }
-        }
+        let intersect_wanted = phrase_slop.is_none() && lead_mode.uses_intersection(num_lists);
+        // Auto starts on the score-first path and switches to the intersect pass
+        // once the first windows show that the exact bound rejects almost
+        // nothing: the score-first path only pays off when it can drop
+        // candidates before decoding follower blocks, and the intersect pass
+        // only pays off when scoring every candidate was wasted.
+        let mut intersect_first = match lead_mode {
+            LeadBulkMode::IntersectFirst => true,
+            LeadBulkMode::ScoreFirst | LeadBulkMode::Auto => false,
+        };
+        // Sampled once per query from score-first windows only, then frozen:
+        // a one-way switch, so the choice never depends on the path taken.
+        let mut sampled_cand = 0usize;
+        let mut sampled_pruned = 0usize;
+        let mut sampled_windows = 0usize;
+        let mut mode_decided = !intersect_wanted;
 
         'window: loop {
             #[cfg(test)]
@@ -5889,6 +5891,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // after each clause with an exact partial score.
             let mut follower_exhausted = false;
             let mut max_follower_doc = 0u64;
+            let mut window_pruned = 0usize;
             {
                 let threshold = self.threshold;
                 let floor_mode = self.floor_mode;
@@ -5932,6 +5935,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             if *LEAD_STATS {
                                 stats_pruned += before_prune - alive.len();
                             }
+                            window_pruned += before_prune - alive.len();
                             if alive.is_empty() {
                                 break;
                             }
@@ -6094,12 +6098,40 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // (f) The next window starts past this one and past the last
             // follower document that was compared: no follower has a doc in
             // between, so nothing can match there.
+            // Freeze the mode once the sample is representative: score-first
+            // windows are the only place both candidates and prunes are
+            // observable, and the switch happens exactly once, at a window
+            // boundary, so the intersect pass re-anchors from `target`.
+            if !mode_decided && has_floor {
+                sampled_cand += hi - lo;
+                sampled_pruned += window_pruned;
+                sampled_windows += 1;
+                if sampled_cand >= 512 || sampled_windows >= 4 {
+                    mode_decided = true;
+                    let keep = sampled_pruned as f64 / sampled_cand as f64;
+                    if keep < 0.60 {
+                        intersect_first = true;
+                    }
+                }
+            }
             if follower_exhausted || window_end == TERMINATED_DOC_ID {
                 break;
             }
             target = (window_end + 1).max(max_follower_doc);
         }
 
+        if *BULK_AND_MARKER {
+            #[allow(clippy::print_stderr)]
+            {
+                // Per-query evidence for the 943-query gate: which half this
+                // conjunction ended on. Auto may start on the score-first path
+                // and switch once, so this has to be reported after the loop.
+                eprintln!(
+                    "fts-bulk-and-lead-mode={} k={num_lists}",
+                    if intersect_first { "b" } else { "p" }
+                );
+            }
+        }
         if *LEAD_STATS {
             #[allow(clippy::print_stderr)]
             {
@@ -9217,6 +9249,10 @@ mod tests {
         max_buckets_per_window: usize,
         exhausted: usize,
         lead_hits: usize,
+        // Counters of the `auto` run, copied onto the returned (forced-intersect)
+        // run so a shape test can assert on the switch itself.
+        auto_windows_p: usize,
+        auto_windows_b: usize,
     }
 
     fn run_lead_mode_once(
@@ -9362,11 +9398,14 @@ mod tests {
             );
         }
 
-        // auto: plain three-clause queries intersect first, every other shape
+        // auto: only plain three-clause queries may reach the intersect pass,
+        // and only after sampling the score-first windows; every other shape
         // keeps scoring first.
         if phrase_slop.is_none() && clauses.len() == 3 {
-            assert_eq!(auto.windows_p, 0, "auto must not score first for k=3");
-            assert!(auto.windows_b > 0, "auto must intersect first for k=3");
+            assert!(
+                auto.windows_p > 0,
+                "auto must sample the score-first path before switching"
+            );
         } else {
             assert_eq!(auto.windows_b, 0, "auto must keep scoring first here");
         }
@@ -9377,6 +9416,9 @@ mod tests {
                 .any(|&bits| bits != 0.0_f32.to_bits()),
             "the largest limit must fill the collector so scores are compared"
         );
+        let mut intersect = intersect;
+        intersect.auto_windows_p = auto.windows_p;
+        intersect.auto_windows_b = auto.windows_b;
         intersect
     }
 
@@ -9443,6 +9485,31 @@ mod tests {
             run.max_buckets_per_window >= 2,
             "one lead block must be split across follower blocks, widest window had {}",
             run.max_buckets_per_window
+        );
+    }
+
+    /// N10: when the exact bound rejects nothing, auto must leave the
+    /// score-first path after the sampling window and finish on the intersect
+    /// pass. Dense clauses plus a small limit keep the bound far above the
+    /// floor, which is exactly the shape the switch exists for.
+    #[test]
+    fn lead_auto_switches_to_intersect_when_the_bound_prunes_nothing() {
+        let num_docs = 8000u32;
+        let dense = (0..num_docs).collect::<Vec<_>>();
+        let almost = (0..num_docs)
+            .filter(|doc| doc % 64 != 0)
+            .collect::<Vec<_>>();
+        let also = (0..num_docs)
+            .filter(|doc| doc % 32 != 1)
+            .collect::<Vec<_>>();
+        let run = assert_lead_mode_parity(&[dense, almost, also], num_docs, &[1, 10], None);
+        assert!(
+            run.auto_windows_p > 0,
+            "auto must sample score-first windows"
+        );
+        assert!(
+            run.auto_windows_b > 0,
+            "auto must switch to the intersect pass when the bound prunes nothing"
         );
     }
 
@@ -14595,16 +14662,19 @@ mod tests {
             lead, classic,
             "lead-driven bulk AND must match the classic path"
         );
-        // auto intersects first only for plain three-clause conjunctions;
-        // phrase queries and every other clause count keep scoring first.
+        // auto may only reach the intersect pass for plain three-clause
+        // conjunctions, and only after sampling score-first windows; phrase
+        // queries and every other clause count never intersect first.
         if phrase || num_clauses != 3 {
             assert_eq!(
                 lead_windows.1, 0,
                 "auto must keep the score-first pass here"
             );
         } else {
-            assert_eq!(lead_windows.0, 0, "auto must intersect first for k=3");
-            assert!(lead_windows.1 > 0, "auto must intersect first for k=3");
+            assert!(
+                lead_windows.0 > 0,
+                "auto must sample the score-first pass for k=3"
+            );
         }
     }
 
