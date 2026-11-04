@@ -5441,7 +5441,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // Sampled once per query from score-first windows only, then frozen:
         // a one-way switch, so the choice never depends on the path taken.
         let mut sampled_cand = 0usize;
-        let mut sampled_pruned = 0usize;
+        let mut sampled_max_rate = 0.0f64;
         let mut sampled_windows = 0usize;
         let mut mode_decided = !intersect_wanted;
 
@@ -6113,14 +6113,24 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // observable, and the switch happens exactly once, at a window
             // boundary, so the intersect pass re-anchors from `target`.
             if !mode_decided && has_floor {
-                sampled_cand += hi - lo;
-                sampled_pruned += window_pruned;
                 sampled_windows += 1;
-                if sampled_cand >= 512 || sampled_windows >= 4 {
-                    mode_decided = true;
-                    let keep = sampled_pruned as f64 / sampled_cand as f64;
-                    if keep < 0.60 {
-                        intersect_first = true;
+                // Skip the first windows: the floor is still climbing, so the
+                // bound rejects less there than it will for the rest of the
+                // query, and sampling early systematically under-estimates the
+                // pruning. The maximum over the sampled windows is the
+                // conservative read: one window that prunes well keeps the
+                // score-first path.
+                if sampled_windows > 2 {
+                    let rate = window_pruned as f64 / (hi - lo).max(1) as f64;
+                    if rate > sampled_max_rate {
+                        sampled_max_rate = rate;
+                    }
+                    sampled_cand += hi - lo;
+                    if sampled_cand >= 2048 || sampled_windows >= 12 {
+                        mode_decided = true;
+                        if sampled_max_rate < 0.50 {
+                            intersect_first = true;
+                        }
                     }
                 }
             }
