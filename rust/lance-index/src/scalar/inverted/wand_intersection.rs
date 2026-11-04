@@ -99,6 +99,7 @@ pub(super) fn intersect_indices(left: &[u32], right: &[u32], out: &mut Vec<(u16,
     append_index_pairs(left, right, 0, 0, out);
 }
 
+#[cfg(test)]
 #[inline]
 pub(super) fn intersect_indices_scalar(left: &[u32], right: &[u32], out: &mut Vec<(u16, u16)>) {
     out.clear();

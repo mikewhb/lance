@@ -26,6 +26,8 @@ use crate::metrics::MetricsCollector;
 mod intersection;
 #[path = "wand_maxscore.rs"]
 mod maxscore;
+#[path = "wand_region.rs"]
+mod region;
 
 use super::{
     CompressedPositionStorage,
@@ -374,6 +376,32 @@ fn bulk_and_kernel_from_env() -> BulkAndKernel {
 }
 
 static BULK_AND_KERNEL: LazyLock<BulkAndKernel> = LazyLock::new(bulk_and_kernel_from_env);
+
+/// Test-only region upper bound. `Deque` calls the shared block-max walk so
+/// tests can compare how many regions each bound skips.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegionBound {
+    Level1,
+    Deque,
+}
+
+/// Test-only segment intersection choice.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegionIntersect {
+    Gallop,
+    Merge,
+}
+
+/// Test-only exact partial-score policy inside a segment.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactPolicy {
+    Always,
+    Never,
+    Auto,
+}
 
 #[cfg(target_arch = "x86_64")]
 static HAS_AVX2: LazyLock<bool> = LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
@@ -2539,6 +2567,30 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     #[cfg(test)]
     region_and_searches: usize,
     #[cfg(test)]
+    force_intersect: Option<RegionIntersect>,
+    #[cfg(test)]
+    force_exact: Option<ExactPolicy>,
+    #[cfg(test)]
+    force_region_bound: Option<RegionBound>,
+    #[cfg(test)]
+    regions: usize,
+    #[cfg(test)]
+    regions_skipped: usize,
+    #[cfg(test)]
+    region_bound_lookups: usize,
+    #[cfg(test)]
+    region_bound_level0: usize,
+    #[cfg(test)]
+    region_bound_level1: usize,
+    #[cfg(test)]
+    follower_doc_blocks_decoded: usize,
+    #[cfg(test)]
+    segments_pruned: usize,
+    #[cfg(test)]
+    gallop_segments: usize,
+    #[cfg(test)]
+    merge_segments: usize,
+    #[cfg(test)]
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
     maxscore_general_windows: usize,
@@ -2663,6 +2715,30 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             #[cfg(test)]
             region_and_searches: 0,
             #[cfg(test)]
+            force_intersect: None,
+            #[cfg(test)]
+            force_exact: None,
+            #[cfg(test)]
+            force_region_bound: None,
+            #[cfg(test)]
+            regions: 0,
+            #[cfg(test)]
+            regions_skipped: 0,
+            #[cfg(test)]
+            region_bound_lookups: 0,
+            #[cfg(test)]
+            region_bound_level0: 0,
+            #[cfg(test)]
+            region_bound_level1: 0,
+            #[cfg(test)]
+            follower_doc_blocks_decoded: 0,
+            #[cfg(test)]
+            segments_pruned: 0,
+            #[cfg(test)]
+            gallop_segments: 0,
+            #[cfg(test)]
+            merge_segments: 0,
+            #[cfg(test)]
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
             maxscore_general_windows: 0,
@@ -2693,6 +2769,24 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     #[cfg(test)]
     fn with_bulk_and_kernel(mut self, kernel: BulkAndKernel) -> Self {
         self.bulk_and_kernel_override = Some(kernel);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_region_intersect(mut self, intersect: RegionIntersect) -> Self {
+        self.force_intersect = Some(intersect);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_exact_policy(mut self, policy: ExactPolicy) -> Self {
+        self.force_exact = Some(policy);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_region_bound(mut self, bound: RegionBound) -> Self {
+        self.force_region_bound = Some(bound);
         self
     }
 
@@ -5131,16 +5225,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
-    /// Region bulk AND. S1 selects the kernel and keeps the existing bulk
-    /// results; the region loop replaces this body in S3.
-    fn and_region_search(
-        &mut self,
-        params: &FtsSearchParams,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<DocCandidate<D::Candidate>>> {
-        self.and_bulk_search(params, metrics)
-    }
-
     fn and_move_to_next_block(&mut self, target: u64) {
         self.invalidate_score_first_and_window();
         if self.threshold <= 0.0 {
@@ -6883,6 +6967,7 @@ mod tests {
         ));
     }
 
+    #[derive(Clone, Copy)]
     struct UnitScorer;
 
     impl Scorer for UnitScorer {
@@ -12412,11 +12497,13 @@ mod tests {
         assert_eq!(auto, classic);
     }
 
+    type RegionHit = (u64, u32, Vec<(u32, u32)>, u64);
+
     fn region_route_rows(
         postings: Vec<PostingIterator>,
         docs: &DocSet,
         kernel: Option<BulkAndKernel>,
-    ) -> (Vec<(u64, u32, Vec<(u32, u32)>, u64)>, usize, usize) {
+    ) -> (Vec<RegionHit>, usize, usize) {
         let mut wand = Wand::new(Operator::And, postings.into_iter(), docs, UnitScorer)
             .with_bulk_and_mode(BulkAndMode::Auto);
         if let Some(kernel) = kernel {
@@ -12516,6 +12603,8 @@ mod tests {
         .unwrap();
         assert_eq!(off.region_and_searches, 0, "bulk off also disables region");
     }
+
+    include!("wand_region_tests.rs");
 
     #[rstest]
     #[case::bulk_two(BulkAndMode::On, 2)]
