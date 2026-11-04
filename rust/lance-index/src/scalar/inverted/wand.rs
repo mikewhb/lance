@@ -5406,8 +5406,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut hit_pos: Vec<u16> = Vec::new();
         // Per-clause columns indexed by a stable slot: a candidate that drops out
         // never moves another candidate's columns. pblk and ppos carry the
-        // posting offset for the phrase path (TODO(T2)); the plain conjunction
-        // only reads pfreq. Every slot is rewritten below before it is read.
+        // posting offset for the phrase path; the plain conjunction
+        // are read by the phrase path; the plain conjunction reads pfreq only.
+        // Every slot is rewritten below before it is read.
         let mut pblk: Vec<usize> = vec![0; num_lists * MAX];
         let mut ppos: Vec<u16> = vec![0; num_lists * MAX];
         let mut pfreq: Vec<u32> = vec![0; num_lists * MAX];
@@ -5543,7 +5544,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         // evidence that pruning works. Sampling it as "nothing was
                         // pruned" would bias the decision towards the intersect
                         // pass, so it freezes the mode on the score-first path.
-                        if !mode_decided && has_floor {
+                        if !mode_decided {
                             mode_decided = true;
                         }
                         target = window_end + 1;
@@ -9571,6 +9572,62 @@ mod tests {
         assert!(
             run.auto_windows_b > 0,
             "auto must switch to the intersect pass when the bound prunes nothing"
+        );
+    }
+
+    /// N12: a window the whole-window bound skips is the strongest evidence
+    /// that pruning works, so auto must freeze on the score-first path instead
+    /// of sampling it as "nothing was pruned".
+    #[test]
+    fn lead_auto_freezes_on_score_first_after_a_whole_window_skip() {
+        let num_docs = 8000u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 24 + doc_id % 41);
+        }
+        let clauses = [
+            (0..num_docs)
+                .filter(|doc| doc % 97 == 0)
+                .collect::<Vec<_>>(),
+            (0..num_docs).collect::<Vec<_>>(),
+            (0..num_docs).filter(|doc| doc % 3 != 1).collect::<Vec<_>>(),
+        ];
+        let postings = clauses
+            .iter()
+            .enumerate()
+            .map(|(position, doc_ids)| {
+                PostingIterator::with_query_weight(
+                    format!("t{position}"),
+                    position as u32,
+                    position as u32,
+                    1.0 + position as f32 * 0.5,
+                    generate_posting_list(doc_ids.clone(), 8.0, None, true),
+                    docs.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // A floor above any reachable score makes every window skip outright.
+        let floor = Arc::new(AtomicU32::new(1.0e9_f32.to_bits()));
+        let params = FtsSearchParams::default().with_limit(Some(10));
+        let mut wand = Wand::new(
+            Operator::And,
+            postings.into_iter(),
+            &docs,
+            InverseDocLengthScorer,
+        )
+        .with_bulk_and_mode(BulkAndMode::On)
+        .with_bulk_and_kernel(BulkAndKernel::Lead)
+        .with_lead_bulk_mode(LeadBulkMode::Auto)
+        .with_shared_threshold(floor);
+        let rows = wand.search(&params, &NoOpMetricsCollector).unwrap();
+        assert!(rows.is_empty(), "nothing can beat the floor");
+        assert!(
+            wand.and_window_stats.lead_windows_skipped > 0,
+            "the fixture must be skipped by the whole-window bound"
+        );
+        assert_eq!(
+            wand.and_window_stats.lead_windows_b, 0,
+            "a skipped window must freeze auto on the score-first path"
         );
     }
 
@@ -14750,10 +14807,11 @@ mod tests {
             lead, classic,
             "lead-driven bulk AND must match the classic path"
         );
-        // auto may only reach the intersect pass for plain three-clause
-        // conjunctions, and only after sampling score-first windows; phrase
-        // queries and every other clause count never intersect first.
-        if phrase || num_clauses != 3 {
+        // auto may only reach the intersect pass for three-clause conjunctions,
+        // and only after sampling score-first windows. Phrases are not excluded,
+        // but this fixture has too few windows to reach the sampling threshold,
+        // so it stays on the score-first path.
+        if num_clauses != 3 {
             assert_eq!(
                 lead_windows.1, 0,
                 "auto must keep the score-first pass here"
