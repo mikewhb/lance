@@ -447,6 +447,11 @@ static LEAD_BULK_MODE: LazyLock<LeadBulkMode> = LazyLock::new(lead_bulk_mode_fro
 static BULK_AND_MARKER: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("LANCE_FTS_BULK_AND_MARKER").is_some());
 
+// Per-query shape counters for offline analysis. Off unless the variable is
+// set, so timed runs pay one predictable branch per window and no atomics.
+static LEAD_STATS: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("LANCE_FTS_BULK_AND_STATS").is_some());
+
 #[cfg(target_arch = "x86_64")]
 static HAS_AVX2: LazyLock<bool> = LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
 
@@ -5394,6 +5399,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut ppos: Vec<u16> = vec![0; num_lists * MAX];
         let mut pfreq: Vec<u32> = vec![0; num_lists * MAX];
 
+        // Shape counters for the offline profile (see LEAD_STATS).
+        let mut stats_windows_p = 0usize;
+        let mut stats_windows_b = 0usize;
+        let mut stats_cand = 0usize;
+        let mut stats_pruned = 0usize;
+
         // Both halves share the window selection and the whole-window skip; the
         // mode only decides what happens inside a window. It depends on the
         // clause count alone, so a query never flips modes between windows.
@@ -5425,6 +5436,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     self.and_window_stats.lead_windows_b += 1;
                 } else {
                     self.and_window_stats.lead_windows_p += 1;
+                }
+            }
+            if *LEAD_STATS {
+                if intersect_first {
+                    stats_windows_b += 1;
+                } else {
+                    stats_windows_p += 1;
                 }
             }
             self.raise_to_shared_floor(params.wand_factor);
@@ -5804,6 +5822,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 continue 'window;
             }
 
+            if *LEAD_STATS {
+                stats_cand += hi - lo;
+            }
             batch_docs.clear();
             alive.clear();
             for i in 0..(hi - lo) {
@@ -5870,7 +5891,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         if exclusive && limit.is_none() {
                             // Nothing is rejected: skip the pass.
                         } else {
-                            #[cfg(test)]
                             let before_prune = alive.len();
                             match limit {
                                 Some(limit) => alive.retain(|&i| partial[i] > limit),
@@ -5884,6 +5904,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             {
                                 self.and_window_stats.lead_alive_pruned +=
                                     before_prune - alive.len();
+                            }
+                            if *LEAD_STATS {
+                                stats_pruned += before_prune - alive.len();
                             }
                             if alive.is_empty() {
                                 break;
@@ -6053,6 +6076,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             target = (window_end + 1).max(max_follower_doc);
         }
 
+        if *LEAD_STATS {
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!(
+                    "fts-bulk-and-stats k={num_lists} mode={} windows_p={stats_windows_p} \
+                     windows_b={stats_windows_b} cand={stats_cand} pruned={stats_pruned}",
+                    if intersect_first { "b" } else { "p" }
+                );
+            }
+        }
         metrics.record_comparisons(num_comparisons);
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
