@@ -331,6 +331,50 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
 
+/// Which bulk AND kernel runs when bulk conjunction search is enabled.
+/// `LANCE_FTS_BULK_AND_KERNEL` accepts `merge` (default) or `region`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BulkAndKernel {
+    #[default]
+    Merge,
+    Region,
+}
+
+impl BulkAndKernel {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("merge") {
+            Some(Self::Merge)
+        } else if value.eq_ignore_ascii_case("region") {
+            Some(Self::Region)
+        } else {
+            None
+        }
+    }
+}
+
+fn bulk_and_kernel_from_env() -> BulkAndKernel {
+    match std::env::var("LANCE_FTS_BULK_AND_KERNEL") {
+        Ok(value) => BulkAndKernel::parse(&value).unwrap_or_else(|| {
+            log::warn!(
+                "Invalid LANCE_FTS_BULK_AND_KERNEL value {value:?}; expected merge or region; \
+                 falling back to merge"
+            );
+            BulkAndKernel::Merge
+        }),
+        Err(std::env::VarError::NotPresent) => BulkAndKernel::Merge,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            log::warn!(
+                "Invalid non-Unicode LANCE_FTS_BULK_AND_KERNEL value {value:?}; expected merge \
+                 or region; falling back to merge"
+            );
+            BulkAndKernel::Merge
+        }
+    }
+}
+
+static BULK_AND_KERNEL: LazyLock<BulkAndKernel> = LazyLock::new(bulk_and_kernel_from_env);
+
 #[cfg(target_arch = "x86_64")]
 static HAS_AVX2: LazyLock<bool> = LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
 
@@ -1648,6 +1692,19 @@ impl PostingIterator {
         matches!(self.list, PostingList::Compressed(_))
     }
 
+    /// Postings whose block max is a real per-block or per-impact bound.
+    ///
+    /// 256-document blocks without impacts only have a scorer-wide ceiling,
+    /// which is too loose to drive a region. Grouped terms are excluded by
+    /// the caller. Mirrors the v2 predicate: no scorer ceiling, and either
+    /// impacts or a block size other than 256.
+    #[inline]
+    fn has_window_bounds(&self) -> bool {
+        !self.use_scorer_upper_bound
+            && matches!(&self.list, PostingList::Compressed(list)
+                if list.impacts.is_some() || list.block_size != MAX_POSTING_BLOCK_SIZE)
+    }
+
     #[inline]
     fn has_next_compressed_block(&self) -> bool {
         match self.list {
@@ -2476,8 +2533,11 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Test-only override for comparing bulk and classic conjunctions without
     // mutating the process-wide environment.
     bulk_and_mode_override: Option<BulkAndMode>,
+    bulk_and_kernel_override: Option<BulkAndKernel>,
     #[cfg(test)]
     bulk_and_searches: usize,
+    #[cfg(test)]
+    region_and_searches: usize,
     #[cfg(test)]
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
@@ -2597,8 +2657,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             #[cfg(test)]
             and_window_stats: AndWindowStats::default(),
             bulk_and_mode_override: None,
+            bulk_and_kernel_override: None,
             #[cfg(test)]
             bulk_and_searches: 0,
+            #[cfg(test)]
+            region_and_searches: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
@@ -2623,6 +2686,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     #[cfg(test)]
     fn with_bulk_and_mode(mut self, mode: BulkAndMode) -> Self {
         self.bulk_and_mode_override = Some(mode);
+        self
+    }
+
+    /// Test hook: force the region bulk kernel without touching the process env.
+    #[cfg(test)]
+    fn with_bulk_and_kernel(mut self, kernel: BulkAndKernel) -> Self {
+        self.bulk_and_kernel_override = Some(kernel);
         self
     }
 
@@ -2743,6 +2813,34 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             })
         {
             return self.maxscore_search(params, metrics);
+        }
+
+        // Region kernel. Independent of the bulk route below; that condition
+        // is left unchanged. Unset kernel stays Merge, so this is false.
+        if self.operator == Operator::And
+            && self.lead.len() >= 2
+            && self
+                .bulk_and_mode_override
+                .unwrap_or_else(|| *BULK_AND_MODE)
+                != BulkAndMode::Off
+            && self
+                .bulk_and_kernel_override
+                .unwrap_or_else(|| *BULK_AND_KERNEL)
+                == BulkAndKernel::Region
+            && params.phrase_slop.is_none()
+            && self.lead.iter().all(|posting| {
+                posting.is_compressed()
+                    && !posting.has_grouped_terms()
+                    && posting.has_window_bounds()
+                    && matches!(&posting.list, PostingList::Compressed(list)
+                        if list.block_size != MAX_POSTING_BLOCK_SIZE)
+            })
+        {
+            #[cfg(test)]
+            {
+                self.region_and_searches += 1;
+            }
+            return self.and_region_search(params, metrics);
         }
 
         // Top-k conjunctions (AND and phrase) over compressed lists use the
@@ -5031,6 +5129,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         metrics.record_comparisons(num_comparisons);
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
+    }
+
+    /// Region bulk AND. S1 selects the kernel and keeps the existing bulk
+    /// results; the region loop replaces this body in S3.
+    fn and_region_search(
+        &mut self,
+        params: &FtsSearchParams,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<DocCandidate<D::Candidate>>> {
+        self.and_bulk_search(params, metrics)
     }
 
     fn and_move_to_next_block(&mut self, target: u64) {
@@ -12302,6 +12410,111 @@ mod tests {
         assert!(!bulk.0.is_empty(), "test corpus should produce matches");
         assert_eq!(bulk, classic);
         assert_eq!(auto, classic);
+    }
+
+    fn region_route_rows(
+        postings: Vec<PostingIterator>,
+        docs: &DocSet,
+        kernel: Option<BulkAndKernel>,
+    ) -> (Vec<(u64, u32, Vec<(u32, u32)>, u64)>, usize, usize) {
+        let mut wand = Wand::new(Operator::And, postings.into_iter(), docs, UnitScorer)
+            .with_bulk_and_mode(BulkAndMode::Auto);
+        if let Some(kernel) = kernel {
+            wand = wand.with_bulk_and_kernel(kernel);
+        }
+        let rows = wand
+            .search(
+                &FtsSearchParams::default().with_limit(Some(10)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|candidate| {
+                (
+                    candidate.posting_doc_id,
+                    candidate.doc_length,
+                    candidate.freqs,
+                    candidate.document,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut rows = rows;
+        rows.sort_unstable();
+        (rows, wand.bulk_and_searches, wand.region_and_searches)
+    }
+
+    #[test]
+    fn region_kernel_unset_skips_wide_128_and_256_lists() {
+        let num_docs = (BLOCK_SIZE * 2) as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 8);
+        }
+        let clause = |salt: u32| {
+            (0..num_docs)
+                .filter(|doc| doc.wrapping_add(salt) % 3 == 0)
+                .collect::<Vec<_>>()
+        };
+        let build = |block_size: usize| {
+            (0..4)
+                .map(|term| {
+                    let doc_ids = clause(term);
+                    let len = doc_ids.len();
+                    let list = if block_size == MAX_POSTING_BLOCK_SIZE {
+                        generate_impact_posting_list_with_freqs_and_block_size(
+                            doc_ids,
+                            vec![1; len],
+                            vec![8; len],
+                            block_size,
+                        )
+                    } else {
+                        generate_posting_list(doc_ids, 1.0, None, true)
+                    };
+                    PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term,
+                        term,
+                        1.0,
+                        list,
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let (classic_128, bulk_128, region_128) = region_route_rows(build(BLOCK_SIZE), &docs, None);
+        assert_eq!(bulk_128, 0, "auto must not bulk a 4-clause 128-block AND");
+        assert_eq!(
+            region_128, 0,
+            "unset kernel must not enter the region kernel"
+        );
+
+        let (_rows_256, _bulk_256, region_256) =
+            region_route_rows(build(MAX_POSTING_BLOCK_SIZE), &docs, None);
+        assert_eq!(
+            region_256, 0,
+            "256-block lists stay out of the region kernel"
+        );
+
+        let (region_rows, _bulk, region_hits) =
+            region_route_rows(build(BLOCK_SIZE), &docs, Some(BulkAndKernel::Region));
+        assert_eq!(region_hits, 1);
+        assert_eq!(region_rows, classic_128);
+
+        let mut off = Wand::new(
+            Operator::And,
+            build(BLOCK_SIZE).into_iter(),
+            &docs,
+            UnitScorer,
+        )
+        .with_bulk_and_mode(BulkAndMode::Off)
+        .with_bulk_and_kernel(BulkAndKernel::Region);
+        off.search(
+            &FtsSearchParams::default().with_limit(Some(10)),
+            &NoOpMetricsCollector,
+        )
+        .unwrap();
+        assert_eq!(off.region_and_searches, 0, "bulk off also disables region");
     }
 
     #[rstest]
