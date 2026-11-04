@@ -405,14 +405,15 @@ impl LeadBulkMode {
         }
     }
 
-    /// Auto only considers bulk conjunctions (three clauses or more) for the
-    /// intersection pass; two-clause queries stay on the merge kernel. Phrases
-    /// are not excluded: the intersect pass rebuilds `posting.index` from its
-    /// per-clause columns before running the same position check. Within that
-    /// set the per-query sampling decides whether to switch.
+    /// Auto only considers three-clause conjunctions for the intersection
+    /// pass: that is the shape where scoring first spends BM25 work on
+    /// documents the followers never match, and where the intersection is
+    /// still cheap. Wider conjunctions keep scoring first. Phrases are not
+    /// excluded here: the intersect pass rebuilds `posting.index` from its
+    /// per-clause columns before running the same position check.
     const fn uses_intersection(self, num_clauses: usize) -> bool {
         match self {
-            Self::Auto => num_clauses >= 3,
+            Self::Auto => num_clauses == 3,
             Self::ScoreFirst => false,
             Self::IntersectFirst => true,
         }
@@ -9447,16 +9448,17 @@ mod tests {
             );
         }
 
-        // auto: every bulk conjunction starts on the score-first path and only
-        // switches after sampling. Two-clause queries never reach the lead
-        // kernel, so they must not report intersect windows.
-        if clauses.len() >= 3 {
+        // auto: only plain three-clause queries may reach the intersect pass,
+        // and only after sampling the score-first windows; every other shape
+        // keeps scoring first. Phrases are not special: they are served by the
+        // intersect pass too.
+        if clauses.len() == 3 {
             assert!(
                 auto.windows_p > 0,
                 "auto must sample the score-first path before switching"
             );
         } else {
-            assert_eq!(auto.windows_b, 0, "k=2 must keep scoring first");
+            assert_eq!(auto.windows_b, 0, "auto must keep scoring first here");
         }
         assert!(
             classic
@@ -9480,7 +9482,7 @@ mod tests {
         assert_eq!(LeadBulkMode::parse(""), None);
         assert!(!LeadBulkMode::Auto.uses_intersection(2));
         assert!(LeadBulkMode::Auto.uses_intersection(3));
-        assert!(LeadBulkMode::Auto.uses_intersection(4));
+        assert!(!LeadBulkMode::Auto.uses_intersection(4));
         assert!(LeadBulkMode::IntersectFirst.uses_intersection(9));
         assert!(!LeadBulkMode::ScoreFirst.uses_intersection(3));
     }
@@ -9523,9 +9525,8 @@ mod tests {
     /// posting.index from pblk/ppos), so the gate is the clause count alone.
     #[test]
     fn lead_intersect_gate_follows_the_clause_count() {
-        assert!(!lead_intersect_requested(LeadBulkMode::Auto, 2));
         assert!(lead_intersect_requested(LeadBulkMode::Auto, 3));
-        assert!(lead_intersect_requested(LeadBulkMode::Auto, 4));
+        assert!(!lead_intersect_requested(LeadBulkMode::Auto, 4));
         assert!(!lead_intersect_requested(LeadBulkMode::ScoreFirst, 3));
         // A forced run bypasses the clause-count gate.
         assert!(lead_intersect_requested(LeadBulkMode::IntersectFirst, 4));
@@ -14806,11 +14807,11 @@ mod tests {
             lead, classic,
             "lead-driven bulk AND must match the classic path"
         );
-        // auto starts every bulk conjunction on the score-first path and only
-        // switches after sampling. This fixture has too few windows to reach
-        // the sampling threshold, so it stays there; only k=2 (which never
-        // enters the lead kernel) is asserted to stay put.
-        if num_clauses < 3 {
+        // auto may only reach the intersect pass for three-clause conjunctions,
+        // and only after sampling score-first windows. Phrases are not excluded,
+        // but this fixture has too few windows to reach the sampling threshold,
+        // so it stays on the score-first path.
+        if num_clauses != 3 {
             assert_eq!(
                 lead_windows.1, 0,
                 "auto must keep the score-first pass here"
