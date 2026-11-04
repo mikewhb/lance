@@ -405,11 +405,12 @@ impl LeadBulkMode {
         }
     }
 
-    /// Auto only switches three-clause conjunctions to the intersection pass:
-    /// that is the shape where scoring first spends BM25 work on documents the
-    /// followers never match, and where the intersection is still cheap. Wider
-    /// conjunctions keep scoring first. Phrase queries are excluded by the
-    /// caller until the position path reads the per-clause columns.
+    /// Auto only considers three-clause conjunctions for the intersection
+    /// pass: that is the shape where scoring first spends BM25 work on
+    /// documents the followers never match, and where the intersection is
+    /// still cheap. Wider conjunctions keep scoring first. Phrases are not
+    /// excluded here: the intersect pass rebuilds `posting.index` from its
+    /// per-clause columns before running the same position check.
     const fn uses_intersection(self, num_clauses: usize) -> bool {
         match self {
             Self::Auto => num_clauses == 3,
@@ -419,9 +420,9 @@ impl LeadBulkMode {
     }
 }
 
-/// Whether a conjunction may take the intersect pass at all. Phrase queries
-/// cannot: their position check reads `posting.index`, which only the
-/// score-first batch builds.
+/// Whether a conjunction may take the intersect pass at all. The gate is the
+/// clause count alone; phrases are served too, because the intersect pass
+/// rebuilds `posting.index` from `pblk`/`ppos` before the position check.
 fn lead_intersect_requested(mode: LeadBulkMode, num_clauses: usize) -> bool {
     mode.uses_intersection(num_clauses)
 }
@@ -5418,8 +5419,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut stats_pruned = 0usize;
 
         // Both halves share the window selection and the whole-window skip; the
-        // mode only decides what happens inside a window. It depends on the
-        // clause count alone, so a query never flips modes between windows.
+        // mode only decides what happens inside a window. Auto samples the
+        // first score-first windows and then freezes the choice, so a query
+        // switches at most once, at a window boundary.
         let lead_mode = self
             .lead_bulk_mode_override
             .unwrap_or_else(|| *LEAD_BULK_MODE);
@@ -5435,7 +5437,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut sampled_cand = 0usize;
         let mut sampled_max_rate = 0.0f64;
         let mut sampled_windows = 0usize;
-        let mut mode_decided = !intersect_wanted;
+        let mut mode_decided = intersect_first || !intersect_wanted;
 
         'window: loop {
             #[cfg(test)]
@@ -5447,12 +5449,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     self.and_window_stats.lead_windows_p += 1;
                 }
             }
-            if *LEAD_STATS {
-                if intersect_first {
-                    stats_windows_b += 1;
-                } else {
-                    stats_windows_p += 1;
-                }
+            if intersect_first {
+                stats_windows_b += 1;
+            } else {
+                stats_windows_p += 1;
             }
             self.raise_to_shared_floor(params.wand_factor);
             let has_floor = self.threshold > 0.0;
@@ -5538,6 +5538,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         }
                         if lead_block_is_last || window_end == TERMINATED_DOC_ID {
                             break;
+                        }
+                        // A window the bound skipped outright is the strongest
+                        // evidence that pruning works. Sampling it as "nothing was
+                        // pruned" would bias the decision towards the intersect
+                        // pass, so it freezes the mode on the score-first path.
+                        if !mode_decided && has_floor {
+                            mode_decided = true;
                         }
                         target = window_end + 1;
                         continue 'window;
@@ -5837,10 +5844,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         // matched, so the index is the same
                         // `(block << shift) | pos` the score-first batch stores.
                         for (clause, posting) in self.lead.iter_mut().enumerate() {
-                            let shift = match posting.list {
-                                PostingList::Compressed(ref list) => list.block_shift(),
-                                PostingList::Plain(_) => 0,
+                            let PostingList::Compressed(ref list) = posting.list else {
+                                unreachable!("bulk AND requires compressed postings");
                             };
+                            let shift = list.block_shift();
                             posting.index = (pblk[clause * MAX + slot] as usize) << shift
                                 | ppos[clause * MAX + slot] as usize;
                             posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
@@ -6167,8 +6174,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 // conjunction ended on. Auto may start on the score-first path
                 // and switch once, so this has to be reported after the loop.
                 eprintln!(
-                    "fts-bulk-and-lead-mode={} k={num_lists}",
-                    if intersect_first { "b" } else { "p" }
+                    "fts-bulk-and-lead-mode={} k={num_lists} windows_p={stats_windows_p} \
+                     windows_b={stats_windows_b}",
+                    if stats_windows_b > 0 { "b" } else { "p" }
                 );
             }
         }
@@ -6177,8 +6185,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             {
                 eprintln!(
                     "fts-bulk-and-stats k={num_lists} mode={} windows_p={stats_windows_p} \
-                     windows_b={stats_windows_b} cand={stats_cand} pruned={stats_pruned}",
-                    if intersect_first { "b" } else { "p" }
+                     windows_b={stats_windows_b} cand={stats_cand} pruned={stats_pruned} \
+                     sampled_windows={sampled_windows} max_rate={sampled_max_rate:.3}",
+                    if stats_windows_b > 0 { "b" } else { "p" }
                 );
             }
         }
@@ -9440,8 +9449,9 @@ mod tests {
 
         // auto: only plain three-clause queries may reach the intersect pass,
         // and only after sampling the score-first windows; every other shape
-        // keeps scoring first.
-        if phrase_slop.is_none() && clauses.len() == 3 {
+        // keeps scoring first. Phrases are not special: they are served by the
+        // intersect pass too.
+        if clauses.len() == 3 {
             assert!(
                 auto.windows_p > 0,
                 "auto must sample the score-first path before switching"
@@ -9929,7 +9939,7 @@ mod tests {
         };
         let mut params = FtsSearchParams::default().with_limit(Some(10));
         params.phrase_slop = Some(slop);
-        let run = |mode, kernel| {
+        let run = |mode, kernel, lead_mode: LeadBulkMode| {
             let mut wand = Wand::new(
                 Operator::And,
                 build().into_iter(),
@@ -9937,7 +9947,8 @@ mod tests {
                 InverseDocLengthScorer,
             )
             .with_bulk_and_mode(mode)
-            .with_bulk_and_kernel(kernel);
+            .with_bulk_and_kernel(kernel)
+            .with_lead_bulk_mode(lead_mode);
             let mut rows = wand
                 .search(&params, &NoOpMetricsCollector)
                 .unwrap()
@@ -9952,15 +9963,41 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             rows.sort_unstable();
-            (rows, wand.lead_bulk_and_searches)
+            (
+                rows,
+                wand.lead_bulk_and_searches,
+                wand.and_window_stats.lead_windows_b,
+            )
         };
-        let (classic, _) = run(BulkAndMode::Off, BulkAndKernel::Merge);
-        let (merge, _) = run(BulkAndMode::On, BulkAndKernel::Merge);
-        let (lead, lead_hits) = run(BulkAndMode::On, BulkAndKernel::Lead);
+        let (classic, _, _) = run(BulkAndMode::Off, BulkAndKernel::Merge, LeadBulkMode::Auto);
+        let (merge, _, _) = run(BulkAndMode::On, BulkAndKernel::Merge, LeadBulkMode::Auto);
+        let (score_first, hits, _) = run(
+            BulkAndMode::On,
+            BulkAndKernel::Lead,
+            LeadBulkMode::ScoreFirst,
+        );
+        // The intersect pass serves phrases too: it rebuilds posting.index from
+        // its per-clause columns. This is the only test that exercises that
+        // path, and it compares the published rows against the classic kernel.
+        let (intersect, _, windows_b) = run(
+            BulkAndMode::On,
+            BulkAndKernel::Lead,
+            LeadBulkMode::IntersectFirst,
+        );
+        let (auto, _, _) = run(BulkAndMode::On, BulkAndKernel::Lead, LeadBulkMode::Auto);
         assert_eq!(classic, merge, "merge kernel diverged on a phrase query");
-        assert_eq!(classic, lead, "lead kernel diverged on a phrase query");
-        assert!(lead_hits > 0, "the lead kernel must handle phrase queries");
-        lead.len()
+        assert_eq!(
+            classic, score_first,
+            "lead score-first diverged on a phrase"
+        );
+        assert_eq!(
+            classic, intersect,
+            "lead intersect-first diverged on a phrase"
+        );
+        assert_eq!(classic, auto, "lead auto diverged on a phrase");
+        assert!(hits > 0, "the lead kernel must handle phrase queries");
+        assert!(windows_b > 0, "the intersection pass must run for phrases");
+        intersect.len()
     }
 
     /// T8: phrase candidates whose clause positions straddle follower blocks,
