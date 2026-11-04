@@ -378,6 +378,69 @@ fn bulk_and_kernel_from_env() -> BulkAndKernel {
 
 static BULK_AND_KERNEL: LazyLock<BulkAndKernel> = LazyLock::new(bulk_and_kernel_from_env);
 
+// Which half of the lead kernel runs: `ScoreFirst` (P) scores every lead
+// document in the window and then prunes clause by clause, `IntersectFirst`
+// (B) intersects the clauses first and only scores the survivors. Both must
+// publish the same top-k, so the switch only moves work around.
+// LANCE_FTS_BULK_AND_LEAD_MODE accepts auto (default), p, or b.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LeadBulkMode {
+    #[default]
+    Auto,
+    ScoreFirst,
+    IntersectFirst,
+}
+
+impl LeadBulkMode {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("auto") {
+            Some(Self::Auto)
+        } else if value.eq_ignore_ascii_case("p") {
+            Some(Self::ScoreFirst)
+        } else if value.eq_ignore_ascii_case("b") {
+            Some(Self::IntersectFirst)
+        } else {
+            None
+        }
+    }
+
+    /// Auto only switches three-clause conjunctions to the intersection pass:
+    /// that is the shape where scoring first spends BM25 work on documents the
+    /// followers never match, and where the intersection is still cheap. Wider
+    /// conjunctions keep scoring first. Phrase queries are excluded by the
+    /// caller until the position path reads the per-clause columns.
+    const fn uses_intersection(self, num_clauses: usize) -> bool {
+        match self {
+            Self::Auto => num_clauses == 3,
+            Self::ScoreFirst => false,
+            Self::IntersectFirst => true,
+        }
+    }
+}
+
+fn lead_bulk_mode_from_env() -> LeadBulkMode {
+    match std::env::var("LANCE_FTS_BULK_AND_LEAD_MODE") {
+        Ok(value) => LeadBulkMode::parse(&value).unwrap_or_else(|| {
+            log::warn!(
+                "Invalid LANCE_FTS_BULK_AND_LEAD_MODE value {value:?}; expected auto, p, or b; \
+                 falling back to auto"
+            );
+            LeadBulkMode::Auto
+        }),
+        Err(std::env::VarError::NotPresent) => LeadBulkMode::Auto,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            log::warn!(
+                "Invalid non-Unicode LANCE_FTS_BULK_AND_LEAD_MODE value {value:?}; expected \
+                 auto, p, or b; falling back to auto"
+            );
+            LeadBulkMode::Auto
+        }
+    }
+}
+
+static LEAD_BULK_MODE: LazyLock<LeadBulkMode> = LazyLock::new(lead_bulk_mode_from_env);
+
 // The release harness (`do_query`) installs no logger, so `log` output never
 // reaches it and cannot attest which kernel ran. This stderr marker is inert
 // unless its own env var is set, which keeps default runs silent.
@@ -2478,6 +2541,13 @@ struct AndWindowStats {
     lead_follower_block_switches: usize,
     lead_alive_pruned: usize,
     lead_bound_degraded: usize,
+    // Which half of the lead kernel ran: `ScoreFirst` scores then prunes,
+    // `IntersectFirst` intersects then scores.
+    lead_windows_p: usize,
+    lead_windows_b: usize,
+    // Follower blocks the intersection pass visited; more than one per window
+    // means a single lead block was split across follower blocks.
+    lead_buckets: usize,
 }
 
 impl Eq for TailPosting {}
@@ -2556,6 +2626,7 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // mutating the process-wide environment.
     bulk_and_mode_override: Option<BulkAndMode>,
     bulk_and_kernel_override: Option<BulkAndKernel>,
+    lead_bulk_mode_override: Option<LeadBulkMode>,
     // Minimum clause count for the lead kernel. Production keeps two-clause
     // conjunctions on the merge kernel; tests force the kernel directly so the
     // kernel itself keeps two-clause coverage.
@@ -2693,6 +2764,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             and_window_stats: AndWindowStats::default(),
             bulk_and_mode_override: None,
             bulk_and_kernel_override: None,
+            lead_bulk_mode_override: None,
             #[cfg(test)]
             lead_kernel_min_clauses: 3,
             #[cfg(test)]
@@ -2727,6 +2799,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     #[cfg(test)]
     fn with_bulk_and_mode(mut self, mode: BulkAndMode) -> Self {
         self.bulk_and_mode_override = Some(mode);
+        self
+    }
+
+    /// Test hook for A/B-ing the two halves of the lead kernel in one process.
+    #[cfg(test)]
+    fn with_lead_bulk_mode(mut self, mode: LeadBulkMode) -> Self {
+        self.lead_bulk_mode_override = Some(mode);
         self
     }
 
@@ -5294,10 +5373,25 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut norm_k = None;
         let mut norm_k_initialized = false;
 
+        // Both halves share the window selection and the whole-window skip; the
+        // mode only decides what happens inside a window. It depends on the
+        // clause count alone, so a query never flips modes between windows.
+        let lead_mode = self
+            .lead_bulk_mode_override
+            .unwrap_or_else(|| *LEAD_BULK_MODE);
+        // TODO(T2): phrase queries keep the score-first path until the position
+        // check can rebuild `posting.index` from the intersection columns.
+        let intersect_first = phrase_slop.is_none() && lead_mode.uses_intersection(num_lists);
+
         'window: loop {
             #[cfg(test)]
             {
                 self.and_window_stats.lead_windows += 1;
+                if intersect_first {
+                    self.and_window_stats.lead_windows_b += 1;
+                } else {
+                    self.and_window_stats.lead_windows_p += 1;
+                }
             }
             self.raise_to_shared_floor(params.wand_factor);
             let has_floor = self.threshold > 0.0;
@@ -5437,6 +5531,236 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let norm_k_ref = norm_k
                 .as_ref()
                 .map(|(norms, cache)| (*norms, cache.as_ref()));
+
+            // (d-B) Intersection first: the lead slice is the candidate set,
+            // each follower narrows it, and only the survivors are scored.
+            if intersect_first {
+                let n_cand = hi - lo;
+                let mut cand_docs: Vec<u32> = Vec::with_capacity(n_cand);
+                let mut cand_slots: Vec<u16> = Vec::with_capacity(n_cand);
+                let mut next_docs: Vec<u32> = Vec::with_capacity(n_cand);
+                let mut next_slots: Vec<u16> = Vec::with_capacity(n_cand);
+                // Per-clause columns indexed by a stable slot: a candidate that
+                // drops out never moves another candidate's columns. pblk and
+                // ppos carry the posting offset for the phrase path (TODO(T2));
+                // the plain conjunction only reads pfreq.
+                let mut pblk: Vec<usize> = vec![0; num_lists * MAX];
+                let mut ppos: Vec<u16> = vec![0; num_lists * MAX];
+                let mut pfreq: Vec<u32> = vec![0; num_lists * MAX];
+                // Clause 0 never takes part in the intersection, so its three
+                // columns are written here instead of in a bucket.
+                for i in 0..n_cand {
+                    cand_docs.push(unsafe { *docs_ptr.add(lo + i) });
+                    cand_slots.push(i as u16);
+                    pblk[i] = lead_block;
+                    ppos[i] = (lo + i) as u16;
+                    pfreq[i] = unsafe { *freqs_ptr.add(lo + i) };
+                }
+                debug_assert_eq!(pblk.len(), num_lists * MAX);
+                debug_assert_eq!(ppos.len(), num_lists * MAX);
+
+                let mut scratch: Vec<u32> = Vec::new();
+                let mut follower_exhausted = false;
+                let mut max_follower_doc = 0u64;
+                for j in 1..num_lists {
+                    let posting = &self.lead[j];
+                    let PostingList::Compressed(ref list) = posting.list else {
+                        unreachable!("bulk AND requires compressed postings");
+                    };
+                    let num_blocks = list.blocks.len();
+                    // Re-anchor at the window target instead of handing the
+                    // cursor over from the previous window.
+                    let mut block = posting.block_idx_for_doc(list, posting.block_idx, target32);
+                    // Candidates ascend, so the bucket scan only moves forward.
+                    let mut ci = 0usize;
+                    let upper = *cand_docs.last().expect("the window has candidates");
+                    let mut last_compared = 0u64;
+                    let mut last_examined_block = None;
+                    while block < num_blocks && ci < cand_docs.len() {
+                        let slab_first = u64::from(list.block_least_doc_id(block));
+                        while ci < cand_docs.len() && u64::from(cand_docs[ci]) < slab_first {
+                            ci += 1;
+                        }
+                        if ci == cand_docs.len() {
+                            break;
+                        }
+                        // A lead block can cover several follower blocks. The
+                        // blocks partition the candidate range, so a bucket owns
+                        // exactly the candidates below the next block's first
+                        // document.
+                        let block_upper = if block + 1 < num_blocks {
+                            u64::from(list.block_least_doc_id(block + 1))
+                        } else {
+                            u64::from(upper) + 1
+                        };
+                        if block_upper <= u64::from(cand_docs[ci]) {
+                            block += 1;
+                            continue;
+                        }
+                        let cj = ci
+                            + cand_docs[ci..].partition_point(|&doc| u64::from(doc) < block_upper);
+                        // One decoded block at a time: doc ids and frequencies
+                        // share this state and stay valid until the next bucket.
+                        let state = unsafe { &*posting.ensure_compressed_block_ptr(list, block) };
+                        let slab = state.doc_ids.as_slice();
+                        let freqs = state.freqs.as_slice();
+                        debug_assert_eq!(slab.len(), freqs.len());
+
+                        #[cfg(test)]
+                        {
+                            self.and_window_stats.lead_buckets += 1;
+                        }
+                        last_examined_block = Some(block);
+                        let n_bucket = cj - ci;
+                        if slab.len() <= 8 * n_bucket {
+                            // Dense enough for the SIMD slice intersection: its
+                            // output is the ascending subset of the candidates.
+                            intersection::intersect(&cand_docs[ci..cj], slab, &mut scratch);
+                            // Recover slot, block-local position and frequency in
+                            // the same pass: the block is gone once the next
+                            // bucket decodes.
+                            let mut slot_idx = ci;
+                            let mut slab_pos = 0usize;
+                            for &doc in scratch.iter() {
+                                while cand_docs[slot_idx] < doc {
+                                    slot_idx += 1;
+                                }
+                                while slab[slab_pos] < doc {
+                                    slab_pos += 1;
+                                }
+                                let slot = cand_slots[slot_idx] as usize;
+                                pblk[j * MAX + slot] = block;
+                                ppos[j * MAX + slot] = slab_pos as u16;
+                                pfreq[j * MAX + slot] = freqs[slab_pos];
+                                next_docs.push(doc);
+                                next_slots.push(cand_slots[slot_idx]);
+                            }
+                        } else {
+                            // Sparse candidates against a wide block: gallop per
+                            // candidate, the same choice the merge kernel makes
+                            // for its two- and three-clause path.
+                            let mut slab_pos = 0usize;
+                            for k in ci..cj {
+                                let doc = cand_docs[k];
+                                slab_pos = find_next_geq_in_block(slab, slab_pos, doc);
+                                if slab_pos == slab.len() {
+                                    break;
+                                }
+                                if slab[slab_pos] != doc {
+                                    continue;
+                                }
+                                let slot = cand_slots[k] as usize;
+                                pblk[j * MAX + slot] = block;
+                                ppos[j * MAX + slot] = slab_pos as u16;
+                                pfreq[j * MAX + slot] = freqs[slab_pos];
+                                next_docs.push(doc);
+                                next_slots.push(cand_slots[k]);
+                            }
+                        }
+
+                        // The next window starts past the first follower
+                        // document above the last candidate examined here: using
+                        // the block's last document would skip followers that
+                        // sit between it and the candidates.
+                        let above =
+                            find_next_geq_in_block(slab, 0, cand_docs[cj - 1].saturating_add(1));
+                        let compared = if above < slab.len() {
+                            u64::from(slab[above])
+                        } else if block + 1 < num_blocks {
+                            u64::from(list.block_least_doc_id(block + 1))
+                        } else {
+                            window_end.saturating_add(1)
+                        };
+                        last_compared = last_compared.max(compared);
+
+                        ci = cj;
+                        block += 1;
+                    }
+
+                    if ci < cand_docs.len() {
+                        // No block is left for the remaining candidates: nothing
+                        // later can match this clause. Keep applying the other
+                        // clauses to the survivors, exactly like the score-first
+                        // path, and leave the window afterwards.
+                        follower_exhausted = true;
+                    }
+                    // Only hand back a block that was actually decoded: the next
+                    // window re-anchors from the target, and `block_idx_for_doc`
+                    // only moves forward, so publishing a block the scan never
+                    // reached would drop the candidates between the target and
+                    // that block's first document.
+                    if let Some(examined) = last_examined_block {
+                        self.lead[j].block_idx = examined;
+                        cursor_block[j] = examined;
+                    }
+                    cursor_pos[j] = 0;
+                    max_follower_doc = max_follower_doc.max(last_compared);
+
+                    std::mem::swap(&mut cand_docs, &mut next_docs);
+                    next_docs.clear();
+                    std::mem::swap(&mut cand_slots, &mut next_slots);
+                    next_slots.clear();
+                    if cand_docs.is_empty() {
+                        break;
+                    }
+                }
+
+                // (e-B) Score the survivors only. The per-clause expressions and
+                // the f32 summation order are the score-first path's, so the
+                // published score is bit-identical.
+                for (index, &doc) in cand_docs.iter().enumerate() {
+                    let slot = cand_slots[index] as usize;
+                    num_comparisons += 1;
+                    let Some(document_key) = self.documents.document_key_for_doc_id(doc) else {
+                        continue;
+                    };
+                    let (addend, doc_len) = match norm_k_ref {
+                        Some((norms, cache)) => {
+                            let code = norms[doc as usize];
+                            (Some(cache[code as usize]), dequantize_doc_length(code))
+                        }
+                        None => match self.documents.scoring_norms() {
+                            Some(norms) => (None, dequantize_doc_length(norms[doc as usize])),
+                            None => (None, self.documents.scoring_num_tokens(doc)),
+                        },
+                    };
+                    #[cfg(test)]
+                    if addend.is_some() {
+                        self.lead_norm_cache_hits += 1;
+                    }
+                    let mut score = 0.0_f32;
+                    for &clause in &score_order {
+                        let posting = &self.lead[clause];
+                        let freq = pfreq[clause * MAX + slot];
+                        let contrib = match addend {
+                            Some(addend) => {
+                                posting.query_weight * bm25_doc_weight_with_norm(freq, addend)
+                            }
+                            None => posting.score(&self.scorer, freq, doc_len),
+                        };
+                        score += contrib;
+                    }
+                    let inserted = candidates.insert(
+                        ScoredDoc::new(document_key, score),
+                        doc_len,
+                        u64::from(doc),
+                        (0..num_lists).map(|clause| {
+                            (self.lead[clause].term_index(), pfreq[clause * MAX + slot])
+                        }),
+                    )?;
+                    if inserted && let Some(kth) = candidates.kth_score_if_full() {
+                        self.update_threshold(kth, params.wand_factor);
+                    }
+                }
+
+                // (f) Same exit as the score-first path: the next window starts
+                // past this one and past the last follower document compared.
+                if follower_exhausted || window_end == TERMINATED_DOC_ID {
+                    break;
+                }
+                target = (window_end + 1).max(max_follower_doc);
+                continue 'window;
+            }
 
             batch_docs.clear();
             alive.clear();
@@ -8771,6 +9095,299 @@ mod tests {
         assert_eq!(classic_floor, lead_floor, "lead kernel floor diverged");
         assert!(lead_hits > 0, "the lead kernel must have run");
         (windows, switches, lead.len(), pruned)
+    }
+
+    /// One lead-kernel configuration run over a list of limits. Raising the
+    /// limit one step at a time makes the shared floor record the limit-th best
+    /// published score, so comparing `limit_bits` compares score bits for every
+    /// rank instead of only the ranking.
+    #[derive(Default)]
+    struct LeadModeRun {
+        rows: Vec<(u64, u32, Vec<(u32, u32)>, u64)>,
+        limit_bits: Vec<u32>,
+        windows_p: usize,
+        windows_b: usize,
+        buckets: usize,
+        lead_hits: usize,
+    }
+
+    fn run_lead_mode_once(
+        clauses: &[Vec<u32>],
+        num_docs: u32,
+        limits: &[usize],
+        phrase_slop: Option<u32>,
+        bulk: BulkAndMode,
+        mode: LeadBulkMode,
+    ) -> LeadModeRun {
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 24 + doc_id % 41);
+        }
+        let mut combined = LeadModeRun::default();
+        for &limit in limits {
+            let postings = clauses
+                .iter()
+                .enumerate()
+                .map(|(position, doc_ids)| {
+                    PostingIterator::with_query_weight(
+                        format!("t{position}"),
+                        position as u32,
+                        position as u32,
+                        1.0 + position as f32 * 0.5,
+                        generate_posting_list(doc_ids.clone(), 8.0, None, true),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+            let mut params = FtsSearchParams::default().with_limit(Some(limit));
+            params.phrase_slop = phrase_slop;
+            let mut wand = Wand::new(
+                Operator::And,
+                postings.into_iter(),
+                &docs,
+                InverseDocLengthScorer,
+            )
+            .with_bulk_and_mode(bulk)
+            .with_bulk_and_kernel(BulkAndKernel::Lead)
+            .with_lead_bulk_mode(mode)
+            .with_shared_threshold(floor.clone());
+            let mut rows = wand
+                .search(&params, &NoOpMetricsCollector)
+                .unwrap()
+                .into_iter()
+                .map(|candidate| {
+                    (
+                        candidate.posting_doc_id,
+                        candidate.doc_length,
+                        candidate.freqs,
+                        candidate.document,
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            if rows.len() > combined.rows.len() {
+                combined.rows = rows;
+            }
+            combined.limit_bits.push(floor.load(Ordering::Relaxed));
+            combined.windows_p += wand.and_window_stats.lead_windows_p;
+            combined.windows_b += wand.and_window_stats.lead_windows_b;
+            combined.buckets += wand.and_window_stats.lead_buckets;
+            combined.lead_hits += wand.lead_bulk_and_searches;
+        }
+        combined
+    }
+
+    /// Classic, score-first (P) and intersect-first (B) must agree on the sorted
+    /// rows and on every rank's score bits. `auto` must agree too and pick the
+    /// documented half. Returns the intersect-first run for shape assertions.
+    fn assert_lead_mode_parity(
+        clauses: &[Vec<u32>],
+        num_docs: u32,
+        limits: &[usize],
+        phrase_slop: Option<u32>,
+    ) -> LeadModeRun {
+        let classic = run_lead_mode_once(
+            clauses,
+            num_docs,
+            limits,
+            phrase_slop,
+            BulkAndMode::Off,
+            LeadBulkMode::ScoreFirst,
+        );
+        let score_first = run_lead_mode_once(
+            clauses,
+            num_docs,
+            limits,
+            phrase_slop,
+            BulkAndMode::On,
+            LeadBulkMode::ScoreFirst,
+        );
+        let intersect = run_lead_mode_once(
+            clauses,
+            num_docs,
+            limits,
+            phrase_slop,
+            BulkAndMode::On,
+            LeadBulkMode::IntersectFirst,
+        );
+        let auto = run_lead_mode_once(
+            clauses,
+            num_docs,
+            limits,
+            phrase_slop,
+            BulkAndMode::On,
+            LeadBulkMode::Auto,
+        );
+
+        assert!(score_first.lead_hits > 0);
+        assert!(intersect.lead_hits > 0);
+        assert!(auto.lead_hits > 0);
+        for (name, run) in [
+            ("score-first", &score_first),
+            ("intersect-first", &intersect),
+            ("auto", &auto),
+        ] {
+            assert_eq!(
+                run.rows, classic.rows,
+                "{name} rows diverged from the classic path"
+            );
+            assert_eq!(
+                run.limit_bits, classic.limit_bits,
+                "{name} published score bits diverged from the classic path"
+            );
+        }
+
+        // auto: plain three-clause queries intersect first, every other shape
+        // keeps scoring first.
+        if phrase_slop.is_none() && clauses.len() == 3 {
+            assert_eq!(auto.windows_p, 0, "auto must not score first for k=3");
+            assert!(auto.windows_b > 0, "auto must intersect first for k=3");
+        } else {
+            assert_eq!(auto.windows_b, 0, "auto must keep scoring first here");
+        }
+        assert!(
+            classic
+                .limit_bits
+                .iter()
+                .any(|&bits| bits != 0.0_f32.to_bits()),
+            "the largest limit must fill the collector so scores are compared"
+        );
+        intersect
+    }
+
+    #[test]
+    fn lead_bulk_mode_parses_env_values() {
+        assert_eq!(LeadBulkMode::parse("auto"), Some(LeadBulkMode::Auto));
+        assert_eq!(LeadBulkMode::parse(" P "), Some(LeadBulkMode::ScoreFirst));
+        assert_eq!(LeadBulkMode::parse("b"), Some(LeadBulkMode::IntersectFirst));
+        assert_eq!(LeadBulkMode::parse("both"), None);
+        assert_eq!(LeadBulkMode::parse(""), None);
+        assert!(!LeadBulkMode::Auto.uses_intersection(2));
+        assert!(LeadBulkMode::Auto.uses_intersection(3));
+        assert!(!LeadBulkMode::Auto.uses_intersection(4));
+        assert!(LeadBulkMode::IntersectFirst.uses_intersection(9));
+        assert!(!LeadBulkMode::ScoreFirst.uses_intersection(3));
+    }
+
+    /// The 19-case fixture of `test_bulk_and_matches_classic`, now compared
+    /// three ways: classic, score-first and intersect-first, including the
+    /// score bits each rank publishes.
+    #[rstest]
+    #[case::two_clauses(2)]
+    #[case::three_clauses(3)]
+    #[case::four_clauses(4)]
+    #[case::eight_clauses(8)]
+    #[case::sixteen_clauses(16)]
+    fn lead_bulk_modes_match_classic(#[case] num_clauses: usize) {
+        let num_docs = (BLOCK_SIZE * 8 + 37) as u32;
+        let clause_docs = |modulus: u32, salt: u32| -> Vec<u32> {
+            (0..num_docs)
+                .filter(|doc| (doc.wrapping_mul(2654435761).wrapping_add(salt)) % modulus < 2)
+                .collect()
+        };
+        let clauses = [
+            clause_docs(3, 7),
+            clause_docs(4, 13),
+            clause_docs(5, 29),
+            clause_docs(3, 41),
+            clause_docs(3, 7),
+            clause_docs(4, 13),
+        ]
+        .into_iter()
+        .cycle()
+        .take(num_clauses)
+        .collect::<Vec<_>>();
+
+        let run = assert_lead_mode_parity(&clauses, num_docs, &[1, 3, 10], None);
+        assert!(!run.rows.is_empty(), "the fixture must produce matches");
+        assert!(run.buckets > 0, "the intersection pass must decode a block");
+    }
+
+    /// N5: one lead block spans several follower blocks, so the intersection
+    /// has to split the candidate range per follower block.
+    #[test]
+    fn lead_intersect_splits_candidates_across_follower_blocks() {
+        let num_docs = 4000u32;
+        // 400 lead documents inside [0, 800): four lead blocks, each covering
+        // roughly six follower blocks.
+        let lead = (0..400u32).map(|doc| doc * 2).collect::<Vec<_>>();
+        let thirds = (0..num_docs).filter(|doc| doc % 3 == 0).collect::<Vec<_>>();
+        let not_fifths = (0..num_docs).filter(|doc| doc % 5 != 0).collect::<Vec<_>>();
+        let run = assert_lead_mode_parity(&[lead, thirds, not_fifths], num_docs, &[1, 5, 10], None);
+        assert!(
+            run.buckets > 2 * run.windows_b,
+            "each window must decode more than one block per follower: {} buckets, {} windows",
+            run.buckets,
+            run.windows_b
+        );
+    }
+
+    /// N2: dense three-clause conjunction (rho close to 1) over several windows.
+    #[test]
+    fn lead_intersect_dense_three_clauses() {
+        let num_docs = (BLOCK_SIZE * 40 + 7) as u32;
+        let dense = (0..num_docs).collect::<Vec<_>>();
+        let almost = (0..num_docs)
+            .filter(|doc| doc % 32 != 0)
+            .collect::<Vec<_>>();
+        let run =
+            assert_lead_mode_parity(&[dense.clone(), almost, dense], num_docs, &[1, 10], None);
+        assert!(
+            run.windows_b >= 2,
+            "the dense query must span several windows"
+        );
+    }
+
+    /// N3: a sparse lead against dense followers still intersects in auto mode.
+    /// The mode depends on the clause count only, never on the density.
+    #[test]
+    fn lead_intersect_high_skew_three_clauses() {
+        let num_docs = 8000u32;
+        let lead = (0..num_docs)
+            .filter(|doc| doc % 97 == 0)
+            .collect::<Vec<_>>();
+        let dense = (0..num_docs).collect::<Vec<_>>();
+        let sparse = (0..num_docs).filter(|doc| doc % 7 == 0).collect::<Vec<_>>();
+        let run = assert_lead_mode_parity(&[lead, dense, sparse], num_docs, &[1, 10], None);
+        assert!(run.windows_b > 0);
+        assert!(
+            run.buckets > run.windows_b,
+            "the dense followers must be split per block: {} buckets, {} windows",
+            run.buckets,
+            run.windows_b
+        );
+    }
+
+    /// N8b: force-b across the 65536-document window cap. Every window
+    /// re-anchors the followers at the target instead of inheriting the cursor
+    /// of the previous window.
+    #[test]
+    fn lead_intersect_reanchors_across_windows() {
+        let num_docs = 70_000u32;
+        let lead = vec![0u32, 30_000, 60_000, 69_000];
+        let dense = (0..num_docs).collect::<Vec<_>>();
+        let not_thirds = (0..num_docs).filter(|doc| doc % 3 != 1).collect::<Vec<_>>();
+        let run = assert_lead_mode_parity(&[lead, dense, not_thirds], num_docs, &[1, 4], None);
+        assert!(
+            run.windows_b >= 2,
+            "the window cap must split the lead block, got {} windows",
+            run.windows_b
+        );
+    }
+
+    /// A follower that runs out mid-window must not stop the remaining clauses
+    /// from being applied to the survivors.
+    #[test]
+    fn lead_intersect_follower_exhausts_mid_window() {
+        let num_docs = 8000u32;
+        let lead = (0..num_docs)
+            .filter(|doc| doc % 97 == 0)
+            .collect::<Vec<_>>();
+        let short = (0..3200u32).collect::<Vec<_>>();
+        let dense = (0..num_docs).collect::<Vec<_>>();
+        let run = assert_lead_mode_parity(&[lead, short, dense], num_docs, &[1, 10], None);
+        assert!(!run.rows.is_empty(), "the early intersection must survive");
     }
 
     /// T3: a sparse lead whose single block spans many dense follower blocks.
@@ -13810,6 +14427,7 @@ mod tests {
             )
             .with_bulk_and_mode(mode)
             .with_bulk_and_kernel(kernel)
+            .with_lead_bulk_mode(LeadBulkMode::Auto)
             .with_shared_threshold(shared_floor.clone());
             let rows = normalize(wand.search(&params, &NoOpMetricsCollector).unwrap());
             let used_bulk = wand.bulk_and_searches > 0;
@@ -13817,13 +14435,18 @@ mod tests {
                 (rows, shared_floor.load(Ordering::Relaxed)),
                 used_bulk,
                 wand.lead_bulk_and_searches,
+                (
+                    wand.and_window_stats.lead_windows_p,
+                    wand.and_window_stats.lead_windows_b,
+                ),
             )
         };
 
-        let (bulk, bulk_used, _) = run(BulkAndMode::On, BulkAndKernel::Merge);
-        let (classic, classic_used, _) = run(BulkAndMode::Off, BulkAndKernel::Merge);
-        let (auto, auto_used, _) = run(BulkAndMode::Auto, BulkAndKernel::Merge);
-        let (lead, lead_used, lead_kernel_hits) = run(BulkAndMode::On, BulkAndKernel::Lead);
+        let (bulk, bulk_used, _, _) = run(BulkAndMode::On, BulkAndKernel::Merge);
+        let (classic, classic_used, _, _) = run(BulkAndMode::Off, BulkAndKernel::Merge);
+        let (auto, auto_used, _, _) = run(BulkAndMode::Auto, BulkAndKernel::Merge);
+        let (lead, lead_used, lead_kernel_hits, lead_windows) =
+            run(BulkAndMode::On, BulkAndKernel::Lead);
         assert!(bulk_used, "on should use bulk conjunction search");
         assert!(!classic_used, "off should use classic conjunction search");
         assert_eq!(auto_used, matches!(num_clauses, 2 | 3));
@@ -13845,6 +14468,17 @@ mod tests {
             lead, classic,
             "lead-driven bulk AND must match the classic path"
         );
+        // auto intersects first only for plain three-clause conjunctions;
+        // phrase queries and every other clause count keep scoring first.
+        if phrase || num_clauses != 3 {
+            assert_eq!(
+                lead_windows.1, 0,
+                "auto must keep the score-first pass here"
+            );
+        } else {
+            assert_eq!(lead_windows.0, 0, "auto must intersect first for k=3");
+            assert!(lead_windows.1 > 0, "auto must intersect first for k=3");
+        }
     }
 
     #[rstest]
