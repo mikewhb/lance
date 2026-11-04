@@ -422,12 +422,8 @@ impl LeadBulkMode {
 /// Whether a conjunction may take the intersect pass at all. Phrase queries
 /// cannot: their position check reads `posting.index`, which only the
 /// score-first batch builds.
-fn lead_intersect_requested(
-    phrase_slop: Option<u32>,
-    mode: LeadBulkMode,
-    num_clauses: usize,
-) -> bool {
-    phrase_slop.is_none() && mode.uses_intersection(num_clauses)
+fn lead_intersect_requested(mode: LeadBulkMode, num_clauses: usize) -> bool {
+    mode.uses_intersection(num_clauses)
 }
 
 fn lead_bulk_mode_from_env() -> LeadBulkMode {
@@ -5427,16 +5423,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let lead_mode = self
             .lead_bulk_mode_override
             .unwrap_or_else(|| *LEAD_BULK_MODE);
-        // TODO(T2): phrase queries keep the score-first path until the position
-        // check can rebuild `posting.index` from the intersection columns.
-        let intersect_wanted = lead_intersect_requested(phrase_slop, lead_mode, num_lists);
+        let intersect_wanted = lead_intersect_requested(lead_mode, num_lists);
         // Auto starts on the score-first path and switches to the intersect pass
         // once the first windows show that the exact bound rejects almost
         // nothing: the score-first path only pays off when it can drop
         // candidates before decoding follower blocks, and the intersect pass
         // only pays off when scoring every candidate was wasted.
-        // Forced intersect-first still honours the phrase gate: the position
-        // check cannot rebuild `posting.index` from the columns yet.
         let mut intersect_first = intersect_wanted && lead_mode == LeadBulkMode::IntersectFirst;
         // Sampled once per query from score-first windows only, then frozen:
         // a one-way switch, so the choice never depends on the path taken.
@@ -5835,6 +5827,34 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             None => posting.score(&self.scorer, freq, doc_len),
                         };
                         score += contrib;
+                    }
+                    if let Some(slop) = phrase_slop {
+                        if self.threshold > 0.0 && self.exclusive_score_cannot_beat_floor(score) {
+                            continue;
+                        }
+                        // Rebuild the per-clause cursor state the position check
+                        // reads. `pblk`/`ppos` were captured at the bucket that
+                        // matched, so the index is the same
+                        // `(block << shift) | pos` the score-first batch stores.
+                        for (clause, posting) in self.lead.iter_mut().enumerate() {
+                            let shift = match posting.list {
+                                PostingList::Compressed(ref list) => list.block_shift(),
+                                PostingList::Plain(_) => 0,
+                            };
+                            posting.index = (pblk[clause * MAX + slot] as usize) << shift
+                                | ppos[clause * MAX + slot] as usize;
+                            posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id: doc,
+                                frequency: pfreq[clause * MAX + slot],
+                            }));
+                        }
+                        let matched = match slop {
+                            0 => self.check_exact_positions_bulk()?,
+                            slop => self.check_positions(slop as i32)?,
+                        };
+                        if !matched {
+                            continue;
+                        }
                     }
                     let inserted = candidates.insert(
                         ScoredDoc::new(document_key, score),
@@ -9490,29 +9510,15 @@ mod tests {
         assert!(run.buckets > 0, "the intersection pass must decode a block");
     }
 
-    /// N11: forcing the intersect pass must not pull phrase queries with it.
-    /// The position check reads posting.index, which only the score-first path
-    /// builds, so a forced run has to keep phrases on that path.
+    /// N11: the intersect pass now serves phrases too (it rebuilds
+    /// posting.index from pblk/ppos), so the gate is the clause count alone.
     #[test]
-    fn lead_force_b_keeps_phrases_on_the_score_first_path() {
-        assert!(!lead_intersect_requested(
-            Some(0),
-            LeadBulkMode::IntersectFirst,
-            3
-        ));
-        assert!(lead_intersect_requested(
-            None,
-            LeadBulkMode::IntersectFirst,
-            3
-        ));
-        assert!(!lead_intersect_requested(None, LeadBulkMode::ScoreFirst, 3));
-        // A forced run bypasses the clause-count gate, never the phrase gate.
-        assert!(lead_intersect_requested(
-            None,
-            LeadBulkMode::IntersectFirst,
-            4
-        ));
-        assert!(lead_intersect_requested(None, LeadBulkMode::Auto, 3));
+    fn lead_intersect_gate_follows_the_clause_count() {
+        assert!(lead_intersect_requested(LeadBulkMode::Auto, 3));
+        assert!(!lead_intersect_requested(LeadBulkMode::Auto, 4));
+        assert!(!lead_intersect_requested(LeadBulkMode::ScoreFirst, 3));
+        // A forced run bypasses the clause-count gate.
+        assert!(lead_intersect_requested(LeadBulkMode::IntersectFirst, 4));
     }
 
     /// N5: one lead block spans several follower blocks, so the intersection
