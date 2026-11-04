@@ -5391,6 +5391,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut next_docs: Vec<u32> = Vec::with_capacity(MAX);
         let mut next_slots: Vec<u16> = Vec::with_capacity(MAX);
         let mut scratch: Vec<u32> = Vec::new();
+        // Hits of one bucket: slot and block-local position. Frequencies are
+        // filled after the merge, from a lazily decoded frequency block, so a
+        // bucket with no survivor pays for doc ids only.
+        let mut hit_slots: Vec<u16> = Vec::new();
+        let mut hit_pos: Vec<u16> = Vec::new();
         // Per-clause columns indexed by a stable slot: a candidate that drops out
         // never moves another candidate's columns. pblk and ppos carry the
         // posting offset for the phrase path (TODO(T2)); the plain conjunction
@@ -5593,6 +5598,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 cand_slots.clear();
                 next_docs.clear();
                 next_slots.clear();
+                hit_slots.clear();
+                hit_pos.clear();
                 // Clause 0 never takes part in the intersection, so its three
                 // columns are written here instead of in a bucket.
                 for i in 0..n_cand {
@@ -5645,12 +5652,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         }
                         let cj = ci
                             + cand_docs[ci..].partition_point(|&doc| u64::from(doc) < block_upper);
-                        // One decoded block at a time: doc ids and frequencies
-                        // share this state and stay valid until the next bucket.
-                        let state = unsafe { &*posting.ensure_compressed_block_ptr(list, block) };
+                        // Doc ids only: a frequency block costs a full
+                        // 256-entry decompression and is decoded below, and
+                        // only for buckets that actually produced a survivor.
+                        // Decoding it unconditionally is what made the
+                        // intersect pass lose to score-first on queries whose
+                        // bound rejects almost every candidate.
+                        let first_hit = hit_slots.len();
+                        let state = unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, block) };
                         let slab = state.doc_ids.as_slice();
-                        let freqs = state.freqs.as_slice();
-                        debug_assert_eq!(slab.len(), freqs.len());
 
                         #[cfg(test)]
                         {
@@ -5675,10 +5685,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 while slab[slab_pos] < doc {
                                     slab_pos += 1;
                                 }
-                                let slot = cand_slots[slot_idx] as usize;
-                                pblk[j * MAX + slot] = block;
-                                ppos[j * MAX + slot] = slab_pos as u16;
-                                pfreq[j * MAX + slot] = freqs[slab_pos];
+                                hit_slots.push(cand_slots[slot_idx]);
+                                hit_pos.push(slab_pos as u16);
                                 next_docs.push(doc);
                                 next_slots.push(cand_slots[slot_idx]);
                             }
@@ -5696,10 +5704,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 if slab[slab_pos] != doc {
                                     continue;
                                 }
-                                let slot = cand_slots[k] as usize;
-                                pblk[j * MAX + slot] = block;
-                                ppos[j * MAX + slot] = slab_pos as u16;
-                                pfreq[j * MAX + slot] = freqs[slab_pos];
+                                hit_slots.push(cand_slots[k]);
+                                hit_pos.push(slab_pos as u16);
                                 next_docs.push(doc);
                                 next_slots.push(cand_slots[k]);
                             }
@@ -5732,6 +5738,24 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 self.and_window_stats.lead_follower_exhausted += 1;
                             }
                             follower_exhausted = true;
+                        }
+
+                        // Only now decode the frequency block, and only when
+                        // this bucket matched something. The decoder replaces
+                        // `freqs`, not `doc_ids`, so `slab` stays valid.
+                        if hit_slots.len() > first_hit {
+                            let freqs_ptr = unsafe {
+                                (*posting.ensure_compressed_block_ptr(list, block))
+                                    .freqs
+                                    .as_ptr()
+                            };
+                            for idx in first_hit..hit_slots.len() {
+                                let slot = hit_slots[idx] as usize;
+                                let pos = hit_pos[idx] as usize;
+                                pblk[j * MAX + slot] = block;
+                                ppos[j * MAX + slot] = pos as u16;
+                                pfreq[j * MAX + slot] = unsafe { *freqs_ptr.add(pos) };
+                            }
                         }
 
                         ci = cj;
