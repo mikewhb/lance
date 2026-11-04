@@ -5617,13 +5617,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 // block; without this the intersect pass decodes blocks for
                 // candidates that can never reach the top-k, which is why it
                 // lost on queries whose bound rejects almost everything.
-                // `degraded` leaves suffix at infinity; pruning against an
-                // infinite bound keeps everything, so it is pure overhead and
-                // the pass is skipped (production is Exclusive, but the
-                // Inclusive floor takes the general predicate).
-                let prune_ready = has_floor && suffix[0].is_finite();
-                let mut pre_scored = false;
-                if prune_ready {
+                if has_floor {
                     let factor = score_sum_upper_bound_factor(num_lists);
                     let exclusive = self.floor_mode == CompetitiveFloorMode::Exclusive;
                     let bound = suffix[1];
@@ -5634,12 +5628,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     // already rejects nothing means the whole pass is pure
                     // overhead, so skip it.
                     if !(exclusive && limit.is_none()) {
-                        pre_scored = true;
                         let posting0 = &self.lead[0];
                         let before = cand_docs.len();
-                        if *LEAD_STATS {
-                            stats_cand += before;
-                        }
                         let mut kept = 0usize;
                         for idx in 0..before {
                             let doc = cand_docs[idx];
@@ -5664,9 +5654,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 None => posting0.score(&self.scorer, freq, doc_len),
                             };
                             partial[slot] = score;
-                            // Reused by the collect pass so the lead clause is
-                            // scored once, not twice.
-                            contrib[slot] = score;
                             let keep = match limit {
                                 Some(limit) => score > limit,
                                 None => !score_sum_cannot_compete(
@@ -5902,22 +5889,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     }
                     let mut score = 0.0_f32;
                     for &clause in &score_order {
-                        // Clause 0 was scored by the pre-prune pass; reuse that
-                        // value so the lead clause costs one BM25 per candidate,
-                        // not two. The summation order is still score_order.
-                        if clause == 0 && pre_scored {
-                            score += contrib[slot];
-                            continue;
-                        }
                         let posting = &self.lead[clause];
                         let freq = pfreq[clause * MAX + slot];
-                        let clause_score = match addend {
+                        let contrib = match addend {
                             Some(addend) => {
                                 posting.query_weight * bm25_doc_weight_with_norm(freq, addend)
                             }
                             None => posting.score(&self.scorer, freq, doc_len),
                         };
-                        score += clause_score;
+                        score += contrib;
                     }
                     let inserted = candidates.insert(
                         ScoredDoc::new(document_key, score),
