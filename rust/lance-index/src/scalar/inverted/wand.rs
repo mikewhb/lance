@@ -5611,6 +5611,81 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 debug_assert!(cand_docs.windows(2).all(|w| w[0] < w[1]));
 
+                // Pre-prune with the lead clause alone, using the same predicate
+                // as the score-first path's first pass. The score-first path
+                // drops most candidates here, *before* decoding any follower
+                // block; without this the intersect pass decodes blocks for
+                // candidates that can never reach the top-k, which is why it
+                // lost on queries whose bound rejects almost everything.
+                if has_floor {
+                    let factor = score_sum_upper_bound_factor(num_lists);
+                    let exclusive = self.floor_mode == CompetitiveFloorMode::Exclusive;
+                    let bound = suffix[1];
+                    let limit = exclusive
+                        .then(|| exclusive_partial_score_limit(bound, self.threshold, factor))
+                        .flatten();
+                    // Mirrors the score-first path: an exclusive limit that
+                    // already rejects nothing means the whole pass is pure
+                    // overhead, so skip it.
+                    if !(exclusive && limit.is_none()) {
+                        let posting0 = &self.lead[0];
+                        let before = cand_docs.len();
+                        let mut kept = 0usize;
+                        for idx in 0..before {
+                            let doc = cand_docs[idx];
+                            let slot = cand_slots[idx] as usize;
+                            let freq = unsafe { *freqs_ptr.add(lo + slot) };
+                            let (addend, doc_len) = match norm_k_ref {
+                                Some((norms, cache)) => {
+                                    let code = norms[doc as usize];
+                                    (Some(cache[code as usize]), dequantize_doc_length(code))
+                                }
+                                None => match self.documents.scoring_norms() {
+                                    Some(norms) => {
+                                        (None, dequantize_doc_length(norms[doc as usize]))
+                                    }
+                                    None => (None, self.documents.scoring_num_tokens(doc)),
+                                },
+                            };
+                            let score = match addend {
+                                Some(addend) => {
+                                    posting0.query_weight * bm25_doc_weight_with_norm(freq, addend)
+                                }
+                                None => posting0.score(&self.scorer, freq, doc_len),
+                            };
+                            partial[slot] = score;
+                            let keep = match limit {
+                                Some(limit) => score > limit,
+                                None => !score_sum_cannot_compete(
+                                    score,
+                                    bound,
+                                    self.threshold,
+                                    factor,
+                                    self.floor_mode,
+                                ),
+                            };
+                            if keep {
+                                cand_docs[kept] = doc;
+                                cand_slots[kept] = slot as u16;
+                                kept += 1;
+                            }
+                        }
+                        stats_pruned += before - kept;
+                        cand_docs.truncate(kept);
+                        cand_slots.truncate(kept);
+                    }
+                }
+                if cand_docs.is_empty() {
+                    // Nothing can reach the top-k in this window, and no
+                    // follower block has been touched: advance exactly like the
+                    // score-first path's empty-survivor exit.
+                    if window_end == TERMINATED_DOC_ID {
+                        break;
+                    }
+                    target = window_end + 1;
+                    continue 'window;
+                }
+
                 let mut follower_exhausted = false;
                 let mut max_follower_doc = 0u64;
                 #[cfg(test)]
