@@ -390,9 +390,37 @@ fn region_span_splits_a_rare_lead_and_a_high_floor_terminates() {
         Some(1.0e20),
     );
     assert!(skipped_rows.is_empty());
+    assert_eq!(
+        skipped, 0,
+        "k=2 does not spend a region upper bound; the search still returns"
+    );
+
+    let build3 = || {
+        let mut postings = build();
+        postings.push(PostingIterator::new(
+            "fol2".into(),
+            2,
+            2,
+            generate_posting_list(ids.clone(), 1.0, None, true),
+            docs.len(),
+        ));
+        postings
+    };
+    let (skipped_rows, _, _, _, skipped, _) = region_rows(
+        build3(),
+        &docs,
+        UnitScorer,
+        10,
+        Some(BulkAndKernel::Region),
+        None,
+        None,
+        None,
+        Some(1.0e20),
+    );
+    assert!(skipped_rows.is_empty());
     assert!(
         skipped > 0,
-        "a huge floor must skip regions and still return"
+        "k>=3 still skips a region whose upper bound cannot meet a huge floor, got {skipped}"
     );
 }
 

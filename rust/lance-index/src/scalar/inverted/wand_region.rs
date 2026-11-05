@@ -239,44 +239,52 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         .map(|clause| clause_lut(&self.lead[clause], &self.scorer))
                         .collect();
                 }
-                bounds_ok = true;
-                let mut upper = vec![0.0f32; k];
-                upper[0] = block_bound_at(&self.lead[0], &self.scorer, lead_block);
-                #[allow(clippy::needless_range_loop)]
-                for clause in 1..k {
-                    upper[clause] = if self.region_bound_is_deque() {
-                        self.lead[clause]
-                            .block_max_score_up_to_with_stats(region_end, &self.scorer)
-                            .score
-                    } else {
-                        self.region_bound(clause, region_end32)
-                    };
-                }
-                if upper
-                    .iter()
-                    .any(|bound| !bound.is_finite() || *bound <= 0.0)
-                {
-                    bounds_ok = false;
-                }
-                if bounds_ok {
-                    for clause in (0..k).rev() {
-                        suffix[clause] = next_up_f64(f64::from(upper[clause]) + suffix[clause + 1]);
+                // k=2: the region upper bound rarely pays for itself. Segment
+                // pruning still sees the follower's block bound (suffix stays 0).
+                if k == 2 {
+                    let lead_bound = block_bound_at(&self.lead[0], &self.scorer, lead_block);
+                    bounds_ok = lead_bound.is_finite() && lead_bound > 0.0;
+                } else {
+                    bounds_ok = true;
+                    let mut upper = vec![0.0f32; k];
+                    upper[0] = block_bound_at(&self.lead[0], &self.scorer, lead_block);
+                    #[allow(clippy::needless_range_loop)]
+                    for clause in 1..k {
+                        upper[clause] = if self.region_bound_is_deque() {
+                            self.lead[clause]
+                                .block_max_score_up_to_with_stats(region_end, &self.scorer)
+                                .score
+                        } else {
+                            self.region_bound(clause, region_end32)
+                        };
                     }
-                    if score_sum_cannot_compete(
-                        0.0,
-                        suffix[0],
-                        self.threshold,
-                        factor,
-                        self.floor_mode,
-                    ) {
-                        tally!(self.regions_skipped += 1);
-                        if region_end >= u64::from(u32::MAX) {
-                            break;
+                    if upper
+                        .iter()
+                        .any(|bound| !bound.is_finite() || *bound <= 0.0)
+                    {
+                        bounds_ok = false;
+                    }
+                    if bounds_ok {
+                        for clause in (0..k).rev() {
+                            suffix[clause] =
+                                next_up_f64(f64::from(upper[clause]) + suffix[clause + 1]);
                         }
-                        let next = region_end + 1;
-                        debug_assert!(next > target);
-                        target = next;
-                        continue;
+                        if score_sum_cannot_compete(
+                            0.0,
+                            suffix[0],
+                            self.threshold,
+                            factor,
+                            self.floor_mode,
+                        ) {
+                            tally!(self.regions_skipped += 1);
+                            if region_end >= u64::from(u32::MAX) {
+                                break;
+                            }
+                            let next = region_end + 1;
+                            debug_assert!(next > target);
+                            target = next;
+                            continue;
+                        }
                     }
                 }
             }
