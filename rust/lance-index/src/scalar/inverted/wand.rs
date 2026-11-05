@@ -388,6 +388,11 @@ fn bulk_and_wide_from_env() -> BulkAndWide {
 
 static BULK_AND_WIDE: LazyLock<BulkAndWide> = LazyLock::new(bulk_and_wide_from_env);
 
+// Per-query evidence that the wide path ran, for the coverage gate. Off unless
+// the variable is set, so timed builds pay one branch per window.
+static WIDE_MARKER: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("LANCE_FTS_WIDE_MARKER").is_some());
+
 #[cfg(target_arch = "x86_64")]
 static HAS_AVX2: LazyLock<bool> = LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
 
@@ -4754,6 +4759,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons: usize = 0;
+        let mut wide_marker_windows = 0usize;
         let mut wins: Vec<WindowList> = Vec::with_capacity(num_lists);
         // Per-window candidate batch. The merge kernel only records matches;
         // scoring then runs in two passes so the doc-length gather issues
@@ -5373,6 +5379,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 if wide == BulkAndWide::Always
                     || (win_end < wide_end && widest_span >= span_threshold)
                 {
+                    wide_marker_windows += 1;
                     #[cfg(test)]
                     {
                         self.and_window_stats.wide_windows += 1;
@@ -5795,6 +5802,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             target = (win_end + 1).max(jump_to);
         }
 
+        if *WIDE_MARKER {
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!("fts-wide k={num_lists} wide_windows={wide_marker_windows}");
+            }
+        }
         metrics.record_comparisons(num_comparisons);
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
