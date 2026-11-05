@@ -14384,27 +14384,31 @@ mod tests {
                 wand.and_window_stats.wide_windows,
             )
         };
-        // Floor at zero first to learn the weak candidate's score, then rerun
-        // with a floor that keeps only the strong one.
-        let (open_rows, _, _) = run(BulkAndMode::On, BulkAndWide::Always, 0.0_f32.to_bits());
+        // Raise the floor through a deterministic ladder and compare the rows at
+        // every step. A floor that rejects the weak candidate also tightens the
+        // window bound, so the interesting case is "some floor, some rows".
+        let (open_rows, _, open_windows) =
+            run(BulkAndMode::On, BulkAndWide::Always, 0.0_f32.to_bits());
         assert_eq!(open_rows.len(), 2, "both candidates match with no floor");
-        // Raise the floor until the weak candidate can no longer compete, then
-        // compare the surviving rows. The ladder is deterministic and needs no
-        // knowledge of the scorer's scale.
-        let mut saw_narrowing = false;
+        assert!(open_windows > 0, "the wide path must run");
+        let mut narrowed = false;
         for step in 1..=12 {
-            let floor = ((1u32 << step) as f32).to_bits();
-            let (classic, _, _) = run(BulkAndMode::Off, BulkAndWide::Off, floor);
-            let (wide_rows, _, _) = run(BulkAndMode::On, BulkAndWide::Always, floor);
+            let floor_bits = ((1u32 << step) as f32).to_bits();
+            let (classic, _, _) = run(BulkAndMode::Off, BulkAndWide::Off, floor_bits);
+            let (wide_rows, _, windows) = run(BulkAndMode::On, BulkAndWide::Always, floor_bits);
             assert_eq!(
                 wide_rows, classic,
                 "compaction changed the phrase rows at floor step {step}"
             );
             if classic.len() < 2 {
-                saw_narrowing = true;
+                narrowed = true;
             }
+            let _ = windows;
         }
-        assert!(saw_narrowing, "the ladder must reject the weak candidate");
+        assert!(
+            narrowed,
+            "the ladder must reject the weak candidate at some floor"
+        );
     }
 
     /// W1: the bulk conjunction corpus, scored four ways across every limit.
