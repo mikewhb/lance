@@ -388,8 +388,27 @@ fn bulk_and_wide_from_env() -> BulkAndWide {
 
 static BULK_AND_WIDE: LazyLock<BulkAndWide> = LazyLock::new(bulk_and_wide_from_env);
 
+// Fine-grained bulk-AND counters for the wide-window study (FINE-DIAG-20261105
+// §2, TASK-WIDE-V2 §5). Diagnostic builds only: the counters never feed a
+// decision, and this binary is never timed.
+static FINE_DIAG: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("LANCE_FTS_FINE_DIAG").is_ok_and(|value| value == "1"));
+
 #[cfg(target_arch = "x86_64")]
 static HAS_AVX2: LazyLock<bool> = LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
+
+/// Whether one `ensure_compressed_doc_ids_ptr` / `ensure_compressed_block_ptr`
+/// call would really decompress: the doc-id block is stale or empty, and the
+/// frequency block is stale (a doc-id decode clears it). Mirrors the guards
+/// inside those functions without moving the cursor, so the fine-grained
+/// counters can tell a real decompression from a cache hit.
+#[inline]
+fn decode_plan(posting: &PostingIterator, block_idx: usize) -> (bool, bool) {
+    let state = unsafe { &*posting.compressed_state_ptr() };
+    let doc_ids = state.block_idx != block_idx || state.doc_ids.is_empty();
+    let freqs = doc_ids || state.frequency_block_idx != Some(block_idx);
+    (doc_ids, freqs)
+}
 
 /// First index in `[pos, end)` where `docs[index] >= target` (scalar).
 #[inline]
@@ -2614,6 +2633,347 @@ impl Ord for TailPosting {
     }
 }
 
+/// Fine-grained bulk-AND counters for the wide-window study (FINE-DIAG-20261105
+/// §2, TASK-WIDE-V2 §5.1/§5.2). Only the diagnostic binary sets
+/// `LANCE_FTS_FINE_DIAG=1`; nothing here feeds a decision.
+///
+/// Field names match the `fine-diag-20261105.tsv` header verbatim so the
+/// collection script can concatenate rows. Per-clause columns are clause-major,
+/// `phase * num_lists + clause`; the trailing `0`/`1` of a scalar is the floor
+/// state when the window (or the insert) started: 1 when the threshold was
+/// already positive.
+#[derive(Default)]
+struct FineDiag {
+    enabled: bool,
+    num_lists: usize,
+    /// Floor state of the window currently being traversed.
+    phase: usize,
+    win: [usize; 2],
+    skiprest: [usize; 2],
+    merge: [usize; 2],
+    tried: [usize; 2],
+    accepted: [usize; 2],
+    scored: [usize; 2],
+    floor_raised: usize,
+    poschk: usize,
+    pos: Vec<usize>,
+    doc: Vec<usize>,
+    dead: Vec<usize>,
+    freq: Vec<usize>,
+    fdead: Vec<usize>,
+    empty: Vec<usize>,
+    slice: Vec<usize>,
+    // Wide-window extras (TASK-WIDE-V2 §5.2).
+    wide_win: [usize; 2],
+    local_floor: usize,
+    cand: Vec<usize>,
+    bskip: Vec<usize>,
+    bdead: Vec<usize>,
+    exact_fail: Vec<usize>,
+    lead_docs: usize,
+    span_hist: [usize; 5],
+    cand_hist: [usize; 4],
+    wskip_docs: usize,
+    phrase_redec: usize,
+    // Decodes made by the window in flight, so a window that ends without a
+    // candidate can attribute every block it decoded to `dead` / `fdead`.
+    window_doc: Vec<usize>,
+    window_freq: Vec<usize>,
+}
+
+impl FineDiag {
+    fn new(num_lists: usize) -> Self {
+        let enabled = *FINE_DIAG;
+        let columns = if enabled { 2 * num_lists } else { 0 };
+        Self {
+            enabled,
+            num_lists,
+            pos: vec![0; columns],
+            doc: vec![0; columns],
+            dead: vec![0; columns],
+            freq: vec![0; columns],
+            fdead: vec![0; columns],
+            empty: vec![0; columns],
+            slice: vec![0; columns],
+            cand: vec![0; columns],
+            bskip: vec![0; columns],
+            bdead: vec![0; columns],
+            exact_fail: vec![0; columns],
+            window_doc: vec![0; num_lists],
+            window_freq: vec![0; num_lists],
+            ..Default::default()
+        }
+    }
+
+    #[inline]
+    fn at(&self, phase: usize, clause: usize) -> usize {
+        phase * self.num_lists + clause
+    }
+
+    fn begin_window(&mut self, phase: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.phase = phase;
+        self.win[phase] += 1;
+        self.window_doc.fill(0);
+        self.window_freq.fill(0);
+    }
+
+    #[inline]
+    fn note_pos(&mut self, clause: usize) {
+        if !self.enabled {
+            return;
+        }
+        let at = self.at(self.phase, clause);
+        self.pos[at] += 1;
+    }
+
+    #[inline]
+    fn note_doc(&mut self, clause: usize) {
+        if !self.enabled {
+            return;
+        }
+        let at = self.at(self.phase, clause);
+        self.doc[at] += 1;
+        self.window_doc[clause] += 1;
+    }
+
+    #[inline]
+    fn note_freq(&mut self, clause: usize) {
+        if !self.enabled {
+            return;
+        }
+        let at = self.at(self.phase, clause);
+        self.freq[at] += 1;
+        self.window_freq[clause] += 1;
+    }
+
+    /// The window stopped at `clause` because its slice was empty; the clauses
+    /// behind it are never entered.
+    fn note_empty(&mut self, clause: usize) {
+        if !self.enabled {
+            return;
+        }
+        let at = self.at(self.phase, clause);
+        self.empty[at] += 1;
+        self.skiprest[self.phase] += self.num_lists - 1 - clause;
+    }
+
+    #[inline]
+    fn note_slice(&mut self, clause: usize, docs: usize) {
+        if !self.enabled {
+            return;
+        }
+        let at = self.at(self.phase, clause);
+        self.slice[at] += docs;
+    }
+
+    #[inline]
+    fn note_merge_empty(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.merge[self.phase] += 1;
+    }
+
+    #[inline]
+    fn note_wide_win(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.wide_win[self.phase] += 1;
+    }
+
+    #[inline]
+    fn note_lead_docs(&mut self, candidates: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.lead_docs += candidates;
+        let at = self.at(self.phase, 0);
+        self.cand[at] += candidates;
+        self.note_cand_hist(candidates);
+    }
+
+    #[inline]
+    fn note_local_floor(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.local_floor += 1;
+    }
+
+    #[inline]
+    fn note_cand(&mut self, clause: usize, candidates: usize) {
+        if !self.enabled {
+            return;
+        }
+        let at = self.at(self.phase, clause);
+        self.cand[at] += candidates;
+    }
+
+    #[inline]
+    fn note_bskip(&mut self, clause: usize) {
+        if !self.enabled {
+            return;
+        }
+        let at = self.at(self.phase, clause);
+        self.bskip[at] += 1;
+    }
+
+    #[inline]
+    fn note_bdead(&mut self, clause: usize) {
+        if !self.enabled {
+            return;
+        }
+        let at = self.at(self.phase, clause);
+        self.bdead[at] += 1;
+    }
+
+    #[inline]
+    fn note_exact_fail(&mut self, clause: usize) {
+        if !self.enabled {
+            return;
+        }
+        let at = self.at(self.phase, clause);
+        self.exact_fail[at] += 1;
+    }
+
+    #[inline]
+    fn note_score(&mut self, phase: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.scored[phase] += 1;
+    }
+
+    #[inline]
+    fn note_try(&mut self, phase: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.tried[phase] += 1;
+    }
+
+    #[inline]
+    fn note_ok(&mut self, phase: usize) {
+        if !self.enabled {
+            return;
+        }
+        self.accepted[phase] += 1;
+    }
+
+    /// Close the window in flight. A window that produced no candidate marks
+    /// every block it decoded as dead (FINE-DIAG §2 `dead`/`fdead`).
+    fn end_window(&mut self, had_candidates: bool) {
+        if !self.enabled || had_candidates {
+            return;
+        }
+        for clause in 0..self.num_lists {
+            let at = self.at(self.phase, clause);
+            self.dead[at] += self.window_doc[clause];
+            self.fdead[at] += self.window_freq[clause];
+        }
+    }
+
+    #[inline]
+    fn note_span(&mut self, span: usize) {
+        if !self.enabled {
+            return;
+        }
+        let bucket = match span {
+            0..=11 => 0,
+            12..=15 => 1,
+            16..=31 => 2,
+            32..=63 => 3,
+            _ => 4,
+        };
+        self.span_hist[bucket] += 1;
+    }
+
+    #[inline]
+    fn note_cand_hist(&mut self, candidates: usize) {
+        if !self.enabled {
+            return;
+        }
+        let bucket = match candidates {
+            0..=3 => 0,
+            4..=15 => 1,
+            16..=63 => 2,
+            _ => 3,
+        };
+        self.cand_hist[bucket] += 1;
+    }
+
+    fn render(&self) -> String {
+        let n = self.num_lists;
+        let list = |values: &[usize], phase: usize| {
+            (0..n)
+                .map(|clause| values[phase * n + clause].to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let flat = |values: &[usize]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "k={} win0={} win1={} skiprest0={} skiprest1={} merge0={} merge1={} \
+             try0={} try1={} ok0={} ok1={} score0={} score1={} floor={} poschk={} \
+             pos0={} pos1={} doc0={} doc1={} dead0={} dead1={} freq0={} freq1={} \
+             fdead0={} fdead1={} empty0={} empty1={} slice0={} slice1={} \
+             wide_win0={} wide_win1={} localfloor1={} cand1={} bskip1={} bdead1={} \
+             exact_fail1={} lead_docs={} span_hist={} cand_hist={} wskip_docs1={} \
+             phrase_redec={}",
+            n,
+            self.win[0],
+            self.win[1],
+            self.skiprest[0],
+            self.skiprest[1],
+            self.merge[0],
+            self.merge[1],
+            self.tried[0],
+            self.tried[1],
+            self.accepted[0],
+            self.accepted[1],
+            self.scored[0],
+            self.scored[1],
+            self.floor_raised,
+            self.poschk,
+            list(&self.pos, 0),
+            list(&self.pos, 1),
+            list(&self.doc, 0),
+            list(&self.doc, 1),
+            list(&self.dead, 0),
+            list(&self.dead, 1),
+            list(&self.freq, 0),
+            list(&self.freq, 1),
+            list(&self.fdead, 0),
+            list(&self.fdead, 1),
+            list(&self.empty, 0),
+            list(&self.empty, 1),
+            list(&self.slice, 0),
+            list(&self.slice, 1),
+            self.wide_win[0],
+            self.wide_win[1],
+            self.local_floor,
+            list(&self.cand, 1),
+            list(&self.bskip, 1),
+            list(&self.bdead, 1),
+            list(&self.exact_fail, 1),
+            self.lead_docs,
+            flat(&self.span_hist[..]),
+            flat(&self.cand_hist[..]),
+            self.wskip_docs,
+            self.phrase_redec
+        )
+    }
+}
+
 pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     threshold: f32, // multiple of factor and the minimum score of the top-k documents
     floor_mode: CompetitiveFloorMode,
@@ -4365,6 +4725,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
             });
         let phrase_slop = params.phrase_slop;
+        // Diagnostic counters for the wide-window study; inert unless
+        // LANCE_FTS_FINE_DIAG=1.
+        let mut fine = FineDiag::new(num_lists);
         // The bulk path never evaluates score-first windows, so keep the block
         // advance from preparing suffix bounds it would not use.
         self.invalidate_score_first_and_window();
@@ -4827,6 +5190,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             lut: Vec<f32>,
             lens: Vec<u32>,
             norms: Vec<u8>,
+            seg_docs: Vec<u32>,
+            seg_offs: Vec<u8>,
+            // Diagnostic-only: doc length (or byte norm when a norm cache
+            // exists) per candidate, read once per window from the same three
+            // sources as the collection pass. Indexed like `docs` and moved
+            // with it, so `exact_fail1` can price a candidate before any
+            // follower runs without re-reading the length source.
+            dlens: Vec<u32>,
+            dnorms: Vec<u8>,
         }
 
         impl WideState {
@@ -4840,6 +5212,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     lut: Vec::new(),
                     lens: Vec::with_capacity(cap),
                     norms: Vec::with_capacity(cap),
+                    seg_docs: Vec::with_capacity(cap),
+                    seg_offs: Vec::with_capacity(cap * 2),
+                    dlens: Vec::with_capacity(cap),
+                    dnorms: Vec::with_capacity(cap),
                 }
             }
         }
@@ -4862,6 +5238,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             num_comparisons: &mut usize,
             wand_factor: f32,
             phrase_slop: Option<u32>,
+            fine: &mut FineDiag,
         ) -> Result<(u64, bool)> {
             let num_lists = wand.lead.len();
             let cap = MAX_POSTING_BLOCK_SIZE;
@@ -4870,6 +5247,23 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let target32 = target as u32;
             let wide_end32 = u32::try_from(wide_end).unwrap_or(u32::MAX);
             let phrase = phrase_slop.is_some();
+            fine.note_wide_win();
+            // Diagnostic norm cache: read once per window so `exact_fail1` can
+            // price a candidate before any follower runs, without initializing
+            // the cache the collection pass owns.
+            let diag_norm = if fine.enabled {
+                wand.norm_k_cache()
+            } else {
+                None
+            };
+            // Every exit closes the diagnostic window, so blocks decoded for a
+            // window that publishes nothing land in `dead` / `fdead`.
+            macro_rules! wide_exit {
+                ($next:expr, $done:expr, $had_candidates:expr) => {{
+                    fine.end_window($had_candidates);
+                    return Ok(($next, $done));
+                }};
+            }
 
             // A narrow window may have moved a follower's own cursor since the
             // last wide one; then that cursor is the better start. Otherwise
@@ -4891,21 +5285,47 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     unreachable!("bulk AND requires compressed postings");
                 };
                 let shift = list.block_shift();
+                let decode = fine.enabled.then(|| decode_plan(posting, lead_block));
                 let state = unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, lead_block) };
+                if decode.is_some_and(|(doc_ids, _)| doc_ids) {
+                    fine.note_doc(0);
+                }
                 let docs0 = state.doc_ids.as_slice();
                 let lo = docs0.partition_point(|&doc| doc < target32);
                 let hi = lo + docs0[lo..].partition_point(|&doc| doc <= wide_end32);
                 if lo == hi {
                     if hi < docs0.len() {
-                        return Ok((u64::from(docs0[hi]), false));
+                        wide_exit!(u64::from(docs0[hi]), false, false);
                     }
                     if lead_block + 1 < list.blocks.len() {
-                        return Ok((u64::from(list.block_least_doc_id(lead_block + 1)), false));
+                        wide_exit!(u64::from(list.block_least_doc_id(lead_block + 1)), false, false);
                     }
-                    return Ok((0, true));
+                    wide_exit!(0, true, false);
                 }
                 st.docs.clear();
                 st.docs.extend_from_slice(&docs0[lo..hi]);
+                fine.note_lead_docs(st.docs.len());
+                if fine.enabled {
+                    st.dlens.clear();
+                    st.dnorms.clear();
+                    for i in 0..st.docs.len() {
+                        let doc = st.docs[i];
+                        match diag_norm.as_ref() {
+                            Some((norms, _)) => {
+                                let code = norms[doc as usize];
+                                st.dnorms.push(code);
+                                st.dlens.push(dequantize_doc_length(code));
+                            }
+                            None => {
+                                st.dnorms.push(0);
+                                st.dlens.push(match wand.documents.scoring_norms() {
+                                    Some(norms) => dequantize_doc_length(norms[doc as usize]),
+                                    None => wand.documents.scoring_num_tokens(doc),
+                                });
+                            }
+                        }
+                    }
+                }
                 // Only the position check reads posting offsets, so a plain
                 // conjunction never writes or moves this column.
                 if phrase {
@@ -4929,6 +5349,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 Some(kth) => (true, wand.threshold.min(kth)),
                 None => (false, wand.threshold),
             };
+            if fine.enabled && prunable && floor_w < wand.threshold {
+                fine.note_local_floor();
+            }
             #[cfg(test)]
             if prunable && floor_w < wand.threshold {
                 wand.and_window_stats.wide_local_floor_windows += 1;
@@ -4946,6 +5369,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         };
                         let b0 = st.fcur[j].0.max(posting.block_idx);
                         let b1 = posting.block_idx_for_doc(list, b0, last_doc);
+                        fine.note_pos(j);
                         posting.region_bound(b0, b1, &wand.scorer)
                     };
                     if !(bound.is_finite() && bound > 0.0) {
@@ -4957,7 +5381,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
             if prunable {
                 if score_sum_cannot_compete(0.0, suffix[0], floor_w, factor, mode) {
-                    return Ok((wide_end + 1, wide_end >= u32::MAX as u64));
+                    if fine.enabled {
+                        fine.wskip_docs += n;
+                    }
+                    wide_exit!(wide_end + 1, wide_end >= u32::MAX as u64, false);
                 }
                 // Query-scoped: the bound only depends on the clause weights.
                 if st.lut.is_empty() {
@@ -4982,7 +5409,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let PostingList::Compressed(ref list) = posting.list else {
                     unreachable!("bulk AND requires compressed postings");
                 };
+                let decode = fine.enabled.then(|| decode_plan(posting, lead_block));
                 let state = unsafe { &*posting.ensure_compressed_block_ptr(list, lead_block) };
+                if decode.is_some_and(|(_, freqs)| freqs) {
+                    fine.note_freq(0);
+                }
                 #[cfg(test)]
                 {
                     wand.and_window_stats.wide_lead_freq_decodes += 1;
@@ -5011,10 +5442,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let mut out = 0usize;
                 let mut max_next_j: u64 = 0;
                 let mut last_decoded: Option<usize> = None;
+                fine.note_cand(j, n);
                 while i < n {
                     let doc = st.docs[i];
                     if fb + 1 < num_blocks && doc >= list.block_least_doc_id(fb + 1) {
                         fb = posting.block_idx_for_doc(list, fb, doc);
+                        fine.note_pos(j);
                         fpos = 0;
                     }
                     let segment_end_doc = if fb + 1 < num_blocks {
@@ -5066,6 +5499,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         {
                             wand.and_window_stats.wide_blocks_skipped += 1;
                         }
+                        fine.note_bskip(j);
                         i = i_end;
                         continue;
                     }
@@ -5075,7 +5509,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             let state = unsafe { &*posting.compressed_state_ptr() };
                             (state.block_idx, state.doc_ids.is_empty())
                         };
+                        let decode = fine.enabled.then(|| decode_plan(posting, fb));
                         let state = unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, fb) };
+                        if decode.is_some_and(|(doc_ids, _)| doc_ids) {
+                            fine.note_doc(j);
+                        }
                         #[cfg(test)]
                         if state.block_idx != before.0 || (before.1 && !state.doc_ids.is_empty()) {
                             wand.and_window_stats.wide_follower_blocks_decoded[j - 1] += 1;
@@ -5097,8 +5535,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             let freqs = match freqs {
                                 Some(ptr) => ptr,
                                 None => {
+                                    let decode_freq = fine.enabled && decode_plan(posting, fb).1;
                                     let state =
                                         unsafe { &*posting.ensure_compressed_block_ptr(list, fb) };
+                                    if decode_freq {
+                                        fine.note_freq(j);
+                                    }
                                     let ptr = state.freqs.as_ptr();
                                     freqs = Some(ptr);
                                     ptr
@@ -5127,6 +5569,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         {
                             wand.and_window_stats.wide_follower_hit_blocks[j - 1] += 1;
                         }
+                    } else {
+                        fine.note_bdead(j);
                     }
                     fpos = unsafe {
                         find_next_geq(docs_b, fpos, len_b, segment_last.saturating_add(1))
@@ -5232,6 +5676,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 frequency: st.freq[c * cap + i],
                             }));
                         }
+                        if fine.enabled {
+                            fine.poschk += 1;
+                        }
                         let matched = if slop == 0 {
                             wand.check_exact_positions_bulk()?
                         } else {
@@ -5246,9 +5693,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         doc_length,
                         u64::from(doc),
                         (0..num_lists).map(|c| (wand.lead[c].term_index(), st.freq[c * cap + i])),
-                    )? && let Some(kth) = candidates.kth_score_if_full()
+                    )?
                     {
-                        wand.update_threshold(kth, wand_factor);
+                        if fine.enabled {
+                            let phase = usize::from(wand.threshold > 0.0);
+                            fine.note_try(phase);
+                            fine.note_ok(phase);
+                        }
+                        if let Some(kth) = candidates.kth_score_if_full() {
+                            let before = wand.threshold;
+                            wand.update_threshold(kth, wand_factor);
+                            if fine.enabled && wand.threshold > before {
+                                fine.floor_raised += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -5257,7 +5715,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // next doc: below the latter no conjunction can start.
             let next_target = (wide_end + 1).max(max_next);
             debug_assert!(next_target > target);
-            Ok((next_target, query_done || wide_end >= u32::MAX as u64))
+            wide_exit!(next_target, query_done || wide_end >= u32::MAX as u64, n > 0)
         }
 
         // Allocated only when a window really opens wide.
@@ -5270,6 +5728,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
             self.raise_to_shared_floor(params.wand_factor);
             let window_started_with_floor = self.threshold > 0.0;
+            fine.begin_window(usize::from(window_started_with_floor));
             if window_started_with_floor {
                 if num_lists >= 2 && freq_bound_lut.is_none() {
                     let mut lut = [f32::INFINITY; FREQ_LUT_BUCKETS];
@@ -5299,6 +5758,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         unreachable!("bulk AND requires compressed postings");
                     };
                     let block_idx = posting.block_idx_for_doc(list, posting.block_idx, target32);
+                    fine.note_pos(j);
                     let block_up_to = if block_idx + 1 < list.blocks.len() {
                         u64::from(list.block_least_doc_id(block_idx + 1)).saturating_sub(1)
                     } else {
@@ -5359,7 +5819,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     usize::MAX
                 } else {
                     let mut span = 0usize;
-                    for posting in self.lead.iter().skip(1) {
+                    for (j, posting) in self.lead.iter().enumerate().skip(1) {
                         let PostingList::Compressed(ref list) = posting.list else {
                             unreachable!("bulk AND requires compressed postings");
                         };
@@ -5368,6 +5828,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             posting.block_idx,
                             u32::try_from(wide_end).unwrap_or(u32::MAX),
                         );
+                        fine.note_pos(j);
                         span = span.max(end_block.saturating_sub(posting.block_idx) + 1);
                     }
                     span
@@ -5375,6 +5836,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 if wide == BulkAndWide::Always
                     || (win_end < wide_end && widest_span >= span_threshold)
                 {
+                    fine.note_span(widest_span);
                     #[cfg(test)]
                     {
                         self.and_window_stats.wide_windows += 1;
@@ -5393,6 +5855,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         &mut num_comparisons,
                         params.wand_factor,
                         params.phrase_slop,
+                        &mut fine,
                     )?;
                     if done {
                         break 'window;
@@ -5425,7 +5888,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     unreachable!("bulk AND requires compressed postings");
                 };
                 let block_idx = posting.block_idx;
+                let decode = fine.enabled.then(|| decode_plan(posting, block_idx));
                 let state = unsafe { &mut *posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
+                if decode.is_some_and(|(doc_ids, _)| doc_ids) {
+                    fine.note_doc(j);
+                }
                 let doc_ids = state.doc_ids.as_slice();
                 let len = doc_ids.len();
                 // Everything before the previous slice's end of this block is
@@ -5447,7 +5914,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     lo + doc_ids[lo..].partition_point(|&doc| doc <= win_end32)
                 };
                 slice_prev[j] = (block_idx, hi);
+                fine.note_slice(j, hi - lo);
                 if lo == hi {
+                    fine.note_empty(j);
                     // No docs of this clause in the window: the whole window
                     // has no conjunction match. If this was the clause's last
                     // block and it is fully behind the target, the clause is
@@ -5471,6 +5940,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 });
             }
             if exhausted {
+                fine.end_window(false);
                 break 'window;
             }
             if !skip_window {
@@ -5498,9 +5968,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     let PostingList::Compressed(ref list) = posting.list else {
                         unreachable!("bulk AND requires compressed postings");
                     };
+                    let decode = fine
+                        .enabled
+                        .then(|| decode_plan(posting, posting.block_idx));
                     let state = unsafe {
                         &mut *posting.ensure_compressed_block_ptr(list, posting.block_idx)
                     };
+                    if decode.is_some_and(|(_, freqs)| freqs) {
+                        fine.note_freq(0);
+                    }
                     wins[0].freqs = state.freqs.as_ptr();
                     let others_block_max =
                         others_block_max.expect("positive floor should initialize bounds");
@@ -5616,14 +6092,25 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     },
                 }
 
+                if batch_docs.is_empty() {
+                    // Every slice was non-empty and the merge still produced
+                    // nothing: the window is a `merge` window for FINE-DIAG.
+                    fine.note_merge_empty();
+                }
                 if !batch_docs.is_empty() {
-                    for (win, posting) in wins.iter_mut().zip(self.lead.iter()) {
+                    for (j, (win, posting)) in wins.iter_mut().zip(self.lead.iter()).enumerate() {
                         let PostingList::Compressed(ref list) = posting.list else {
                             unreachable!("bulk AND requires compressed postings");
                         };
+                        let decode = fine
+                            .enabled
+                            .then(|| decode_plan(posting, posting.block_idx));
                         let state = unsafe {
                             &mut *posting.ensure_compressed_block_ptr(list, posting.block_idx)
                         };
+                        if decode.is_some_and(|(_, freqs)| freqs) {
+                            fine.note_freq(j);
+                        }
                         win.freqs = state.freqs.as_ptr();
                     }
                     if !norm_k_initialized {
@@ -5720,6 +6207,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     // position confirmation would otherwise make every
                     // position-failing candidate pay for a score it never uses.
                     let early_score = (self.threshold > 0.0).then(|| {
+                        if fine.enabled {
+                            fine.note_score(1);
+                        }
                         window_bm25_score(
                             &self.lead,
                             &wins,
@@ -5752,6 +6242,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 frequency: unsafe { *win.freqs.add(off as usize) },
                             }));
                         }
+                        if fine.enabled {
+                            fine.poschk += 1;
+                        }
                         let matched = if slop == 0 {
                             self.check_exact_positions_bulk()?
                         } else {
@@ -5761,19 +6254,25 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             continue;
                         }
                     }
-                    let score = early_score.unwrap_or_else(|| {
-                        window_bm25_score(
-                            &self.lead,
-                            &wins,
-                            offs,
-                            &score_order,
-                            &self.scorer,
-                            norm_addend,
-                            doc_length,
-                        )
-                    });
+                    let score = match early_score {
+                        Some(score) => score,
+                        None => {
+                            if fine.enabled {
+                                fine.note_score(0);
+                            }
+                            window_bm25_score(
+                                &self.lead,
+                                &wins,
+                                offs,
+                                &score_order,
+                                &self.scorer,
+                                norm_addend,
+                                doc_length,
+                            )
+                        }
+                    };
 
-                    if candidates.insert(
+                    let inserted = candidates.insert(
                         ScoredDoc::new(document_key, score),
                         doc_length,
                         u64::from(doc),
@@ -5784,12 +6283,24 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 })
                             },
                         ),
-                    )? && let Some(kth) = candidates.kth_score_if_full()
-                    {
+                    )?;
+                    if fine.enabled {
+                        let phase = usize::from(self.threshold > 0.0);
+                        fine.note_try(phase);
+                        if inserted {
+                            fine.note_ok(phase);
+                        }
+                    }
+                    if inserted && let Some(kth) = candidates.kth_score_if_full() {
+                        let before = self.threshold;
                         self.update_threshold(kth, params.wand_factor);
+                        if fine.enabled && self.threshold > before {
+                            fine.floor_raised += 1;
+                        }
                     }
                 }
             }
+            fine.end_window(!skip_window && !batch_docs.is_empty());
 
             if win_end == TERMINATED_DOC_ID {
                 break;
@@ -5797,6 +6308,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             target = (win_end + 1).max(jump_to);
         }
 
+        if fine.enabled {
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!("fts-fine-diag {}", fine.render());
+            }
+        }
         metrics.record_comparisons(num_comparisons);
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
