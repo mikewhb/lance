@@ -31,6 +31,9 @@ const C_DEC_FREQ_NS: f64 = 40.0;
 const C_GEQ_NS: f64 = 8.6;
 const C_NORM_NS: f64 = 15.0;
 const C_BM25_NS: f64 = 3.0;
+/// One tf-LUT probe. A large segment's probe loop costs more than intersecting
+/// it; the whole-segment check above this still runs.
+const C_LUT_NS: f64 = 8.0;
 
 macro_rules! tally {
     ($wand:ident.$field:ident += $n:expr) => {
@@ -653,15 +656,19 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .take(clause)
             .map(|row| f64::from(row[1]))
             .sum::<f64>();
-        let skip_lut = !score_sum_cannot_compete(
+        let cannot_reject_any = !score_sum_cannot_compete(
             0.0,
             min_prefix + rem,
             self.threshold,
             factor,
             self.floor_mode,
         );
+        // Scanning every candidate is wasted when the segment is already
+        // cheaper to intersect than to probe. Profile of the balanced k=3
+        // queries put this loop well above the SIMD intersection.
+        let probe_costs_more = (end - start) as f64 * C_LUT_NS > C_DEC_NS;
         let mut write = start;
-        if !skip_lut {
+        if !cannot_reject_any && !probe_costs_more {
             for src in start..end {
                 ensure_lut(rows, lut, src, clause);
                 let reject = score_sum_cannot_compete(
