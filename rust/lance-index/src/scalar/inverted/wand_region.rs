@@ -140,6 +140,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, 256));
         let mut num_comparisons = 0usize;
         let mut pos_state = vec![None; k];
+        // Reused across regions and segments. The design allocates these once;
+        // a fresh Vec per region showed up as the k=3 regressions.
+        let mut suffix = vec![0.0f64; k + 1];
+        let mut upper = vec![0.0f32; k];
+        let mut hits: Vec<(usize, usize)> = Vec::new();
+        let mut pairs: Vec<(u16, u16)> = Vec::new();
+        let mut norm_pending: Vec<usize> = Vec::new();
         let norm_k = self.norm_k_cache();
         let norms_only = if norm_k.is_none() {
             self.documents.scoring_norms()
@@ -232,7 +239,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
 
             let mut bounds_ok = false;
-            let mut suffix = vec![0.0f64; k + 1];
+            suffix.fill(0.0);
             if has_floor {
                 if lut.is_empty() {
                     lut = (0..k)
@@ -240,7 +247,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         .collect();
                 }
                 bounds_ok = true;
-                let mut upper = vec![0.0f32; k];
                 upper[0] = block_bound_at(&self.lead[0], &self.scorer, lead_block);
                 #[allow(clippy::needless_range_loop)]
                 for clause in 1..k {
@@ -318,6 +324,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     norm_k.as_ref(),
                     norms_only,
                     &mut max_follower_doc,
+                    &mut hits,
+                    &mut pairs,
                 )?;
                 // Exhausting one follower ends the query after every clause
                 // has filtered this region. It must not skip the clauses that
@@ -341,6 +349,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     params.wand_factor,
                     params.phrase_slop,
                     &mut pos_state,
+                    &mut norm_pending,
                 )?;
             }
 
@@ -480,6 +489,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         norm_k: Option<&super::NormKCache<'a>>,
         norms_only: Option<&'a [u8]>,
         max_follower_doc: &mut u64,
+        hits: &mut Vec<(usize, usize)>,
+        pairs: &mut Vec<(u16, u16)>,
     ) -> Result<bool> {
         let (mut fb, mut fpos) = fcur[clause];
         let mut last_examined = None;
@@ -557,16 +568,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     n_b * MERGE_RATIO >= m_b
                 }
             };
-            let mut hits = Vec::with_capacity(n_b);
+            hits.clear();
             if use_merge {
                 tally!(self.merge_segments += 1);
-                let mut pairs = Vec::new();
-                intersect_indices(
-                    &rows.docs[index..seg_keep],
-                    &block_docs[fpos..len_b],
-                    &mut pairs,
-                );
-                for (left, right) in pairs {
+                intersect_indices(&rows.docs[index..seg_keep], &block_docs[fpos..len_b], pairs);
+                for &(left, right) in pairs.iter() {
                     hits.push((index + left as usize, fpos + right as usize));
                 }
             } else {
@@ -586,7 +592,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let mut wrote_freq = false;
             let mut freq_ptr = std::ptr::null();
             let shift = list.block_shift();
-            for (source, off) in hits {
+            for &(source, off) in hits.iter() {
                 if !wrote_freq {
                     let state = unsafe { &*posting.ensure_compressed_block_ptr(list, fb) };
                     freq_ptr = state.freqs.as_ptr();
@@ -756,16 +762,17 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         wand_factor: f32,
         phrase_slop: Option<u32>,
         pos_state: &mut [Option<super::CompressedState>],
+        pending: &mut Vec<usize>,
     ) -> Result<()> {
         // Gather only the candidates whose norm was not already touched by
         // an exact segment prune.
-        let mut pending = Vec::new();
+        pending.clear();
         for index in 0..rows.n {
             if !rows.norm_ok[index] {
                 pending.push(index);
             }
         }
-        for index in pending {
+        for &index in pending.iter() {
             self.ensure_norm(rows, index, norm_k, norms_only);
         }
         for index in 0..rows.n {
