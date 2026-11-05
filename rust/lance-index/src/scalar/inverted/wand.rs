@@ -14344,6 +14344,69 @@ mod tests {
         assert!(run.windows > 0, "the wide path must serve this window");
     }
 
+    /// W18 (mutation M11): a phrase candidate must survive the in-place
+    /// compaction of the per-clause columns. A floor between the two candidates
+    /// prunes the weaker one at segment level, so the survivor's columns move;
+    /// if the move skips `w_pidx`, its position check reads the pruned entry.
+    #[test]
+    fn wide_window_phrase_survives_segment_pruning() {
+        let num_docs = 50_000usize;
+        let docs = unit_length_docs(num_docs);
+        // Two candidates: doc 0 is a strong match (freq 9), doc 20_000 a weak
+        // one (freq 1). Both are in phrase order.
+        let lead = vec![(0u32, vec![0u32, 1, 2]), (20_000u32, vec![0u32, 1, 2])];
+        let middle = vec![(0u32, vec![1u32, 2, 3]), (20_000u32, vec![1u32, 2, 3])];
+        let tail = vec![(0u32, vec![2u32, 3, 4]), (20_000u32, vec![2u32, 3, 4])];
+        let build = move || {
+            vec![
+                wide_phrase_clause(0, 1.0, &lead, num_docs),
+                wide_phrase_clause(1, 0.6, &middle, num_docs),
+                wide_phrase_clause(2, 0.3, &tail, num_docs),
+            ]
+        };
+        let mut params = wide_params(10);
+        params.phrase_slop = Some(0);
+        let run = |mode: BulkAndMode, wide: BulkAndWide, floor_bits: u32| {
+            let floor = Arc::new(AtomicU32::new(floor_bits));
+            let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode)
+                .with_bulk_and_wide(wide)
+                .with_shared_threshold(floor);
+            let hits = wand.search(&params, &NoOpMetricsCollector).unwrap();
+            let mut rows = hits
+                .into_iter()
+                .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            (
+                rows,
+                wand.and_window_stats.wide_segments_pruned,
+                wand.and_window_stats.wide_windows,
+            )
+        };
+        // Floor at zero first to learn the weak candidate's score, then rerun
+        // with a floor that keeps only the strong one.
+        let (open_rows, _, _) = run(BulkAndMode::On, BulkAndWide::Always, 0.0_f32.to_bits());
+        assert_eq!(open_rows.len(), 2, "both candidates match with no floor");
+        // Raise the floor until the weak candidate can no longer compete, then
+        // compare the surviving rows. The ladder is deterministic and needs no
+        // knowledge of the scorer's scale.
+        let mut saw_narrowing = false;
+        for step in 1..=12 {
+            let floor = ((1u32 << step) as f32).to_bits();
+            let (classic, _, _) = run(BulkAndMode::Off, BulkAndWide::Off, floor);
+            let (wide_rows, _, windows) = run(BulkAndMode::On, BulkAndWide::Always, floor);
+            assert_eq!(
+                wide_rows, classic,
+                "compaction changed the phrase rows at floor step {step}"
+            );
+            if classic.len() < 2 {
+                saw_narrowing = true;
+            }
+        }
+        assert!(saw_narrowing, "the ladder must reject the weak candidate");
+    }
+
     /// W1: the bulk conjunction corpus, scored four ways across every limit.
     /// Scattered clause densities make followers cross lead blocks, so the wide
     /// window is what runs for most of it.
