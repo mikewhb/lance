@@ -1688,6 +1688,117 @@ impl PostingIterator {
         }
     }
 
+    /// Score upper bound for one posting block, addressed by index instead of
+    /// by the cursor. The wide window walks follower blocks by number, so the
+    /// cursor-anchored `block_max_score` / `impact_level0` memos cannot be used:
+    /// they are keyed by `self.block_idx` and would answer for another block.
+    #[allow(dead_code)] // Only the wide-window traversal calls this.
+    fn block_bound_at<S: Scorer + ?Sized>(&self, block: usize, scorer: &S) -> f32 {
+        let PostingList::Compressed(ref list) = self.list else {
+            return if self.use_scorer_upper_bound {
+                scorer_upper_bound(self.query_weight, scorer)
+            } else {
+                self.approximate_upper_bound
+            };
+        };
+        // Bulk routing already rejects grouped terms, which have no stored
+        // per-block bound of their own.
+        debug_assert!(!self.has_grouped_terms());
+        // An out-of-range block holds no documents, but callers treat the result
+        // as a bound: a finite answer would silently prune real candidates, and
+        // reading the block header would panic.
+        if block >= list.blocks.len() {
+            return f32::INFINITY;
+        }
+        if let Some(impacts) = list.impacts.as_ref() {
+            // `level0_score_cached` answers 0.0 past the impact table, which is a
+            // lower bound; the doc-id marker is the only out-of-range test
+            // available outside tests.
+            if impacts.level0_doc_up_to(block).is_none() {
+                return f32::INFINITY;
+            }
+            let compressed = unsafe { &mut *self.compressed_state_ptr() };
+            return impacts.level0_score_cached(
+                block,
+                self.query_weight,
+                scorer,
+                &mut compressed.block_max_window.impact_score_cache,
+            );
+        }
+        if self.use_scorer_upper_bound {
+            return scorer_upper_bound(self.query_weight, scorer);
+        }
+        if list.block_size == MAX_POSTING_BLOCK_SIZE {
+            return scorer_upper_bound(self.query_weight, scorer);
+        }
+        list.block_max_score(block)
+    }
+
+    /// Score upper bound for the block range `[b0, b1]`, where `b1` is the block
+    /// holding the last document of the range. The wide window bounds a
+    /// candidate span before it knows which follower blocks it will touch, so
+    /// this has to cost about one lookup per level-1 group instead of one per
+    /// block; the tight bound is left to `block_bound_at` on the segments that
+    /// really hold candidates.
+    #[allow(dead_code)] // Only the wide-window traversal calls this.
+    fn region_bound<S: Scorer + ?Sized>(&self, b0: usize, b1: usize, scorer: &S) -> f32 {
+        // A group the range only clips is answered block by block: reading four
+        // headers is cheaper than making the caller's span look broader than it
+        // is. The constant is structural, not tuned: both answers are safe.
+        const EDGE_BLOCKS: usize = 4;
+        let PostingList::Compressed(ref list) = self.list else {
+            return if self.use_scorer_upper_bound {
+                scorer_upper_bound(self.query_weight, scorer)
+            } else {
+                self.approximate_upper_bound
+            };
+        };
+        debug_assert!(!self.has_grouped_terms());
+        // An empty or out-of-range span must read as "cannot prune" instead of
+        // panicking or under-bounding the range.
+        if b0 > b1 || b1 >= list.blocks.len() {
+            return f32::INFINITY;
+        }
+        let Some(impacts) = list.impacts.as_ref() else {
+            // No level-1 table on this format: short ranges read the stored
+            // block maxima, long ones fall back to the list-wide bound.
+            if b1 < b0 + EDGE_BLOCKS * 2 {
+                let mut bound = 0.0_f32;
+                for block in b0..=b1 {
+                    bound = bound.max(self.block_bound_at(block, scorer));
+                }
+                return bound;
+            }
+            return self.frequency_clamp_upper_bound(scorer);
+        };
+        let mut bound = 0.0_f32;
+        for group in (b0 / IMPACT_LEVEL1_BLOCKS)..=(b1 / IMPACT_LEVEL1_BLOCKS) {
+            let group_start = group * IMPACT_LEVEL1_BLOCKS;
+            let bs = b0.max(group_start);
+            let be = b1.min(group_start + IMPACT_LEVEL1_BLOCKS - 1);
+            if be < bs + EDGE_BLOCKS {
+                for block in bs..=be {
+                    bound = bound.max(self.block_bound_at(block, scorer));
+                }
+                continue;
+            }
+            // Same trap as `block_bound_at`: a cached score for a missing entry
+            // is 0.0, so the doc-id marker decides whether the entry exists.
+            if impacts.level1_doc_up_to(group).is_none() {
+                return f32::INFINITY;
+            }
+            let compressed = unsafe { &mut *self.compressed_state_ptr() };
+            let score = impacts.level1_score_cached(
+                group,
+                self.query_weight,
+                scorer,
+                &mut compressed.block_max_window.impact_score_cache,
+            );
+            bound = bound.max(score);
+        }
+        bound
+    }
+
     fn window_max_score<S: Scorer + ?Sized>(&self, up_to: Option<u64>, scorer: &S) -> f32 {
         if let Some(up_to) = up_to
             && let PostingList::Compressed(_) = self.list
@@ -8618,6 +8729,271 @@ mod tests {
         )
     }
 
+    /// Fixture for the wide-window bound tests. Doc ids are contiguous and
+    /// every document inside a block shares that block's frequency and length,
+    /// so the exact per-document contribution of a block has a closed form.
+    struct WideBoundsFixture {
+        posting: PostingIterator,
+        blocks: usize,
+    }
+
+    impl WideBoundsFixture {
+        const QUERY_WEIGHT: f32 = 1.7;
+
+        fn new(blocks: usize, block_size: usize) -> Self {
+            let total = blocks * block_size;
+            let doc_ids = (0..total as u32).collect::<Vec<_>>();
+            let freqs = (0..total)
+                .map(|index| Self::freq_of(index / block_size))
+                .collect::<Vec<_>>();
+            let doc_lengths = (0..total)
+                .map(|index| Self::len_of(index / block_size))
+                .collect::<Vec<_>>();
+            let list = if block_size == MAX_POSTING_BLOCK_SIZE {
+                generate_impact_posting_list_with_freqs_and_block_size(
+                    doc_ids,
+                    freqs,
+                    doc_lengths,
+                    block_size,
+                )
+            } else {
+                let scorer = VariedBm25ShapeScorer;
+                let block_max_scores = (0..blocks)
+                    .map(|block| {
+                        Self::QUERY_WEIGHT
+                            * scorer.doc_weight(Self::freq_of(block), Self::len_of(block))
+                    })
+                    .collect::<Vec<_>>();
+                let max_score = block_max_scores.iter().copied().fold(0.0_f32, f32::max);
+                generate_posting_list_with_freqs(
+                    doc_ids,
+                    freqs,
+                    max_score,
+                    Some(block_max_scores),
+                    true,
+                )
+            };
+            Self {
+                posting: PostingIterator::with_query_weight(
+                    String::from("wide"),
+                    0,
+                    0,
+                    Self::QUERY_WEIGHT,
+                    list,
+                    total,
+                ),
+                blocks,
+            }
+        }
+
+        fn freq_of(block: usize) -> u32 {
+            1 + (block % 4) as u32
+        }
+
+        fn len_of(block: usize) -> u32 {
+            8 + ((block * 13) % 61) as u32
+        }
+
+        /// Exact contribution of any document in this block.
+        fn exact(&self, block: usize) -> f32 {
+            let scorer = VariedBm25ShapeScorer;
+            Self::QUERY_WEIGHT * scorer.doc_weight(Self::freq_of(block), Self::len_of(block))
+        }
+    }
+
+    /// Rebuild a posting with one impact entry replaced by a null, the shape a
+    /// truncated entry takes on disk.
+    fn with_corrupt_impact_entry(posting: &PostingIterator, entry: usize) -> PostingIterator {
+        let PostingList::Compressed(ref list) = posting.list else {
+            panic!("bound fixtures are compressed");
+        };
+        let impacts = list.impacts.as_ref().expect("fixture carries impacts");
+        assert!(entry < impacts.entries().len(), "entry {entry} is in range");
+        let mut builder = arrow_array::builder::LargeBinaryBuilder::new();
+        for index in 0..impacts.entries().len() {
+            if index == entry {
+                builder.append_null();
+            } else {
+                builder.append_value(impacts.entries().value(index));
+            }
+        }
+        let corrupted = ImpactSkipData::new(builder.finish(), impacts.level0_len()).unwrap();
+        let mut list = list.clone();
+        list.impacts = Some(corrupted);
+        PostingIterator::with_query_weight(
+            posting.token.clone(),
+            posting.token_id,
+            posting.position,
+            posting.query_weight,
+            PostingList::Compressed(list),
+            1_000_000,
+        )
+    }
+
+    /// W13: block_bound_at bounds every document of the block it names in both
+    /// posting formats, and answers +infinity -- never a lower bound -- for a
+    /// block past the list.
+    #[rstest]
+    #[case::impact_blocks(MAX_POSTING_BLOCK_SIZE)]
+    #[case::stored_block_maxima(crate::scalar::inverted::LEGACY_BLOCK_SIZE)]
+    fn block_bound_at_bounds_every_document(#[case] block_size: usize) {
+        let fixture = WideBoundsFixture::new(6, block_size);
+        let scorer = VariedBm25ShapeScorer;
+        for block in 0..fixture.blocks {
+            let bound = fixture.posting.block_bound_at(block, &scorer);
+            let exact = fixture.exact(block);
+            assert!(bound.is_finite(), "block {block} must keep a usable bound");
+            assert!(
+                bound >= exact,
+                "block {block}: bound {bound} < exact {exact}"
+            );
+        }
+        assert_eq!(
+            fixture.posting.block_bound_at(fixture.blocks, &scorer),
+            f32::INFINITY,
+        );
+        assert_eq!(
+            fixture.posting.block_bound_at(fixture.blocks + 7, &scorer),
+            f32::INFINITY,
+        );
+    }
+
+    /// W13 (continued): a missing level-0 entry must read as "cannot prune"
+    /// while the neighbouring entries keep answering.
+    #[test]
+    fn block_bound_at_reports_infinity_for_a_corrupt_entry() {
+        let fixture = WideBoundsFixture::new(6, MAX_POSTING_BLOCK_SIZE);
+        let scorer = VariedBm25ShapeScorer;
+        let corrupted = with_corrupt_impact_entry(&fixture.posting, 2);
+        assert_eq!(corrupted.block_bound_at(2, &scorer), f32::INFINITY);
+        assert!(corrupted.block_bound_at(1, &scorer).is_finite());
+        assert!(corrupted.block_bound_at(3, &scorer).is_finite());
+    }
+
+    /// W14: region_bound bounds every document in the queried range. The fixed
+    /// cases clip level-1 groups unevenly -- one starts on a group's last block,
+    /// others straddle the group edge or stay below the per-block threshold --
+    /// and the random cases sweep the rest.
+    #[test]
+    fn region_bound_covers_every_document_in_the_range() {
+        const BLOCKS: usize = 64;
+        let fixture = WideBoundsFixture::new(BLOCKS, MAX_POSTING_BLOCK_SIZE);
+        let scorer = VariedBm25ShapeScorer;
+        let mut ranges = vec![
+            (0usize, 0usize),
+            (0, 3),
+            (0, 31),
+            (0, 32),
+            (4, 7),
+            (5, 40),
+            (16, 31),
+            (30, 33),
+            (31, 31),
+            (31, 60),
+            (32, 63),
+            (40, 63),
+            (63, 63),
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..64 {
+            let b0 = (next() % BLOCKS as u64) as usize;
+            let b1 = b0 + (next() % (BLOCKS - b0) as u64) as usize;
+            ranges.push((b0, b1));
+        }
+        for (b0, b1) in ranges {
+            let bound = fixture.posting.region_bound(b0, b1, &scorer);
+            assert!(bound.is_finite(), "[{b0}, {b1}] must have a finite bound");
+            for block in b0..=b1 {
+                let exact = fixture.exact(block);
+                assert!(
+                    bound >= exact,
+                    "[{b0}, {b1}] at block {block}: bound {bound} < exact {exact}"
+                );
+            }
+        }
+        assert_eq!(
+            fixture.posting.region_bound(0, BLOCKS, &scorer),
+            f32::INFINITY,
+        );
+        assert_eq!(fixture.posting.region_bound(9, 8, &scorer), f32::INFINITY);
+    }
+
+    /// W14 (continued): the bound must reach the last block of the range when
+    /// that block holds the maximum, including when it is the last block of a
+    /// level-1 group.
+    #[test]
+    fn region_bound_includes_the_maximum_in_an_edge_group() {
+        let total = 32 * MAX_POSTING_BLOCK_SIZE;
+        let doc_ids = (0..total as u32).collect::<Vec<_>>();
+        let freqs = (0..total)
+            .map(|index| {
+                if index / MAX_POSTING_BLOCK_SIZE == 31 {
+                    9
+                } else {
+                    1
+                }
+            })
+            .collect::<Vec<_>>();
+        let doc_lengths = vec![12; total];
+        let list = generate_impact_posting_list_with_freqs_and_block_size(
+            doc_ids,
+            freqs,
+            doc_lengths,
+            MAX_POSTING_BLOCK_SIZE,
+        );
+        let posting =
+            PostingIterator::with_query_weight(String::from("edge"), 0, 0, 1.3, list, total);
+        let scorer = VariedBm25ShapeScorer;
+        let peak = 1.3 * scorer.doc_weight(9, 12);
+        // Two blocks of the group's tail, answered block by block.
+        assert!(posting.region_bound(30, 31, &scorer) >= peak);
+        assert!(posting.region_bound(31, 31, &scorer) >= peak);
+        // Starting on the group's last block and crossing into the next group.
+        assert!(posting.region_bound(31, 32, &scorer) >= peak);
+    }
+
+    /// W14 (continued): a corrupt level-1 entry makes the range unprunable
+    /// instead of under-estimating it, while ranges answered block by block
+    /// still work.
+    #[test]
+    fn region_bound_reports_infinity_for_a_corrupt_level1_entry() {
+        let fixture = WideBoundsFixture::new(64, MAX_POSTING_BLOCK_SIZE);
+        let scorer = VariedBm25ShapeScorer;
+        let PostingList::Compressed(ref list) = fixture.posting.list else {
+            panic!("fixture is compressed");
+        };
+        let level0_len = list.impacts.as_ref().unwrap().level0_len();
+        let corrupted = with_corrupt_impact_entry(&fixture.posting, level0_len + 1);
+        assert_eq!(corrupted.region_bound(32, 63, &scorer), f32::INFINITY);
+        assert_eq!(corrupted.region_bound(0, 63, &scorer), f32::INFINITY);
+        assert!(corrupted.region_bound(31, 31, &scorer).is_finite());
+        assert!(corrupted.region_bound(62, 63, &scorer).is_finite());
+    }
+
+    /// W14 (continued): without impacts, short ranges read the stored block
+    /// maxima and long ones fall back to the list-wide bound.
+    #[test]
+    fn region_bound_covers_stored_block_maxima_ranges() {
+        let fixture = WideBoundsFixture::new(40, crate::scalar::inverted::LEGACY_BLOCK_SIZE);
+        let scorer = VariedBm25ShapeScorer;
+        for (b0, b1) in [(0usize, 0usize), (3, 10), (5, 12), (17, 33), (0, 39)] {
+            let bound = fixture.posting.region_bound(b0, b1, &scorer);
+            assert!(bound.is_finite(), "[{b0}, {b1}] must have a finite bound");
+            for block in b0..=b1 {
+                let exact = fixture.exact(block);
+                assert!(
+                    bound >= exact,
+                    "[{b0}, {b1}] at block {block}: bound {bound} < exact {exact}"
+                );
+            }
+        }
+    }
     fn generate_posting_list_with_positions(
         doc_ids: Vec<u32>,
         positions_by_doc: Vec<Vec<u32>>,
