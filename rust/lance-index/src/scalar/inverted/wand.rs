@@ -4855,6 +4855,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             candidates: &mut TopKCollector,
             num_comparisons: &mut usize,
             wand_factor: f32,
+            phrase_slop: Option<u32>,
         ) -> Result<(u64, bool)> {
             let num_lists = wand.lead.len();
             let cap = MAX_POSTING_BLOCK_SIZE;
@@ -5209,9 +5210,30 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             None => wand.lead[c].score(&wand.scorer, freq, doc_length),
                         };
                     }
-                    // No exact-score floor prune here: the narrow path only does
-                    // that for phrase queries, and this partition's rows must
-                    // stay identical to it.
+                    if let Some(slop) = phrase_slop {
+                        // Same order as the narrow path: the exact-score floor
+                        // check runs before the position check when a floor
+                        // exists, and the position check needs every clause's
+                        // cursor parked on this candidate.
+                        if wand.threshold > 0.0 && wand.exclusive_score_cannot_beat_floor(score) {
+                            continue;
+                        }
+                        for (c, posting) in wand.lead.iter_mut().enumerate() {
+                            posting.index = st.pidx[c * cap + i] as usize;
+                            posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id: doc,
+                                frequency: st.freq[c * cap + i],
+                            }));
+                        }
+                        let matched = if slop == 0 {
+                            wand.check_exact_positions_bulk()?
+                        } else {
+                            wand.check_positions(slop as i32)?
+                        };
+                        if !matched {
+                            continue;
+                        }
+                    }
                     if candidates.insert(
                         ScoredDoc::new(document_key, score),
                         doc_length,
@@ -5302,7 +5324,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // worst-case measurement, not for production routing.
             let wide_applies =
                 wide == BulkAndWide::Always || (wide == BulkAndWide::Auto && num_lists >= 3);
-            if wide_applies && num_lists >= 2 && phrase_slop.is_none() {
+            if wide_applies && num_lists >= 2 {
                 let lead_block = self.lead[0].block_idx;
                 let lead_block_end = {
                     let PostingList::Compressed(ref list) = self.lead[0].list else {
@@ -5316,7 +5338,34 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 };
                 let wide_end = lead_block_end.min(target.saturating_add(WIDE_MAX_SPAN - 1));
                 debug_assert!(wide_end >= target);
-                if wide == BulkAndWide::Always || win_end < wide_end {
+                // A wide window only pays for itself when the narrow path would
+                // have opened several windows inside it. Estimate that from block
+                // metadata alone: the widest follower's block span over
+                // [target, wide_end] bounds the number of narrow windows. Below
+                // the threshold the per-window bounds and segment bookkeeping
+                // cost more than the setup they would amortise (measured: the
+                // five int3 regressions all sit at span <= 7).
+                let span_threshold = if wide == BulkAndWide::Always { 1 } else { 8 };
+                let widest_span = if wide == BulkAndWide::Always {
+                    usize::MAX
+                } else {
+                    let mut span = 0usize;
+                    for posting in self.lead.iter().skip(1) {
+                        let PostingList::Compressed(ref list) = posting.list else {
+                            unreachable!("bulk AND requires compressed postings");
+                        };
+                        let end_block = posting.block_idx_for_doc(
+                            list,
+                            posting.block_idx,
+                            u32::try_from(wide_end).unwrap_or(u32::MAX),
+                        );
+                        span = span.max(end_block.saturating_sub(posting.block_idx) + 1);
+                    }
+                    span
+                };
+                if wide == BulkAndWide::Always
+                    || (win_end < wide_end && widest_span >= span_threshold)
+                {
                     #[cfg(test)]
                     {
                         self.and_window_stats.wide_windows += 1;
@@ -5334,6 +5383,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         &mut candidates,
                         &mut num_comparisons,
                         params.wand_factor,
+                        params.phrase_slop,
                     )?;
                     if done {
                         break 'window;
