@@ -5293,7 +5293,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // Phrase queries stay on the narrow path until the wide traversal
             // verifies positions itself (S4); the counters above are then only
             // meaningful for non-phrase queries.
-            if wide != BulkAndWide::Off && num_lists >= 2 && phrase_slop.is_none() {
+            // Two-clause conjunctions stay on the narrow path: measured
+            // 1.005x with 32 >1.05 queries against a 0.995 control, because the
+            // per-window bounds and segment bookkeeping cost more than the single
+            // merge they replace. The upside P0 saw for k=2 sits entirely in the
+            // skew >= 32 buckets and needs a per-window gate, not a blanket one.
+            // `always` bypasses the clause-count gate: it exists for tests and
+            // worst-case measurement, not for production routing.
+            let wide_applies =
+                wide == BulkAndWide::Always || (wide == BulkAndWide::Auto && num_lists >= 3);
+            if wide_applies && num_lists >= 2 && phrase_slop.is_none() {
                 let lead_block = self.lead[0].block_idx;
                 let lead_block_end = {
                     let PostingList::Compressed(ref list) = self.lead[0].list else {
