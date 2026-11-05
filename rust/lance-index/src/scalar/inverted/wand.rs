@@ -5322,17 +5322,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // Phrase queries stay on the narrow path until the wide traversal
             // verifies positions itself (S4); the counters above are then only
             // meaningful for non-phrase queries.
-            // Two-clause conjunctions are routed too (S6), but only behind the
-            // same follower-span gate as the wider conjunctions: a blanket k=2
-            // switch measured 1.005x with 32 >1.05 queries against a 0.995
-            // control, because the per-window bounds and segment bookkeeping
-            // cost more than the single merge they replace. The upside P0 saw
-            // for k=2 sits entirely in the skew >= 32 buckets, which is what the
-            // span gate selects.
+            // Two-clause conjunctions stay on the narrow path: measured
+            // 1.005x with 32 >1.05 queries against a 0.995 control, because the
+            // per-window bounds and segment bookkeeping cost more than the single
+            // merge they replace. The upside P0 saw for k=2 sits entirely in the
+            // skew >= 32 buckets and needs a per-window gate, not a blanket one.
             // `always` bypasses the clause-count gate: it exists for tests and
             // worst-case measurement, not for production routing.
             let wide_applies =
-                wide == BulkAndWide::Always || (wide == BulkAndWide::Auto && num_lists >= 2);
+                wide == BulkAndWide::Always || (wide == BulkAndWide::Auto && num_lists >= 3);
             if wide_applies && num_lists >= 2 {
                 let lead_block = self.lead[0].block_idx;
                 let lead_block_end = {
@@ -14888,46 +14886,6 @@ mod tests {
             run.windows
         );
         assert_eq!(run.rows.len(), 2);
-    }
-
-    /// V8 (S6): a two-clause conjunction whose follower is uniform while the
-    /// lead is 128x sparser must open wide windows under auto, and must still
-    /// publish the classic rows and score bits.
-    #[test]
-    fn wide_window_serves_a_skewed_two_clause_conjunction() {
-        let num_docs = 16_384usize;
-        let docs = unit_length_docs(num_docs);
-        let sparse = (0..num_docs as u32)
-            .step_by(128)
-            .map(|doc| (doc, 1))
-            .collect::<Vec<_>>();
-        let dense = (0..num_docs as u32).map(|doc| (doc, 1)).collect::<Vec<_>>();
-        let build = move || {
-            vec![
-                wide_clause(0, 1.0, &sparse, LEGACY_BLOCK_SIZE, num_docs),
-                wide_clause(1, 0.8, &dense, LEGACY_BLOCK_SIZE, num_docs),
-            ]
-        };
-        for limit in WIDE_LIMITS {
-            let auto = run_wide_path(
-                &build,
-                &docs,
-                &|| UnitScorer,
-                &wide_params(limit),
-                BulkAndMode::On,
-                BulkAndWide::Auto,
-            );
-            assert!(
-                auto.fit_windows > 0,
-                "the dispatch must be reached at limit {limit}"
-            );
-            assert!(
-                auto.windows > 0,
-                "a 128x skew must open wide windows at limit {limit}"
-            );
-        }
-        let run = assert_wide_paths_agree(&build, &docs, &|| UnitScorer, &wide_params(3));
-        assert_eq!(run.rows.len(), 3);
     }
 
     /// W9: with identical block boundaries in every clause the narrow window is
