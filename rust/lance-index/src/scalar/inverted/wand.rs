@@ -4760,6 +4760,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons: usize = 0;
         let mut wide_marker_windows = 0usize;
+        let mut wide_marker_lead_docs = 0usize;
         let mut wins: Vec<WindowList> = Vec::with_capacity(num_lists);
         // Per-window candidate batch. The merge kernel only records matches;
         // scoring then runs in two passes so the doc-length gather issues
@@ -5380,6 +5381,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     || (win_end < wide_end && widest_span >= span_threshold)
                 {
                     wide_marker_windows += 1;
+                    if *WIDE_MARKER {
+                        // Evidence only: the marker binary is never timed, so an
+                        // extra lead-block decode here is acceptable.
+                        let posting = &self.lead[0];
+                        if let PostingList::Compressed(ref list) = posting.list {
+                            let state = unsafe {
+                                &*posting.ensure_compressed_doc_ids_ptr(list, lead_block)
+                            };
+                            let docs = state.doc_ids.as_slice();
+                            let lo = docs.partition_point(|&d| u64::from(d) < target);
+                            let hi = lo + docs[lo..].partition_point(|&d| u64::from(d) <= wide_end);
+                            wide_marker_lead_docs += hi - lo;
+                        }
+                    }
                     #[cfg(test)]
                     {
                         self.and_window_stats.wide_windows += 1;
@@ -5805,7 +5820,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         if *WIDE_MARKER {
             #[allow(clippy::print_stderr)]
             {
-                eprintln!("fts-wide k={num_lists} wide_windows={wide_marker_windows}");
+                eprintln!(
+                    "fts-wide k={num_lists} wide_windows={wide_marker_windows} \
+                     lead_docs={wide_marker_lead_docs}"
+                );
             }
         }
         metrics.record_comparisons(num_comparisons);
@@ -14156,6 +14174,22 @@ mod tests {
                 always = Some(run);
             }
         }
+        // The shared floor records the rank-th best published score, so a
+        // ladder over the limit compares every rank's f32 bits rather than
+        // only the k-th. Ranks beyond ten add little and cost four runs each.
+        let top = params.limit.unwrap_or(1).clamp(1, 10);
+        for rank in 1..=top {
+            let mut p = params.clone();
+            p.limit = Some(rank);
+            let c = run_wide_path(build, docs, scorer, &p, BulkAndMode::Off, BulkAndWide::Off);
+            for wide in [BulkAndWide::Auto, BulkAndWide::Always] {
+                let w = run_wide_path(build, docs, scorer, &p, BulkAndMode::On, wide);
+                assert_eq!(
+                    w.floor, c.floor,
+                    "{wide:?} changed the rank-{rank} score bits"
+                );
+            }
+        }
         always.expect("always run")
     }
 
@@ -14263,6 +14297,51 @@ mod tests {
             run.windows > 0,
             "the wide path must serve the repeated-token phrase"
         );
+    }
+
+    /// W16: several phrase candidates inside one wide window, most of which
+    /// fail the position check, must still publish the classic rows.
+    #[test]
+    fn wide_window_phrase_position_failures_stay_correct() {
+        let num_docs = 40_000usize;
+        let docs = unit_length_docs(num_docs);
+        // Every third candidate is in phrase order; the rest are inverted so
+        // the exact check rejects them after the intersection admitted them.
+        let lead = (0..40u32)
+            .map(|i| {
+                let pos = if i % 3 == 0 {
+                    vec![i % 5]
+                } else {
+                    vec![50 + (i % 5)]
+                };
+                (i * 900, pos)
+            })
+            .collect::<Vec<_>>();
+        let middle = (0..20_000u32)
+            .map(|i| {
+                let doc = i * 2;
+                let pos = if doc % 3 == 0 {
+                    vec![1 + (doc % 5)]
+                } else {
+                    vec![60 + (doc % 4)]
+                };
+                (doc, pos)
+            })
+            .collect::<Vec<_>>();
+        let tail = (0..num_docs as u32)
+            .map(|doc| (doc, vec![2 + (doc % 6)]))
+            .collect::<Vec<_>>();
+        let build = move || {
+            vec![
+                wide_phrase_clause(0, 1.0, &lead, num_docs),
+                wide_phrase_clause(1, 0.6, &middle, num_docs),
+                wide_phrase_clause(2, 0.3, &tail, num_docs),
+            ]
+        };
+        let mut params = wide_params(10);
+        params.phrase_slop = Some(0);
+        let run = assert_wide_paths_agree(&build, &docs, &|| UnitScorer, &params);
+        assert!(run.windows > 0, "the wide path must serve this window");
     }
 
     /// W1: the bulk conjunction corpus, scored four ways across every limit.
