@@ -5354,7 +5354,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 // the threshold the per-window bounds and segment bookkeeping
                 // cost more than the setup they would amortise (measured: the
                 // five int3 regressions all sit at span <= 7).
-                let span_threshold = if wide == BulkAndWide::Always { 1 } else { 8 };
+                // Two-clause windows keep the tighter gate: at span 8..15 the
+                // per-window bounds cost more than the single merge they replace
+                // (measured: +columbia +university 1.10x, +chicago +bulls 1.08x,
+                // +international +baseball 1.07x, all with spans in 8..15).
+                let span_threshold = match (wide, num_lists) {
+                    (BulkAndWide::Always, _) => 1,
+                    (BulkAndWide::Auto, 2) => 32,
+                    _ => 8,
+                };
                 let widest_span = if wide == BulkAndWide::Always {
                     usize::MAX
                 } else {
