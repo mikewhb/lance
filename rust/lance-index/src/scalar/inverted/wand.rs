@@ -1754,10 +1754,17 @@ impl PostingIterator {
             };
         };
         debug_assert!(!self.has_grouped_terms());
+        // Partition only marks postings without impacts as scorer-upper-bound,
+        // so the impact branch below can never see one; pin the invariant
+        // because an impact bound from a different scorer would under-estimate.
+        debug_assert!(list.impacts.is_none() || !self.use_scorer_upper_bound);
         // An empty or out-of-range span must read as "cannot prune" instead of
         // panicking or under-bounding the range.
         if b0 > b1 || b1 >= list.blocks.len() {
             return f32::INFINITY;
+        }
+        if self.use_scorer_upper_bound {
+            return scorer_upper_bound(self.query_weight, scorer);
         }
         let Some(impacts) = list.impacts.as_ref() else {
             // No level-1 table on this format: short ranges read the stored
@@ -9452,7 +9459,10 @@ mod tests {
     /// level-1 group.
     #[test]
     fn region_bound_includes_the_maximum_in_an_edge_group() {
-        let total = 32 * MAX_POSTING_BLOCK_SIZE;
+        // 64 blocks so block 31 is the last block of group 0 and a range can
+        // cross into group 1; with 32 blocks the crossing assertion would take
+        // the out-of-range branch and never exercise level 1.
+        let total = 64 * MAX_POSTING_BLOCK_SIZE;
         let doc_ids = (0..total as u32).collect::<Vec<_>>();
         let freqs = (0..total)
             .map(|index| {
@@ -9477,8 +9487,10 @@ mod tests {
         // Two blocks of the group's tail, answered block by block.
         assert!(posting.region_bound(30, 31, &scorer) >= peak);
         assert!(posting.region_bound(31, 31, &scorer) >= peak);
-        // Starting on the group's last block and crossing into the next group.
-        assert!(posting.region_bound(31, 32, &scorer) >= peak);
+        // Crossing from group 0's last block into group 1: level 1 of group 0
+        // must include block 31, which the out-of-range branch would hide.
+        assert!(posting.region_bound(31, 60, &scorer) >= peak);
+        assert!(posting.region_bound(0, 31, &scorer) >= peak);
     }
 
     /// W14 (continued): a corrupt level-1 entry makes the range unprunable
@@ -14159,6 +14171,85 @@ mod tests {
 
     fn wide_params(limit: usize) -> FtsSearchParams {
         FtsSearchParams::default().with_limit(Some(limit))
+    }
+
+    /// Positions for a phrase fixture: some documents carry the phrase in
+    /// order, others invert it so the position check must reject them.
+    fn wide_phrase_clause(
+        rank: u32,
+        weight: f32,
+        docs: &[(u32, Vec<u32>)],
+        num_docs: usize,
+    ) -> PostingIterator {
+        let ids = docs.iter().map(|&(doc, _)| doc).collect::<Vec<_>>();
+        let positions = docs.iter().map(|(_, pos)| pos.clone()).collect::<Vec<_>>();
+        let list = generate_posting_list_with_positions(ids, positions, weight * 4.0, true);
+        PostingIterator::with_query_weight(format!("t{rank}"), rank, rank, weight, list, num_docs)
+    }
+
+    /// W15: phrase queries served by the wide window must publish exactly the
+    /// classic kernel's rows and k-th score bits, for exact and sloppy matching.
+    #[rstest]
+    fn wide_window_serves_phrases(#[values(0u32, 2)] slop: u32) {
+        let num_docs = 60_000usize;
+        let docs = unit_length_docs(num_docs);
+        // Lead spans many follower blocks; each candidate is either in phrase
+        // order (accepted) or inverted (rejected by the position check).
+        let lead = (0..60u32)
+            .map(|i| (i * 1000, vec![i % 7]))
+            .collect::<Vec<_>>();
+        let middle = (0..30_000u32)
+            .map(|i| {
+                let doc = i * 2;
+                (doc, vec![1 + (doc % 3)])
+            })
+            .collect::<Vec<_>>();
+        let tail = (0..num_docs as u32)
+            .map(|doc| (doc, vec![2 + (doc % 5)]))
+            .collect::<Vec<_>>();
+        let build = move || {
+            vec![
+                wide_phrase_clause(0, 1.0, &lead, num_docs),
+                wide_phrase_clause(1, 0.6, &middle, num_docs),
+                wide_phrase_clause(2, 0.3, &tail, num_docs),
+            ]
+        };
+        let mut params = wide_params(10);
+        params.phrase_slop = Some(slop);
+        let run = assert_wide_paths_agree(&build, &docs, &|| UnitScorer, &params);
+        assert!(run.windows > 0, "the wide path must serve the phrase query");
+    }
+
+    /// W17: a query that repeats a token still intersects and position-checks
+    /// each clause independently through the wide window.
+    #[test]
+    fn wide_window_serves_a_phrase_with_repeated_tokens() {
+        let num_docs = 30_000usize;
+        let docs = unit_length_docs(num_docs);
+        let lead = (0..30u32)
+            .map(|i| (i * 1000, vec![i % 5]))
+            .collect::<Vec<_>>();
+        let second = (0..15_000u32)
+            .map(|i| (i * 2, vec![1 + (i % 4)]))
+            .collect::<Vec<_>>();
+        // Same token as the lead clause, one position later.
+        let third = (0..num_docs as u32)
+            .map(|doc| (doc, vec![1 + (doc % 5)]))
+            .collect::<Vec<_>>();
+        let build = move || {
+            vec![
+                wide_phrase_clause(0, 1.0, &lead, num_docs),
+                wide_phrase_clause(1, 0.7, &second, num_docs),
+                wide_phrase_clause(2, 0.4, &third, num_docs),
+            ]
+        };
+        let mut params = wide_params(10);
+        params.phrase_slop = Some(1);
+        let run = assert_wide_paths_agree(&build, &docs, &|| UnitScorer, &params);
+        assert!(
+            run.windows > 0,
+            "the wide path must serve the repeated-token phrase"
+        );
     }
 
     /// W1: the bulk conjunction corpus, scored four ways across every limit.
