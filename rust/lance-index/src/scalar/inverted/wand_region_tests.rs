@@ -828,3 +828,138 @@ fn region_bound_is_at_least_the_block_maximum() {
         Some(RegionBound::Deque),
     );
 }
+
+fn positioned(
+    token: &str,
+    token_id: u32,
+    query_pos: u32,
+    rows: &[(u32, Vec<u32>)],
+    num_docs: usize,
+) -> PostingIterator {
+    let doc_ids = rows.iter().map(|(doc, _)| *doc).collect::<Vec<_>>();
+    let positions = rows.iter().map(|(_, pos)| pos.clone()).collect::<Vec<_>>();
+    PostingIterator::with_query_weight(
+        token.to_string(),
+        token_id,
+        query_pos,
+        1.0,
+        generate_posting_list_with_positions(doc_ids, positions, 4.0, true),
+        num_docs,
+    )
+}
+
+fn phrase_ids(
+    postings: Vec<PostingIterator>,
+    docs: &DocSet,
+    slop: Option<u32>,
+    limit: usize,
+    region: bool,
+) -> (Vec<u64>, usize) {
+    let mut params = FtsSearchParams::default().with_limit(Some(limit));
+    params.phrase_slop = slop;
+    let mut wand = Wand::new(Operator::And, postings.into_iter(), docs, UnitScorer)
+        .with_bulk_and_mode(if region {
+            BulkAndMode::Auto
+        } else {
+            BulkAndMode::Off
+        });
+    if region {
+        wand = wand.with_bulk_and_kernel(BulkAndKernel::Region);
+    }
+    let mut ids = wand
+        .search(&params, &NoOpMetricsCollector)
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.document)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    (ids, wand.pos_state_decodes)
+}
+
+#[test]
+fn region_phrase_matches_across_blocks_and_slop() {
+    let num_docs = 201usize;
+    let mut docs = DocSet::default();
+    for doc_id in 0..num_docs as u32 {
+        docs.append(u64::from(doc_id), 8);
+    }
+    // The long clause puts doc 200 in its second block. The short clause keeps
+    // that same doc in block 0, so one candidate's positions span blocks.
+    let mut long_rows = (0..BLOCK_SIZE as u32)
+        .map(|doc| (doc, vec![30]))
+        .collect::<Vec<_>>();
+    long_rows[0].1 = vec![10];
+    long_rows[10].1 = vec![10];
+    long_rows[12].1 = vec![3];
+    long_rows.push((200, vec![4]));
+    let short_rows = vec![(0, vec![11]), (10, vec![11]), (12, vec![6]), (200, vec![5])];
+    let build = || {
+        vec![
+            positioned("a", 0, 0, &long_rows, num_docs),
+            positioned("b", 1, 1, &short_rows, num_docs),
+        ]
+    };
+    for slop in [0u32, 2] {
+        let (region, decodes) = phrase_ids(build(), &docs, Some(slop), 10, true);
+        let (classic, _) = phrase_ids(build(), &docs, Some(slop), 10, false);
+        assert_eq!(region, classic, "slop {slop}");
+        assert_eq!(decodes, 3, "each clause block is decoded once, slop {slop}");
+    }
+    let (slop0, _) = phrase_ids(build(), &docs, Some(0), 10, true);
+    assert!(slop0.contains(&0) && slop0.contains(&10) && slop0.contains(&200));
+    assert!(!slop0.contains(&12));
+    let (slop2, _) = phrase_ids(build(), &docs, Some(2), 10, true);
+    assert!(slop2.contains(&12), "slop 2 keeps the query-order pair");
+}
+
+#[test]
+fn region_phrase_keeps_later_candidate_after_a_position_miss() {
+    let mut docs = DocSet::default();
+    for doc_id in 0..8u32 {
+        docs.append(u64::from(doc_id), 8);
+    }
+    let build = || {
+        vec![
+            positioned("a", 0, 0, &[(0, vec![1]), (1, vec![9]), (2, vec![3])], 8),
+            positioned("b", 1, 1, &[(0, vec![2]), (1, vec![1]), (2, vec![4])], 8),
+        ]
+    };
+    let (region, _) = phrase_ids(build(), &docs, Some(0), 10, true);
+    let (classic, _) = phrase_ids(build(), &docs, Some(0), 10, false);
+    assert_eq!(region, classic);
+    assert_eq!(region, vec![0, 2]);
+}
+
+#[test]
+fn region_repeated_tokens_match_phrase_and_conjunction() {
+    let mut docs = DocSet::default();
+    for doc_id in 0..4u32 {
+        docs.append(u64::from(doc_id), 8);
+    }
+    let tokens = ["to", "be", "or", "not", "to", "be"];
+    let phrase_doc = [0u32, 1, 2, 3, 4, 5];
+    let scrambled = [5u32, 4, 0, 1, 2, 3];
+    let build = || {
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(pos, token)| {
+                positioned(
+                    token,
+                    pos as u32,
+                    pos as u32,
+                    &[(0, vec![phrase_doc[pos]]), (1, vec![scrambled[pos]])],
+                    4,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let (phrase, _) = phrase_ids(build(), &docs, Some(0), 10, true);
+    let (classic_phrase, _) = phrase_ids(build(), &docs, Some(0), 10, false);
+    assert_eq!(phrase, classic_phrase);
+    assert_eq!(phrase, vec![0]);
+    let (conjunction, _) = phrase_ids(build(), &docs, None, 10, true);
+    let (classic_and, _) = phrase_ids(build(), &docs, None, 10, false);
+    assert_eq!(conjunction, classic_and);
+    assert_eq!(conjunction, vec![0, 1]);
+}

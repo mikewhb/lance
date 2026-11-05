@@ -1443,6 +1443,165 @@ impl PostingIterator {
         }
     }
 
+    /// Position cursor over an absolute posting index, decoding into `state`
+    /// instead of this iterator's shared compressed block.
+    ///
+    /// Copied from [`Self::position_cursor`] (Compressed arm). The list is read
+    /// from `self` so the caller can mutably borrow a separate decode state
+    /// without also holding `&self.list`. The returned cursor borrows
+    /// `position_scratch` only, so several clauses can hold cursors at once.
+    fn position_cursor_from_state(
+        &self,
+        state: &mut CompressedState,
+        index: usize,
+    ) -> Result<PositionCursor<'_>> {
+        let PostingList::Compressed(list) = &self.list else {
+            return Err(Error::invalid_input(
+                "region phrase positions require a compressed posting".to_string(),
+            ));
+        };
+        let positions = list.positions.as_ref().ok_or_else(|| {
+            Error::index(format!(
+                "positions are missing for token {:?} (token id {}, query position {})",
+                self.token, self.token_id, self.position
+            ))
+        })?;
+        match positions {
+            CompressedPositionStorage::LegacyPerDoc(positions) => {
+                let positions = positions.value(index);
+                let positions = decompress_positions(positions.as_binary());
+                Ok(PositionCursor::new(
+                    PositionValues::Owned(positions),
+                    self.position as i32,
+                ))
+            }
+            CompressedPositionStorage::SharedStream(stream) => {
+                let block_idx = index >> list.block_shift();
+                let block_offset = index & list.block_mask();
+                // Same two guards as `ensure_compressed_doc_ids_ptr` /
+                // `ensure_compressed_block_ptr`. A fresh state reports
+                // `block_idx == 0` with empty doc ids, so block 0 still needs
+                // the emptiness check or it would never be decoded.
+                if state.block_idx != block_idx || state.doc_ids.is_empty() {
+                    let block = list.blocks.value(block_idx);
+                    state.decompress_doc_ids(
+                        block,
+                        block_idx,
+                        list.blocks.len(),
+                        list.length,
+                        list.posting_tail_codec,
+                        list.block_size,
+                    );
+                }
+                if state.frequency_block_idx != Some(block_idx) {
+                    let block = list.blocks.value(block_idx);
+                    state.decompress_frequencies(
+                        block,
+                        block_idx,
+                        list.blocks.len(),
+                        list.length,
+                        list.posting_tail_codec,
+                        list.block_size,
+                    );
+                }
+                match stream.codec() {
+                    PositionStreamCodec::PackedDelta => {
+                        if state.position_block_idx != Some(block_idx) {
+                            state.position_group_offsets.clear();
+                            state.position_group_offsets.push(0);
+                            state.position_tail.clear();
+                            state.position_unpacked_group_idx = None;
+                            state.position_offsets.clear();
+                            state.position_offsets.reserve(state.freqs.len() + 1);
+                            state.position_offsets.push(0);
+                            let mut offset = 0usize;
+                            for &freq in &state.freqs {
+                                offset += freq as usize;
+                                state.position_offsets.push(offset);
+                            }
+                            state.position_total_deltas = offset;
+                            state.position_block_idx = Some(block_idx);
+                        }
+                        let delta_start = state.position_offsets[block_offset];
+                        let delta_end = state.position_offsets[block_offset + 1];
+                        let mut position_values = self
+                            .position_scratch
+                            .borrow_mut()
+                            .take()
+                            .unwrap_or_default();
+                        if let Err(error) = seek_packed_doc_positions(
+                            stream.block(block_idx),
+                            state.position_total_deltas,
+                            delta_start..delta_end,
+                            &mut state.position_group_offsets,
+                            state
+                                .position_unpacked_group
+                                .get_or_insert_with(|| Box::new([0; BLOCK_SIZE])),
+                            &mut state.position_unpacked_group_idx,
+                            &mut state.position_tail,
+                            &mut position_values,
+                        ) {
+                            *self.position_scratch.borrow_mut() = Some(position_values);
+                            return Err(Error::index(format!(
+                                "failed to decode positions for token {:?} (token id {}, query position {}) at posting index {index}: {error}",
+                                self.token, self.token_id, self.position
+                            )));
+                        }
+                        Ok(PositionCursor::new(
+                            PositionValues::Recycled(RecycledPositionValues::new(
+                                position_values,
+                                &self.position_scratch,
+                            )),
+                            self.position as i32,
+                        ))
+                    }
+                    PositionStreamCodec::VarintDocDelta => {
+                        if state.position_block_idx != Some(block_idx) {
+                            state.position_values.clear();
+                            decode_position_stream_block(
+                                stream.block(block_idx),
+                                state.freqs.as_slice(),
+                                stream.codec(),
+                                &mut state.position_values,
+                            )
+                            .map_err(|error| {
+                                Error::index(format!(
+                                    "failed to decode positions for token {:?} (token id {}, query position {}) in block {block_idx}: {error}",
+                                    self.token, self.token_id, self.position
+                                ))
+                            })?;
+                            state.position_offsets.clear();
+                            state.position_offsets.reserve(state.freqs.len() + 1);
+                            state.position_offsets.push(0);
+                            let mut offset = 0usize;
+                            for &freq in &state.freqs {
+                                offset += freq as usize;
+                                state.position_offsets.push(offset);
+                            }
+                            state.position_block_idx = Some(block_idx);
+                        }
+                        let start = state.position_offsets[block_offset];
+                        let end = state.position_offsets[block_offset + 1];
+                        let mut position_values = self
+                            .position_scratch
+                            .borrow_mut()
+                            .take()
+                            .unwrap_or_default();
+                        position_values.clear();
+                        position_values.extend_from_slice(&state.position_values[start..end]);
+                        Ok(PositionCursor::new(
+                            PositionValues::Recycled(RecycledPositionValues::new(
+                                position_values,
+                                &self.position_scratch,
+                            )),
+                            self.position as i32,
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
     // move to the next doc id that is greater than or equal to least_id
     fn next(&mut self, least_id: u64) {
         match self.list {
@@ -2591,6 +2750,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     #[cfg(test)]
     merge_segments: usize,
     #[cfg(test)]
+    pos_state_decodes: usize,
+    #[cfg(test)]
     maxscore_single_essential_windows: usize,
     #[cfg(test)]
     maxscore_general_windows: usize,
@@ -2738,6 +2899,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             gallop_segments: 0,
             #[cfg(test)]
             merge_segments: 0,
+            #[cfg(test)]
+            pos_state_decodes: 0,
             #[cfg(test)]
             maxscore_single_essential_windows: 0,
             #[cfg(test)]
@@ -2921,7 +3084,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 .bulk_and_kernel_override
                 .unwrap_or_else(|| *BULK_AND_KERNEL)
                 == BulkAndKernel::Region
-            && params.phrase_slop.is_none()
             && self.lead.iter().all(|posting| {
                 posting.is_compressed()
                     && !posting.has_grouped_terms()
@@ -5887,6 +6049,41 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             position_iters.iter_mut().for_each(|iter| {
                 iter.advance_to_relative(max_relative_pos.unwrap());
+            });
+        }
+    }
+
+    /// Slop check copied from [`Self::check_positions`].
+    ///
+    /// Cursors arrive in cost order. The first line sorts them into query
+    /// order; without that, `windows(2)` compares the wrong neighbors.
+    fn sloppy_positions_match(mut cursors: Vec<PositionCursor<'_>>, slop: i32) -> bool {
+        cursors.sort_unstable_by_key(|cursor| cursor.position_in_query);
+        loop {
+            let mut max_relative_pos = None;
+            let mut all_same = true;
+            for window in cursors.windows(2) {
+                let last = window[0].relative_position();
+                let next = window[1].relative_position();
+                let (Some(last), Some(next)) = (last, next) else {
+                    return false;
+                };
+                let move_to = if last > next {
+                    last
+                } else {
+                    std::cmp::max(last + 1, next - slop)
+                };
+                max_relative_pos = max_relative_pos.max(Some(move_to));
+                if !(last <= next && next <= last + slop) {
+                    all_same = false;
+                    break;
+                }
+            }
+            if all_same {
+                return true;
+            }
+            cursors.iter_mut().for_each(|cursor| {
+                cursor.advance_to_relative(max_relative_pos.unwrap());
             });
         }
     }

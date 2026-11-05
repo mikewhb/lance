@@ -53,10 +53,12 @@ struct Rows {
     scored_lut: Vec<u8>,
     partial: Vec<f32>,
     scored_exact: Vec<u8>,
+    /// Absolute posting index per clause. Empty unless this search is a phrase.
+    pidx: Vec<u32>,
 }
 
 impl Rows {
-    fn new(k: usize) -> Self {
+    fn new(k: usize, phrase: bool) -> Self {
         let cap = MAX_POSTING_BLOCK_SIZE;
         Self {
             n: 0,
@@ -71,6 +73,7 @@ impl Rows {
             scored_lut: vec![0; cap],
             partial: vec![0.0; cap],
             scored_exact: vec![0; cap],
+            pidx: if phrase { vec![0; k * cap] } else { Vec::new() },
         }
     }
 
@@ -98,6 +101,12 @@ impl Rows {
         self.scored_lut[dst] = self.scored_lut[src];
         self.partial[dst] = self.partial[src];
         self.scored_exact[dst] = self.scored_exact[src];
+        if !self.pidx.is_empty() {
+            for clause in 0..clauses {
+                let copied = self.pidx[clause * self.cap + src];
+                self.pidx[clause * self.cap + dst] = copied;
+            }
+        }
     }
 }
 
@@ -111,9 +120,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         if limit == 0 {
             return Ok(vec![]);
         }
-        // Phrase positions stay on the main kernel until the position-state
-        // path is switched on. The route already requires `phrase_slop` none.
-        debug_assert!(params.phrase_slop.is_none());
+        let phrase = params.phrase_slop.is_some();
         self.invalidate_score_first_and_window();
         self.score_first_and_enabled = false;
 
@@ -124,13 +131,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             (posting.position, posting.token_id)
         });
         let factor = score_sum_upper_bound_factor(k);
-        let mut rows = Rows::new(k);
+        let mut rows = Rows::new(k, phrase);
         let mut lut: Vec<[f32; FREQ_LUT_BUCKETS]> = Vec::new();
         let mut fcur = (0..k)
             .map(|j| (self.lead[j].block_idx, 0usize))
             .collect::<Vec<_>>();
         let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, 256));
         let mut num_comparisons = 0usize;
+        let mut pos_state = vec![None; k];
         let norm_k = self.norm_k_cache();
         let norms_only = if norm_k.is_none() {
             self.documents.scoring_norms()
@@ -280,8 +288,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let state = unsafe { &*posting.ensure_compressed_block_ptr(list, lead_block) };
                 rows.n = hi - lo;
                 rows.docs[..rows.n].copy_from_slice(&state.doc_ids[lo..hi]);
+                let shift = list.block_shift();
                 for (offset, index) in (0..rows.n).enumerate() {
                     *rows.freq_mut(0, index) = state.freqs[lo + offset];
+                    if !rows.pidx.is_empty() {
+                        rows.pidx[index] = ((lead_block as u32) << shift) | ((lo + offset) as u32);
+                    }
                     rows.norm_ok[index] = false;
                     rows.scored_lut[index] = 0;
                     rows.scored_exact[index] = 0;
@@ -326,6 +338,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     &mut candidates,
                     &mut num_comparisons,
                     params.wand_factor,
+                    params.phrase_slop,
+                    &mut pos_state,
                 )?;
             }
 
@@ -570,6 +584,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
             let mut wrote_freq = false;
             let mut freq_ptr = std::ptr::null();
+            let shift = list.block_shift();
             for (source, off) in hits {
                 if !wrote_freq {
                     let state = unsafe { &*posting.ensure_compressed_block_ptr(list, fb) };
@@ -578,6 +593,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 rows.copy_row(source, out, clause);
                 *rows.freq_mut(clause, out) = unsafe { *freq_ptr.add(off) };
+                if !rows.pidx.is_empty() {
+                    rows.pidx[clause * rows.cap + out] = ((fb as u32) << shift) | (off as u32);
+                }
                 out += 1;
             }
             let scan_from = fpos;
@@ -735,6 +753,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         candidates: &mut TopKCollector,
         num_comparisons: &mut usize,
         wand_factor: f32,
+        phrase_slop: Option<u32>,
+        pos_state: &mut [Option<super::CompressedState>],
     ) -> Result<()> {
         // Gather only the candidates whose norm was not already touched by
         // an exact segment prune.
@@ -752,20 +772,24 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let Some(key) = self.documents.document_key_for_doc_id(rows.docs[index]) else {
                 continue;
             };
-            let (addend, doc_len) = row_length(rows, index, norm_k);
-            let mut score = 0.0f32;
-            for &clause in score_order {
-                score += clause_contrib(
-                    &self.lead[clause],
-                    &self.scorer,
-                    rows.freq(clause, index),
-                    addend,
-                    doc_len,
-                );
-            }
-            if self.threshold > 0.0 && self.exclusive_score_cannot_beat_floor(score) {
+            let score = if self.threshold > 0.0 {
+                let scored = score_row(&self.lead, &self.scorer, rows, score_order, index, norm_k);
+                if self.exclusive_score_cannot_beat_floor(scored) {
+                    continue;
+                }
+                Some(scored)
+            } else {
+                None
+            };
+            if let Some(slop) = phrase_slop
+                && !self.phrase_hit(rows, pos_state, index, slop)?
+            {
                 continue;
             }
+            let score = score.unwrap_or_else(|| {
+                score_row(&self.lead, &self.scorer, rows, score_order, index, norm_k)
+            });
+            let (_, doc_len) = row_length(rows, index, norm_k);
             let freqs = (0..rows.k)
                 .map(|clause| (self.lead[clause].term_index(), rows.freq(clause, index)));
             if candidates.insert(
@@ -780,6 +804,99 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
         Ok(())
     }
+
+    #[allow(clippy::needless_range_loop)]
+    fn phrase_hit(
+        &mut self,
+        rows: &Rows,
+        pos_state: &mut [Option<super::CompressedState>],
+        index: usize,
+        slop: u32,
+    ) -> Result<bool> {
+        for clause in 0..rows.k {
+            if pos_state[clause].is_none() {
+                let PostingList::Compressed(list) = &self.lead[clause].list else {
+                    return Err(Error::internal(
+                        "region phrase requires compressed postings".to_string(),
+                    ));
+                };
+                pos_state[clause] = Some(super::CompressedState::new(list.block_size));
+            }
+        }
+        let mut decodes = 0usize;
+        let matched = if slop == 0 {
+            super::exact_phrase_positions_match(
+                rows.k,
+                |clause| rows.freq(clause, index),
+                |clause| {
+                    let Some(state) = pos_state[clause].as_mut() else {
+                        return Err(Error::internal(
+                            "region phrase state was not initialized".to_string(),
+                        ));
+                    };
+                    let before = state.position_block_idx;
+                    let cursor = self.lead[clause].position_cursor_from_state(
+                        state,
+                        rows.pidx[clause * rows.cap + index] as usize,
+                    )?;
+                    if before != state.position_block_idx {
+                        decodes += 1;
+                    }
+                    Ok(cursor)
+                },
+            )?
+        } else {
+            let mut cursors = Vec::with_capacity(rows.k);
+            for clause in 0..rows.k {
+                let Some(state) = pos_state[clause].as_mut() else {
+                    return Err(Error::internal(
+                        "region phrase state was not initialized".to_string(),
+                    ));
+                };
+                let before = state.position_block_idx;
+                let cursor = self.lead[clause].position_cursor_from_state(
+                    state,
+                    rows.pidx[clause * rows.cap + index] as usize,
+                )?;
+                if before != state.position_block_idx {
+                    decodes += 1;
+                }
+                cursors.push(cursor);
+            }
+            Self::sloppy_positions_match(cursors, slop as i32)
+        };
+        #[cfg(test)]
+        {
+            self.pos_state_decodes += decodes;
+        }
+        #[cfg(not(test))]
+        {
+            let _ = decodes;
+        }
+        Ok(matched)
+    }
+}
+
+fn score_row<S: Scorer + ?Sized>(
+    lead: &[Box<PostingIterator>],
+    scorer: &S,
+    rows: &Rows,
+    score_order: &[usize],
+    index: usize,
+    norm_k: Option<&super::NormKCache<'_>>,
+) -> f32 {
+    let (addend, doc_len) = row_length(rows, index, norm_k);
+    let mut score = 0.0f32;
+    for &clause in score_order {
+        score += clause_contrib(
+            &lead[clause],
+            scorer,
+            rows.freq(clause, index),
+            addend,
+            doc_len,
+        );
+    }
+    score
 }
 
 fn clause_lut<S: Scorer + ?Sized>(
