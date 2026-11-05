@@ -3,6 +3,8 @@
 //! Region upper bounds are group-granular (§5.2.1). Tight pruning stays on the
 //! per-block bound, which only touches blocks that still have candidates.
 
+use std::cell::Cell;
+
 use arrow_array::Array;
 use lance_core::{Error, Result};
 
@@ -38,6 +40,159 @@ macro_rules! tally {
             $wand.$field += $n;
         }
     };
+}
+
+#[derive(Clone, Copy)]
+struct RegionDiag {
+    live: bool,
+    deque: bool,
+    regions: u32,
+    skipped: u32,
+    no_floor: u32,
+    located: u32,
+    doc_dec: u32,
+    freq_dec: u32,
+    gallop: u32,
+    merge: u32,
+    hits: u32,
+    survivors: u32,
+    phrase_checks: u32,
+    pos_decodes: u32,
+    lookups: u32,
+    level1: u32,
+    level0: u32,
+    lut_rej: [u32; 8],
+    exact_runs: [u32; 8],
+    exact_rej: [u32; 8],
+    seg_pruned: [u32; 8],
+}
+
+impl Default for RegionDiag {
+    fn default() -> Self {
+        Self {
+            live: false,
+            deque: false,
+            regions: 0,
+            skipped: 0,
+            no_floor: 0,
+            located: 0,
+            doc_dec: 0,
+            freq_dec: 0,
+            gallop: 0,
+            merge: 0,
+            hits: 0,
+            survivors: 0,
+            phrase_checks: 0,
+            pos_decodes: 0,
+            lookups: 0,
+            level1: 0,
+            level0: 0,
+            lut_rej: [0; 8],
+            exact_runs: [0; 8],
+            exact_rej: [0; 8],
+            seg_pruned: [0; 8],
+        }
+    }
+}
+
+thread_local! {
+    static REGION_DIAG: Cell<RegionDiag> = const { Cell::new(RegionDiag {
+        live: false,
+        deque: false,
+        regions: 0,
+        skipped: 0,
+        no_floor: 0,
+        located: 0,
+        doc_dec: 0,
+        freq_dec: 0,
+        gallop: 0,
+        merge: 0,
+        hits: 0,
+        survivors: 0,
+        phrase_checks: 0,
+        pos_decodes: 0,
+        lookups: 0,
+        level1: 0,
+        level0: 0,
+        lut_rej: [0; 8],
+        exact_runs: [0; 8],
+        exact_rej: [0; 8],
+        seg_pruned: [0; 8],
+    }) };
+}
+
+fn diag_update(update: impl FnOnce(&mut RegionDiag)) {
+    REGION_DIAG.with(|cell| {
+        let mut diag = cell.get();
+        if diag.live {
+            update(&mut diag);
+            cell.set(diag);
+        }
+    });
+}
+
+fn diag_slot(index: usize) -> usize {
+    index.min(7)
+}
+
+struct DiagSession {
+    k: usize,
+}
+
+impl DiagSession {
+    fn begin(k: usize) -> Self {
+        let live = std::env::var("LANCE_FTS_REGION_DIAG")
+            .ok()
+            .is_some_and(|value| value == "1");
+        let deque = live
+            && std::env::var("LANCE_FTS_REGION_BOUND")
+                .ok()
+                .is_some_and(|value| value.eq_ignore_ascii_case("deque"));
+        REGION_DIAG.with(|cell| {
+            cell.set(RegionDiag {
+                live,
+                deque,
+                ..RegionDiag::default()
+            });
+        });
+        Self { k }
+    }
+}
+
+impl Drop for DiagSession {
+    fn drop(&mut self) {
+        REGION_DIAG.with(|cell| {
+            let diag = cell.get();
+            if !diag.live {
+                return;
+            }
+            eprintln!(
+                "fts-region-diag k={} regions={} skipped={} no_floor={} lookups={} l1={} l0={} located={} doc_dec={} freq_dec={} gallop={} merge={} hits={} survivors={} phrase={} pos_dec={} lut_rej={:?} exact_runs={:?} exact_rej={:?} seg_pruned={:?} deque={}",
+                self.k,
+                diag.regions,
+                diag.skipped,
+                diag.no_floor,
+                diag.lookups,
+                diag.level1,
+                diag.level0,
+                diag.located,
+                diag.doc_dec,
+                diag.freq_dec,
+                diag.gallop,
+                diag.merge,
+                diag.hits,
+                diag.survivors,
+                diag.phrase_checks,
+                diag.pos_decodes,
+                &diag.lut_rej[..self.k.min(8)],
+                &diag.exact_runs[..self.k.min(8)],
+                &diag.exact_rej[..self.k.min(8)],
+                &diag.seg_pruned[..self.k.min(8)],
+                u8::from(diag.deque),
+            );
+            cell.set(RegionDiag::default());
+        });
+    }
 }
 
 struct Rows {
@@ -125,6 +280,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         self.score_first_and_enabled = false;
 
         let k = self.lead.len();
+        let _diag = DiagSession::begin(k);
         let mut score_order = (0..k).collect::<Vec<_>>();
         score_order.sort_unstable_by_key(|&index| {
             let posting = &self.lead[index];
@@ -159,6 +315,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             tally!(self.regions += 1);
             self.raise_to_shared_floor(params.wand_factor);
             let has_floor = self.threshold > 0.0;
+            diag_update(|diag| {
+                diag.regions += 1;
+                if !has_floor {
+                    diag.no_floor += 1;
+                }
+            });
             let mut max_follower_doc = 0u64;
 
             for posting in &mut self.lead {
@@ -269,6 +431,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         self.floor_mode,
                     ) {
                         tally!(self.regions_skipped += 1);
+                        diag_update(|diag| diag.skipped += 1);
                         if region_end >= u64::from(u32::MAX) {
                             break;
                         }
@@ -357,17 +520,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
     fn region_bound_is_deque(&self) -> bool {
         #[cfg(test)]
-        {
-            self.force_region_bound == Some(RegionBound::Deque)
+        if self.force_region_bound == Some(RegionBound::Deque) {
+            return true;
         }
-        #[cfg(not(test))]
-        {
-            false
-        }
+        REGION_DIAG.with(|cell| cell.get().deque)
     }
 
     pub(super) fn region_bound(&mut self, clause: usize, hi: u32) -> f32 {
         tally!(self.region_bound_lookups += 1);
+        diag_update(|diag| diag.lookups += 1);
         let (b0, b1, has_impacts) = {
             let posting = &self.lead[clause];
             let PostingList::Compressed(list) = &posting.list else {
@@ -401,6 +562,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         {
                             level0_reads += 1;
                         }
+                        diag_update(|diag| diag.level0 += 1);
                         if !bound.is_finite() {
                             tally!(self.region_bound_level0 += level0_reads);
                             tally!(self.region_bound_level1 += level1_reads);
@@ -442,6 +604,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     {
                         level1_reads += 1;
                     }
+                    diag_update(|diag| diag.level1 += 1);
                     acc = acc.max(bound);
                 }
             }
@@ -456,6 +619,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let mut acc = 0.0f32;
                 for block in b0..=b1 {
                     acc = acc.max(list.block_max_score(block));
+                    diag_update(|diag| diag.level0 += 1);
                 }
                 acc
             };
@@ -524,6 +688,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
             if seg_keep == index {
                 tally!(self.segments_pruned += 1);
+                diag_update(|diag| diag.seg_pruned[diag_slot(clause)] += 1);
                 index = seg_end;
                 continue;
             }
@@ -539,6 +704,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let docs_ptr = state.doc_ids.as_ptr();
             last_examined = Some(fb);
             tally!(self.follower_doc_blocks_decoded += 1);
+            diag_update(|diag| {
+                diag.located += 1;
+                diag.doc_dec += 1;
+            });
             let block_docs = unsafe { std::slice::from_raw_parts(docs_ptr, len_b) };
             let n_b = seg_keep - index;
             let m_b = len_b.saturating_sub(fpos);
@@ -559,6 +728,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let mut hits = Vec::with_capacity(n_b);
             if use_merge {
                 tally!(self.merge_segments += 1);
+                diag_update(|diag| diag.merge += 1);
                 let mut pairs = Vec::new();
                 intersect_indices(
                     &rows.docs[index..seg_keep],
@@ -570,6 +740,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
             } else {
                 tally!(self.gallop_segments += 1);
+                diag_update(|diag| diag.gallop += 1);
                 let mut pos = fpos;
                 for candidate in index..seg_keep {
                     let doc = rows.docs[candidate];
@@ -590,9 +761,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     let state = unsafe { &*posting.ensure_compressed_block_ptr(list, fb) };
                     freq_ptr = state.freqs.as_ptr();
                     wrote_freq = true;
+                    diag_update(|diag| diag.freq_dec += 1);
                 }
                 rows.copy_row(source, out, clause);
                 *rows.freq_mut(clause, out) = unsafe { *freq_ptr.add(off) };
+                diag_update(|diag| diag.hits += 1);
                 if !rows.pidx.is_empty() {
                     rows.pidx[clause * rows.cap + out] = ((fb as u32) << shift) | (off as u32);
                 }
@@ -667,6 +840,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 if !reject {
                     rows.copy_row(src, write, clause);
                     write += 1;
+                } else {
+                    diag_update(|diag| diag.lut_rej[diag_slot(clause)] += 1);
                 }
             }
         } else {
@@ -684,7 +859,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         if !run_exact {
             return write;
         }
+        diag_update(|diag| diag.exact_runs[diag_slot(clause)] += 1);
         let mut exact_write = start;
+        let mut exact_rejected = 0u32;
         for src in start..write {
             self.ensure_norm(rows, src, norm_k, norms_only);
             ensure_partial(rows, &self.lead, &self.scorer, norm_k, src, clause);
@@ -698,8 +875,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             if !reject {
                 rows.copy_row(src, exact_write, clause);
                 exact_write += 1;
+            } else {
+                exact_rejected += 1;
             }
         }
+        diag_update(|diag| diag.exact_rej[diag_slot(clause)] += exact_rejected);
         exact_write
     }
 
@@ -767,6 +947,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         for index in pending {
             self.ensure_norm(rows, index, norm_k, norms_only);
         }
+        diag_update(|diag| diag.survivors += rows.n as u32);
         for index in 0..rows.n {
             *num_comparisons += 1;
             let Some(key) = self.documents.document_key_for_doc_id(rows.docs[index]) else {
@@ -869,6 +1050,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         {
             self.pos_state_decodes += decodes;
         }
+        diag_update(|diag| {
+            diag.phrase_checks += 1;
+            diag.pos_decodes += decodes as u32;
+        });
         #[cfg(not(test))]
         {
             let _ = decodes;
