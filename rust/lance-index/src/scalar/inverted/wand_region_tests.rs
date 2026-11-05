@@ -963,3 +963,70 @@ fn region_repeated_tokens_match_phrase_and_conjunction() {
     assert_eq!(conjunction, classic_and);
     assert_eq!(conjunction, vec![0, 1]);
 }
+
+#[test]
+#[ignore = "release timing for S6 constants; not part of wand::tests"]
+fn region_primitive_times() {
+    let iters = 200u32;
+    let started = std::time::Instant::now();
+    let mut acc = 0.0f32;
+    for i in 0..iters * 1000 {
+        acc += super::super::scorer::bm25_doc_weight_with_norm(1 + (i % 32), 0.75);
+    }
+    let bm25_ns = started.elapsed().as_nanos() as f64 / f64::from(iters * 1000);
+    assert!(acc.is_finite());
+
+    let mut bytes = vec![0u8; 5 * 1024 * 1024];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = (i % 251) as u8;
+    }
+    let mut gather = 0u64;
+    let started = std::time::Instant::now();
+    let gathers = 128usize * 2000;
+    for i in 0..gathers {
+        gather += u64::from(bytes[(i * 997) % bytes.len()]);
+    }
+    let norm_ns = started.elapsed().as_nanos() as f64 / gathers as f64;
+    assert!(gather > 0);
+
+    let docs = (0..BLOCK_SIZE as u32).collect::<Vec<_>>();
+    let list = generate_posting_list(docs, 1.0, None, true);
+    let posting = PostingIterator::new("t".into(), 0, 0, list, BLOCK_SIZE);
+    let PostingList::Compressed(compressed) = &posting.list else {
+        panic!("compressed");
+    };
+    let started = std::time::Instant::now();
+    for _ in 0..iters {
+        let state = unsafe { &mut *posting.compressed_state_ptr() };
+        state.doc_ids.clear();
+        state.block_idx = usize::MAX;
+        let decoded = unsafe { &*posting.ensure_compressed_doc_ids_ptr(compressed, 0) };
+        assert_eq!(decoded.doc_ids.len(), BLOCK_SIZE);
+    }
+    let dec_ns = started.elapsed().as_nanos() as f64 / f64::from(iters);
+
+    let state = unsafe { &*posting.compressed_state_ptr() };
+    let doc_ids = state.doc_ids.clone();
+    let started = std::time::Instant::now();
+    let mut pos = 0usize;
+    for i in 0..10_000u32 {
+        pos = unsafe { super::find_next_geq(doc_ids.as_ptr(), 0, doc_ids.len(), i % 128) };
+    }
+    let geq_ns = started.elapsed().as_nanos() as f64 / 10_000.0;
+    assert!(pos < doc_ids.len());
+
+    let left: Vec<u32> = (0..64).map(|i| i * 2).collect();
+    let right: Vec<u32> = (0..128).collect();
+    let mut out = Vec::new();
+    let started = std::time::Instant::now();
+    for _ in 0..2_000 {
+        super::intersection::intersect_indices(&left, &right, &mut out);
+    }
+    let merge_ns =
+        started.elapsed().as_nanos() as f64 / (2_000.0 * (left.len() + right.len()) as f64);
+    assert!(!out.is_empty());
+
+    eprintln!(
+        "CALIB bm25_ns={bm25_ns:.2} norm_ns={norm_ns:.2} dec_ns={dec_ns:.1} geq_ns={geq_ns:.2} merge_per_elem_ns={merge_ns:.3}"
+    );
+}

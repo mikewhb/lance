@@ -20,14 +20,15 @@ const REGION_MAX_SPAN: u64 = 1 << 16;
 /// Edge groups this small use per-block bounds. A structural cutoff, not a
 /// tuned threshold: both choices are safe upper bounds.
 const EDGE_BLOCKS: usize = 4;
-/// Comparison-model crossover. S3 seed; S6 replaces it from the microbench.
-const MERGE_RATIO: usize = 8;
+/// Merge when `n_b * MERGE_RATIO >= m_b`. 3 is the hot-cache crossover of
+/// `find_next_geq` (8.6 ns) and `intersect_indices` (2.12 ns/elem).
+const MERGE_RATIO: usize = 3;
 const FREQ_LUT_BUCKETS: usize = 64;
-/// Nanosecond seeds. Only the decision to run exact partial scores moves;
-/// S6 overwrites them. They are not fitted on the 943-query set.
-const C_DEC_NS: f64 = 150.0;
+/// Block decode and gallop are hot-cache release times. Freq, norm, and BM25
+/// stay at the in-kernel allowances. None of these are fitted on the 943-query set.
+const C_DEC_NS: f64 = 38.0;
 const C_DEC_FREQ_NS: f64 = 40.0;
-const C_GEQ_NS: f64 = 5.0;
+const C_GEQ_NS: f64 = 8.6;
 const C_NORM_NS: f64 = 15.0;
 const C_BM25_NS: f64 = 3.0;
 
