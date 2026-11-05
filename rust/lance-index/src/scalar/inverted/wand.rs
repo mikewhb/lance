@@ -14395,7 +14395,7 @@ mod tests {
         for step in 1..=12 {
             let floor = ((1u32 << step) as f32).to_bits();
             let (classic, _, _) = run(BulkAndMode::Off, BulkAndWide::Off, floor);
-            let (wide_rows, _, windows) = run(BulkAndMode::On, BulkAndWide::Always, floor);
+            let (wide_rows, _, _) = run(BulkAndMode::On, BulkAndWide::Always, floor);
             assert_eq!(
                 wide_rows, classic,
                 "compaction changed the phrase rows at floor step {step}"
