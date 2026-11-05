@@ -3074,8 +3074,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         // Region kernel. Independent of the bulk route below; that condition
         // is left unchanged. Unset kernel stays Merge, so this is false.
+        // k=2 stays on the main merge path: the region fixed cost did not
+        // match it (K1). k>=3 is the structural cutoff, not a data gate.
         if self.operator == Operator::And
-            && self.lead.len() >= 2
+            && self.lead.len() >= 3
             && self
                 .bulk_and_mode_override
                 .unwrap_or_else(|| *BULK_AND_MODE)

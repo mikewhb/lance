@@ -92,7 +92,8 @@ fn assert_region_matches<S: Scorer + Clone>(
         None,
     );
     assert_eq!(classic_region, 0);
-    assert_eq!(searches, 1);
+    // k=2 stays on main. The kernel itself starts at three clauses.
+    assert_eq!(searches, usize::from(postings().len() >= 3));
     assert_eq!(region, classic);
     assert_eq!(region_floor, classic_floor);
 }
@@ -237,6 +238,13 @@ fn region_skips_follower_blocks_without_candidates() {
                 generate_posting_list(follower_docs.clone(), 1.0, None, true),
                 docs.len(),
             ),
+            PostingIterator::new(
+                "also".into(),
+                2,
+                2,
+                generate_posting_list(lead_docs.clone(), 1.0, None, true),
+                docs.len(),
+            ),
         ]
     };
     let (rows, _, searches, regions, _, _) = region_rows(
@@ -295,6 +303,13 @@ fn region_stops_when_follower_is_exhausted_and_crosses_block_gaps() {
                 1,
                 1,
                 generate_posting_list(follower.clone(), 1.0, None, true),
+                docs.len(),
+            ),
+            PostingIterator::new(
+                "also".into(),
+                2,
+                2,
+                generate_posting_list(lead.clone(), 1.0, None, true),
                 docs.len(),
             ),
         ]
@@ -375,8 +390,8 @@ fn region_span_splits_a_rare_lead_and_a_high_floor_terminates() {
     let (classic, _, _, _, _, _) =
         region_rows(build(), &docs, UnitScorer, 10, None, None, None, None, None);
     assert_eq!(rows, classic);
-    assert_eq!(searches, 1);
-    assert!(regions >= 2, "regions {regions}");
+    assert_eq!(searches, 0, "k=2 stays on the main path");
+    let _ = regions;
 
     let (skipped_rows, _, _, _, skipped, _) = region_rows(
         build(),
@@ -390,10 +405,7 @@ fn region_span_splits_a_rare_lead_and_a_high_floor_terminates() {
         Some(1.0e20),
     );
     assert!(skipped_rows.is_empty());
-    assert_eq!(
-        skipped, 0,
-        "k=2 does not spend a region upper bound; the search still returns"
-    );
+    assert_eq!(skipped, 0, "k=2 does not enter the region kernel");
 
     let build3 = || {
         let mut postings = build();
@@ -406,6 +418,31 @@ fn region_span_splits_a_rare_lead_and_a_high_floor_terminates() {
         ));
         postings
     };
+    let (rows, _, searches, regions, _, _) = region_rows(
+        build3(),
+        &docs,
+        UnitScorer,
+        10,
+        Some(BulkAndKernel::Region),
+        None,
+        None,
+        None,
+        None,
+    );
+    let (classic, _, _, _, _, _) = region_rows(
+        build3(),
+        &docs,
+        UnitScorer,
+        10,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(rows, classic);
+    assert_eq!(searches, 1);
+    assert!(regions >= 2, "regions {regions}");
     let (skipped_rows, _, _, _, skipped, _) = region_rows(
         build3(),
         &docs,
@@ -434,7 +471,7 @@ fn region_exact_policies_agree_and_always_prunes() {
     let hot = 0u32;
     let later = BLOCK_SIZE as u32 * 4;
     let build = || {
-        (0..2)
+        (0..3)
             .map(|term| {
                 let doc_ids = (0..num_docs).collect::<Vec<_>>();
                 let freqs = doc_ids
@@ -518,7 +555,7 @@ fn region_score_paths_match_and_excluded_shapes_stay_on_main() {
     }
     quantized.set_quantized_scoring(true);
     let build = |docs: &DocSet| {
-        (0..2)
+        (0..3)
             .map(|term| {
                 let doc_ids = (0..num_docs)
                     .filter(|doc| doc % (2 + term) == 0)
@@ -588,7 +625,7 @@ fn region_partial_prune_keeps_the_segment_tail_doc() {
     let weak = 2u32;
     let later = BLOCK_SIZE as u32 + 5;
     let build = || {
-        (0..2)
+        (0..3)
             .map(|term| {
                 let doc_ids = vec![strong, weak, later];
                 let freqs = vec![30, 1, 30];
@@ -931,12 +968,29 @@ fn region_phrase_matches_across_blocks_and_slop() {
         let (region, decodes) = phrase_ids(build(), &docs, Some(slop), 10, true);
         let (classic, _) = phrase_ids(build(), &docs, Some(slop), 10, false);
         assert_eq!(region, classic, "slop {slop}");
-        assert_eq!(decodes, 3, "each clause block is decoded once, slop {slop}");
+        assert_eq!(decodes, 0, "a two-clause phrase stays on main, slop {slop}");
     }
-    let (slop0, _) = phrase_ids(build(), &docs, Some(0), 10, true);
+    let c_rows = vec![(0, vec![12]), (10, vec![12]), (12, vec![7]), (200, vec![6])];
+    let build3 = || {
+        vec![
+            positioned("a", 0, 0, &long_rows, num_docs),
+            positioned("b", 1, 1, &short_rows, num_docs),
+            positioned("c", 2, 2, &c_rows, num_docs),
+        ]
+    };
+    for slop in [0u32, 2] {
+        let (region, decodes) = phrase_ids(build3(), &docs, Some(slop), 10, true);
+        let (classic, _) = phrase_ids(build3(), &docs, Some(slop), 10, false);
+        assert_eq!(region, classic, "k=3 slop {slop}");
+        assert_eq!(
+            decodes, 4,
+            "each clause block is decoded once, k=3 slop {slop}"
+        );
+    }
+    let (slop0, _) = phrase_ids(build3(), &docs, Some(0), 10, true);
     assert!(slop0.contains(&0) && slop0.contains(&10) && slop0.contains(&200));
     assert!(!slop0.contains(&12));
-    let (slop2, _) = phrase_ids(build(), &docs, Some(2), 10, true);
+    let (slop2, _) = phrase_ids(build3(), &docs, Some(2), 10, true);
     assert!(slop2.contains(&12), "slop 2 keeps the query-order pair");
 }
 
@@ -950,6 +1004,7 @@ fn region_phrase_keeps_later_candidate_after_a_position_miss() {
         vec![
             positioned("a", 0, 0, &[(0, vec![1]), (1, vec![9]), (2, vec![3])], 8),
             positioned("b", 1, 1, &[(0, vec![2]), (1, vec![1]), (2, vec![4])], 8),
+            positioned("c", 2, 2, &[(0, vec![3]), (1, vec![2]), (2, vec![5])], 8),
         ]
     };
     let (region, _) = phrase_ids(build(), &docs, Some(0), 10, true);
