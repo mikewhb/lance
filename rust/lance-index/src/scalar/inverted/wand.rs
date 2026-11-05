@@ -2966,12 +2966,24 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let mode = self
                     .bulk_and_mode_override
                     .unwrap_or_else(|| *BULK_AND_MODE);
+                let wide = self
+                    .bulk_and_wide_override
+                    .unwrap_or_else(|| *BULK_AND_WIDE);
                 mode.enabled_for(self.lead.len())
                     || (mode == BulkAndMode::Auto
                         && self.lead.len() >= 4
                         && self.lead.iter().all(|posting| {
                             matches!(&posting.list, PostingList::Compressed(list)
                                 if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
+                        }))
+                    // Wide windows keep the per-window bound on 128-block lists
+                    // too, so four-clause conjunctions can use the bulk path
+                    // whenever every clause carries impacts.
+                    || (matches!(wide, BulkAndWide::Auto)
+                        && mode == BulkAndMode::Auto
+                        && self.lead.len() >= 4
+                        && self.lead.iter().all(|posting| {
+                            matches!(&posting.list, PostingList::Compressed(list) if list.impacts.is_some())
                         }))
             }
         {
