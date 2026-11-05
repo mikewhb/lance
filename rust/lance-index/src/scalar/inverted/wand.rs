@@ -51,6 +51,11 @@ use super::{DocInfo, builder::BLOCK_SIZE};
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
 
+/// Widest window a wide bulk-AND traversal keeps open, matching Lucene's
+/// `MAX_WINDOW_SIZE`. It caps the candidate slice handed to the follower
+/// loop so one lead block cannot turn a sparse query into a scan.
+const WIDE_MAX_SPAN: u64 = 1 << 16;
+
 /// Top-k heap entry: (scored doc, doc length, posting doc id, frequency slot).
 /// The (term, freq) pairs live outside the heap so heap churn moves a compact
 /// tuple instead of a `Vec`.
@@ -330,6 +335,58 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 }
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
+
+// Wide-window switch for the bulk conjunction path. `off` (default) keeps every
+// window ending at the nearest follower block boundary, exactly like the narrow
+// path. `auto` opens the window to the lead clause's block when a follower
+// would cross a block boundary inside it, so the per-window setup is paid once
+// per lead block instead of once per lead document. `always` skips the
+// structural dispatch and only exists for tests and worst-case measurement.
+// LANCE_FTS_BULK_AND_WIDE selects the mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BulkAndWide {
+    #[default]
+    Off,
+    Auto,
+    Always,
+}
+
+impl BulkAndWide {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("off") || value == "0" {
+            Some(Self::Off)
+        } else if value.eq_ignore_ascii_case("auto") {
+            Some(Self::Auto)
+        } else if value.eq_ignore_ascii_case("always") || value == "1" {
+            Some(Self::Always)
+        } else {
+            None
+        }
+    }
+}
+
+fn bulk_and_wide_from_env() -> BulkAndWide {
+    match std::env::var("LANCE_FTS_BULK_AND_WIDE") {
+        Ok(value) => BulkAndWide::parse(&value).unwrap_or_else(|| {
+            log::warn!(
+                "Invalid LANCE_FTS_BULK_AND_WIDE value {value:?}; expected off/0, auto, or \
+                 always/1; falling back to off"
+            );
+            BulkAndWide::Off
+        }),
+        Err(std::env::VarError::NotPresent) => BulkAndWide::Off,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            log::warn!(
+                "Invalid non-Unicode LANCE_FTS_BULK_AND_WIDE value {value:?}; expected off/0, \
+                 auto, or always/1; falling back to off"
+            );
+            BulkAndWide::Off
+        }
+    }
+}
+
+static BULK_AND_WIDE: LazyLock<BulkAndWide> = LazyLock::new(bulk_and_wide_from_env);
 
 #[cfg(target_arch = "x86_64")]
 static HAS_AVX2: LazyLock<bool> = LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
@@ -2399,6 +2456,25 @@ struct AndWindowStats {
     pairwise_intersections: usize,
     windows_sliced: usize,
     windows_frequency_pruned: usize,
+    // Wide-window counters. They only move when the wide switch is on, so the
+    // default configuration never reads or writes them. The ones the wide path
+    // has not started writing yet are allowed to sit idle: they are part of the
+    // switch's instrumentation and are consumed by the wide-window tests that
+    // land with the traversal itself.
+    wide_windows: usize,
+    wide_fit_windows: usize,
+    #[allow(dead_code)]
+    wide_segments: usize,
+    #[allow(dead_code)]
+    wide_segments_pruned: usize,
+    // One entry per follower clause (indices 1..k): how many of its blocks the
+    // wide path really decoded, and how many of its segments kept candidates.
+    #[allow(dead_code)]
+    wide_follower_blocks_decoded: Vec<usize>,
+    #[allow(dead_code)]
+    wide_follower_hit_segments: Vec<usize>,
+    #[allow(dead_code)]
+    wide_phrase_redecodes: usize,
 }
 
 impl Eq for TailPosting {}
@@ -2476,6 +2552,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Test-only override for comparing bulk and classic conjunctions without
     // mutating the process-wide environment.
     bulk_and_mode_override: Option<BulkAndMode>,
+    // Same idea for the wide-window switch; `None` defers to the environment.
+    bulk_and_wide_override: Option<BulkAndWide>,
     #[cfg(test)]
     bulk_and_searches: usize,
     #[cfg(test)]
@@ -2597,6 +2675,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             #[cfg(test)]
             and_window_stats: AndWindowStats::default(),
             bulk_and_mode_override: None,
+            bulk_and_wide_override: None,
             #[cfg(test)]
             bulk_and_searches: 0,
             #[cfg(test)]
@@ -2623,6 +2702,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     #[cfg(test)]
     fn with_bulk_and_mode(mut self, mode: BulkAndMode) -> Self {
         self.bulk_and_mode_override = Some(mode);
+        self
+    }
+
+    /// Test hook: force one wide-window mode so parity tests can exercise the
+    /// wide dispatch and the narrow path within one process.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn with_bulk_and_wide(mut self, wide: BulkAndWide) -> Self {
+        self.bulk_and_wide_override = Some(wide);
         self
     }
 
@@ -4140,6 +4228,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             return Ok(vec![]);
         }
         let num_lists = self.lead.len();
+        // Read the wide-window switch once per search: the environment lookup is
+        // process-wide and must not sit inside the window loop.
+        let wide = self
+            .bulk_and_wide_override
+            .unwrap_or_else(|| *BULK_AND_WIDE);
         let use_pairwise_intersection = num_lists >= 4
             && self.lead.iter().all(|posting| {
                 matches!(&posting.list, PostingList::Compressed(list)
@@ -4640,6 +4733,47 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 win_end = win_end.min(block_up_to);
             }
             let win_end32 = u32::try_from(win_end).unwrap_or(u32::MAX);
+
+            // Wide-window structural dispatch. The narrow window ends where the
+            // nearest follower block ends, so it shrinks to one lead document
+            // whenever a follower crosses a block boundary inside the lead
+            // block. Opening the window to the lead block's end pays the
+            // per-window setup once per lead block instead. The test is pure
+            // metadata already read above: when the narrow end already equals
+            // the lead block's end there is nothing to gain and the narrow path
+            // below runs unchanged.
+            if wide != BulkAndWide::Off && num_lists >= 2 {
+                let lead_block = self.lead[0].block_idx;
+                let lead_block_end = {
+                    let PostingList::Compressed(ref list) = self.lead[0].list else {
+                        unreachable!("bulk AND requires compressed postings");
+                    };
+                    if lead_block + 1 < list.blocks.len() {
+                        u64::from(list.block_least_doc_id(lead_block + 1)).saturating_sub(1)
+                    } else {
+                        u64::from(u32::MAX)
+                    }
+                };
+                let wide_end = lead_block_end.min(target.saturating_add(WIDE_MAX_SPAN - 1));
+                debug_assert!(wide_end >= target);
+                if wide == BulkAndWide::Always || win_end < wide_end {
+                    // Placeholder for the wide path: it lands here, so the
+                    // dispatch is observable in tests while behaviour is still
+                    // the narrow one.
+                    #[cfg(test)]
+                    {
+                        self.and_window_stats.wide_windows += 1;
+                    }
+                } else {
+                    // Every follower already ends its block at or after the
+                    // lead block end: the narrow window is the widest useful
+                    // one, so the main path is kept byte for byte.
+                    #[cfg(test)]
+                    {
+                        self.and_window_stats.wide_fit_windows += 1;
+                    }
+                }
+            }
 
             // Decompress each clause's block and slice it to [target, win_end].
             wins.clear();
