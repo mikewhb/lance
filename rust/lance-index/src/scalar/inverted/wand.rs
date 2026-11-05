@@ -14352,11 +14352,16 @@ mod tests {
     fn wide_window_phrase_survives_segment_pruning() {
         let num_docs = 50_000usize;
         let docs = unit_length_docs(num_docs);
-        // Two candidates: doc 0 is a strong match (freq 9), doc 20_000 a weak
-        // one (freq 1). Both are in phrase order.
-        let lead = vec![(0u32, vec![0u32, 1, 2]), (20_000u32, vec![0u32, 1, 2])];
-        let middle = vec![(0u32, vec![1u32, 2, 3]), (20_000u32, vec![1u32, 2, 3])];
-        let tail = vec![(0u32, vec![2u32, 3, 4]), (20_000u32, vec![2u32, 3, 4])];
+        // Two candidates: doc 0 is a strong match (lead freq 9), doc 20_000 a
+        // weak one (lead freq 1). The other clauses stay at freq 1 so their
+        // block maxima cannot mask the lead-frequency difference in the
+        // segment-level bound.
+        let lead = vec![
+            (0u32, (0u32..9).collect::<Vec<_>>()),
+            (20_000u32, vec![0u32]),
+        ];
+        let middle = vec![(0u32, vec![1u32]), (20_000u32, vec![1u32])];
+        let tail = vec![(0u32, vec![2u32]), (20_000u32, vec![2u32])];
         let build = move || {
             vec![
                 wide_phrase_clause(0, 1.0, &lead, num_docs),
@@ -14384,31 +14389,33 @@ mod tests {
                 wand.and_window_stats.wide_windows,
             )
         };
-        // Raise the floor through a deterministic ladder and compare the rows at
-        // every step. A floor that rejects the weak candidate also tightens the
-        // window bound, so the interesting case is "some floor, some rows".
         let (open_rows, _, open_windows) =
             run(BulkAndMode::On, BulkAndWide::Always, 0.0_f32.to_bits());
         assert_eq!(open_rows.len(), 2, "both candidates match with no floor");
         assert!(open_windows > 0, "the wide path must run");
-        let mut narrowed = false;
-        for step in 1..=12 {
-            let floor_bits = ((1u32 << step) as f32).to_bits();
-            let (classic, _, _) = run(BulkAndMode::Off, BulkAndWide::Off, floor_bits);
-            let (wide_rows, _, windows) = run(BulkAndMode::On, BulkAndWide::Always, floor_bits);
-            assert_eq!(
-                wide_rows, classic,
-                "compaction changed the phrase rows at floor step {step}"
-            );
-            if classic.len() < 2 {
-                narrowed = true;
-            }
-            let _ = windows;
-        }
-        assert!(
-            narrowed,
-            "the ladder must reject the weak candidate at some floor"
-        );
+        // Segment pruning needs a full top-k collector: with limit 1 the strong
+        // candidate fills it and the weak one is rejected by its bound inside
+        // the same segment, which compacts the survivor's columns.
+        let prune_params = FtsSearchParams::default().with_limit(Some(1));
+        let run_prune = |mode: BulkAndMode, wide: BulkAndWide| {
+            let floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+            let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode)
+                .with_bulk_and_wide(wide)
+                .with_shared_threshold(floor);
+            let hits = wand.search(&prune_params, &NoOpMetricsCollector).unwrap();
+            let mut rows = hits
+                .into_iter()
+                .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            (rows, wand.and_window_stats.wide_windows)
+        };
+        let (classic, _) = run_prune(BulkAndMode::Off, BulkAndWide::Off);
+        let (wide_rows, windows) = run_prune(BulkAndMode::On, BulkAndWide::Always);
+        assert_eq!(classic.len(), 1, "only the strong candidate may compete");
+        assert!(windows > 0, "the wide path must run with limit 1");
+        assert_eq!(wide_rows, classic, "compaction changed the surviving row");
     }
 
     /// W1: the bulk conjunction corpus, scored four ways across every limit.
