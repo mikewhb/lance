@@ -2457,6 +2457,8 @@ struct AndWindowStats {
     pairwise_intersections: usize,
     windows_sliced: usize,
     windows_frequency_pruned: usize,
+    #[cfg(test)]
+    classic_lead_freq_rejections: usize,
 }
 
 impl Eq for TailPosting {}
@@ -2514,6 +2516,10 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Exact query-order score computed while progressively confirming a
     // conjunction candidate. This is valid only for `and_last_doc`.
     and_candidate_score: Option<f32>,
+    and_followers_bound: f64,
+    and_lead_freq_lut: Option<[f32; FREQ_LUT_BUCKETS]>,
+    and_lead_freq_cutoff: usize,
+    and_lead_freq_cutoff_key: Option<(u32, u64)>,
     // Score-first conjunction pruning is restricted to the current impact
     // format and scorers that expose the BM25 denominator contract.
     score_first_and_enabled: bool,
@@ -2645,6 +2651,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             and_max_score: f32::INFINITY,
             and_last_doc: None,
             and_candidate_score: None,
+            and_followers_bound: f64::INFINITY,
+            and_lead_freq_lut: None,
+            and_lead_freq_cutoff: FREQ_LUT_BUCKETS,
+            and_lead_freq_cutoff_key: None,
             score_first_and_enabled,
             #[cfg(test)]
             disable_score_first_and: false,
@@ -4066,6 +4076,31 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
             }
 
+            // Reject from the frequency table before any follower advances;
+            // the same bound is checked again after all followers match.
+            if self.operator == Operator::And
+                && self.threshold > 0.0
+                && self.num_terms >= 2
+                && self.lead.len() == self.num_terms
+                && self.and_followers_bound.is_finite()
+                && !self.lead.iter().any(|posting| posting.has_grouped_terms())
+            {
+                let cutoff = self.and_lead_freq_cutoff();
+                let frequency = self.lead[0].doc()?.frequency() as usize;
+                if frequency < cutoff {
+                    #[cfg(test)]
+                    {
+                        self.and_window_stats.classic_lead_freq_rejections += 1;
+                    }
+                    let next_target = self.and_advance_target(self.and_next_target_after(doc)?);
+                    if next_target == TERMINATED_DOC_ID {
+                        return None;
+                    }
+                    self.lead[0].next_doc_id(next_target, is_vectorized_search_enabled);
+                    continue;
+                }
+            }
+
             let mut is_score_first = self.score_first_and_bounds_up_to == self.up_to
                 && self.score_first_and_suffix_bounds.len() == self.lead.len() + 1
                 && self
@@ -5098,12 +5133,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 target
             });
             self.and_max_score = f32::INFINITY;
+            self.and_followers_bound = f64::INFINITY;
             return;
         }
 
         if self.lead.is_empty() {
             self.up_to = Some(TERMINATED_DOC_ID);
             self.and_max_score = 0.0;
+            self.and_followers_bound = f64::INFINITY;
             return;
         }
 
@@ -5126,6 +5163,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         if narrow_max_score >= self.threshold {
             self.up_to = Some(narrow_up_to);
             self.and_max_score = narrow_max_score;
+            self.and_followers_bound = self.and_followers_block_bound();
             self.prepare_score_first_and_window();
             #[cfg(test)]
             {
@@ -5164,6 +5202,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             if wide_max_score < self.threshold {
                 self.up_to = Some(lead_up_to);
                 self.and_max_score = wide_max_score;
+                self.and_followers_bound = f64::INFINITY;
                 #[cfg(test)]
                 {
                     self.and_window_stats.windows_wide += 1;
@@ -5174,11 +5213,52 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         self.up_to = Some(narrow_up_to);
         self.and_max_score = narrow_max_score;
+        self.and_followers_bound = self.and_followers_block_bound();
         self.prepare_score_first_and_window();
         #[cfg(test)]
         {
             self.and_window_stats.windows_narrow += 1;
         }
+    }
+
+    /// Followers' block maxima; +inf unless every clause is present.
+    fn and_followers_block_bound(&self) -> f64 {
+        if self.lead.len() != self.num_terms || self.num_terms < 2 {
+            return f64::INFINITY;
+        }
+        self.lead
+            .iter()
+            .skip(1)
+            .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+            .sum()
+    }
+
+    fn and_lead_freq_cutoff(&mut self) -> usize {
+        let key = (self.threshold.to_bits(), self.and_followers_bound.to_bits());
+        if self.and_lead_freq_cutoff_key == Some(key) {
+            return self.and_lead_freq_cutoff;
+        }
+        if self.and_lead_freq_lut.is_none() {
+            self.and_lead_freq_lut = Some(freq_bound_lut(&self.lead[0], &self.scorer));
+        }
+        let lut = self
+            .and_lead_freq_lut
+            .expect("frequency table initialized above");
+        let factor = score_sum_upper_bound_factor(self.num_terms);
+        let cutoff = (0..FREQ_LUT_BUCKETS)
+            .find(|&bucket| {
+                !score_sum_cannot_compete(
+                    lut[bucket],
+                    self.and_followers_bound,
+                    self.threshold,
+                    factor,
+                    self.floor_mode,
+                )
+            })
+            .unwrap_or(FREQ_LUT_BUCKETS);
+        self.and_lead_freq_cutoff = cutoff;
+        self.and_lead_freq_cutoff_key = Some(key);
+        cutoff
     }
 
     fn and_advance_target(&mut self, mut target: u64) -> u64 {
@@ -10088,12 +10168,16 @@ mod tests {
         assert!(wand.next().unwrap().is_none());
         assert!(wand.score_first_and_dense_range.is_none());
         assert!(wand.score_first_and_norm_k.get().is_none());
+        // The early lead-frequency bound decodes lead[0]'s frequency once;
+        // the followers still leapfrog without decoding theirs.
         assert!(
             wand.lead
                 .iter()
+                .skip(1)
                 .all(|posting| posting.frequency_blocks_decoded() == 0),
-            "the first follower miss must leapfrog before any frequency decode"
+            "followers must leapfrog before any frequency decode"
         );
+        assert!(wand.lead[0].frequency_blocks_decoded() <= 1);
     }
 
     #[test]
@@ -10127,7 +10211,7 @@ mod tests {
             .map(|posting| (posting.token_id, posting.frequency_blocks_decoded()))
             .sorted_unstable()
             .collect::<Vec<_>>();
-        assert_eq!(decoded_by_term, vec![(0, 0), (1, 0), (2, 0), (3, 0)]);
+        assert_eq!(decoded_by_term, vec![(0, 1), (1, 0), (2, 0), (3, 0)]);
     }
 
     #[rstest]
@@ -13281,5 +13365,133 @@ mod tests {
         let inside =
             posting.block_max_score_up_to_with_stats((35 * block_size - 1) as u64, &UnitScorer);
         assert!(inside.score >= wide.score);
+    }
+
+    /// The classic path rejects a lead document from the frequency table before
+    /// any follower advances; results must still match the bulk path.
+    #[test]
+    fn classic_lead_frequency_rejects_before_followers_advance() {
+        let num_docs = 256u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 1);
+        }
+        let run = |mode| {
+            // The lead's first document sets a floor its sparse siblings cannot
+            // reach; the followers stay balanced so their block bound is tight.
+            let lead_docs: Vec<u32> = (0..num_docs).step_by(2).collect();
+            let lead_freqs: Vec<u32> = lead_docs
+                .iter()
+                .map(|&doc| if doc == 0 { 100 } else { 1 })
+                .collect();
+            let follower_docs: Vec<u32> = (0..num_docs).collect();
+            let follower_freqs = vec![1u32; follower_docs.len()];
+            let clauses = [
+                (lead_docs, lead_freqs),
+                (follower_docs.clone(), follower_freqs.clone()),
+                (follower_docs.clone(), follower_freqs.clone()),
+                (follower_docs, follower_freqs),
+            ];
+            let postings = clauses
+                .into_iter()
+                .enumerate()
+                .map(|(term, (doc_ids, freqs))| {
+                    let len = doc_ids.len();
+                    PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term as u32,
+                        term as u32,
+                        1.0,
+                        generate_impact_posting_list_with_freqs_and_block_size(
+                            doc_ids,
+                            freqs,
+                            vec![1; len],
+                            128,
+                        ),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut wand = Wand::new(
+                Operator::And,
+                postings.into_iter(),
+                &docs,
+                CountingBm25ShapeScorer {
+                    scored: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .with_bulk_and_mode(mode);
+            let hits = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(1)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.document)
+                .collect::<Vec<_>>();
+            (hits, wand.and_window_stats.classic_lead_freq_rejections)
+        };
+        let (classic, rejections) = run(BulkAndMode::Off);
+        let (bulk, _) = run(BulkAndMode::On);
+        assert_eq!(classic, bulk);
+        assert_eq!(classic, vec![0]);
+        assert!(
+            rejections > 0,
+            "the sparse lead documents after the first window must be rejected early"
+        );
+    }
+
+    /// Every clause ends in the last block, so the window end is TERMINATED.
+    /// A rejected lead document must advance through the overflow-safe helper.
+    #[test]
+    fn classic_lead_frequency_rejection_handles_the_last_block() {
+        let num_docs = 512u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 1);
+        }
+        let clause_docs: Vec<u32> = (384..num_docs).collect();
+        let postings = (0..4)
+            .map(|term| {
+                let freqs: Vec<u32> = clause_docs
+                    .iter()
+                    .map(|&doc| if term == 0 && doc == 384 { 5 } else { 1 })
+                    .collect();
+                PostingIterator::with_query_weight(
+                    format!("t{term}"),
+                    term as u32,
+                    term as u32,
+                    1.0,
+                    generate_impact_posting_list_with_freqs_and_block_size(
+                        clause_docs.clone(),
+                        freqs,
+                        vec![1; clause_docs.len()],
+                        128,
+                    ),
+                    docs.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut wand = Wand::new(
+            Operator::And,
+            postings.into_iter(),
+            &docs,
+            CountingBm25ShapeScorer {
+                scored: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .with_bulk_and_mode(BulkAndMode::Off);
+        let hits = wand
+            .search(
+                &FtsSearchParams::default().with_limit(Some(1)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.document)
+            .collect::<Vec<_>>();
+        assert_eq!(hits, vec![384]);
+        assert!(wand.and_window_stats.classic_lead_freq_rejections > 0);
     }
 }
