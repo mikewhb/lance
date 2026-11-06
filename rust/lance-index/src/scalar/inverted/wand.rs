@@ -334,6 +334,24 @@ static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_e
 #[cfg(target_arch = "x86_64")]
 static HAS_AVX2: LazyLock<bool> = LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
 
+/// Whether the scorer's weight is non-increasing in the document length.
+///
+/// The frequency table below prices a candidate from `doc_weight(freq, 0)`,
+/// which is its maximum over lengths only when the weight never grows with the
+/// document. `doc_norm` reports the BM25 addend, whose growth in the document
+/// length is the practical shape here, so sampling the 256 quantised lengths is
+/// a cheap necessary condition. It is not sufficient: a scorer that reports the
+/// addend but evaluates `doc_weight` some other way still has to honour the
+/// contract documented on `Scorer::doc_weight`.
+fn has_bm25_length_shape<S: Scorer + ?Sized>(scorer: &S) -> bool {
+    norm_addends(scorer).is_some_and(|addends| {
+        addends
+            .iter()
+            .all(|addend| addend.is_finite() && *addend >= 0.0)
+            && addends.windows(2).all(|pair| pair[0] <= pair[1])
+    })
+}
+
 /// First index in `[pos, end)` where `docs[index] >= target` (scalar).
 #[inline]
 unsafe fn find_next_geq_scalar(docs: *const u32, mut pos: usize, end: usize, target: u32) -> usize {
@@ -4208,9 +4226,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // frequency-bucketed score bound (plus the other clauses' block
         // maxes) cannot beat the threshold — the score-first ordering
         // Lucene's conjunction scorer uses, with doc length dropped from the
-        // bound so no doc-length load is involved. The bound is monotone
-        // (doc length only shrinks a BM25 weight, and the last bucket holds
-        // the clause sup), so every skipped doc would also fail the exact
+        // bound so no doc-length load is involved. The bound is an upper bound
+        // only for a scorer whose weight does not grow with the document
+        // length (checked before the table is built), and the last bucket holds
+        // the clause sup, so every skipped doc would also fail the exact
         // per-candidate prune: results are unchanged, the work never happens.
         macro_rules! merge_kernels {
             ($name2:ident, $name3:ident, $name_n:ident, $docs_name2:ident, $docs_name3:ident, $geq:ident $(, #[$feat:meta])?) => {
@@ -4583,6 +4602,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // when the floor or the followers' block maxes change.
         let mut first_score_limit: Option<f32> = None;
         let mut first_score_limit_key: Option<(u32, u64)> = None;
+        // The table below stores `score(freq, 0)` as the first clause's upper
+        // bound over document lengths. That only holds while `doc_weight` is
+        // non-increasing in the document length, and a scorer that violates it
+        // loses rows silently. Probe the shape once per search (256 `doc_norm`
+        // calls, no allocation) and leave the pre-filter off when it cannot be
+        // established: the sampling is necessary, not sufficient, so the
+        // contract on `Scorer::doc_weight` is still what makes the prune sound.
+        let mut freq_lut_sound: Option<bool> = None;
 
         // The conjunction can only start at the max of the clauses' first docs.
         let mut target: u64 = 0;
@@ -4601,7 +4628,17 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             self.raise_to_shared_floor(params.wand_factor);
             let window_started_with_floor = self.threshold > 0.0;
             if window_started_with_floor {
-                if num_lists >= 2 && freq_bound_lut.is_none() {
+                // Short-circuit before the probe: single-clause conjunctions
+                // never build the table. Negative weights reverse the order
+                // (score(freq, 0) becomes a lower bound) and a negative
+                // follower weight would invalidate the summed bound, so every
+                // clause must be non-negative, as in the score-first window.
+                let freq_lut_allowed = num_lists >= 2
+                    && self.lead.iter().all(|posting| {
+                        posting.query_weight.is_finite() && posting.query_weight >= 0.0
+                    })
+                    && *freq_lut_sound.get_or_insert_with(|| has_bm25_length_shape(&self.scorer));
+                if freq_lut_allowed && freq_bound_lut.is_none() {
                     let mut lut = [f32::INFINITY; FREQ_LUT_BUCKETS];
                     for (freq, slot) in lut.iter_mut().enumerate().take(FREQ_LUT_BUCKETS - 1) {
                         *slot = self.lead[0].score(&self.scorer, freq as u32, 0);
@@ -4745,14 +4782,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         first_score_limit_key = Some(key);
                     }
                     if freq_cannot_beat_key != Some(key) {
-                        let freq_bound_lut = freq_bound_lut
-                            .as_ref()
-                            .expect("positive threshold should initialize the frequency bound LUT");
-                        freq_cannot_beat = match first_score_limit {
-                            Some(limit) => {
+                        freq_cannot_beat = match (freq_bound_lut.as_ref(), first_score_limit) {
+                            (Some(freq_bound_lut), Some(limit)) => {
                                 std::array::from_fn(|frequency| freq_bound_lut[frequency] <= limit)
                             }
-                            None => [false; FREQ_LUT_BUCKETS],
+                            // No sound table, or no positive limit: keep every
+                            // candidate and let the exact per-candidate prune
+                            // decide.
+                            _ => [false; FREQ_LUT_BUCKETS],
                         };
                         freq_cannot_beat_key = Some(key);
                     }
@@ -12934,84 +12971,183 @@ mod tests {
         assert!(scored.load(Ordering::Relaxed) > 0);
     }
 
-    /// The floor turns positive in the middle of the first window, where only
-    /// the per-candidate prune refreshes the score limit. The second window
-    /// has the same floor and the same follower block max, so the frequency
-    /// prune table must still be built for it instead of staying disabled.
-    #[test]
-    fn bulk_and_builds_frequency_prune_table_after_mid_window_floor() {
+    /// Fixture shared by the frequency-table tests: one lead block spanning two
+    /// windows, a follower whose block bounds stay finite, and a floor that
+    /// turns positive in the middle of the first window so the second window
+    /// must consult the table.
+    type HitRow = (u64, u32, Vec<(u32, u32)>);
+
+    struct FrequencyPruneRun {
+        hits: Vec<HitRow>,
+        floor: f32,
+        windows_sliced: usize,
+        windows_frequency_pruned: usize,
+    }
+
+    /// Weight shapes the frequency table has to distinguish.
+    #[derive(Clone, Copy)]
+    enum Shape {
+        /// \`(K1 + 1) * freq / (freq + addend)\` with a constant addend.
+        Bm25,
+        /// The same form with an addend that shrinks with the document length.
+        ShrinkingAddend,
+        /// No \`doc_norm\`, and a weight that grows with the document length.
+        LengthGrowing,
+    }
+
+    struct ShapeScorer(Shape);
+
+    impl Scorer for ShapeScorer {
+        fn query_weight(&self, _token: &str) -> f32 {
+            1.0
+        }
+
+        fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
+            match self.0 {
+                Shape::Bm25 => bm25_doc_weight_with_norm(freq, 1.2),
+                Shape::ShrinkingAddend => {
+                    bm25_doc_weight_with_norm(freq, 1.2 / (1.0 + doc_tokens as f32))
+                }
+                Shape::LengthGrowing => freq as f32 * (1.0 + doc_tokens as f32),
+            }
+        }
+
+        fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
+            match self.0 {
+                Shape::Bm25 => Some(1.2),
+                Shape::ShrinkingAddend => Some(1.2 / (1.0 + doc_tokens as f32)),
+                Shape::LengthGrowing => None,
+            }
+        }
+
+        fn doc_weight_upper_bound(&self) -> Option<f32> {
+            matches!(self.0, Shape::Bm25).then_some(BM25_DOC_WEIGHT_UPPER_BOUND)
+        }
+    }
+
+    /// One lead block spanning two windows, a follower whose block bounds stay
+    /// finite, and a floor that turns positive in the middle of the first window
+    /// so the second window must consult the table.
+    fn frequency_prune_fixture(
+        shape: Shape,
+        mode: BulkAndMode,
+        lead_weight: f32,
+        follower_weight: f32,
+    ) -> FrequencyPruneRun {
         let num_docs = (MAX_POSTING_BLOCK_SIZE * 2) as u32;
         let mut docs = DocSet::default();
         for doc_id in 0..num_docs {
             docs.append(u64::from(doc_id), 1);
         }
-        let run = |mode| {
-            // One block spanning both windows; only document 0 can win.
-            let sparse_docs = (0..num_docs).step_by(2).collect::<Vec<_>>();
-            let sparse_freqs = sparse_docs
-                .iter()
-                .map(|&doc| if doc == 0 { 10 } else { 1 })
-                .collect::<Vec<_>>();
-            // Two blocks with the same block max, so the follower bound is
-            // identical in both windows. Document 257 keeps the second window
-            // competitive by block max without matching the sparse clause.
-            let dense_docs = (0..num_docs).collect::<Vec<_>>();
-            let dense_freqs = dense_docs
-                .iter()
-                .map(|&doc| if doc == 0 || doc == 257 { 10 } else { 1 })
-                .collect::<Vec<_>>();
-            let postings = [(sparse_docs, sparse_freqs), (dense_docs, dense_freqs)]
-                .into_iter()
-                .enumerate()
-                .map(|(term, (doc_ids, freqs))| {
-                    let len = doc_ids.len();
-                    PostingIterator::with_query_weight(
-                        format!("t{term}"),
-                        term as u32,
-                        term as u32,
-                        1.0,
-                        generate_impact_posting_list_with_freqs_and_block_size(
-                            doc_ids,
-                            freqs,
-                            vec![1; len],
-                            MAX_POSTING_BLOCK_SIZE,
-                        ),
-                        docs.len(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
-                .with_bulk_and_mode(mode);
-            let hits = wand
-                .search(
-                    &FtsSearchParams::default().with_limit(Some(1)),
-                    &NoOpMetricsCollector,
-                )
-                .unwrap()
-                .into_iter()
-                .map(|hit| (hit.document, hit.doc_length, hit.freqs))
-                .collect::<Vec<_>>();
-            (
-                hits,
-                wand.threshold,
-                wand.and_window_stats.windows_sliced,
-                wand.and_window_stats.windows_frequency_pruned,
+        let sparse_docs = (0..num_docs).step_by(2).collect::<Vec<_>>();
+        let sparse_freqs = sparse_docs
+            .iter()
+            .map(|&doc| if doc == 0 { 10 } else { 1 })
+            .collect::<Vec<_>>();
+        let dense_docs = (0..num_docs).collect::<Vec<_>>();
+        let dense_freqs = dense_docs
+            .iter()
+            .map(|&doc| if doc == 0 || doc == 257 { 10 } else { 1 })
+            .collect::<Vec<_>>();
+        let postings = [
+            (sparse_docs, sparse_freqs, lead_weight),
+            (dense_docs, dense_freqs, follower_weight),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(term, (doc_ids, freqs, weight))| {
+            let len = doc_ids.len();
+            PostingIterator::with_query_weight(
+                format!("t{term}"),
+                term as u32,
+                term as u32,
+                weight,
+                generate_impact_posting_list_with_freqs_and_block_size(
+                    doc_ids,
+                    freqs,
+                    vec![1; len],
+                    MAX_POSTING_BLOCK_SIZE,
+                ),
+                docs.len(),
             )
-        };
-        let (classic, classic_floor, _, _) = run(BulkAndMode::Off);
-        let (bulk, bulk_floor, windows_sliced, windows_frequency_pruned) = run(BulkAndMode::On);
-        assert_eq!(bulk, classic);
-        assert_eq!(bulk.len(), 1);
-        assert_eq!(bulk[0].0, 0);
-        assert_eq!(bulk_floor, 20.0);
-        assert_eq!(bulk_floor, classic_floor);
+        })
+        .collect::<Vec<_>>();
+        let mut wand = Wand::new(
+            Operator::And,
+            postings.into_iter(),
+            &docs,
+            ShapeScorer(shape),
+        )
+        .with_bulk_and_mode(mode);
+        let hits = wand
+            .search(
+                &FtsSearchParams::default().with_limit(Some(1)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+            .collect::<Vec<_>>();
+        FrequencyPruneRun {
+            hits,
+            floor: wand.threshold,
+            windows_sliced: wand.and_window_stats.windows_sliced,
+            windows_frequency_pruned: wand.and_window_stats.windows_frequency_pruned,
+        }
+    }
+
+    /// The floor turns positive in the middle of the first window, where only
+    /// the per-candidate prune refreshes the score limit. The second window has
+    /// the same floor and follower block max, so the frequency prune table must
+    /// still be built for it.
+    #[test]
+    fn bulk_and_builds_frequency_prune_table_after_mid_window_floor() {
+        let classic = frequency_prune_fixture(Shape::Bm25, BulkAndMode::Off, 1.0, 1.0);
+        let bulk = frequency_prune_fixture(Shape::Bm25, BulkAndMode::On, 1.0, 1.0);
+        assert_eq!(bulk.hits, classic.hits);
+        assert_eq!(bulk.hits.len(), 1);
+        assert_eq!(bulk.hits[0].0, 0);
+        assert_eq!(bulk.floor, classic.floor);
+        // Two clauses, both at frequency 10, against the constant addend.
+        assert_eq!(bulk.floor, 2.0 * bm25_doc_weight_with_norm(10, 1.2));
         assert_eq!(
-            windows_sliced, 2,
+            bulk.windows_sliced, 2,
             "the dense clause's block boundary splits two windows"
         );
         assert_eq!(
-            windows_frequency_pruned, 1,
+            bulk.windows_frequency_pruned, 1,
             "the second window must apply the frequency prune table"
         );
+    }
+
+    /// Without a shape that makes \`score(freq, 0)\` the maximum over lengths, the
+    /// table must stay off instead of dropping candidates with a lower bound.
+    #[test]
+    fn bulk_and_stops_the_frequency_prune_without_the_bm25_length_shape() {
+        for shape in [Shape::ShrinkingAddend, Shape::LengthGrowing] {
+            let run = frequency_prune_fixture(shape, BulkAndMode::On, 1.0, 1.0);
+            assert!(run.floor > 0.0, "the second window must have a floor");
+            assert_eq!(run.windows_sliced, 2);
+            assert_eq!(
+                run.windows_frequency_pruned, 0,
+                "the table must not run without the BM25 length shape"
+            );
+        }
+    }
+
+    /// A negative weight reverses the order: \`score(freq, 0)\` becomes a lower
+    /// bound for that clause, and a negative follower weight invalidates the
+    /// summed bound.
+    #[test]
+    fn bulk_and_stops_the_frequency_prune_with_a_negative_weight() {
+        for (lead, follower) in [(-1.0, 2.0), (1.0, -0.5)] {
+            let run = frequency_prune_fixture(Shape::Bm25, BulkAndMode::On, lead, follower);
+            assert!(run.floor > 0.0, "the second window must have a floor");
+            assert_eq!(run.windows_sliced, 2);
+            assert_eq!(
+                run.windows_frequency_pruned, 0,
+                "a negative weight must disable the frequency prune"
+            );
+        }
     }
 }

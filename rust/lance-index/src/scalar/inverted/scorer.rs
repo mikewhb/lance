@@ -10,6 +10,16 @@ use std::sync::Arc;
 // sum over all query_weight(query_token) * doc_weight(freq, doc_tokens)
 pub trait Scorer: Send + Sync {
     fn query_weight(&self, token: &str) -> f32;
+
+    /// Weight of one matching occurrence in a document.
+    ///
+    /// Pruning requires this to be **non-decreasing in `freq`** and
+    /// **non-increasing in `doc_tokens`**. The impact frontier written at
+    /// index time keeps only the pairs that are dominant under that order, and
+    /// the query-time frequency table prices a candidate from
+    /// `doc_weight(freq, 0)`. A scorer that violates either direction can lose
+    /// rows silently on pruned paths, so the order is part of the contract
+    /// rather than an optimization detail.
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32;
 
     /// Finite upper bound for every non-negative value returned by
@@ -33,6 +43,11 @@ pub trait Scorer: Send + Sync {
     /// without that shape. Scoring hot loops use this to bake a per-norm-code
     /// addend cache (Lucene's norm cache), which is bit-identical to calling
     /// `doc_weight` because both paths evaluate the same expressions.
+    ///
+    /// The addend must be **non-decreasing in `doc_tokens`**: pruning samples
+    /// this function over the quantised lengths to decide whether the weight is
+    /// non-increasing in the document length, and treats a decreasing addend as
+    /// "no such shape".
     fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
         let _ = doc_tokens;
         None
