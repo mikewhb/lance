@@ -8,8 +8,16 @@ use std::sync::Arc;
 // the Scorer trait is used to calculate the score of a token in a document
 // in general, the score is calculated as:
 // sum over all query_weight(query_token) * doc_weight(freq, doc_tokens)
+//
+// Ordering contract, relied on by the impact frontier (`impact.rs`) and every
+// pruning bound: `query_weight` >= 0; `doc_weight` non-decreasing in `freq`
+// and non-increasing in `doc_tokens`; `doc_norm` non-decreasing in
+// `doc_tokens`. Index statistics are assumed sane (`avg_doc_length` positive
+// and finite, no token's df above the document count).
 pub trait Scorer: Send + Sync {
     fn query_weight(&self, token: &str) -> f32;
+
+    /// Weight of one matching occurrence; must follow the trait-level order.
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32;
 
     /// Finite upper bound for every non-negative value returned by
@@ -33,6 +41,8 @@ pub trait Scorer: Send + Sync {
     /// without that shape. Scoring hot loops use this to bake a per-norm-code
     /// addend cache (Lucene's norm cache), which is bit-identical to calling
     /// `doc_weight` because both paths evaluate the same expressions.
+    ///
+    /// Must be non-decreasing in `doc_tokens`.
     fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
         let _ = doc_tokens;
         None
@@ -345,7 +355,58 @@ impl CombinedFieldsBM25Scorer {
 
 #[cfg(test)]
 mod tests {
+    use super::super::index::dequantize_doc_length;
     use super::*;
+
+    /// S-1: the ordering contract that the impact frontier and the frequency
+    /// table rely on. `IndexBM25Scorer` evaluates the same two formulas as
+    /// [`MemBM25Scorer`] (both call `bm25_doc_norm` and
+    /// `bm25_doc_weight_with_norm`), so checking this scorer checks both.
+    #[test]
+    fn test_mem_bm25_scorer_respects_pruning_order() {
+        let scorer = MemBM25Scorer::new(100_000, 1_000, HashMap::new());
+        assert!(scorer.avg_doc_length() > 0.0 && scorer.avg_doc_length().is_finite());
+
+        let mut previous_norm = f32::NEG_INFINITY;
+        for code in 0..=u8::MAX {
+            let doc_norm = scorer
+                .doc_norm(dequantize_doc_length(code))
+                .expect("MemBM25Scorer implements doc_norm");
+            assert!(
+                doc_norm.is_finite() && doc_norm >= 0.0,
+                "doc_norm({code}) = {doc_norm:e}"
+            );
+            assert!(
+                doc_norm >= previous_norm,
+                "doc_norm must not decrease with the document length at code {code}"
+            );
+            previous_norm = doc_norm;
+        }
+
+        let freqs = [0u32, 1, 2, 63, (1 << 24) - 1, 1 << 24, u32::MAX];
+        for doc_tokens in [1u32, 2, 63, 1_000, 100_000, u32::MAX] {
+            let mut previous_weight = f32::NEG_INFINITY;
+            for freq in freqs {
+                let doc_weight = scorer.doc_weight(freq, doc_tokens);
+                assert!(
+                    doc_weight.is_finite() && doc_weight >= previous_weight,
+                    "doc_weight must not decrease with the frequency:                      freq={freq} doc_tokens={doc_tokens} gives {doc_weight:e}"
+                );
+                previous_weight = doc_weight;
+            }
+        }
+        for freq in freqs {
+            let mut previous_weight = f32::INFINITY;
+            for code in 0..=u8::MAX {
+                let doc_weight = scorer.doc_weight(freq, dequantize_doc_length(code));
+                assert!(
+                    doc_weight <= previous_weight,
+                    "doc_weight must not increase with the document length:                      freq={freq} code={code} gives {doc_weight:e}"
+                );
+                previous_weight = doc_weight;
+            }
+        }
+    }
 
     #[test]
     fn bm25_doc_weight_upper_bound_covers_f32_rounding() {

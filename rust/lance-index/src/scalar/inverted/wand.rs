@@ -51,6 +51,11 @@ use super::{DocInfo, builder::BLOCK_SIZE};
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
 
+/// Buckets of the conjunction frequency prune table. Buckets below the last
+/// hold the score bound at that exact frequency; the last covers every larger
+/// frequency and the frequency-independent sup.
+const FREQ_LUT_BUCKETS: usize = 64;
+
 /// Top-k heap entry: (scored doc, doc length, posting doc id, frequency slot).
 /// The (term, freq) pairs live outside the heap so heap churn moves a compact
 /// tuple instead of a `Vec`.
@@ -408,6 +413,34 @@ fn conservative_bm25_upper_bound(query_weight: f32) -> f32 {
     } else {
         query_weight * BM25_DOC_WEIGHT_UPPER_BOUND
     }
+}
+
+/// Frequency-bucketed upper bounds of `posting`'s score with the document
+/// length dropped; the last bucket holds the frequency-independent sup.
+/// Only the table is shared: bulk applies `exclusive_partial_score_limit`,
+/// the classic path `score_sum_cannot_compete`. Keep the predicates separate.
+fn freq_bound_lut<S: Scorer + ?Sized>(
+    posting: &PostingIterator,
+    scorer: &S,
+) -> [f32; FREQ_LUT_BUCKETS] {
+    // Grouped terms ignore the frequency argument and a negative query weight
+    // would make the table a lower bound; prune neither.
+    if posting.has_grouped_terms() || posting.query_weight < 0.0 {
+        return [f32::INFINITY; FREQ_LUT_BUCKETS];
+    }
+    let mut lut = [f32::INFINITY; FREQ_LUT_BUCKETS];
+    for (freq, slot) in lut.iter_mut().enumerate().take(FREQ_LUT_BUCKETS - 1) {
+        *slot = posting.score(scorer, freq as u32, 0);
+    }
+    let clamp = posting.frequency_clamp_upper_bound(scorer);
+    // Impact lists have no frequency clamp; the scorer ceiling still bounds
+    // every frequency, so the tail stays finite.
+    lut[FREQ_LUT_BUCKETS - 1] = if clamp.is_finite() {
+        clamp
+    } else {
+        scorer_upper_bound(posting.query_weight, scorer)
+    };
+    lut
 }
 
 #[inline]
@@ -4576,8 +4609,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // The last bucket holds the frequency-independent sup, so clamping
         // stays a valid upper bound. Skips only avoid work; every emitted
         // candidate still goes through the exact per-candidate prune below.
-        const FREQ_LUT_BUCKETS: usize = 64;
-        let mut freq_bound_lut: Option<[f32; FREQ_LUT_BUCKETS]> = None;
+        let mut freq_bounds: Option<[f32; FREQ_LUT_BUCKETS]> = None;
         // Exclusive limit on the first clause's partial score for the current
         // window: scores at or below it cannot beat the floor. Recomputed only
         // when the floor or the followers' block maxes change.
@@ -4601,14 +4633,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             self.raise_to_shared_floor(params.wand_factor);
             let window_started_with_floor = self.threshold > 0.0;
             if window_started_with_floor {
-                if num_lists >= 2 && freq_bound_lut.is_none() {
-                    let mut lut = [f32::INFINITY; FREQ_LUT_BUCKETS];
-                    for (freq, slot) in lut.iter_mut().enumerate().take(FREQ_LUT_BUCKETS - 1) {
-                        *slot = self.lead[0].score(&self.scorer, freq as u32, 0);
-                    }
-                    lut[FREQ_LUT_BUCKETS - 1] =
-                        self.lead[0].frequency_clamp_upper_bound(&self.scorer);
-                    freq_bound_lut = Some(lut);
+                if num_lists >= 2 && freq_bounds.is_none() {
+                    freq_bounds = Some(freq_bound_lut(&self.lead[0], &self.scorer));
                 }
                 let advanced = self.and_advance_target(target);
                 if advanced == TERMINATED_DOC_ID {
@@ -4745,12 +4771,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         first_score_limit_key = Some(key);
                     }
                     if freq_cannot_beat_key != Some(key) {
-                        let freq_bound_lut = freq_bound_lut
+                        let freq_bounds = freq_bounds
                             .as_ref()
                             .expect("positive threshold should initialize the frequency bound LUT");
+                        // Bulk's own predicate: the exclusive partial score
+                        // limit, never `score_sum_cannot_compete`.
                         freq_cannot_beat = match first_score_limit {
                             Some(limit) => {
-                                std::array::from_fn(|frequency| freq_bound_lut[frequency] <= limit)
+                                std::array::from_fn(|frequency| freq_bounds[frequency] <= limit)
                             }
                             None => [false; FREQ_LUT_BUCKETS],
                         };
@@ -13013,5 +13041,163 @@ mod tests {
             windows_frequency_pruned, 1,
             "the second window must apply the frequency prune table"
         );
+    }
+
+    /// The tail bucket covers every frequency the table does not spell out.
+    /// On an impact list there is no frequency clamp, so before C0 the tail was
+    /// +infinity and no lead document at freq >= FREQ_LUT_BUCKETS - 1 could ever
+    /// be rejected. It must now be the scorer's own ceiling, which is still a
+    /// valid bound for every frequency.
+    #[test]
+    fn frequency_prune_tail_bucket_is_finite_for_impact_lists() {
+        let num_docs = 512usize;
+        let doc_ids: Vec<u32> = (0..num_docs as u32).collect();
+        let freqs: Vec<u32> = doc_ids
+            .iter()
+            .map(|&doc| if doc == 0 { 300 } else { 1 })
+            .collect();
+        let list = generate_impact_posting_list_with_freqs_and_block_size(
+            doc_ids,
+            freqs,
+            vec![1; num_docs],
+            MAX_POSTING_BLOCK_SIZE,
+        );
+        let scorer = CountingBm25ShapeScorer {
+            scored: Arc::new(AtomicUsize::new(0)),
+        };
+        let posting =
+            PostingIterator::with_query_weight(String::from("t"), 0, 0, 1.0, list, num_docs);
+
+        let lut = freq_bound_lut(&posting, &scorer);
+        for (freq, bound) in lut.iter().enumerate().take(FREQ_LUT_BUCKETS - 1) {
+            assert_eq!(*bound, posting.score(&scorer, freq as u32, 0));
+        }
+        let tail = lut[FREQ_LUT_BUCKETS - 1];
+        assert!(
+            tail.is_finite(),
+            "the tail bucket must not stay infinite on an impact list"
+        );
+        // A bound below the real ceiling would reject documents that compete.
+        let sup = scorer.doc_weight_upper_bound().unwrap();
+        assert_eq!(tail, sup);
+        assert!(tail >= scorer.doc_weight(u32::MAX, 0));
+        assert!(tail >= scorer.doc_weight(u32::MAX, u32::MAX));
+    }
+
+    /// `PostingIterator::score` ignores the frequency of a grouped clause and
+    /// sums the grouped terms at the current position, so no per-frequency table
+    /// bounds it. The table must stay infinite (prune nothing) for grouped
+    /// clauses; the classic path allows them even though bulk does not.
+    #[test]
+    fn frequency_prune_table_is_infinite_for_grouped_clauses() {
+        let num_docs = 512usize;
+        let doc_ids: Vec<u32> = (0..num_docs as u32).collect();
+        let list = generate_impact_posting_list_with_freqs_and_block_size(
+            doc_ids,
+            vec![7; num_docs],
+            vec![1; num_docs],
+            MAX_POSTING_BLOCK_SIZE,
+        );
+        let scorer = CountingBm25ShapeScorer {
+            scored: Arc::new(AtomicUsize::new(0)),
+        };
+        let grouped_terms = Arc::<[GroupedTermScorer]>::from([GroupedTermScorer::new(1.0, &list)]);
+        let posting =
+            PostingIterator::with_query_weight(String::from("t"), 0, 0, 1.0, list, num_docs)
+                .with_grouped_terms(grouped_terms);
+
+        assert!(
+            freq_bound_lut(&posting, &scorer)
+                .iter()
+                .all(|bound| *bound == f32::INFINITY),
+            "a grouped clause has no per-frequency bound"
+        );
+    }
+
+    /// Bulk and the classic path must agree when the lead clause's densest
+    /// document sits at a frequency inside the tail bucket. The window prune
+    /// only skips work: its bound is the lead's length-independent ceiling plus
+    /// the followers' block maxes, so every skipped document would fail the
+    /// exact per-candidate prune too.
+    #[test]
+    fn bulk_frequency_prune_agrees_with_classic_at_high_lead_frequency() {
+        let num_docs = (MAX_POSTING_BLOCK_SIZE * 2) as u32;
+        let mut docs = DocSet::default();
+        for doc_id in 0..num_docs {
+            docs.append(u64::from(doc_id), 1);
+        }
+        let run = |mode| {
+            // The lead is sparse, so it drives the window end; document 256 is
+            // its only dense-frequency entry and only matches the followers at
+            // frequency 1, well under the floor document 0 sets.
+            let lead_docs: Vec<u32> = (0..num_docs).step_by(2).collect();
+            let lead_freqs = lead_docs
+                .iter()
+                .map(|&doc| if doc % 256 == 0 { 200 } else { 1 })
+                .collect::<Vec<_>>();
+            let follower_docs: Vec<u32> = (0..num_docs).collect();
+            let follower_freqs = follower_docs
+                .iter()
+                .map(|&doc| if doc == 0 { 200 } else { 1 })
+                .collect::<Vec<_>>();
+            let clauses = [
+                (lead_docs, lead_freqs),
+                (follower_docs.clone(), follower_freqs.clone()),
+                (follower_docs, follower_freqs),
+            ];
+            let postings = clauses
+                .into_iter()
+                .enumerate()
+                .map(|(term, (doc_ids, freqs))| {
+                    let len = doc_ids.len();
+                    PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term as u32,
+                        term as u32,
+                        1.0,
+                        generate_impact_posting_list_with_freqs_and_block_size(
+                            doc_ids,
+                            freqs,
+                            vec![1; len],
+                            MAX_POSTING_BLOCK_SIZE,
+                        ),
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut wand = Wand::new(
+                Operator::And,
+                postings.into_iter(),
+                &docs,
+                CountingBm25ShapeScorer {
+                    scored: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .with_bulk_and_mode(mode);
+            let hits = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(1)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+                .collect::<Vec<_>>();
+            (
+                hits,
+                wand.threshold,
+                wand.and_window_stats.windows_frequency_pruned,
+            )
+        };
+        let (classic, classic_floor, _) = run(BulkAndMode::Off);
+        let (bulk, bulk_floor, _) = run(BulkAndMode::On);
+        assert_eq!(bulk, classic);
+        assert_eq!(bulk_floor, classic_floor);
+        assert_eq!(bulk[0].0, 0);
+        // The tail bound is exercised by
+        // frequency_prune_tail_bucket_is_finite_for_impact_lists. A positive
+        // floor always keeps this clause's own contribution <= its ceiling, so
+        // the tail bucket cannot be *rejected* here; what this fixture guards
+        // is that the finite tail does not change the emitted results.
     }
 }
