@@ -747,23 +747,48 @@ impl BlockMaxWindow {
         self.next_block_idx = self.next_block_idx.max(start_block_idx);
         #[cfg(test)]
         let mut blocks_scanned = 0;
-        while self.next_block_idx < list.blocks.len()
+        let num_blocks = list.blocks.len();
+        let impact_bounds = list.impacts.as_ref().map(|impacts| {
+            (
+                impacts,
+                impacts.doc_weight_bounds_cached(scorer, &mut self.impact_score_cache),
+            )
+        });
+        while self.next_block_idx < num_blocks
             && list.block_least_doc_id(self.next_block_idx) as u64 <= up_to
         {
-            let score = match list.impacts.as_ref() {
-                Some(impacts) => impacts.level0_score_cached(
-                    self.next_block_idx,
-                    query_weight,
-                    scorer,
-                    &mut self.impact_score_cache,
-                ),
+            let mut last_block_idx = self.next_block_idx;
+            let score = match impact_bounds {
+                Some((impacts, bounds)) => {
+                    // A level1 group that ends inside the window enters the
+                    // deque as one entry keyed by its last block. While the
+                    // window start is inside that group the entry still
+                    // covers its earlier blocks, which only loosens the bound.
+                    let group_idx = self.next_block_idx / IMPACT_LEVEL1_BLOCKS;
+                    let entry_idx = if self.next_block_idx.is_multiple_of(IMPACT_LEVEL1_BLOCKS)
+                        && impacts
+                            .level1_doc_up_to(group_idx)
+                            .is_some_and(|doc_up_to| u64::from(doc_up_to) <= up_to)
+                    {
+                        last_block_idx =
+                            ((group_idx + 1) * IMPACT_LEVEL1_BLOCKS).min(num_blocks) - 1;
+                        num_blocks + group_idx
+                    } else {
+                        self.next_block_idx
+                    };
+                    if query_weight <= 0.0 {
+                        0.0
+                    } else {
+                        query_weight * bounds[entry_idx]
+                    }
+                }
                 None => list.block_max_score(self.next_block_idx),
             };
             while matches!(self.max_scores.back(), Some((_, old_score)) if *old_score <= score) {
                 self.max_scores.pop_back();
             }
-            self.max_scores.push_back((self.next_block_idx, score));
-            self.next_block_idx += 1;
+            self.max_scores.push_back((last_block_idx, score));
+            self.next_block_idx = last_block_idx + 1;
             #[cfg(test)]
             {
                 blocks_scanned += 1;
@@ -13199,5 +13224,62 @@ mod tests {
         // floor always keeps this clause's own contribution <= its ceiling, so
         // the tail bucket cannot be *rejected* here; what this fixture guards
         // is that the finite tail does not change the emitted results.
+    }
+
+    /// From a group start, a fully covered level1 group enters the sliding
+    /// deque as one entry, and a probe that starts inside the group still sees
+    /// the group bound (looser, never lower).
+    #[test]
+    fn test_impact_wide_window_bound_slides_over_level0_and_level1_maxima() {
+        let blocks = 40usize;
+        let block_size = 128usize;
+        let doc_ids: Vec<u32> = (0..(blocks * block_size) as u32).collect();
+        let freqs: Vec<u32> = doc_ids
+            .iter()
+            .map(|doc| 1 + (*doc as usize / block_size % 7) as u32)
+            .collect();
+        let list = generate_impact_posting_list_with_freqs_and_block_size(
+            doc_ids.clone(),
+            freqs,
+            vec![1; doc_ids.len()],
+            block_size,
+        );
+        let mut posting = PostingIterator::with_query_weight(
+            String::from("t"),
+            0,
+            0,
+            1.0,
+            list.clone(),
+            doc_ids.len(),
+        );
+
+        // Blocks 0..=2 carry frequencies 1..=3: the bound is their maximum.
+        let up_to = (3 * block_size - 1) as u64;
+        let first = posting.block_max_score_up_to_with_stats(up_to, &UnitScorer);
+        assert_eq!(first.score, 3.0);
+        assert_eq!(first.blocks_scanned, 3);
+        posting.shallow_next(block_size as u64);
+        let slid = posting.block_max_score_up_to_with_stats(up_to, &UnitScorer);
+        assert_eq!(slid.score, 3.0);
+        assert_eq!(slid.blocks_scanned, 0);
+
+        // From a group start, the first level1 group folds into one entry.
+        let mut posting =
+            PostingIterator::with_query_weight(String::from("t"), 0, 0, 1.0, list, doc_ids.len());
+        let wide =
+            posting.block_max_score_up_to_with_stats((35 * block_size - 1) as u64, &UnitScorer);
+        assert_eq!(wide.score, 7.0);
+        assert_eq!(
+            wide.blocks_scanned,
+            1 + 3,
+            "one level1 group plus blocks 32..=34"
+        );
+
+        // A probe whose start falls inside the folded group keeps the group
+        // entry, so the bound stays >= every block maximum in the group.
+        posting.shallow_next((5 * block_size) as u64);
+        let inside =
+            posting.block_max_score_up_to_with_stats((35 * block_size - 1) as u64, &UnitScorer);
+        assert!(inside.score >= wide.score);
     }
 }

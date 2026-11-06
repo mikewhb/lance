@@ -229,6 +229,16 @@ impl ImpactSkipData {
         &cache.bounds(self, scorer).per_entry[..self.0.level0_len]
     }
 
+    /// Cached max doc weights of every entry: level0 blocks first, then the
+    /// level1 group `g` at index `level0_len + g`.
+    pub(crate) fn doc_weight_bounds_cached<'a, S: Scorer + ?Sized>(
+        &self,
+        scorer: &S,
+        cache: &'a mut ImpactScoreCache,
+    ) -> &'a [f32] {
+        &cache.bounds(self, scorer).per_entry
+    }
+
     pub fn entries(&self) -> &LargeBinaryArray {
         &self.0.entries
     }
