@@ -281,14 +281,18 @@ impl CompetitiveFloorMode {
 // Bulk conjunction path for top-k AND / phrase queries: block-max window
 // skipping plus a slice-level merge over decompressed blocks, replacing the
 // per-doc `next()` leapfrog. Results are identical to the classic AND loop.
-// LANCE_FTS_BULK_AND accepts auto (default), on/1, or off/0. Auto enables the
-// bulk path for two and three clauses and for wider current-format conjunctions.
+// LANCE_FTS_BULK_AND accepts auto (default), on/1, off/0, or narrow. Auto
+// enables the bulk path for two and three clauses and for wider
+// current-format conjunctions. Narrow routes exactly like auto but never opens
+// a wide window, which makes it the same-binary control arm for the wide path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BulkAndMode {
     #[default]
     Auto,
     On,
     Off,
+    /// Same routing as Auto, never a wide window.
+    Narrow,
 }
 
 impl BulkAndMode {
@@ -300,6 +304,8 @@ impl BulkAndMode {
             Some(Self::On)
         } else if value.eq_ignore_ascii_case("off") || value == "0" {
             Some(Self::Off)
+        } else if value.eq_ignore_ascii_case("narrow") {
+            Some(Self::Narrow)
         } else {
             None
         }
@@ -307,7 +313,7 @@ impl BulkAndMode {
 
     const fn enabled_for(self, num_clauses: usize) -> bool {
         match self {
-            Self::Auto => matches!(num_clauses, 2 | 3),
+            Self::Auto | Self::Narrow => matches!(num_clauses, 2 | 3),
             Self::On => true,
             Self::Off => false,
         }
@@ -336,57 +342,35 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
 
-// Wide-window switch for the bulk conjunction path. `off` (default) keeps every
-// window ending at the nearest follower block boundary, exactly like the narrow
-// path. `auto` opens the window to the lead clause's block when a follower
-// would cross a block boundary inside it, so the per-window setup is paid once
-// per lead block instead of once per lead document. `always` skips the
-// structural dispatch and only exists for tests and worst-case measurement.
-// LANCE_FTS_BULK_AND_WIDE selects the mode.
+/// Wide-window override, tests only: Off disables the window even when the
+/// gate opens, Always bypasses the gate and L1. Production follows the gate.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum BulkAndWide {
+enum WideOverride {
     #[default]
     Off,
     Auto,
     Always,
 }
 
-impl BulkAndWide {
-    fn parse(value: &str) -> Option<Self> {
-        let value = value.trim();
-        if value.eq_ignore_ascii_case("off") || value == "0" {
-            Some(Self::Off)
-        } else if value.eq_ignore_ascii_case("auto") {
-            Some(Self::Auto)
-        } else if value.eq_ignore_ascii_case("always") || value == "1" {
-            Some(Self::Always)
-        } else {
-            None
-        }
-    }
+/// L2 draft limit: after this many consecutive wide windows that prune nothing,
+/// stop opening wide windows for the rest of the search. usize::MAX is off
+/// until D2 picks M.
+const WIDE_L2_MISS_LIMIT: usize = usize::MAX;
+
+/// Wide-window gate: one lead block must make the narrow path open at least
+/// block_size / 8 windows, i.e. 8 * sum(follower cost) >= block * lead cost.
+/// Cross-multiplied in u64, so no division and no float. Every clause is
+/// assumed to share a block size (an index is built with one block size).
+fn wide_gate(lead_cost: u64, followers_cost: u64, block_size: u64) -> bool {
+    followers_cost.saturating_mul(8) >= block_size.saturating_mul(lead_cost)
 }
 
-fn bulk_and_wide_from_env() -> BulkAndWide {
-    match std::env::var("LANCE_FTS_BULK_AND_WIDE") {
-        Ok(value) => BulkAndWide::parse(&value).unwrap_or_else(|| {
-            log::warn!(
-                "Invalid LANCE_FTS_BULK_AND_WIDE value {value:?}; expected off/0, auto, or \
-                 always/1; falling back to off"
-            );
-            BulkAndWide::Off
-        }),
-        Err(std::env::VarError::NotPresent) => BulkAndWide::Off,
-        Err(std::env::VarError::NotUnicode(value)) => {
-            log::warn!(
-                "Invalid non-Unicode LANCE_FTS_BULK_AND_WIDE value {value:?}; expected off/0, \
-                 auto, or always/1; falling back to off"
-            );
-            BulkAndWide::Off
-        }
-    }
+/// L2 draft streak: a window that pruned nothing extends the miss streak, any
+/// pruning clears it.
+fn l2_streak(streak: usize, ineffective: bool) -> usize {
+    if ineffective { streak + 1 } else { 0 }
 }
-
-static BULK_AND_WIDE: LazyLock<BulkAndWide> = LazyLock::new(bulk_and_wide_from_env);
 
 #[cfg(target_arch = "x86_64")]
 static HAS_AVX2: LazyLock<bool> = LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
@@ -2574,11 +2558,7 @@ struct AndWindowStats {
     pairwise_intersections: usize,
     windows_sliced: usize,
     windows_frequency_pruned: usize,
-    // Wide-window counters. They only move when the wide switch is on, so the
-    // default configuration never reads or writes them. The ones the wide path
-    // has not started writing yet are allowed to sit idle: they are part of the
-    // switch's instrumentation and are consumed by the wide-window tests that
-    // land with the traversal itself.
+    // Wide-window counters, moved only when a wide window runs.
     wide_windows: usize,
     wide_fit_windows: usize,
     wide_blocks_skipped: usize,
@@ -2588,12 +2568,6 @@ struct AndWindowStats {
     // Windows pruned against this partition's own k-th instead of the shared
     // floor (the partition's floor was the looser of the two).
     wide_local_floor_windows: usize,
-    // One entry per follower clause (indices 1..k): how many of its blocks the
-    // wide path really decoded, and how many kept at least one candidate.
-    wide_follower_blocks_decoded: Vec<usize>,
-    wide_follower_hit_blocks: Vec<usize>,
-    #[allow(dead_code)]
-    wide_phrase_redecodes: usize,
 }
 
 impl Eq for TailPosting {}
@@ -2671,8 +2645,11 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Test-only override for comparing bulk and classic conjunctions without
     // mutating the process-wide environment.
     bulk_and_mode_override: Option<BulkAndMode>,
-    // Same idea for the wide-window switch; `None` defers to the environment.
-    bulk_and_wide_override: Option<BulkAndWide>,
+    // Test-only wide-window override; None follows the gate.
+    #[cfg(test)]
+    wide_override: Option<WideOverride>,
+    // L2 limit; production uses the draft constant until D2 picks M.
+    wide_l2_limit: usize,
     #[cfg(test)]
     bulk_and_searches: usize,
     #[cfg(test)]
@@ -2794,7 +2771,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             #[cfg(test)]
             and_window_stats: AndWindowStats::default(),
             bulk_and_mode_override: None,
-            bulk_and_wide_override: None,
+            #[cfg(test)]
+            wide_override: None,
+            wide_l2_limit: WIDE_L2_MISS_LIMIT,
             #[cfg(test)]
             bulk_and_searches: 0,
             #[cfg(test)]
@@ -2824,12 +2803,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         self
     }
 
-    /// Test hook: force one wide-window mode so parity tests can exercise the
-    /// wide dispatch and the narrow path within one process.
+    /// Test hook: Off suppresses the wide window, Always bypasses the gate and
+    /// L1, Auto follows the gate.
     #[cfg(test)]
     #[allow(dead_code)]
-    fn with_bulk_and_wide(mut self, wide: BulkAndWide) -> Self {
-        self.bulk_and_wide_override = Some(wide);
+    fn with_bulk_and_wide(mut self, wide: WideOverride) -> Self {
+        self.wide_override = Some(wide);
+        self
+    }
+
+    /// Test hook: set the L2 consecutive-miss limit.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn with_wide_l2_limit(mut self, limit: usize) -> Self {
+        self.wide_l2_limit = limit;
         self
     }
 
@@ -2967,7 +2954,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     .bulk_and_mode_override
                     .unwrap_or_else(|| *BULK_AND_MODE);
                 mode.enabled_for(self.lead.len())
-                    || (mode == BulkAndMode::Auto
+                    || (matches!(mode, BulkAndMode::Auto | BulkAndMode::Narrow)
                         && self.lead.len() >= 4
                         && self.lead.iter().all(|posting| {
                             matches!(&posting.list, PostingList::Compressed(list)
@@ -4347,18 +4334,45 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             return Ok(vec![]);
         }
         let num_lists = self.lead.len();
-        // Read the wide-window switch once per search: the environment lookup is
-        // process-wide and must not sit inside the window loop.
-        let wide = self
-            .bulk_and_wide_override
-            .unwrap_or_else(|| *BULK_AND_WIDE);
-        // One counter per follower clause for the wide-window counters.
+        // Query-level wide-window gate, evaluated once. The narrow path ends a
+        // window at the nearest follower block end, so it opens about
+        // sum(cost_j) / cost_0 windows inside one lead block; only a block cut
+        // into block_size / 8 windows pays for the wide path.
+        let mode = self
+            .bulk_and_mode_override
+            .unwrap_or_else(|| *BULK_AND_MODE);
+        let block_size = self
+            .lead
+            .iter()
+            .map(|posting| match &posting.list {
+                PostingList::Compressed(list) => list.block_size,
+                _ => MAX_POSTING_BLOCK_SIZE,
+            })
+            .max()
+            .unwrap_or(MAX_POSTING_BLOCK_SIZE) as u64;
+        // A wide window needs a full heap and a lead block the narrow window
+        // cannot span; both are checked per window below.
+        let gated = matches!(mode, BulkAndMode::Auto | BulkAndMode::On)
+            && wide_gate(
+                self.lead[0].cost() as u64,
+                self.lead[1..]
+                    .iter()
+                    .map(|posting| posting.cost() as u64)
+                    .sum(),
+                block_size,
+            );
+        // Tests may force the window on (Always) or off (Off); production
+        // follows the gate and L1 only.
         #[cfg(test)]
-        if wide != BulkAndWide::Off {
-            self.and_window_stats.wide_follower_blocks_decoded =
-                vec![0; num_lists.saturating_sub(1)];
-            self.and_window_stats.wide_follower_hit_blocks = vec![0; num_lists.saturating_sub(1)];
-        }
+        let (mut wide_enabled, always) = match self.wide_override {
+            Some(WideOverride::Off) => (false, false),
+            Some(WideOverride::Always) => (true, true),
+            _ => (gated, false),
+        };
+        #[cfg(not(test))]
+        let (mut wide_enabled, always) = (gated, false);
+        let wide_l2_limit = self.wide_l2_limit;
+        let mut wide_misses: usize = 0;
         let use_pairwise_intersection = num_lists >= 4
             && self.lead.iter().all(|posting| {
                 matches!(&posting.list, PostingList::Compressed(list)
@@ -4817,13 +4831,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         struct WideState {
             docs: Vec<u32>,
             // Clause-major survivor columns: absolute posting index (only the
-            // phrase check reads it) and frequency. One lead block bounds the
-            // candidate count, so MAX_POSTING_BLOCK_SIZE slots per clause fit.
+            // phrase check reads it) and frequency.
             freq: Vec<u32>,
             pidx: Vec<u32>,
-            // Per follower (block, position) lookup cursor; only moves forward.
+            // Per follower (block, position) cursor; only moves forward.
             fcur: SmallVec<[(usize, usize); 8]>,
-            // Per clause: doc-length-free BM25 bound by clamped frequency.
+            // Per clause: doc-length-free score bound by clamped frequency.
             lut: Vec<f32>,
             lens: Vec<u32>,
             norms: Vec<u8>,
@@ -4844,10 +4857,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
         }
 
-        // Intersect one wide window, [target, wide_end] inside the lead's block
+        // Intersect one wide window [target, wide_end] inside the lead block
         // lead_block. Candidates advance past one follower at a time and a
-        // follower block is decoded only when a surviving candidate reaches it.
-        // Returns the next target and whether the query ended.
+        // follower block is decoded only when a survivor reaches it. Returns
+        // the next target, whether the query ended, and whether the window
+        // pruned nothing at all (L2 counts those).
         #[allow(clippy::too_many_arguments)]
         fn run_wide_window<'q, S: Scorer, D: WandDocuments>(
             wand: &mut Wand<'q, S, D>,
@@ -4862,7 +4876,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             num_comparisons: &mut usize,
             wand_factor: f32,
             phrase_slop: Option<u32>,
-        ) -> Result<(u64, bool)> {
+        ) -> Result<(u64, bool, bool)> {
             let num_lists = wand.lead.len();
             let cap = MAX_POSTING_BLOCK_SIZE;
             let factor = score_sum_upper_bound_factor(num_lists);
@@ -4873,8 +4887,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             // A narrow window may have moved a follower's own cursor since the
             // last wide one; then that cursor is the better start. Otherwise
-            // keep the wide cursor: both only move forward, so it is never
-            // behind this window's candidates.
+            // keep the wide cursor: both only move forward.
             for j in 1..num_lists {
                 let start = wand.lead[j].block_idx;
                 if st.fcur[j].0 == usize::MAX || start > st.fcur[j].0 {
@@ -4897,17 +4910,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let hi = lo + docs0[lo..].partition_point(|&doc| doc <= wide_end32);
                 if lo == hi {
                     if hi < docs0.len() {
-                        return Ok((u64::from(docs0[hi]), false));
+                        return Ok((u64::from(docs0[hi]), false, false));
                     }
                     if lead_block + 1 < list.blocks.len() {
-                        return Ok((u64::from(list.block_least_doc_id(lead_block + 1)), false));
+                        let next = list.block_least_doc_id(lead_block + 1);
+                        return Ok((u64::from(next), false, false));
                     }
-                    return Ok((0, true));
+                    return Ok((0, true, false));
                 }
                 st.docs.clear();
                 st.docs.extend_from_slice(&docs0[lo..hi]);
                 // Only the position check reads posting offsets, so a plain
-                // conjunction never writes or moves this column.
+                // conjunction never writes this column.
                 if phrase {
                     for (i, slot) in st.pidx[..st.docs.len()].iter_mut().enumerate() {
                         *slot = u32::try_from((lead_block << shift) | (lo + i)).unwrap_or(u32::MAX);
@@ -4916,15 +4930,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 lead_lo = lo;
             }
             let mut n = st.docs.len();
+
             // (b) Bound every clause over the span the candidates really cover;
             // a window-wide follower bound is too loose to ever reject.
             let mut suffix = SmallVec::<[f64; 8]>::new();
             // Sibling partitions can publish a floor above this partition's
-            // k-th score, and that floor cannot license a prune here: rows below
-            // it may still belong to this partition's top-k. The collector only
-            // accepts a score strictly above k-th, so a bound at or below that
-            // k-th can never be collected, which makes min(threshold, kth) a
-            // safe floor whatever the shared one says.
+            // k-th, and that floor cannot license a prune here: the collector
+            // only accepts a score strictly above k-th, so min(threshold, kth)
+            // is a safe floor whatever the shared one says.
             let (mut prunable, floor_w) = match candidates.kth_score_if_full() {
                 Some(kth) => (true, wand.threshold.min(kth)),
                 None => (false, wand.threshold),
@@ -4957,7 +4970,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
             if prunable {
                 if score_sum_cannot_compete(0.0, suffix[0], floor_w, factor, mode) {
-                    return Ok((wide_end + 1, wide_end >= u32::MAX as u64));
+                    return Ok((wide_end + 1, wide_end >= u32::MAX as u64, false));
                 }
                 // Query-scoped: the bound only depends on the clause weights.
                 if st.lut.is_empty() {
@@ -4974,9 +4987,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
 
             // (b') Decode the lead frequencies only now: a window retired by the
-            // whole-window bound must not touch the frequency block. No LUT
-            // prune here; (c) prunes the lead against its own block bound, which
-            // is tighter than this window-wide one.
+            // whole-window bound must not touch the frequency block.
             {
                 let posting = &wand.lead[0];
                 let PostingList::Compressed(ref list) = posting.list else {
@@ -4994,10 +5005,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             // (c) Advance the candidates past one follower at a time. A follower
             // block is decoded only when a surviving candidate reaches it, and
-            // the survivors of that block are left in place by a single
-            // in-place compaction that carries every clause column with them.
+            // its survivors are left in place by a single in-place compaction
+            // that carries every clause column with them.
             let mut max_next: u64 = 0;
             let mut query_done = false;
+            let mut pruning = false;
             let mut pruned = [false; MAX_POSTING_BLOCK_SIZE];
             for j in 1..num_lists {
                 let posting = &wand.lead[j];
@@ -5032,11 +5044,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         let rem = next_up_f64(
                             f64::from(posting.block_bound_at(fb, &wand.scorer)) + suffix[j + 1],
                         );
+                        // Frequency one is the weakest a posting can be: when
+                        // even that clears the floor, nothing can be cut.
                         let weakest = (0..j)
                             .map(|c| f64::from(st.lut[c * FREQ_LUT_BUCKETS + 1]))
                             .sum::<f64>();
-                        // Frequency one is the weakest a posting can be: when
-                        // even that clears the floor, nothing can be cut.
                         if score_sum_cannot_compete(0.0, weakest + rem, floor_w, factor, mode) {
                             // The index feeds the candidate columns as well as
                             // the marks, so walking the range is the natural
@@ -5058,6 +5070,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             }
                         }
                     }
+                    pruning |= keep != i_end - i;
                     if keep == 0 {
                         // Every candidate in this block is out of reach, so the
                         // block is not decoded and the cursor stays where it was:
@@ -5070,20 +5083,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         continue;
                     }
                     let (docs_b, len_b) = {
-                        #[cfg(test)]
-                        let before = {
-                            let state = unsafe { &*posting.compressed_state_ptr() };
-                            (state.block_idx, state.doc_ids.is_empty())
-                        };
                         let state = unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, fb) };
-                        #[cfg(test)]
-                        if state.block_idx != before.0 || (before.1 && !state.doc_ids.is_empty()) {
-                            wand.and_window_stats.wide_follower_blocks_decoded[j - 1] += 1;
-                        }
                         (state.doc_ids.as_ptr(), state.doc_ids.len())
                     };
                     last_decoded = Some(fb);
-                    let out_before = out;
                     // Frequencies stay packed until the first hit: a block that
                     // no candidate lands in costs one doc-id decode only.
                     let mut freqs: Option<*const u32> = None;
@@ -5122,12 +5125,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             out += 1;
                         }
                     }
-                    if out > out_before {
-                        #[cfg(test)]
-                        {
-                            wand.and_window_stats.wide_follower_hit_blocks[j - 1] += 1;
-                        }
-                    }
                     fpos = unsafe {
                         find_next_geq(docs_b, fpos, len_b, segment_last.saturating_add(1))
                     };
@@ -5149,8 +5146,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 st.fcur[j] = (fb, fpos);
                 // Only a decoded block moves the clause cursor, and only
                 // forward: the block holding next_target is at or after the last
-                // decoded block, so the next forward block_idx_for_doc from here
-                // is still correct.
+                // decoded block.
                 if let Some(block) = last_decoded {
                     wand.lead[j].block_idx = wand.lead[j].block_idx.max(block);
                 }
@@ -5257,7 +5253,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // next doc: below the latter no conjunction can start.
             let next_target = (wide_end + 1).max(max_next);
             debug_assert!(next_target > target);
-            Ok((next_target, query_done || wide_end >= u32::MAX as u64))
+            Ok((
+                next_target,
+                query_done || wide_end >= u32::MAX as u64,
+                !pruning,
+            ))
         }
 
         // Allocated only when a window really opens wide.
@@ -5311,27 +5311,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
             let win_end32 = u32::try_from(win_end).unwrap_or(u32::MAX);
 
-            // Wide-window structural dispatch. The narrow window ends where the
-            // nearest follower block ends, so it shrinks to one lead document
-            // whenever a follower crosses a block boundary inside the lead
-            // block. Opening the window to the lead block's end pays the
-            // per-window setup once per lead block instead. The test is pure
-            // metadata already read above: when the narrow end already equals
-            // the lead block's end there is nothing to gain and the narrow path
-            // below runs unchanged.
-            // Phrase queries stay on the narrow path until the wide traversal
-            // verifies positions itself (S4); the counters above are then only
-            // meaningful for non-phrase queries.
-            // Two-clause conjunctions stay on the narrow path: measured
-            // 1.005x with 32 >1.05 queries against a 0.995 control, because the
-            // per-window bounds and segment bookkeeping cost more than the single
-            // merge they replace. The upside P0 saw for k=2 sits entirely in the
-            // skew >= 32 buckets and needs a per-window gate, not a blanket one.
-            // `always` bypasses the clause-count gate: it exists for tests and
-            // worst-case measurement, not for production routing.
-            let wide_applies =
-                wide == BulkAndWide::Always || (wide == BulkAndWide::Auto && num_lists >= 3);
-            if wide_applies && num_lists >= 2 {
+            // Wide-window dispatch. The narrow window ends at the nearest
+            // follower block end, so it shrinks to one lead document whenever a
+            // follower crosses a block boundary inside the lead block; opening
+            // to the lead block end pays the per-window setup once per lead
+            // block instead. The window stays narrow while this partition's
+            // top-k is unfilled: with no floor the wide path prunes nothing.
+            if wide_enabled && (always || candidates.kth_score_if_full().is_some()) {
                 let lead_block = self.lead[0].block_idx;
                 let lead_block_end = {
                     let PostingList::Compressed(ref list) = self.lead[0].list else {
@@ -5344,41 +5330,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     }
                 };
                 let wide_end = lead_block_end.min(target.saturating_add(WIDE_MAX_SPAN - 1));
-                debug_assert!(wide_end >= target);
-                // A wide window only pays for itself when the narrow path would
-                // have opened several windows inside it. Estimate that from block
-                // metadata alone: the widest follower's block span over
-                // [target, wide_end] bounds the number of narrow windows. Below
-                // the threshold the per-window bounds and segment bookkeeping
-                // cost more than the setup they would amortise (measured: the
-                // five int3 regressions all sit at span <= 7).
-                let span_threshold = if wide == BulkAndWide::Always { 1 } else { 8 };
-                let widest_span = if wide == BulkAndWide::Always {
-                    usize::MAX
-                } else {
-                    let mut span = 0usize;
-                    for posting in self.lead.iter().skip(1) {
-                        let PostingList::Compressed(ref list) = posting.list else {
-                            unreachable!("bulk AND requires compressed postings");
-                        };
-                        let end_block = posting.block_idx_for_doc(
-                            list,
-                            posting.block_idx,
-                            u32::try_from(wide_end).unwrap_or(u32::MAX),
-                        );
-                        span = span.max(end_block.saturating_sub(posting.block_idx) + 1);
-                    }
-                    span
-                };
-                if wide == BulkAndWide::Always
-                    || (win_end < wide_end && widest_span >= span_threshold)
-                {
+                // Always is the test-only worst case: it opens the window even
+                // when the narrow one already reaches the lead block end.
+                if always || win_end < wide_end {
                     #[cfg(test)]
                     {
                         self.and_window_stats.wide_windows += 1;
                     }
                     let st = wide_state.get_or_insert_with(|| WideState::new(num_lists));
-                    let (next_target, done) = run_wide_window(
+                    let (next_target, done, ineffective) = run_wide_window(
                         self,
                         st,
                         target,
@@ -5392,8 +5352,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         params.wand_factor,
                         params.phrase_slop,
                     )?;
+                    // L2 draft: consecutive windows that prune nothing mean the
+                    // floor is too low for the wide path to pay, so stop opening
+                    // them for the rest of this search. One-way; Always is
+                    // exempt.
                     if done {
                         break 'window;
+                    }
+                    if !always {
+                        wide_misses = l2_streak(wide_misses, ineffective);
+                        if wide_misses >= wide_l2_limit {
+                            wide_enabled = false;
+                        }
                     }
                     target = next_target;
                     continue 'window;
@@ -8777,11 +8747,11 @@ mod tests {
             )
         };
 
-        let (bulk, bulk_score, bulk_used) = run(BulkAndMode::On, BulkAndWide::Off);
-        let (classic, classic_score, classic_used) = run(BulkAndMode::Off, BulkAndWide::Off);
+        let (bulk, bulk_score, bulk_used) = run(BulkAndMode::On, WideOverride::Off);
+        let (classic, classic_score, classic_used) = run(BulkAndMode::Off, WideOverride::Off);
         assert!(bulk_used);
         assert!(!classic_used);
-        for wide in [BulkAndWide::Auto, BulkAndWide::Always] {
+        for wide in [WideOverride::Auto, WideOverride::Always] {
             let (hits, score, used) = run(BulkAndMode::On, wide);
             assert!(used);
             assert_eq!(hits.len(), 1, "{wide:?} must keep the single row");
@@ -8900,6 +8870,8 @@ mod tests {
     #[case::on_legacy("1", Some(BulkAndMode::On))]
     #[case::off("off", Some(BulkAndMode::Off))]
     #[case::off_legacy("0", Some(BulkAndMode::Off))]
+    #[case::narrow("narrow", Some(BulkAndMode::Narrow))]
+    #[case::narrow_case(" NARROW ", Some(BulkAndMode::Narrow))]
     #[case::invalid("true", None)]
     #[case::empty("", None)]
     fn test_bulk_and_mode_parse(#[case] value: &str, #[case] expected: Option<BulkAndMode>) {
@@ -8915,6 +8887,9 @@ mod tests {
     #[case::on_five(BulkAndMode::On, 5, true)]
     #[case::off_two(BulkAndMode::Off, 2, false)]
     #[case::off_five(BulkAndMode::Off, 5, false)]
+    #[case::narrow_two(BulkAndMode::Narrow, 2, true)]
+    #[case::narrow_three(BulkAndMode::Narrow, 3, true)]
+    #[case::narrow_four(BulkAndMode::Narrow, 4, false)]
     fn test_bulk_and_mode_enabled_for(
         #[case] mode: BulkAndMode,
         #[case] num_clauses: usize,
@@ -14073,8 +14048,6 @@ mod tests {
         floor: u32,
         windows: usize,
         fit_windows: usize,
-        blocks_decoded: Vec<usize>,
-        hit_blocks: Vec<usize>,
         blocks_skipped: usize,
         lead_freq_decodes: usize,
     }
@@ -14085,7 +14058,7 @@ mod tests {
         scorer: &impl Fn() -> S,
         params: &FtsSearchParams,
         mode: BulkAndMode,
-        wide: BulkAndWide,
+        wide: WideOverride,
     ) -> WideRun {
         let floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let mut wand = Wand::new(Operator::And, build().into_iter(), docs, scorer())
@@ -14103,8 +14076,6 @@ mod tests {
             floor: floor.load(Ordering::Relaxed),
             windows: wand.and_window_stats.wide_windows,
             fit_windows: wand.and_window_stats.wide_fit_windows,
-            blocks_decoded: wand.and_window_stats.wide_follower_blocks_decoded.clone(),
-            hit_blocks: wand.and_window_stats.wide_follower_hit_blocks.clone(),
             blocks_skipped: wand.and_window_stats.wide_blocks_skipped,
             lead_freq_decodes: wand.and_window_stats.wide_lead_freq_decodes,
         }
@@ -14125,7 +14096,7 @@ mod tests {
             scorer,
             params,
             BulkAndMode::Off,
-            BulkAndWide::Off,
+            WideOverride::Off,
         );
         let bulk = run_wide_path(
             build,
@@ -14133,16 +14104,16 @@ mod tests {
             scorer,
             params,
             BulkAndMode::On,
-            BulkAndWide::Off,
+            WideOverride::Off,
         );
         assert_eq!(bulk.rows, classic.rows, "wide off changed the rows");
         assert_eq!(bulk.floor, classic.floor, "wide off changed the k-th score");
         let mut always = None;
-        for wide in [BulkAndWide::Auto, BulkAndWide::Always] {
+        for wide in [WideOverride::Auto, WideOverride::Always] {
             let run = run_wide_path(build, docs, scorer, params, BulkAndMode::On, wide);
             assert_eq!(run.rows, classic.rows, "{wide:?} changed the rows");
             assert_eq!(run.floor, classic.floor, "{wide:?} changed the k-th score");
-            if wide == BulkAndWide::Always {
+            if wide == WideOverride::Always {
                 always = Some(run);
             }
         }
@@ -14153,8 +14124,8 @@ mod tests {
         for rank in 1..=top {
             let mut p = params.clone();
             p.limit = Some(rank);
-            let c = run_wide_path(build, docs, scorer, &p, BulkAndMode::Off, BulkAndWide::Off);
-            for wide in [BulkAndWide::Auto, BulkAndWide::Always] {
+            let c = run_wide_path(build, docs, scorer, &p, BulkAndMode::Off, WideOverride::Off);
+            for wide in [WideOverride::Auto, WideOverride::Always] {
                 let w = run_wide_path(build, docs, scorer, &p, BulkAndMode::On, wide);
                 assert_eq!(
                     w.floor, c.floor,
@@ -14343,7 +14314,7 @@ mod tests {
         };
         let mut params = wide_params(10);
         params.phrase_slop = Some(0);
-        let run = |mode: BulkAndMode, wide: BulkAndWide, floor_bits: u32| {
+        let run = |mode: BulkAndMode, wide: WideOverride, floor_bits: u32| {
             let floor = Arc::new(AtomicU32::new(floor_bits));
             let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
                 .with_bulk_and_mode(mode)
@@ -14362,14 +14333,14 @@ mod tests {
             )
         };
         let (open_rows, _, open_windows) =
-            run(BulkAndMode::On, BulkAndWide::Always, 0.0_f32.to_bits());
+            run(BulkAndMode::On, WideOverride::Always, 0.0_f32.to_bits());
         assert_eq!(open_rows.len(), 2, "both candidates match with no floor");
         assert!(open_windows > 0, "the wide path must run");
         // Segment pruning needs a full top-k collector: with limit 1 the strong
         // candidate fills it and the weak one is rejected by its bound inside
         // the same segment, which compacts the survivor's columns.
         let prune_params = FtsSearchParams::default().with_limit(Some(1));
-        let run_prune = |mode: BulkAndMode, wide: BulkAndWide| {
+        let run_prune = |mode: BulkAndMode, wide: WideOverride| {
             let floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
             let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
                 .with_bulk_and_mode(mode)
@@ -14383,8 +14354,8 @@ mod tests {
             rows.sort_unstable();
             (rows, wand.and_window_stats.wide_windows)
         };
-        let (classic, _) = run_prune(BulkAndMode::Off, BulkAndWide::Off);
-        let (wide_rows, windows) = run_prune(BulkAndMode::On, BulkAndWide::Always);
+        let (classic, _) = run_prune(BulkAndMode::Off, WideOverride::Off);
+        let (wide_rows, windows) = run_prune(BulkAndMode::On, WideOverride::Always);
         assert_eq!(classic.len(), 1, "only the strong candidate may compete");
         assert!(windows > 0, "the wide path must run with limit 1");
         assert_eq!(wide_rows, classic, "compaction changed the surviving row");
@@ -14465,14 +14436,6 @@ mod tests {
             run.blocks_skipped, 2,
             "one block per span is out of reach: {:?}",
             run
-        );
-        // The first block is decoded when the cursor is created, so the only
-        // fresh decode is the one the region bound covers. A decode of a skipped
-        // block, or a bound that lost the following clauses, changes this.
-        assert_eq!(run.blocks_decoded[0], 1, "{:?}", run.blocks_decoded);
-        assert_eq!(
-            run.hit_blocks[0], 2,
-            "the strong block and the covered one keep a candidate"
         );
         assert_eq!(run.rows.len(), 3, "only the first span's candidates fit");
     }
@@ -14575,7 +14538,7 @@ mod tests {
             &|| UnitScorer,
             &wide_params(1),
             BulkAndMode::On,
-            BulkAndWide::Always,
+            WideOverride::Always,
         );
         assert_eq!(run.windows, 2, "the span cap must split the lead block");
         assert_eq!(
@@ -14657,7 +14620,7 @@ mod tests {
         // A wand factor above one lifts the threshold above the k-th score, the
         // same shape a sibling partition's floor produces.
         let params = wide_params(2).with_wand_factor(1.5);
-        let run = |mode: BulkAndMode, wide: BulkAndWide| {
+        let run = |mode: BulkAndMode, wide: WideOverride| {
             let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
                 .with_bulk_and_mode(mode)
                 .with_bulk_and_wide(wide)
@@ -14675,8 +14638,8 @@ mod tests {
                 wand.and_window_stats.wide_blocks_skipped,
             )
         };
-        let (classic, ..) = run(BulkAndMode::Off, BulkAndWide::Off);
-        let (rows, windows, local, skipped) = run(BulkAndMode::On, BulkAndWide::Always);
+        let (classic, ..) = run(BulkAndMode::Off, WideOverride::Off);
+        let (rows, windows, local, skipped) = run(BulkAndMode::On, WideOverride::Always);
         assert!(windows > 0, "the wide path must serve this corpus");
         assert_eq!(
             rows, classic,
@@ -14736,11 +14699,11 @@ mod tests {
         assert!(windows > 0, "always must open wide windows");
     }
 
-    /// W3: high skew with two clauses. The lead holds a handful of docs spread
-    /// far apart, so one wide window spans hundreds of follower blocks while
-    /// only the few blocks that hold a candidate may be decoded.
+    /// V2b: a two-clause skew query opens one window per lead block and skips
+    /// the follower blocks no candidate reaches, while still publishing the
+    /// classic rows.
     #[test]
-    fn wide_window_decodes_only_follower_blocks_with_candidates() {
+    fn wide_window_skips_follower_blocks_between_candidates() {
         let num_docs = 100_000usize;
         let docs = unit_length_docs(num_docs);
         let lead_docs = [0u32, 1, 20_000, 20_001, 40_000, 40_001, 60_000, 60_001]
@@ -14755,42 +14718,6 @@ mod tests {
         };
         let run = assert_wide_paths_agree(&build, &docs, &|| UnitScorer, &wide_params(100));
         assert!(run.windows > 0);
-        // One lead block spans 65536 doc ids, i.e. 512 follower blocks.
-        assert!(
-            run.blocks_decoded[0] <= 4,
-            "only the follower blocks holding a candidate may be decoded, got {:?}",
-            run.blocks_decoded
-        );
-    }
-
-    /// W4: three clauses. The densest clause must be decoded only for the
-    /// candidates that survived the middle one.
-    #[test]
-    fn wide_window_decodes_dense_follower_for_survivors_only() {
-        let num_docs = 40_000usize;
-        let docs = unit_length_docs(num_docs);
-        let lead_docs = (0..40u32).map(|i| (i * 1000, 1)).collect::<Vec<_>>();
-        let middle_docs = (0..(num_docs as u32 / 2))
-            .map(|i| (i * 2, 1))
-            .collect::<Vec<_>>();
-        let dense_docs = (0..num_docs as u32).map(|doc| (doc, 1)).collect::<Vec<_>>();
-        let build = move || {
-            vec![
-                wide_clause(0, 1.0, &lead_docs, LEGACY_BLOCK_SIZE, num_docs),
-                wide_clause(1, 0.6, &middle_docs, LEGACY_BLOCK_SIZE, num_docs),
-                wide_clause(2, 0.3, &dense_docs, LEGACY_BLOCK_SIZE, num_docs),
-            ]
-        };
-        let run = assert_wide_paths_agree(&build, &docs, &|| UnitScorer, &wide_params(100));
-        assert!(run.windows > 0);
-        assert!(
-            run.blocks_decoded[1] <= run.hit_blocks[0],
-            "the dense clause decoded {} blocks for {} surviving blocks",
-            run.blocks_decoded[1],
-            run.hit_blocks[0]
-        );
-        // The window covers 512 dense blocks; only the survivor blocks decode.
-        assert!(run.blocks_decoded[1] < 100, "{:?}", run.blocks_decoded);
     }
 
     /// W5: a follower that runs out in the middle of a wide window ends the
@@ -14888,11 +14815,12 @@ mod tests {
         assert_eq!(run.rows.len(), 2);
     }
 
-    /// W9: with identical block boundaries in every clause the narrow window is
-    /// already as wide as it gets, so auto must stay on the narrow path; a
-    /// uniform corpus with different densities must still agree with classic.
+    /// G-1: a balanced query (every follower as long as the lead) fails the
+    /// gate, so the wide dispatch never runs; an aligned but skewed query opens
+    /// the gate and still stays narrow, because the narrow window already
+    /// reaches the lead block end. Both must publish the classic rows.
     #[test]
-    fn wide_window_dispatch_keeps_aligned_blocks_on_the_narrow_path() {
+    fn wide_gate_keeps_balanced_and_aligned_queries_narrow() {
         let num_docs = 2_048usize;
         let docs = unit_length_docs(num_docs);
         let all = (0..num_docs as u32)
@@ -14908,17 +14836,56 @@ mod tests {
                 ]
             }
         };
+        // Equal list lengths put 8 * 2 * c_0 far below 128 * c_0.
         let auto = run_wide_path(
             &aligned,
             &docs,
             &|| UnitScorer,
             &wide_params(10),
             BulkAndMode::On,
-            BulkAndWide::Auto,
+            WideOverride::Auto,
         );
-        assert_eq!(auto.windows, 0, "aligned blocks have nothing to widen");
-        assert!(auto.fit_windows > 0, "the dispatch must be reached");
+        assert_eq!(auto.windows, 0, "the gate must close on a balanced query");
+        assert_eq!(
+            auto.fit_windows, 0,
+            "a closed gate never reaches the window"
+        );
+        // Always is the test-only worst case and bypasses the gate.
+        let always = run_wide_path(
+            &aligned,
+            &docs,
+            &|| UnitScorer,
+            &wide_params(10),
+            BulkAndMode::On,
+            WideOverride::Always,
+        );
+        assert!(always.windows > 0, "Always must bypass the gate");
+        // The same binary through Narrow is the same-binary control arm.
+        let narrow = run_wide_path(
+            &aligned,
+            &docs,
+            &|| UnitScorer,
+            &wide_params(10),
+            BulkAndMode::Narrow,
+            WideOverride::Auto,
+        );
+        assert_eq!(narrow.windows, 0);
+        let classic = run_wide_path(
+            &aligned,
+            &docs,
+            &|| UnitScorer,
+            &wide_params(10),
+            BulkAndMode::Off,
+            WideOverride::Off,
+        );
+        assert_eq!(narrow.rows, classic.rows);
+        assert_eq!(narrow.floor, classic.floor);
         assert_wide_paths_agree(&aligned, &docs, &|| UnitScorer, &wide_params(10));
+
+        // A skewed, gated query whose blocks are aligned stays narrow for the
+        // blocks whose narrow window already reaches the lead block end.
+        let run = gate_probe(&docs, 6_144, 2, 1);
+        assert!(run.fit_windows > 0, "the dispatch must be reached");
 
         let sparse = (0..num_docs as u32)
             .filter(|doc| doc % 3 == 0)
@@ -15046,9 +15013,8 @@ mod tests {
         assert_eq!(run.rows.len(), 1);
         assert!(run.windows >= 2, "two lead blocks, at least two windows");
         assert!(
-            run.blocks_decoded[0] <= 33,
-            "the second window must be skipped by the bound, decoded {:?}",
-            run.blocks_decoded
+            run.blocks_skipped > 0,
+            "the second window's candidates are all out of reach"
         );
 
         // A rare single-doc lead still ends the query cleanly.
@@ -15061,5 +15027,269 @@ mod tests {
         };
         let run = assert_wide_paths_agree(&rare_build, &docs, &|| UnitScorer, &wide_params(10));
         assert_eq!(run.rows.len(), 1);
+    }
+
+    /// A gated conjunction fixture: a 384-posting lead plus follower_docs
+    /// postings split evenly across the followers. With the 128-document block
+    /// format, 6144 follower postings put 8 * S exactly on B * c_0.
+    fn gate_fixture(
+        num_docs: usize,
+        follower_docs: u32,
+        clauses: usize,
+    ) -> impl Fn() -> Vec<PostingIterator> {
+        move || {
+            let lead = (0..384u32).map(|doc| (doc, 1)).collect::<Vec<_>>();
+            let share = (follower_docs / (clauses as u32 - 1).max(1)).max(1);
+            let mut posts = vec![wide_clause(0, 1.0, &lead, LEGACY_BLOCK_SIZE, num_docs)];
+            for j in 1..clauses {
+                let docs = (0..share).map(|doc| (doc, 1)).collect::<Vec<_>>();
+                posts.push(wide_clause(
+                    j as u32,
+                    1.0,
+                    &docs,
+                    LEGACY_BLOCK_SIZE,
+                    num_docs,
+                ));
+            }
+            posts
+        }
+    }
+
+    fn gate_probe(docs: &DocSet, follower_docs: u32, clauses: usize, limit: usize) -> WideRun {
+        run_wide_path(
+            &gate_fixture(docs.len(), follower_docs, clauses),
+            docs,
+            &|| UnitScorer,
+            &wide_params(limit),
+            BulkAndMode::On,
+            WideOverride::Auto,
+        )
+    }
+
+    /// Run one wide-window query with an explicit L2 limit, returning the rows
+    /// plus the two counters the L2 tests read.
+    /// A clause whose stored list-wide bound is given explicitly, so a scored
+    /// fixture never under-states it and the narrow path cannot skip windows.
+    fn wide_clause_scored(rank: u32, docs: &[(u32, u32)], num_docs: usize) -> PostingIterator {
+        let ids = docs.iter().map(|&(doc, _)| doc).collect::<Vec<_>>();
+        let freqs = docs.iter().map(|&(_, freq)| freq).collect::<Vec<_>>();
+        let list =
+            generate_posting_list_with_freqs(ids, freqs, BM25_DOC_WEIGHT_UPPER_BOUND, None, true);
+        PostingIterator::with_query_weight(format!("t{rank}"), rank, rank, 1.0, list, num_docs)
+    }
+
+    fn l2_probe<S: Scorer>(
+        build: &impl Fn() -> Vec<PostingIterator>,
+        docs: &DocSet,
+        scorer: S,
+        limit: usize,
+        l2_limit: usize,
+    ) -> (Vec<WideRow>, usize, usize, usize) {
+        let floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
+        let mut wand = Wand::new(Operator::And, build().into_iter(), docs, scorer)
+            .with_bulk_and_mode(BulkAndMode::On)
+            .with_bulk_and_wide(WideOverride::Auto)
+            .with_wide_l2_limit(l2_limit)
+            .with_shared_threshold(floor);
+        let hits = wand
+            .search(&wide_params(limit), &NoOpMetricsCollector)
+            .unwrap();
+        let mut rows = hits
+            .into_iter()
+            .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        (
+            rows,
+            wand.and_window_stats.wide_windows,
+            wand.and_window_stats.wide_lead_freq_decodes,
+            wand.and_window_stats.wide_blocks_skipped,
+        )
+    }
+
+    /// G-2: the gate is a pure inequality on 8 * S and B * c_0. Both sides are
+    /// multiples of eight, so the reachable neighbours are +/- 8.
+    #[test]
+    fn wide_gate_thresholds() {
+        // B = 128, c_0 = 1: the bar is 16 follower postings per lead posting.
+        assert!(!wide_gate(1, 15, 128), "8 * 15 = 120 < 128");
+        assert!(
+            wide_gate(1, 16, 128),
+            "8 * 16 = 128, equality opens the gate"
+        );
+        assert!(wide_gate(1, 17, 128), "8 * 17 = 136 > 128");
+        // Saturating multiplication keeps the extremes defined.
+        assert!(wide_gate(1, u64::MAX, 128));
+        assert!(!wide_gate(u64::MAX, 1, 128));
+        assert!(!wide_gate(u64::MAX, 0, u64::MAX));
+        assert!(wide_gate(0, 0, 128), "an empty lead has nothing to lose");
+    }
+
+    /// L2 (bookkeeping): a window that pruned something clears the miss streak,
+    /// so only consecutive unproductive windows can switch the wide path off.
+    #[test]
+    fn l2_streak_resets_when_a_window_prunes() {
+        assert_eq!(l2_streak(0, true), 1);
+        assert_eq!(l2_streak(1, true), 2);
+        assert_eq!(l2_streak(2, false), 0);
+    }
+
+    /// G-3: doubling the block size doubles the required follower density.
+    #[test]
+    fn wide_gate_doubles_with_the_block_size() {
+        assert!(!wide_gate(1, 31, 256), "8 * 31 = 248 < 256");
+        assert!(wide_gate(1, 32, 256), "8 * 32 = 256, equality");
+        assert!(wide_gate(1, 33, 256));
+        // The density that opens a 128-document block fails at 256.
+        assert!(wide_gate(1, 16, 128));
+        assert!(!wide_gate(1, 16, 256));
+    }
+
+    /// G-2 (integration): a query built so that 8 * S == B * c_0 reaches the
+    /// dispatch, and one follower posting less does not. Equality has to open
+    /// the gate, or the threshold would silently be one step stricter.
+    #[rstest]
+    #[case::two_clauses(2)]
+    #[case::three_clauses(3)]
+    fn wide_gate_opens_at_exact_equality(#[case] clauses: usize) {
+        let docs = unit_length_docs(8_192);
+        let open = gate_probe(&docs, 6_144, clauses, 1);
+        assert!(
+            open.windows + open.fit_windows > 0,
+            "8 * S == B * c_0 must reach the dispatch: {open:?}"
+        );
+        let closed = gate_probe(&docs, 6_143, clauses, 1);
+        assert_eq!(closed.windows + closed.fit_windows, 0, "{closed:?}");
+        assert_eq!(open.rows, closed.rows, "the gate must not change results");
+    }
+
+    /// L1: the window stays narrow until this partition's top-k is full. An
+    /// unfilled heap prunes nothing, so the wide traversal could only lose.
+    #[test]
+    fn wide_window_waits_for_a_full_heap() {
+        let docs = unit_length_docs(8_192);
+        let build = gate_fixture(8_192, 8_192, 2);
+        // 384 matches, so a limit of 4096 never fills the heap.
+        let roomy = run_wide_path(
+            &build,
+            &docs,
+            &|| UnitScorer,
+            &wide_params(4_096),
+            BulkAndMode::On,
+            WideOverride::Auto,
+        );
+        assert_eq!(roomy.rows.len(), 384);
+        assert_eq!(roomy.windows, 0, "an unfilled heap opens no wide window");
+        assert_eq!(roomy.fit_windows, 0);
+        // The same query with room for one row fills the heap immediately.
+        let tight = run_wide_path(
+            &build,
+            &docs,
+            &|| UnitScorer,
+            &wide_params(1),
+            BulkAndMode::On,
+            WideOverride::Auto,
+        );
+        assert!(tight.windows > 0, "a full heap must reach the wide window");
+        assert_eq!(tight.rows, roomy.rows[..1].to_vec());
+    }
+
+    /// N-1: Narrow routes exactly like Auto but never opens a wide window, so it
+    /// is the same-binary control arm for the wide path.
+    #[test]
+    fn narrow_mode_matches_the_classic_path() {
+        let docs = unit_length_docs(8_192);
+        let build = gate_fixture(8_192, 8_192, 2);
+        let classic = run_wide_path(
+            &build,
+            &docs,
+            &|| UnitScorer,
+            &wide_params(10),
+            BulkAndMode::Off,
+            WideOverride::Off,
+        );
+        let auto = run_wide_path(
+            &build,
+            &docs,
+            &|| UnitScorer,
+            &wide_params(10),
+            BulkAndMode::On,
+            WideOverride::Auto,
+        );
+        assert!(auto.windows > 0, "the fixture must use the wide path");
+        let narrow = run_wide_path(
+            &build,
+            &docs,
+            &|| UnitScorer,
+            &wide_params(10),
+            BulkAndMode::Narrow,
+            WideOverride::Auto,
+        );
+        assert_eq!(narrow.windows, 0, "Narrow must never open a wide window");
+        assert_eq!(narrow.fit_windows, 0, "Narrow must skip the dispatch");
+        assert_eq!(narrow.rows, classic.rows);
+        assert_eq!(narrow.floor, classic.floor);
+    }
+
+    /// L2-a: a wide window that prunes something is not a miss, so the streak
+    /// resets. With a limit of one miss, counting pruned windows as misses would
+    /// stop the wide path after the first of them.
+    #[test]
+    fn wide_window_pruning_clears_the_l2_streak() {
+        let num_docs = 400_000usize;
+        let docs = unit_length_docs(num_docs);
+        // A sparse lead, one posting every 1000 doc ids: its blocks span far
+        // more doc ids than the dense follower's, so the window opens wide. Doc
+        // 0 alone is strong, so once a limit-1 heap holds it every later window
+        // is out of reach and its follower blocks are skipped undecoded.
+        let lead = (0..384u32)
+            .map(|i| (i * 1000, if i == 0 { 9 } else { 1 }))
+            .collect::<Vec<_>>();
+        let dense = (0..num_docs as u32).map(|doc| (doc, 1)).collect::<Vec<_>>();
+        let build = move || {
+            vec![
+                wide_clause(0, 1.0, &lead, LEGACY_BLOCK_SIZE, num_docs),
+                wide_clause(1, 1.0, &dense, LEGACY_BLOCK_SIZE, num_docs),
+            ]
+        };
+        let (rows, windows, _, blocks_skipped) = l2_probe(&build, &docs, UnitScorer, 1, 1);
+        assert_eq!(rows.len(), 1);
+        assert!(blocks_skipped > 0, "the fixture must prune inside a window");
+        assert!(
+            windows >= 2,
+            "a pruned window must not disable the wide path: {windows}"
+        );
+    }
+
+    /// L2 draft, off in production: after M consecutive wide windows that prune
+    /// nothing, the rest of the search stays narrow and the rows are unchanged.
+    #[test]
+    fn wide_window_l2_stops_after_m_ineffective_windows() {
+        let num_docs = 400_000usize;
+        let docs = unit_length_docs(num_docs);
+        // Equal frequencies and equal lengths make every candidate score the
+        // same, so the doc-length-free bounds can never cut one: the wide path
+        // prunes nothing and only pays for its bookkeeping. The lead is sparse
+        // so its blocks end before the follower's, which is what opens the
+        // window at all.
+        let lead = (0..384u32).map(|i| (i * 1000, 1)).collect::<Vec<_>>();
+        let dense = (0..num_docs as u32).map(|doc| (doc, 1)).collect::<Vec<_>>();
+        let build = move || {
+            vec![
+                wide_clause_scored(0, &lead, num_docs),
+                wide_clause_scored(1, &dense, num_docs),
+            ]
+        };
+        let (open_rows, open, _, _) = l2_probe(&build, &docs, VariedBm25ShapeScorer, 1, usize::MAX);
+        let (stopped_rows, stopped, _, _) = l2_probe(&build, &docs, VariedBm25ShapeScorer, 1, 2);
+        assert!(
+            open > 2,
+            "without L2 the wide path serves every lead block: {open}"
+        );
+        assert_eq!(
+            stopped, 2,
+            "L2 must stop the wide path after two misses: {stopped}"
+        );
+        assert_eq!(stopped_rows, open_rows);
     }
 }
