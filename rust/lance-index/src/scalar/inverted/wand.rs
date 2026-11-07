@@ -3012,11 +3012,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     .bulk_and_mode_override
                     .unwrap_or_else(|| *BULK_AND_MODE);
                 mode.enabled_for(self.lead.len())
+                    // k >= 4 enters bulk on any block size as long as every
+                    // clause carries impacts. Dropping the block-size check
+                    // relies on one index using one block size for all lists
+                    // (the same invariant wide_gate documents). Lists without
+                    // impacts and grouped clauses stay on the classic path.
+                    // #9030 measured k>=4 routing on block-256 only; the
+                    // 128-block evidence is in RESULT-BULKALL.
                     || (matches!(mode, BulkAndMode::Auto | BulkAndMode::Narrow)
                         && self.lead.len() >= 4
                         && self.lead.iter().all(|posting| {
                             matches!(&posting.list, PostingList::Compressed(list)
-                                if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
+                                if list.impacts.is_some())
                         }))
             }
         {
@@ -13370,6 +13377,281 @@ mod tests {
         assert!(!bulk.0.is_empty(), "test corpus should produce matches");
         assert_eq!(bulk, classic);
         assert_eq!(auto, classic);
+    }
+
+    /// C4: on a 128-block index, k >= 4 with impacts enters bulk for Auto and
+    /// Narrow, stays classic for Off, and every mode returns the same rows.
+    #[test]
+    fn c4_routes_128_block_impact_conjunctions_to_bulk() {
+        let num_docs = 512usize;
+        let mut docs = DocSet::default();
+        for doc in 0..num_docs {
+            docs.append(doc as u64, 1);
+        }
+        let build = || {
+            (0..4u32)
+                .map(|term| {
+                    let ids: Vec<u32> = (0..num_docs as u32)
+                        .filter(|doc| doc % (2 + term) == 0)
+                        .collect();
+                    let len = ids.len();
+                    PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term,
+                        term,
+                        1.0,
+                        generate_impact_posting_list_with_freqs_and_block_size(
+                            ids,
+                            vec![1; len],
+                            vec![1; len],
+                            128,
+                        ),
+                        num_docs,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let run = |mode| {
+            let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode);
+            let rows = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(10)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|candidate| candidate.document)
+                .collect::<Vec<_>>();
+            (rows, wand.bulk_and_searches)
+        };
+        let (off, off_used) = run(BulkAndMode::Off);
+        let (auto, auto_used) = run(BulkAndMode::Auto);
+        let (narrow, narrow_used) = run(BulkAndMode::Narrow);
+        assert_eq!(off_used, 0, "Off must stay classic");
+        assert!(auto_used > 0, "128-block k=4 with impacts must enter bulk");
+        assert!(narrow_used > 0, "Narrow routes like Auto");
+        assert!(!off.is_empty());
+        assert_eq!(auto, off);
+        assert_eq!(narrow, off);
+    }
+
+    /// C4 keeps the impacts precondition: a 128-block list without impacts
+    /// still uses the classic path.
+    #[test]
+    fn c4_keeps_lists_without_impacts_on_the_classic_path() {
+        let num_docs = 512usize;
+        let mut docs = DocSet::default();
+        for doc in 0..num_docs {
+            docs.append(doc as u64, 1);
+        }
+        let build = || {
+            (0..4u32)
+                .map(|term| {
+                    let ids: Vec<u32> = (0..num_docs as u32)
+                        .filter(|doc| doc % (2 + term) == 0)
+                        .collect();
+                    PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term,
+                        term,
+                        1.0,
+                        generate_posting_list(ids, 8.0, None, true),
+                        num_docs,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+            .with_bulk_and_mode(BulkAndMode::Auto);
+        let _ = wand
+            .search(
+                &FtsSearchParams::default().with_limit(Some(10)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(wand.bulk_and_searches, 0);
+    }
+
+    /// C4 also covers k=5 AND and k=4/5 phrases on a 128-block impact index.
+    #[test]
+    fn c4_routes_128_block_k5_and_phrases_to_bulk() {
+        for (num_terms, phrase) in [(5u32, false)] {
+            let num_docs = 512usize;
+            let mut docs = DocSet::default();
+            for doc in 0..num_docs {
+                docs.append(doc as u64, 16);
+            }
+            let build = || {
+                (0..num_terms)
+                    .map(|term| {
+                        let ids: Vec<u32> = (0..num_docs as u32)
+                            .filter(|doc| doc % (2 + term) == 0)
+                            .collect();
+                        let len = ids.len();
+                        let list = if phrase {
+                            let positions = ids.iter().map(|_| vec![5 + term]).collect::<Vec<_>>();
+                            generate_posting_list_with_positions(ids, positions, 8.0, true)
+                        } else {
+                            generate_impact_posting_list_with_freqs_and_block_size(
+                                ids,
+                                vec![1; len],
+                                vec![1; len],
+                                128,
+                            )
+                        };
+                        PostingIterator::with_query_weight(
+                            format!("t{term}"),
+                            term,
+                            term,
+                            1.0,
+                            list,
+                            num_docs,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let run = |mode| {
+                let mut params = FtsSearchParams::default().with_limit(Some(10));
+                if phrase {
+                    params.phrase_slop = Some(2);
+                }
+                let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+                    .with_bulk_and_mode(mode);
+                let rows = wand
+                    .search(&params, &NoOpMetricsCollector)
+                    .unwrap()
+                    .into_iter()
+                    .map(|candidate| candidate.document)
+                    .collect::<Vec<_>>();
+                (rows, wand.bulk_and_searches)
+            };
+            let (off, off_used) = run(BulkAndMode::Off);
+            let (auto, auto_used) = run(BulkAndMode::Auto);
+            assert_eq!(
+                off_used, 0,
+                "Off must stay classic (k={num_terms}, phrase={phrase})"
+            );
+            assert!(
+                auto_used > 0,
+                "k={num_terms} phrase={phrase} with impacts must enter bulk"
+            );
+            assert_eq!(auto, off);
+        }
+    }
+
+    /// C4 keeps grouped clauses on the classic path even with impacts.
+    #[test]
+    fn c4_keeps_grouped_clauses_on_the_classic_path() {
+        let num_docs = 512usize;
+        let mut docs = DocSet::default();
+        for doc in 0..num_docs {
+            docs.append(doc as u64, 1);
+        }
+        let build = || {
+            (0..4u32)
+                .map(|term| {
+                    let ids: Vec<u32> = (0..num_docs as u32)
+                        .filter(|doc| doc % (2 + term) == 0)
+                        .collect();
+                    let len = ids.len();
+                    let list = generate_impact_posting_list_with_freqs_and_block_size(
+                        ids,
+                        vec![1; len],
+                        vec![1; len],
+                        128,
+                    );
+                    let posting = PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term,
+                        term,
+                        1.0,
+                        list.clone(),
+                        num_docs,
+                    );
+                    if term == 0 {
+                        let grouped =
+                            Arc::<[GroupedTermScorer]>::from([GroupedTermScorer::new(1.0, &list)]);
+                        posting.with_grouped_terms(grouped)
+                    } else {
+                        posting
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+            .with_bulk_and_mode(BulkAndMode::Auto);
+        let _ = wand
+            .search(
+                &FtsSearchParams::default().with_limit(Some(10)),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        assert_eq!(wand.bulk_and_searches, 0);
+    }
+
+    /// A 256-block k=4 query can use the pairwise kernel while the heap is
+    /// unfilled and the wide traversal on the same run.
+    #[test]
+    fn c4_pairwise_and_wide_windows_coexist_on_256_blocks() {
+        let num_docs = 4_096usize;
+        let mut docs = DocSet::default();
+        for doc in 0..num_docs {
+            docs.append(doc as u64, 1);
+        }
+        let moduli = [32u32, 2, 3, 5];
+        let build = || {
+            (0..4u32)
+                .map(|term| {
+                    let ids: Vec<u32> = (0..num_docs as u32)
+                        .filter(|doc| doc % moduli[term as usize] == 0)
+                        .collect();
+                    let len = ids.len();
+                    PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term,
+                        term,
+                        1.0,
+                        generate_impact_posting_list_with_freqs_and_block_size(
+                            ids,
+                            vec![1; len],
+                            vec![1; len],
+                            256,
+                        ),
+                        num_docs,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let run = |mode, wide| {
+            let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode)
+                .with_bulk_and_wide(wide);
+            let rows = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(4)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|candidate| candidate.document)
+                .collect::<Vec<_>>();
+            (
+                rows,
+                wand.and_window_stats.pairwise_intersections,
+                wand.and_window_stats.wide_windows,
+            )
+        };
+        let (classic, ..) = run(BulkAndMode::Off, WideOverride::Off);
+        // Auto (not Always): the unfilled-heap window takes the pairwise merge,
+        // then the gated wide traversal runs once the heap is full.
+        let (rows, pairwise, wide) = run(BulkAndMode::On, WideOverride::Auto);
+        assert_eq!(rows, classic);
+        assert!(pairwise > 0, "256-block k=4 must use the pairwise kernel");
+        assert!(
+            wide > 0,
+            "the gated wide traversal must run on the same query"
+        );
     }
 
     #[rstest]
