@@ -4340,8 +4340,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             })
             .max()
             .unwrap_or(MAX_POSTING_BLOCK_SIZE) as u64;
-        // A wide window needs a full heap and a lead block the narrow window
-        // cannot span; both are checked per window below.
+        // C6: a wide window uses the same positive floor as the narrow path
+        // and does not wait for this partition's heap to fill. The per-window
+        // check below is whether the narrow window already reaches the lead
+        // block end.
         let gated = matches!(mode, BulkAndMode::Auto | BulkAndMode::On)
             && self.lead.len() >= 2
             && wide_gate(
