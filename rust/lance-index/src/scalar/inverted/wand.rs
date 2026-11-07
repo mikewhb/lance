@@ -5319,10 +5319,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             debug_assert!(target <= u32::MAX as u64);
             let target32 = target as u32;
 
-            // Position every clause's block cursor at the block that can hold
-            // `target`, and end the window at the nearest next-block boundary.
+            // Position block cursors and end the narrow window at the nearest
+            // next-block boundary. When every window is already forced wide,
+            // follower cursors are not consulted: the wide kernel reseeds from
+            // the previous block and walks forward itself. Lead is still
+            // positioned, because the wide end is the lead block end.
+            let position_through = if always { 1 } else { num_lists };
             let mut win_end = TERMINATED_DOC_ID;
-            for j in 0..num_lists {
+            for j in 0..position_through {
                 let (block_idx, block_up_to) = {
                     let posting = &self.lead[j];
                     let PostingList::Compressed(ref list) = posting.list else {
