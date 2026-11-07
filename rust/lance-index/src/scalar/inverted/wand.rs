@@ -4820,8 +4820,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         // Wide-window state, allocated on the first wide window so the default
         // configuration never touches it.
+        // A survivor index fits in u8: one block never holds more than 256 docs.
+        const _: () = assert!(MAX_POSTING_BLOCK_SIZE <= 256);
+
         struct WideState {
-            docs: Vec<u32>,
+            // Original index of each surviving lead candidate. Columns stay at
+            // those indexes, so a hit does not move earlier clauses' frequencies.
+            sel: Vec<u8>,
             // Clause-major survivor columns: absolute posting index (only the
             // phrase check reads it) and frequency.
             freq: Vec<u32>,
@@ -4838,7 +4843,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             fn new(num_lists: usize) -> Self {
                 let cap = MAX_POSTING_BLOCK_SIZE;
                 Self {
-                    docs: Vec::with_capacity(cap),
+                    sel: vec![0; cap],
                     freq: vec![0; cap * num_lists],
                     pidx: vec![0; cap * num_lists],
                     fcur: std::iter::repeat_n((usize::MAX, 0), num_lists).collect(),
@@ -4890,6 +4895,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // (a) Every doc of the lead's block inside the window; when there is
             // none, metadata alone retires it.
             let lead_lo;
+            let docs0_ptr: *const u32;
+            let n0;
             {
                 let posting = &wand.lead[0];
                 let PostingList::Compressed(ref list) = posting.list else {
@@ -4910,18 +4917,24 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     }
                     return Ok((0, true, false));
                 }
-                st.docs.clear();
-                st.docs.extend_from_slice(&docs0[lo..hi]);
+                // SAFETY: this pointer addresses the lead block's doc-id buffer.
+                // The block cursor does not move inside the window. Later
+                // frequency and position decodes write other fields of the same
+                // state, or another clause's state, and do not reallocate
+                // `doc_ids`. Same contract as the narrow `WindowList` pointers.
+                docs0_ptr = docs0.as_ptr();
                 // Only the position check reads posting offsets, so a plain
                 // conjunction never writes this column.
                 if phrase {
-                    for (i, slot) in st.pidx[..st.docs.len()].iter_mut().enumerate() {
-                        *slot = u32::try_from((lead_block << shift) | (lo + i)).unwrap_or(u32::MAX);
+                    for i in 0..(hi - lo) {
+                        st.pidx[i] =
+                            u32::try_from((lead_block << shift) | (lo + i)).unwrap_or(u32::MAX);
                     }
                 }
                 lead_lo = lo;
+                n0 = hi - lo;
             }
-            let mut n = st.docs.len();
+            let mut n = n0;
 
             // (b) Bound every clause over the span the candidates really cover;
             // a window-wide follower bound is too loose to ever reject.
@@ -4933,7 +4946,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let (mut prunable, floor_w) = (wand.threshold > 0.0, wand.threshold);
             if prunable {
                 suffix.resize(num_lists + 1, 0.0);
-                let last_doc = st.docs[n - 1];
                 for j in (0..num_lists).rev() {
                     let posting = &wand.lead[j];
                     let bound = if j == 0 {
@@ -4978,6 +4990,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     st.freq[i] = state.freqs[lead_lo + i];
                 }
             }
+            for i in 0..n {
+                st.sel[i] = i as u8;
+            }
 
             // (c) Advance the candidates past one follower at a time. A follower
             // block is decoded only when a surviving candidate reaches it, and
@@ -5000,7 +5015,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let mut max_next_j: u64 = 0;
                 let mut last_decoded: Option<usize> = None;
                 while i < n {
-                    let doc = st.docs[i];
+                    let doc = unsafe { *docs0_ptr.add(lead_lo + st.sel[i] as usize) };
                     if fb + 1 < num_blocks && doc >= list.block_least_doc_id(fb + 1) {
                         fb = posting.block_idx_for_doc(list, fb, doc);
                         fpos = 0;
@@ -5010,10 +5025,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     } else {
                         u32::MAX
                     };
-                    let i_end = i + st.docs[i..n].partition_point(|&doc| doc <= segment_end_doc);
+                    let mut i_end = i;
+                    while i_end < n {
+                        let next = unsafe { *docs0_ptr.add(lead_lo + st.sel[i_end] as usize) };
+                        if next > segment_end_doc {
+                            break;
+                        }
+                        i_end += 1;
+                    }
                     // The cursor must skip the whole block, not just its last
                     // survivor, so remember this before any compaction.
-                    let segment_last = st.docs[i_end - 1];
+                    let segment_last =
+                        unsafe { *docs0_ptr.add(lead_lo + st.sel[i_end - 1] as usize) };
                     pruned[i..i_end].fill(false);
                     let mut keep = i_end - i;
                     if prunable {
@@ -5031,9 +5054,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             // shape here.
                             #[allow(clippy::needless_range_loop)]
                             for x in i..i_end {
+                                let origin = st.sel[x] as usize;
                                 let bound = (0..j)
                                     .map(|c| {
-                                        let freq = (st.freq[c * cap + x] as usize)
+                                        let freq = (st.freq[c * cap + origin] as usize)
                                             .min(FREQ_LUT_BUCKETS - 1);
                                         f64::from(st.lut[c * FREQ_LUT_BUCKETS + freq])
                                     })
@@ -5071,8 +5095,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         if pruned[x] {
                             continue;
                         }
-                        fpos = unsafe { find_next_geq(docs_b, fpos, len_b, st.docs[x]) };
-                        if fpos < len_b && unsafe { *docs_b.add(fpos) } == st.docs[x] {
+                        let origin = st.sel[x] as usize;
+                        let doc = unsafe { *docs0_ptr.add(lead_lo + origin) };
+                        fpos = unsafe { find_next_geq(docs_b, fpos, len_b, doc) };
+                        if fpos < len_b && unsafe { *docs_b.add(fpos) } == doc {
                             let freqs = match freqs {
                                 Some(ptr) => ptr,
                                 None => {
@@ -5083,20 +5109,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                     ptr
                                 }
                             };
-                            if out != x {
-                                st.docs[out] = st.docs[x];
-                                for c in 0..j {
-                                    st.freq[c * cap + out] = st.freq[c * cap + x];
-                                    if phrase {
-                                        st.pidx[c * cap + out] = st.pidx[c * cap + x];
-                                    }
-                                }
-                            }
-                            st.freq[j * cap + out] = unsafe { *freqs.add(fpos) };
+                            st.freq[j * cap + origin] = unsafe { *freqs.add(fpos) };
                             if phrase {
-                                st.pidx[j * cap + out] =
+                                st.pidx[j * cap + origin] =
                                     u32::try_from((fb << shift) | fpos).unwrap_or(u32::MAX);
                             }
+                            st.sel[out] = origin as u8;
                             debug_assert!(out <= x);
                             out += 1;
                         }
@@ -5150,22 +5168,28 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 st.lens.clear();
                 st.norms.clear();
                 match (norm_k_ref, source_norms) {
-                    (Some((norms, _)), _) => st
-                        .norms
-                        .extend(st.docs[..n].iter().map(|&doc| norms[doc as usize])),
-                    (None, Some(norms)) => st.lens.extend(
-                        st.docs[..n]
-                            .iter()
-                            .map(|&doc| dequantize_doc_length(norms[doc as usize])),
-                    ),
-                    (None, None) => st.lens.extend(
-                        st.docs[..n]
-                            .iter()
-                            .map(|&doc| wand.documents.scoring_num_tokens(doc)),
-                    ),
+                    (Some((norms, _)), _) => {
+                        for i in 0..n {
+                            let doc = unsafe { *docs0_ptr.add(lead_lo + st.sel[i] as usize) };
+                            st.norms.push(norms[doc as usize]);
+                        }
+                    }
+                    (None, Some(norms)) => {
+                        for i in 0..n {
+                            let doc = unsafe { *docs0_ptr.add(lead_lo + st.sel[i] as usize) };
+                            st.lens.push(dequantize_doc_length(norms[doc as usize]));
+                        }
+                    }
+                    (None, None) => {
+                        for i in 0..n {
+                            let doc = unsafe { *docs0_ptr.add(lead_lo + st.sel[i] as usize) };
+                            st.lens.push(wand.documents.scoring_num_tokens(doc));
+                        }
+                    }
                 }
                 for i in 0..n {
-                    let doc = st.docs[i];
+                    let origin = st.sel[i] as usize;
+                    let doc = unsafe { *docs0_ptr.add(lead_lo + origin) };
                     *num_comparisons += 1;
                     let Some(document_key) = wand.documents.document_key_for_doc_id(doc) else {
                         continue;
@@ -5181,7 +5205,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     // expression, so the f32 total is bit-identical.
                     let mut score = 0.0_f32;
                     for &c in score_order {
-                        let freq = st.freq[c * cap + i];
+                        let freq = st.freq[c * cap + origin];
                         score += match norm_addend {
                             Some(addend) => {
                                 wand.lead[c].query_weight * bm25_doc_weight_with_norm(freq, addend)
@@ -5198,10 +5222,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             continue;
                         }
                         for (c, posting) in wand.lead.iter_mut().enumerate() {
-                            posting.index = st.pidx[c * cap + i] as usize;
+                            posting.index = st.pidx[c * cap + origin] as usize;
                             posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
                                 doc_id: doc,
-                                frequency: st.freq[c * cap + i],
+                                frequency: st.freq[c * cap + origin],
                             }));
                         }
                         let matched = if slop == 0 {
@@ -5217,7 +5241,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         ScoredDoc::new(document_key, score),
                         doc_length,
                         u64::from(doc),
-                        (0..num_lists).map(|c| (wand.lead[c].term_index(), st.freq[c * cap + i])),
+                        (0..num_lists)
+                            .map(|c| (wand.lead[c].term_index(), st.freq[c * cap + origin])),
                     )? && let Some(kth) = candidates.kth_score_if_full()
                     {
                         wand.update_threshold(kth, wand_factor);
