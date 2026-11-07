@@ -347,6 +347,23 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
 
+/// Diagnostic only (`fts/bulk-and-all-wide-diag`, never merged). `all` forces
+/// every Auto/On bulk window onto the wide kernel, including windows whose
+/// narrow end already reaches the lead block. Unset leaves the gate in place.
+static WIDE_DIAG_ALL: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_BULK_AND_WIDE_DIAG")
+        .ok()
+        .is_some_and(|value| value == "all")
+});
+
+/// Diagnostic only. One stderr line per bulk search: whether `wide_gate`
+/// itself would open, before the diagnostic force is applied.
+static WIDE_MARKER: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_WIDE_MARKER")
+        .ok()
+        .is_some_and(|value| value == "1")
+});
+
 /// Wide-window override, tests only: Off disables the window even when the
 /// gate opens, Always bypasses the gate and L1. Production follows the gate.
 #[cfg(test)]
@@ -4355,15 +4372,33 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 block_size,
             );
         // Tests may force the window on (Always) or off (Off); production
-        // follows the gate and L1 only.
+        // follows the gate. The diagnostic env forces every Auto/On window
+        // wide, which is the W0 measurement of deleting the gate.
+        if *WIDE_MARKER {
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!(
+                    "fts-wide-marker gate={}",
+                    if gated { "open" } else { "closed" }
+                );
+            }
+        }
+        let force_all = *WIDE_DIAG_ALL
+            && matches!(mode, BulkAndMode::Auto | BulkAndMode::On)
+            && self.lead.len() >= 2;
         #[cfg(test)]
         let (mut wide_enabled, always) = match self.wide_override {
             Some(WideOverride::Off) => (false, false),
             Some(WideOverride::Always) => (true, true),
+            _ if force_all => (true, true),
             _ => (gated, false),
         };
         #[cfg(not(test))]
-        let (mut wide_enabled, always) = (gated, false);
+        let (mut wide_enabled, always) = if force_all {
+            (true, true)
+        } else {
+            (gated, false)
+        };
         let wide_l2_limit = self.wide_l2_limit;
         let mut wide_misses: usize = 0;
         let use_pairwise_intersection = num_lists >= 4
