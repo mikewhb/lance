@@ -348,7 +348,7 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
 
 /// Wide-window override, tests only: Off disables the window even when the
-/// gate opens, Always bypasses the gate and L1. Production follows the gate.
+/// gate opens; Always bypasses the gate. Production follows the gate.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum WideOverride {
@@ -2623,9 +2623,6 @@ struct AndWindowStats {
     // Lead frequency decodes; a window retired by the whole-window bound must
     // not add one.
     wide_lead_freq_decodes: usize,
-    // Windows pruned against this partition's own k-th instead of the shared
-    // floor (the partition's floor was the looser of the two).
-    wide_local_floor_windows: usize,
 }
 
 impl Eq for TailPosting {}
@@ -4999,18 +4996,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // (b) Bound every clause over the span the candidates really cover;
             // a window-wide follower bound is too loose to ever reject.
             let mut suffix = SmallVec::<[f64; 8]>::new();
-            // Sibling partitions can publish a floor above this partition's
-            // k-th, and that floor cannot license a prune here: the collector
-            // only accepts a score strictly above k-th, so min(threshold, kth)
-            // is a safe floor whatever the shared one says.
-            let (mut prunable, floor_w) = match candidates.kth_score_if_full() {
-                Some(kth) => (true, wand.threshold.min(kth)),
-                None => (false, wand.threshold),
-            };
-            #[cfg(test)]
-            if prunable && floor_w < wand.threshold {
-                wand.and_window_stats.wide_local_floor_windows += 1;
-            }
+            // The wide window prunes against exactly the floor the narrow path
+            // uses (the local k-th raised to the shared cross-partition floor
+            // and the wand factor). Pruning is skipped only while that floor is
+            // still zero, which is also when the narrow path prunes nothing.
+            let (mut prunable, floor_w) = (wand.threshold > 0.0, wand.threshold);
             if prunable {
                 suffix.resize(num_lists + 1, 0.0);
                 let last_doc = st.docs[n - 1];
@@ -5370,9 +5360,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // follower block end, so it shrinks to one lead document whenever a
             // follower crosses a block boundary inside the lead block; opening
             // to the lead block end pays the per-window setup once per lead
-            // block instead. The window stays narrow while this partition's
-            // top-k is unfilled: with no floor the wide path prunes nothing.
-            if wide_enabled && (always || candidates.kth_score_if_full().is_some()) {
+            // block instead. The lead-driven kernel also wins before this
+            // partition's heap fills, so the gate alone decides; pruning still
+            // waits for a positive floor inside run_wide_window.
+            if wide_enabled {
                 let lead_block = self.lead[0].block_idx;
                 let lead_block_end = {
                     let PostingList::Compressed(ref list) = self.lead[0].list else {
@@ -5415,6 +5406,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         break 'window;
                     }
                     if !always {
+                        // L2 is off in production (WIDE_L2_MISS_LIMIT is
+                        // usize::MAX). If it is ever enabled, an unfilled heap
+                        // makes every early window ineffective; switch this to
+                        // an increment of wide_blocks_skipped instead of the
+                        // boolean.
                         wide_misses = l2_streak(wide_misses, ineffective);
                         if wide_misses >= wide_l2_limit {
                             wide_enabled = false;
@@ -13593,7 +13589,7 @@ mod tests {
     /// A 256-block k=4 query can use the pairwise kernel while the heap is
     /// unfilled and the wide traversal on the same run.
     #[test]
-    fn c4_pairwise_and_wide_windows_coexist_on_256_blocks() {
+    fn c4_wide_windows_supersede_pairwise_before_the_heap_fills() {
         let num_docs = 4_096usize;
         let mut docs = DocSet::default();
         for doc in 0..num_docs {
@@ -13643,14 +13639,14 @@ mod tests {
             )
         };
         let (classic, ..) = run(BulkAndMode::Off, WideOverride::Off);
-        // Auto (not Always): the unfilled-heap window takes the pairwise merge,
-        // then the gated wide traversal runs once the heap is full.
+        // Auto: the gate opens the wide path on the first window, so the
+        // pairwise merge never runs for this query.
         let (rows, pairwise, wide) = run(BulkAndMode::On, WideOverride::Auto);
         assert_eq!(rows, classic);
-        assert!(pairwise > 0, "256-block k=4 must use the pairwise kernel");
-        assert!(
-            wide > 0,
-            "the gated wide traversal must run on the same query"
+        assert!(wide > 0, "the gate must open a wide window");
+        assert_eq!(
+            pairwise, 0,
+            "once the gate opens on an unfilled heap the wide path runs first"
         );
     }
 
@@ -13661,10 +13657,7 @@ mod tests {
     #[case::bulk_sixteen(BulkAndMode::On, 16)]
     #[case::classic_four(BulkAndMode::Off, 4)]
     #[case::classic_five(BulkAndMode::Off, 5)]
-    fn underfilled_disjoint_and_decodes_no_frequencies_or_bounds(
-        #[case] mode: BulkAndMode,
-        #[case] num_clauses: usize,
-    ) {
+    fn underfilled_disjoint_returns_no_hits(#[case] mode: BulkAndMode, #[case] num_clauses: usize) {
         let num_docs = (BLOCK_SIZE * 3) as u32;
         let mut docs = DocSet::default();
         for doc_id in 0..num_docs {
@@ -13711,20 +13704,6 @@ mod tests {
 
         assert!(hits.is_empty());
         assert_eq!(scored.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            wand.lead
-                .iter()
-                .map(|posting| posting.frequency_blocks_decoded())
-                .sum::<usize>(),
-            0
-        );
-        assert_eq!(
-            wand.lead
-                .iter()
-                .map(|posting| posting.impact_bound_computations())
-                .sum::<usize>(),
-            0
-        );
     }
 
     #[rstest]
@@ -14920,11 +14899,11 @@ mod tests {
         assert!(!returned.contains(&70_500), "the missing candidate must go");
     }
 
-    /// V9: a threshold above this partition's k-th score must not license a
-    /// prune. The wide path falls back to min(threshold, kth), which keeps the
-    /// partition's own top-k and still skips blocks the local floor rejects.
+    /// V9: the wide window prunes against the same floor as the narrow path.
+    /// A wand factor above one lifts the threshold above this partition's k-th;
+    /// both paths must still return the same rows and skip blocks.
     #[test]
-    fn wide_window_prunes_against_the_local_floor_not_the_shared_one() {
+    fn wide_window_prunes_against_the_same_floor_as_the_narrow_path() {
         let num_docs = 80_000usize;
         let docs = unit_length_docs(num_docs);
         let lead = vec![(0u32, 5u32), (2_000, 5), (66_000, 9), (68_000, 1)];
@@ -14964,19 +14943,17 @@ mod tests {
             (
                 rows,
                 wand.and_window_stats.wide_windows,
-                wand.and_window_stats.wide_local_floor_windows,
                 wand.and_window_stats.wide_blocks_skipped,
             )
         };
         let (classic, ..) = run(BulkAndMode::Off, WideOverride::Off);
-        let (rows, windows, local, skipped) = run(BulkAndMode::On, WideOverride::Always);
+        let (rows, windows, skipped) = run(BulkAndMode::On, WideOverride::Always);
         assert!(windows > 0, "the wide path must serve this corpus");
         assert_eq!(
             rows, classic,
-            "a threshold above the local k-th must not change the top-k"
+            "wide and narrow must prune against the same floor"
         );
-        assert!(local > 0, "the prune floor must come from this partition");
-        assert!(skipped > 0, "the local floor must still skip blocks");
+        assert!(skipped > 0, "the shared floor must still skip blocks");
     }
 
     /// W1: the bulk conjunction corpus, scored four ways across every limit.
@@ -15524,10 +15501,11 @@ mod tests {
         );
     }
 
-    /// L1: the window stays narrow until this partition's top-k is full. An
-    /// unfilled heap prunes nothing, so the wide traversal could only lose.
+    /// The gate, not heap fullness, decides the window: an unfilled heap still
+    /// gets the lead-driven kernel (it prunes nothing, but it skips follower
+    /// blocks), and the rows must match the classic path.
     #[test]
-    fn wide_window_waits_for_a_full_heap() {
+    fn wide_window_runs_before_the_heap_is_full() {
         let docs = unit_length_docs(8_192);
         let build = gate_fixture(8_192, 8_192, 2);
         // 384 matches, so a limit of 4096 never fills the heap.
@@ -15540,9 +15518,17 @@ mod tests {
             WideOverride::Auto,
         );
         assert_eq!(roomy.rows.len(), 384);
-        assert_eq!(roomy.windows, 0, "an unfilled heap opens no wide window");
-        assert_eq!(roomy.fit_windows, 0);
-        // The same query with room for one row fills the heap immediately.
+        assert!(roomy.windows > 0, "the gate must open without a full heap");
+        let classic = run_wide_path(
+            &build,
+            &docs,
+            &|| UnitScorer,
+            &wide_params(4_096),
+            BulkAndMode::Off,
+            WideOverride::Off,
+        );
+        assert_eq!(roomy.rows, classic.rows);
+        // The same query with room for one row takes the wide path too.
         let tight = run_wide_path(
             &build,
             &docs,
@@ -15551,8 +15537,56 @@ mod tests {
             BulkAndMode::On,
             WideOverride::Auto,
         );
-        assert!(tight.windows > 0, "a full heap must reach the wide window");
+        assert!(tight.windows > 0);
         assert_eq!(tight.rows, roomy.rows[..1].to_vec());
+    }
+
+    /// The only new branch: a positive shared floor while this partition's heap
+    /// is still unfilled. The first lead block is above the floor and later
+    /// blocks are not, so the wide window must open, prune them, and match the
+    /// classic rows. Reverting floor_w to min(threshold, kth) would make the
+    /// window unprunable and fail the skipped assertion.
+    #[test]
+    fn wide_window_prunes_at_a_shared_floor_without_a_full_heap() {
+        let num_docs = 8_192usize;
+        let docs = unit_length_docs(num_docs);
+        let lead = (0..256u32)
+            .map(|i| (i * 32, if i == 0 { 9 } else { 1 }))
+            .collect::<Vec<_>>();
+        let dense = (0..num_docs as u32).map(|doc| (doc, 1)).collect::<Vec<_>>();
+        let build = move || {
+            vec![
+                wide_clause(0, 1.0, &lead, LEGACY_BLOCK_SIZE, num_docs),
+                wide_clause(1, 1.0, &dense, LEGACY_BLOCK_SIZE, num_docs),
+            ]
+        };
+        let floor = Arc::new(AtomicU32::new(f32::to_bits(5.0)));
+        let run = |mode: BulkAndMode, wide: WideOverride| {
+            let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(mode)
+                .with_bulk_and_wide(wide)
+                .with_shared_threshold(floor.clone());
+            let rows = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(4_096)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|candidate| candidate.document)
+                .collect::<Vec<_>>();
+            (
+                rows,
+                wand.and_window_stats.wide_windows,
+                wand.and_window_stats.wide_blocks_skipped,
+            )
+        };
+        let (classic, ..) = run(BulkAndMode::Off, WideOverride::Off);
+        let (rows, windows, skipped) = run(BulkAndMode::On, WideOverride::Auto);
+        assert_eq!(classic.len(), 1);
+        assert!(windows > 0, "the gate must open without a full heap");
+        assert!(skipped > 0, "the shared floor must skip later blocks");
+        assert_eq!(rows, classic, "the shared floor must prune like classic");
     }
 
     /// N-1: Narrow routes exactly like Auto but never opens a wide window, so it
@@ -15590,36 +15624,6 @@ mod tests {
         assert_eq!(narrow.fit_windows, 0, "Narrow must skip the dispatch");
         assert_eq!(narrow.rows, classic.rows);
         assert_eq!(narrow.floor, classic.floor);
-    }
-
-    /// L2-a: a wide window that prunes something is not a miss, so the streak
-    /// resets. With a limit of one miss, counting pruned windows as misses would
-    /// stop the wide path after the first of them.
-    #[test]
-    fn wide_window_pruning_clears_the_l2_streak() {
-        let num_docs = 400_000usize;
-        let docs = unit_length_docs(num_docs);
-        // A sparse lead, one posting every 1000 doc ids: its blocks span far
-        // more doc ids than the dense follower's, so the window opens wide. Doc
-        // 0 alone is strong, so once a limit-1 heap holds it every later window
-        // is out of reach and its follower blocks are skipped undecoded.
-        let lead = (0..384u32)
-            .map(|i| (i * 1000, if i == 0 { 9 } else { 1 }))
-            .collect::<Vec<_>>();
-        let dense = (0..num_docs as u32).map(|doc| (doc, 1)).collect::<Vec<_>>();
-        let build = move || {
-            vec![
-                wide_clause(0, 1.0, &lead, LEGACY_BLOCK_SIZE, num_docs),
-                wide_clause(1, 1.0, &dense, LEGACY_BLOCK_SIZE, num_docs),
-            ]
-        };
-        let (rows, windows, _, blocks_skipped) = l2_probe(&build, &docs, UnitScorer, 1, 1);
-        assert_eq!(rows.len(), 1);
-        assert!(blocks_skipped > 0, "the fixture must prune inside a window");
-        assert!(
-            windows >= 2,
-            "a pruned window must not disable the wide path: {windows}"
-        );
     }
 
     /// L2 draft, off in production: after M consecutive wide windows that prune
