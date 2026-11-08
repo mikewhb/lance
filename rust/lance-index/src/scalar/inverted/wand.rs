@@ -2941,7 +2941,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         && self.lead.len() >= 4
                         && self.lead.iter().all(|posting| {
                             matches!(&posting.list, PostingList::Compressed(list)
-                                if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
+                                if list.impacts.is_some())
                         }))
             }
         {
@@ -5336,6 +5336,36 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     {
                         self.and_window_stats.wide_fit_windows += 1;
                     }
+                }
+            }
+
+            // Retire the window before decoding anything when the clauses'
+            // own block maxima cannot clear the floor. `block_max_score` reads
+            // the impact metadata only, so a retired window costs k metadata
+            // lookups instead of k block decodes. The window lies inside every
+            // clause's current block, so the sum bounds every doc in it.
+            if window_started_with_floor {
+                let window_max: f64 = self
+                    .lead
+                    .iter()
+                    .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+                    .sum();
+                if score_sum_cannot_compete(
+                    0.0,
+                    window_max,
+                    self.threshold,
+                    score_sum_upper_bound_factor(num_lists),
+                    self.floor_mode,
+                ) {
+                    #[cfg(test)]
+                    {
+                        self.and_window_stats.windows_skipped += 1;
+                    }
+                    if win_end == TERMINATED_DOC_ID {
+                        break 'window;
+                    }
+                    target = win_end + 1;
+                    continue 'window;
                 }
             }
 
