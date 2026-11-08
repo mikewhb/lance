@@ -371,6 +371,36 @@ fn auto_wide_allowed(mode: BulkAndMode, gate: bool, narrow_only: bool) -> bool {
         && !(narrow_only && matches!(mode, BulkAndMode::Auto))
 }
 
+/// Slice one decoded block to the docs inside `[target, win_end]`. `prev` is
+/// only a resume hint: a stale end scans a few extra entries and still returns
+/// every doc in range.
+fn window_bounds(
+    doc_ids: &[u32],
+    prev: (usize, usize),
+    block_idx: usize,
+    target32: u32,
+    win_end32: u32,
+) -> (usize, usize) {
+    let len = doc_ids.len();
+    let (prev_block, prev_hi) = prev;
+    let start = if prev_block == block_idx {
+        prev_hi.min(len)
+    } else {
+        0
+    };
+    let lo = if start < len && doc_ids[start] >= target32 {
+        start
+    } else {
+        start + doc_ids[start..].partition_point(|&doc| doc < target32)
+    };
+    let hi = if win_end32 == u32::MAX || len == 0 || doc_ids[len - 1] <= win_end32 {
+        len
+    } else {
+        lo + doc_ids[lo..].partition_point(|&doc| doc <= win_end32)
+    };
+    (lo, hi)
+}
+
 /// Wide-window override, tests only: Off disables the window even when the
 /// gate opens; Always bypasses the gate. Production follows the gate.
 #[cfg(test)]
@@ -5397,7 +5427,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // sparse lead then drives the traversal and dense followers skip
             // whole blocks by metadata instead of being sliced block by block.
             let mut jump_to: u64 = 0;
-            for (j, posting) in self.lead.iter().enumerate() {
+            // With a floor, screen the lead before any follower block is
+            // decoded. A follower whose slice is never taken keeps a stale
+            // `slice_prev`; that value is only a resume hint, never a cursor
+            // that skips unread docs.
+            let mut used_lazy = false;
+            if window_started_with_floor && num_lists >= 2 {
+                used_lazy = true;
+                batch_docs.clear();
+                batch_offs.clear();
+                let posting = &self.lead[0];
                 let PostingList::Compressed(ref list) = posting.list else {
                     unreachable!("bulk AND requires compressed postings");
                 };
@@ -5405,85 +5444,39 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 if narrow_diag {
                     diag_decodes += 1;
                 }
-                let state = unsafe { &mut *posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
-                let doc_ids = state.doc_ids.as_slice();
-                let len = doc_ids.len();
-                // Everything before the previous slice's end of this block is
-                // below the current target, so resume from there.
-                let (prev_block, prev_hi) = slice_prev[j];
-                let start = if prev_block == block_idx {
-                    prev_hi.min(len)
-                } else {
-                    0
-                };
-                let lo = if start < len && doc_ids[start] >= target32 {
-                    start
-                } else {
-                    start + doc_ids[start..].partition_point(|&doc| doc < target32)
-                };
-                let hi = if win_end32 == u32::MAX || len == 0 || doc_ids[len - 1] <= win_end32 {
-                    len
-                } else {
-                    lo + doc_ids[lo..].partition_point(|&doc| doc <= win_end32)
-                };
-                slice_prev[j] = (block_idx, hi);
-                if lo == hi {
-                    // No docs of this clause in the window: the whole window
-                    // has no conjunction match. If this was the clause's last
-                    // block and it is fully behind the target, the clause is
-                    // exhausted and the conjunction is done.
-                    if lo < state.doc_ids.len() {
-                        jump_to = u64::from(state.doc_ids[lo]);
-                    } else if block_idx + 1 < list.blocks.len() {
-                        jump_to = u64::from(list.block_least_doc_id(block_idx + 1));
-                    } else {
-                        exhausted = true;
+                let (lo, hi, shift) = {
+                    let state = unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
+                    let doc_ids = state.doc_ids.as_slice();
+                    let (lo, hi) =
+                        window_bounds(doc_ids, slice_prev[0], block_idx, target32, win_end32);
+                    if lo == hi {
+                        if lo < doc_ids.len() {
+                            jump_to = u64::from(doc_ids[lo]);
+                        } else if block_idx + 1 < list.blocks.len() {
+                            jump_to = u64::from(list.block_least_doc_id(block_idx + 1));
+                        } else {
+                            exhausted = true;
+                        }
+                        skip_window = true;
                     }
-                    skip_window = true;
-                    break;
-                }
-                wins.push(WindowList {
-                    docs: state.doc_ids.as_ptr(),
-                    freqs: std::ptr::null(),
-                    pos: lo,
-                    end: hi,
-                    block_start: block_idx << list.block_shift(),
-                });
-            }
-            if exhausted {
-                break 'window;
-            }
-            if !skip_window {
-                // Constant within the window (block-anchored); mirrors
-                // `and_candidate_cannot_beat_threshold`'s remaining-clause
-                // bound of first-clause-exact + rest-block-max.
-                let mut others_block_max = if window_started_with_floor {
-                    Some(
-                        self.lead[1..]
-                            .iter()
-                            .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
-                            .sum::<f64>(),
-                    )
-                } else {
-                    None
+                    (lo, hi, list.block_shift())
                 };
-
-                batch_docs.clear();
-                batch_offs.clear();
-                // Precompute the conservative decision once per frequency
-                // bucket so the scalar and SIMD merge kernels stay
-                // floating-point-free.
-                if window_started_with_floor && num_lists >= 2 {
-                    let posting = &self.lead[0];
-                    let PostingList::Compressed(ref list) = posting.list else {
-                        unreachable!("bulk AND requires compressed postings");
+                slice_prev[0] = (block_idx, hi);
+                if !skip_window {
+                    let freq_ptr = {
+                        let state =
+                            unsafe { &*posting.ensure_compressed_block_ptr(list, block_idx) };
+                        state.freqs.as_ptr()
                     };
-                    let state = unsafe {
-                        &mut *posting.ensure_compressed_block_ptr(list, posting.block_idx)
+                    let docs_ptr = {
+                        let state =
+                            unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
+                        state.doc_ids.as_ptr()
                     };
-                    wins[0].freqs = state.freqs.as_ptr();
-                    let others_block_max =
-                        others_block_max.expect("positive floor should initialize bounds");
+                    let others_block_max: f64 = self.lead[1..]
+                        .iter()
+                        .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+                        .sum();
                     let key = (self.threshold.to_bits(), others_block_max.to_bits());
                     if first_score_limit_key != Some(key) {
                         first_score_limit = exclusive_partial_score_limit(
@@ -5494,106 +5487,318 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         first_score_limit_key = Some(key);
                     }
                     if freq_cannot_beat_key != Some(key) {
-                        let freq_bounds = freq_bounds
+                        let bounds = freq_bounds
                             .as_ref()
                             .expect("positive threshold should initialize the frequency bound LUT");
                         freq_cannot_beat = match first_score_limit {
                             Some(limit) => {
-                                std::array::from_fn(|frequency| freq_bounds[frequency] <= limit)
+                                std::array::from_fn(|frequency| bounds[frequency] <= limit)
                             }
                             None => [false; FREQ_LUT_BUCKETS],
                         };
                         freq_cannot_beat_key = Some(key);
                     }
-                } else if freq_cannot_beat_key.is_some() {
-                    freq_cannot_beat = [false; FREQ_LUT_BUCKETS];
-                    freq_cannot_beat_key = None;
-                }
-                #[cfg(test)]
-                if freq_cannot_beat.iter().any(|&pruned| pruned) {
-                    self.and_window_stats.windows_frequency_pruned += 1;
-                }
-                #[cfg(target_arch = "x86_64")]
-                let use_avx2 = *HAS_AVX2;
-                #[cfg(not(target_arch = "x86_64"))]
-                let use_avx2 = false;
-                match (num_lists, use_avx2, window_started_with_floor) {
-                    (1, _, _) => merge_window_1(&wins, &mut batch_docs, &mut batch_offs),
-                    #[cfg(target_arch = "x86_64")]
-                    (2, true, false) => unsafe {
-                        merge_window_docs_2_avx2(&wins, &mut batch_docs, &mut batch_offs)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (3, true, false) => unsafe {
-                        merge_window_docs_3_avx2(&wins, &mut batch_docs, &mut batch_offs)
-                    },
-                    (2, _, false) => unsafe {
-                        merge_window_docs_2(&wins, &mut batch_docs, &mut batch_offs)
-                    },
-                    (3, _, false) => unsafe {
-                        merge_window_docs_3(&wins, &mut batch_docs, &mut batch_offs)
-                    },
-                    (_, _, false) if use_pairwise_intersection => {
-                        #[cfg(test)]
-                        {
-                            self.and_window_stats.pairwise_intersections += 1;
-                        }
-                        merge_window_docs_pairwise(
-                            &wins,
-                            &mut intersection_scratch,
-                            &mut batch_docs,
-                            &mut batch_offs,
-                        )
+                    #[cfg(test)]
+                    if freq_cannot_beat.iter().any(|&pruned| pruned) {
+                        self.and_window_stats.windows_frequency_pruned += 1;
                     }
-                    (_, _, false) => merge_window_docs_n(
-                        &wins,
-                        &mut cursor_scratch,
-                        &mut batch_docs,
-                        &mut batch_offs,
-                    ),
+                    wins.push(WindowList {
+                        docs: docs_ptr,
+                        freqs: std::ptr::null(),
+                        pos: lo,
+                        end: hi,
+                        block_start: block_idx << shift,
+                    });
+                    let mut docs = Vec::new();
+                    let mut lead_pos = Vec::new();
+                    for pos in lo..hi {
+                        let freq = unsafe { *freq_ptr.add(pos) };
+                        let bucket = (freq as usize).min(FREQ_LUT_BUCKETS - 1);
+                        if freq_cannot_beat[bucket] {
+                            continue;
+                        }
+                        docs.push(unsafe { *docs_ptr.add(pos) });
+                        lead_pos.push(pos as u8);
+                    }
+                    let mut offs = vec![0u8; docs.len() * num_lists];
+                    for (i, &pos) in lead_pos.iter().enumerate() {
+                        offs[i * num_lists] = pos;
+                    }
+                    for j in 1..num_lists {
+                        if docs.is_empty() {
+                            break;
+                        }
+                        let posting = &self.lead[j];
+                        let PostingList::Compressed(ref list) = posting.list else {
+                            unreachable!("bulk AND requires compressed postings");
+                        };
+                        let block_idx = posting.block_idx;
+                        if narrow_diag {
+                            diag_decodes += 1;
+                        }
+                        let state =
+                            unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
+                        let doc_ids = state.doc_ids.as_slice();
+                        let (lo, hi) =
+                            window_bounds(doc_ids, slice_prev[j], block_idx, target32, win_end32);
+                        slice_prev[j] = (block_idx, hi);
+                        if lo == hi {
+                            if lo < doc_ids.len() {
+                                jump_to = u64::from(doc_ids[lo]);
+                            } else if block_idx + 1 < list.blocks.len() {
+                                jump_to = u64::from(list.block_least_doc_id(block_idx + 1));
+                            } else {
+                                exhausted = true;
+                            }
+                            skip_window = true;
+                            docs.clear();
+                            break;
+                        }
+                        wins.push(WindowList {
+                            docs: doc_ids.as_ptr(),
+                            freqs: std::ptr::null(),
+                            pos: lo,
+                            end: hi,
+                            block_start: block_idx << list.block_shift(),
+                        });
+                        let mut kept = 0usize;
+                        let mut fpos = lo;
+                        let ptr = doc_ids.as_ptr();
+                        for i in 0..docs.len() {
+                            fpos = unsafe { find_next_geq(ptr, fpos, hi, docs[i]) };
+                            if fpos < hi && unsafe { *ptr.add(fpos) } == docs[i] {
+                                if kept != i {
+                                    docs[kept] = docs[i];
+                                    offs.copy_within(
+                                        i * num_lists..(i + 1) * num_lists,
+                                        kept * num_lists,
+                                    );
+                                }
+                                offs[kept * num_lists + j] = fpos as u8;
+                                kept += 1;
+                            }
+                        }
+                        docs.truncate(kept);
+                        offs.truncate(kept * num_lists);
+                    }
+                    if !skip_window {
+                        batch_docs = docs;
+                        batch_offs = offs;
+                    }
+                }
+            }
+            if !used_lazy {
+                for (j, posting) in self.lead.iter().enumerate() {
+                    let PostingList::Compressed(ref list) = posting.list else {
+                        unreachable!("bulk AND requires compressed postings");
+                    };
+                    let block_idx = posting.block_idx;
+                    if narrow_diag {
+                        diag_decodes += 1;
+                    }
+                    let state =
+                        unsafe { &mut *posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
+                    let doc_ids = state.doc_ids.as_slice();
+                    let len = doc_ids.len();
+                    // Everything before the previous slice's end of this block is
+                    // below the current target, so resume from there.
+                    let (prev_block, prev_hi) = slice_prev[j];
+                    let start = if prev_block == block_idx {
+                        prev_hi.min(len)
+                    } else {
+                        0
+                    };
+                    let lo = if start < len && doc_ids[start] >= target32 {
+                        start
+                    } else {
+                        start + doc_ids[start..].partition_point(|&doc| doc < target32)
+                    };
+                    let hi = if win_end32 == u32::MAX || len == 0 || doc_ids[len - 1] <= win_end32 {
+                        len
+                    } else {
+                        lo + doc_ids[lo..].partition_point(|&doc| doc <= win_end32)
+                    };
+                    slice_prev[j] = (block_idx, hi);
+                    if lo == hi {
+                        // No docs of this clause in the window: the whole window
+                        // has no conjunction match. If this was the clause's last
+                        // block and it is fully behind the target, the clause is
+                        // exhausted and the conjunction is done.
+                        if lo < state.doc_ids.len() {
+                            jump_to = u64::from(state.doc_ids[lo]);
+                        } else if block_idx + 1 < list.blocks.len() {
+                            jump_to = u64::from(list.block_least_doc_id(block_idx + 1));
+                        } else {
+                            exhausted = true;
+                        }
+                        skip_window = true;
+                        break;
+                    }
+                    wins.push(WindowList {
+                        docs: state.doc_ids.as_ptr(),
+                        freqs: std::ptr::null(),
+                        pos: lo,
+                        end: hi,
+                        block_start: block_idx << list.block_shift(),
+                    });
+                }
+            }
+            if exhausted {
+                break 'window;
+            }
+            if !skip_window {
+                // Constant within the window (block-anchored); mirrors
+                // `and_candidate_cannot_beat_threshold`'s remaining-clause
+                // bound of first-clause-exact + rest-block-max. The lazy path
+                // scores through this same value.
+                let mut others_block_max = if window_started_with_floor {
+                    Some(
+                        self.lead[1..]
+                            .iter()
+                            .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+                            .sum::<f64>(),
+                    )
+                } else {
+                    None
+                };
+                if !used_lazy {
+                    batch_docs.clear();
+                    batch_offs.clear();
+                    // Precompute the conservative decision once per frequency
+                    // bucket so the scalar and SIMD merge kernels stay
+                    // floating-point-free.
+                    if window_started_with_floor && num_lists >= 2 {
+                        let posting = &self.lead[0];
+                        let PostingList::Compressed(ref list) = posting.list else {
+                            unreachable!("bulk AND requires compressed postings");
+                        };
+                        let state = unsafe {
+                            &mut *posting.ensure_compressed_block_ptr(list, posting.block_idx)
+                        };
+                        wins[0].freqs = state.freqs.as_ptr();
+                        let others_block_max =
+                            others_block_max.expect("positive floor should initialize bounds");
+                        let key = (self.threshold.to_bits(), others_block_max.to_bits());
+                        if first_score_limit_key != Some(key) {
+                            first_score_limit = exclusive_partial_score_limit(
+                                others_block_max,
+                                self.threshold,
+                                score_sum_upper_bound_factor(num_lists),
+                            );
+                            first_score_limit_key = Some(key);
+                        }
+                        if freq_cannot_beat_key != Some(key) {
+                            let freq_bounds = freq_bounds.as_ref().expect(
+                                "positive threshold should initialize the frequency bound LUT",
+                            );
+                            freq_cannot_beat = match first_score_limit {
+                                Some(limit) => {
+                                    std::array::from_fn(|frequency| freq_bounds[frequency] <= limit)
+                                }
+                                None => [false; FREQ_LUT_BUCKETS],
+                            };
+                            freq_cannot_beat_key = Some(key);
+                        }
+                    } else if freq_cannot_beat_key.is_some() {
+                        freq_cannot_beat = [false; FREQ_LUT_BUCKETS];
+                        freq_cannot_beat_key = None;
+                    }
+                    #[cfg(test)]
+                    if freq_cannot_beat.iter().any(|&pruned| pruned) {
+                        self.and_window_stats.windows_frequency_pruned += 1;
+                    }
                     #[cfg(target_arch = "x86_64")]
-                    (2, true, true) => unsafe {
-                        merge_window_2_avx2(
+                    let use_avx2 = *HAS_AVX2;
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let use_avx2 = false;
+                    match (num_lists, use_avx2, window_started_with_floor) {
+                        (1, _, _) => merge_window_1(&wins, &mut batch_docs, &mut batch_offs),
+                        #[cfg(target_arch = "x86_64")]
+                        (2, true, false) => unsafe {
+                            merge_window_docs_2_avx2(&wins, &mut batch_docs, &mut batch_offs)
+                        },
+                        #[cfg(target_arch = "x86_64")]
+                        (3, true, false) => unsafe {
+                            merge_window_docs_3_avx2(&wins, &mut batch_docs, &mut batch_offs)
+                        },
+                        (2, _, false) => unsafe {
+                            merge_window_docs_2(&wins, &mut batch_docs, &mut batch_offs)
+                        },
+                        (3, _, false) => unsafe {
+                            merge_window_docs_3(&wins, &mut batch_docs, &mut batch_offs)
+                        },
+                        (_, _, false) if use_pairwise_intersection => {
+                            #[cfg(test)]
+                            {
+                                self.and_window_stats.pairwise_intersections += 1;
+                            }
+                            merge_window_docs_pairwise(
+                                &wins,
+                                &mut intersection_scratch,
+                                &mut batch_docs,
+                                &mut batch_offs,
+                            )
+                        }
+                        (_, _, false) => merge_window_docs_n(
                             &wins,
-                            &freq_cannot_beat,
-                            &mut batch_docs,
-                            &mut batch_offs,
-                        )
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (3, true, true) => unsafe {
-                        merge_window_3_avx2(
-                            &wins,
-                            &freq_cannot_beat,
-                            &mut batch_docs,
-                            &mut batch_offs,
-                        )
-                    },
-                    (2, _, true) => unsafe {
-                        merge_window_2(&wins, &freq_cannot_beat, &mut batch_docs, &mut batch_offs)
-                    },
-                    (3, _, true) => unsafe {
-                        merge_window_3(&wins, &freq_cannot_beat, &mut batch_docs, &mut batch_offs)
-                    },
-                    #[cfg(target_arch = "x86_64")]
-                    (_, true, true) => unsafe {
-                        merge_window_n_avx2(
-                            &wins,
-                            &freq_cannot_beat,
                             &mut cursor_scratch,
                             &mut batch_docs,
                             &mut batch_offs,
-                        )
-                    },
-                    (_, _, true) => unsafe {
-                        merge_window_n(
-                            &wins,
-                            &freq_cannot_beat,
-                            &mut cursor_scratch,
-                            &mut batch_docs,
-                            &mut batch_offs,
-                        )
-                    },
+                        ),
+                        #[cfg(target_arch = "x86_64")]
+                        (2, true, true) => unsafe {
+                            merge_window_2_avx2(
+                                &wins,
+                                &freq_cannot_beat,
+                                &mut batch_docs,
+                                &mut batch_offs,
+                            )
+                        },
+                        #[cfg(target_arch = "x86_64")]
+                        (3, true, true) => unsafe {
+                            merge_window_3_avx2(
+                                &wins,
+                                &freq_cannot_beat,
+                                &mut batch_docs,
+                                &mut batch_offs,
+                            )
+                        },
+                        (2, _, true) => unsafe {
+                            merge_window_2(
+                                &wins,
+                                &freq_cannot_beat,
+                                &mut batch_docs,
+                                &mut batch_offs,
+                            )
+                        },
+                        (3, _, true) => unsafe {
+                            merge_window_3(
+                                &wins,
+                                &freq_cannot_beat,
+                                &mut batch_docs,
+                                &mut batch_offs,
+                            )
+                        },
+                        #[cfg(target_arch = "x86_64")]
+                        (_, true, true) => unsafe {
+                            merge_window_n_avx2(
+                                &wins,
+                                &freq_cannot_beat,
+                                &mut cursor_scratch,
+                                &mut batch_docs,
+                                &mut batch_offs,
+                            )
+                        },
+                        (_, _, true) => unsafe {
+                            merge_window_n(
+                                &wins,
+                                &freq_cannot_beat,
+                                &mut cursor_scratch,
+                                &mut batch_docs,
+                                &mut batch_offs,
+                            )
+                        },
+                    }
                 }
 
                 if !batch_docs.is_empty() {
