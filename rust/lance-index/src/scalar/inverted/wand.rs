@@ -2566,6 +2566,8 @@ struct AndWindowStats {
     // Lead frequency decodes; a window retired by the whole-window bound must
     // not add one.
     wide_lead_freq_decodes: usize,
+    // Followers intersected from a decoded scratch instead of per block.
+    wide_scratch_followers: usize,
 }
 
 impl Eq for TailPosting {}
@@ -5034,128 +5036,270 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let mut out = 0usize;
                 let mut max_next_j: u64 = 0;
                 let mut last_decoded: Option<usize> = None;
-                while i < n {
-                    let doc = unsafe { *docs0_ptr.add(lead_lo + st.sel[i] as usize) };
-                    if fb + 1 < num_blocks && doc >= list.block_least_doc_id(fb + 1) {
-                        fb = posting.block_idx_for_doc(list, fb, doc);
-                        fpos = 0;
-                    }
-                    let segment_end_doc = if fb + 1 < num_blocks {
-                        list.block_least_doc_id(fb + 1) - 1
-                    } else {
-                        u32::MAX
-                    };
-                    let mut i_end = i;
-                    while i_end < n {
-                        let next = unsafe { *docs0_ptr.add(lead_lo + st.sel[i_end] as usize) };
-                        if next > segment_end_doc {
-                            break;
-                        }
-                        i_end += 1;
-                    }
-                    // The cursor must skip the whole block, not just its last
-                    // survivor, so remember this before any compaction.
-                    let segment_last =
-                        unsafe { *docs0_ptr.add(lead_lo + st.sel[i_end - 1] as usize) };
-                    pruned[i..i_end].fill(false);
-                    let mut keep = i_end - i;
-                    if prunable {
-                        let rem = next_up_f64(
-                            f64::from(posting.block_bound_at(fb, &wand.scorer)) + suffix[j + 1],
-                        );
-                        // Frequency one is the weakest a posting can be: when
-                        // even that clears the floor, nothing can be cut.
-                        let weakest = (0..j)
-                            .map(|c| f64::from(st.lut[c * FREQ_LUT_BUCKETS + 1]))
-                            .sum::<f64>();
-                        if score_sum_cannot_compete(0.0, weakest + rem, floor_w, factor, mode) {
-                            // The index feeds the candidate columns as well as
-                            // the marks, so walking the range is the natural
-                            // shape here.
-                            #[allow(clippy::needless_range_loop)]
-                            for x in i..i_end {
-                                let origin = st.sel[x] as usize;
-                                let bound = (0..j)
-                                    .map(|c| {
-                                        let freq = (st.freq[c * cap + origin] as usize)
-                                            .min(FREQ_LUT_BUCKETS - 1);
-                                        f64::from(st.lut[c * FREQ_LUT_BUCKETS + freq])
-                                    })
-                                    .sum::<f64>();
-                                if score_sum_cannot_compete(0.0, bound + rem, floor_w, factor, mode)
-                                {
-                                    pruned[x] = true;
-                                    keep -= 1;
-                                }
-                            }
+                // No floor: every touched block would be decoded anyway. When
+                // each block holds at least one candidate (m >= nb), gather
+                // those blocks into one scratch and intersect once. Hit writes
+                // match the per-block loop, including the survivor index.
+                let mut used_scratch = false;
+                if !prunable && n > 0 {
+                    let mut nb = 0usize;
+                    let mut scan_block = fb;
+                    let mut previous = usize::MAX;
+                    for s in 0..n {
+                        let doc = unsafe { *docs0_ptr.add(lead_lo + st.sel[s] as usize) };
+                        scan_block = posting.block_idx_for_doc(list, scan_block, doc);
+                        if scan_block != previous {
+                            nb += 1;
+                            previous = scan_block;
                         }
                     }
-                    pruning |= keep != i_end - i;
-                    if keep == 0 {
-                        // Every candidate in this block is out of reach, so the
-                        // block is not decoded and the cursor stays where it was:
-                        // the bound already accounts for the whole block.
+                    if n >= nb && nb > 0 {
+                        used_scratch = true;
                         #[cfg(test)]
                         {
-                            wand.and_window_stats.wide_blocks_skipped += 1;
+                            wand.and_window_stats.wide_scratch_followers += 1;
                         }
-                        i = i_end;
-                        continue;
-                    }
-                    let (docs_b, len_b) = {
-                        let state = unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, fb) };
-                        (state.doc_ids.as_ptr(), state.doc_ids.len())
-                    };
-                    last_decoded = Some(fb);
-                    // Frequencies stay packed until the first hit: a block that
-                    // no candidate lands in costs one doc-id decode only.
-                    let mut freqs: Option<*const u32> = None;
-                    #[allow(clippy::needless_range_loop)]
-                    for x in i..i_end {
-                        if pruned[x] {
-                            continue;
-                        }
-                        let origin = st.sel[x] as usize;
-                        let doc = unsafe { *docs0_ptr.add(lead_lo + origin) };
-                        fpos = unsafe { find_next_geq(docs_b, fpos, len_b, doc) };
-                        if fpos < len_b && unsafe { *docs_b.add(fpos) } == doc {
-                            let freqs = match freqs {
-                                Some(ptr) => ptr,
-                                None => {
-                                    let state =
-                                        unsafe { &*posting.ensure_compressed_block_ptr(list, fb) };
-                                    let ptr = state.freqs.as_ptr();
-                                    freqs = Some(ptr);
-                                    ptr
-                                }
+                        let block_size = list.block_size;
+                        let mut unpack = vec![0u32; block_size];
+                        let mut scratch_docs = Vec::new();
+                        let mut spans: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(nb);
+                        scan_block = fb;
+                        previous = usize::MAX;
+                        for s in 0..n {
+                            let doc = unsafe { *docs0_ptr.add(lead_lo + st.sel[s] as usize) };
+                            scan_block = posting.block_idx_for_doc(list, scan_block, doc);
+                            if scan_block == previous {
+                                continue;
+                            }
+                            previous = scan_block;
+                            let block = list.blocks.value(scan_block);
+                            let start = scratch_docs.len();
+                            let remainder = list.length as usize % block_size;
+                            let freq_off = if scan_block + 1 == num_blocks && remainder != 0 {
+                                decompress_posting_remainder_doc_ids(
+                                    block,
+                                    remainder,
+                                    list.posting_tail_codec,
+                                    block_size,
+                                    &mut scratch_docs,
+                                )
+                            } else {
+                                decompress_posting_block_doc_ids(
+                                    block,
+                                    &mut unpack,
+                                    &mut scratch_docs,
+                                    block_size,
+                                )
                             };
-                            st.freq[j * cap + origin] = unsafe { *freqs.add(fpos) };
+                            spans.push((scan_block, start, freq_off, remainder));
+                        }
+                        let mut scratch_freqs = vec![0u32; scratch_docs.len()];
+                        let mut freq_ready = vec![false; spans.len()];
+                        let ptr = scratch_docs.as_ptr();
+                        let scratch_len = scratch_docs.len();
+                        let mut spos = 0usize;
+                        let mut span_i = 0usize;
+                        for s in 0..n {
+                            let origin = st.sel[s] as usize;
+                            let doc = unsafe { *docs0_ptr.add(lead_lo + origin) };
+                            spos = unsafe { find_next_geq(ptr, spos, scratch_len, doc) };
+                            if spos >= scratch_len || unsafe { *ptr.add(spos) } != doc {
+                                continue;
+                            }
+                            while span_i + 1 < spans.len() && spans[span_i + 1].1 <= spos {
+                                span_i += 1;
+                            }
+                            let (span_block, span_start, freq_off, remainder) = spans[span_i];
+                            if !freq_ready[span_i] {
+                                let block = list.blocks.value(span_block);
+                                let mut tmp = Vec::new();
+                                if remainder != 0 && span_block + 1 == num_blocks {
+                                    decompress_posting_remainder_frequencies(
+                                        block,
+                                        freq_off,
+                                        remainder,
+                                        list.posting_tail_codec,
+                                        &mut tmp,
+                                    );
+                                } else {
+                                    decompress_posting_block_frequencies(
+                                        block,
+                                        freq_off,
+                                        &mut unpack,
+                                        &mut tmp,
+                                        block_size,
+                                    );
+                                }
+                                let end = span_start + tmp.len();
+                                scratch_freqs[span_start..end].copy_from_slice(&tmp);
+                                freq_ready[span_i] = true;
+                            }
+                            let local = spos - span_start;
+                            st.freq[j * cap + origin] = scratch_freqs[spos];
                             if phrase {
                                 st.pidx[j * cap + origin] =
-                                    u32::try_from((fb << shift) | fpos).unwrap_or(u32::MAX);
+                                    u32::try_from((span_block << shift) | local)
+                                        .unwrap_or(u32::MAX);
                             }
                             st.sel[out] = origin as u8;
-                            debug_assert!(out <= x);
                             out += 1;
                         }
+                        let last_doc = unsafe { *docs0_ptr.add(lead_lo + st.sel[n - 1] as usize) };
+                        spos = unsafe {
+                            find_next_geq(ptr, spos, scratch_len, last_doc.saturating_add(1))
+                        };
+                        let last_span = *spans.last().expect("scratch has a block");
+                        last_decoded = Some(last_span.0);
+                        if spos < scratch_len {
+                            while span_i + 1 < spans.len() && spans[span_i + 1].1 <= spos {
+                                span_i += 1;
+                            }
+                            fb = spans[span_i].0;
+                            fpos = spos - spans[span_i].1;
+                            max_next_j = max_next_j.max(u64::from(scratch_docs[spos]));
+                            last_decoded = Some(fb);
+                        } else if last_span.0 + 1 == num_blocks {
+                            query_done = true;
+                            fb = last_span.0;
+                            fpos = scratch_len - last_span.1;
+                        } else {
+                            fb = last_span.0 + 1;
+                            fpos = 0;
+                            max_next_j = max_next_j.max(u64::from(list.block_least_doc_id(fb)));
+                        }
                     }
-                    fpos = unsafe {
-                        find_next_geq(docs_b, fpos, len_b, segment_last.saturating_add(1))
-                    };
-                    if fpos < len_b {
-                        max_next_j = max_next_j.max(u64::from(unsafe { *docs_b.add(fpos) }));
-                    } else if fb + 1 == num_blocks {
-                        // Nothing left in this follower, so nothing left in the
-                        // window can join; the survivors still have to clear the
-                        // remaining clauses.
-                        query_done = true;
-                        break;
-                    } else {
-                        max_next_j = max_next_j.max(u64::from(list.block_least_doc_id(fb + 1)));
-                        fb += 1;
-                        fpos = 0;
+                }
+                if !used_scratch {
+                    while i < n {
+                        let doc = unsafe { *docs0_ptr.add(lead_lo + st.sel[i] as usize) };
+                        if fb + 1 < num_blocks && doc >= list.block_least_doc_id(fb + 1) {
+                            fb = posting.block_idx_for_doc(list, fb, doc);
+                            fpos = 0;
+                        }
+                        let segment_end_doc = if fb + 1 < num_blocks {
+                            list.block_least_doc_id(fb + 1) - 1
+                        } else {
+                            u32::MAX
+                        };
+                        let mut i_end = i;
+                        while i_end < n {
+                            let next = unsafe { *docs0_ptr.add(lead_lo + st.sel[i_end] as usize) };
+                            if next > segment_end_doc {
+                                break;
+                            }
+                            i_end += 1;
+                        }
+                        // The cursor must skip the whole block, not just its last
+                        // survivor, so remember this before any compaction.
+                        let segment_last =
+                            unsafe { *docs0_ptr.add(lead_lo + st.sel[i_end - 1] as usize) };
+                        pruned[i..i_end].fill(false);
+                        let mut keep = i_end - i;
+                        if prunable {
+                            let rem = next_up_f64(
+                                f64::from(posting.block_bound_at(fb, &wand.scorer)) + suffix[j + 1],
+                            );
+                            // Frequency one is the weakest a posting can be: when
+                            // even that clears the floor, nothing can be cut.
+                            let weakest = (0..j)
+                                .map(|c| f64::from(st.lut[c * FREQ_LUT_BUCKETS + 1]))
+                                .sum::<f64>();
+                            if score_sum_cannot_compete(0.0, weakest + rem, floor_w, factor, mode) {
+                                // The index feeds the candidate columns as well as
+                                // the marks, so walking the range is the natural
+                                // shape here.
+                                #[allow(clippy::needless_range_loop)]
+                                for x in i..i_end {
+                                    let origin = st.sel[x] as usize;
+                                    let bound = (0..j)
+                                        .map(|c| {
+                                            let freq = (st.freq[c * cap + origin] as usize)
+                                                .min(FREQ_LUT_BUCKETS - 1);
+                                            f64::from(st.lut[c * FREQ_LUT_BUCKETS + freq])
+                                        })
+                                        .sum::<f64>();
+                                    if score_sum_cannot_compete(
+                                        0.0,
+                                        bound + rem,
+                                        floor_w,
+                                        factor,
+                                        mode,
+                                    ) {
+                                        pruned[x] = true;
+                                        keep -= 1;
+                                    }
+                                }
+                            }
+                        }
+                        pruning |= keep != i_end - i;
+                        if keep == 0 {
+                            // Every candidate in this block is out of reach, so the
+                            // block is not decoded and the cursor stays where it was:
+                            // the bound already accounts for the whole block.
+                            #[cfg(test)]
+                            {
+                                wand.and_window_stats.wide_blocks_skipped += 1;
+                            }
+                            i = i_end;
+                            continue;
+                        }
+                        let (docs_b, len_b) = {
+                            let state =
+                                unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, fb) };
+                            (state.doc_ids.as_ptr(), state.doc_ids.len())
+                        };
+                        last_decoded = Some(fb);
+                        // Frequencies stay packed until the first hit: a block that
+                        // no candidate lands in costs one doc-id decode only.
+                        let mut freqs: Option<*const u32> = None;
+                        #[allow(clippy::needless_range_loop)]
+                        for x in i..i_end {
+                            if pruned[x] {
+                                continue;
+                            }
+                            let origin = st.sel[x] as usize;
+                            let doc = unsafe { *docs0_ptr.add(lead_lo + origin) };
+                            fpos = unsafe { find_next_geq(docs_b, fpos, len_b, doc) };
+                            if fpos < len_b && unsafe { *docs_b.add(fpos) } == doc {
+                                let freqs = match freqs {
+                                    Some(ptr) => ptr,
+                                    None => {
+                                        let state = unsafe {
+                                            &*posting.ensure_compressed_block_ptr(list, fb)
+                                        };
+                                        let ptr = state.freqs.as_ptr();
+                                        freqs = Some(ptr);
+                                        ptr
+                                    }
+                                };
+                                st.freq[j * cap + origin] = unsafe { *freqs.add(fpos) };
+                                if phrase {
+                                    st.pidx[j * cap + origin] =
+                                        u32::try_from((fb << shift) | fpos).unwrap_or(u32::MAX);
+                                }
+                                st.sel[out] = origin as u8;
+                                debug_assert!(out <= x);
+                                out += 1;
+                            }
+                        }
+                        fpos = unsafe {
+                            find_next_geq(docs_b, fpos, len_b, segment_last.saturating_add(1))
+                        };
+                        if fpos < len_b {
+                            max_next_j = max_next_j.max(u64::from(unsafe { *docs_b.add(fpos) }));
+                        } else if fb + 1 == num_blocks {
+                            // Nothing left in this follower, so nothing left in the
+                            // window can join; the survivors still have to clear the
+                            // remaining clauses.
+                            query_done = true;
+                            break;
+                        } else {
+                            max_next_j = max_next_j.max(u64::from(list.block_least_doc_id(fb + 1)));
+                            fb += 1;
+                            fpos = 0;
+                        }
+                        i = i_end;
                     }
-                    i = i_end;
                 }
                 st.fcur[j] = (fb, fpos);
                 // Only a decoded block moves the clause cursor, and only
