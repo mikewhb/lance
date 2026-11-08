@@ -14963,10 +14963,6 @@ mod tests {
         assert_eq!(run.rows.len(), 2);
     }
 
-    /// G-1: a balanced query (every follower as long as the lead) fails the
-    /// gate, so the wide dispatch never runs; an aligned but skewed query opens
-    /// the gate and still stays narrow, because the narrow window already
-    /// reaches the lead block end. Both must publish the classic rows.
     #[test]
     fn wide_diag_forces_only_auto_and_on_with_two_clauses() {
         assert!(wide_diag_forces(BulkAndMode::Auto, 2, true));
@@ -14976,6 +14972,11 @@ mod tests {
         assert!(!wide_diag_forces(BulkAndMode::Auto, 2, false));
     }
 
+    /// G-1: a balanced query (every follower as long as the lead) fails the
+    /// gate, so the wide dispatch never runs; an aligned but skewed query opens
+    /// the gate and still stays narrow, because the narrow window already
+    /// reaches the lead block end. Both must publish the classic rows.
+    #[test]
     fn wide_gate_keeps_balanced_and_aligned_queries_narrow() {
         let num_docs = 2_048usize;
         let docs = unit_length_docs(num_docs);
