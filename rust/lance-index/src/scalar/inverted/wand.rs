@@ -4391,10 +4391,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let (mut wide_enabled, always) = (gated, false);
         let wide_l2_limit = self.wide_l2_limit;
         let mut wide_misses: usize = 0;
+        // Pairwise only needs one decoded block per clause. Offsets are u8,
+        // and every posting block holds at most 256 entries, so 128-block
+        // blocks are in range. Impacts stay required, matching the k>=4 route.
+        // This arm is selected only when the window has no floor.
         let use_pairwise_intersection = num_lists >= 4
             && self.lead.iter().all(|posting| {
-                matches!(&posting.list, PostingList::Compressed(list)
-                    if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
+                matches!(&posting.list, PostingList::Compressed(list) if list.impacts.is_some())
             });
         let phrase_slop = params.phrase_slop;
         // The bulk path never evaluates score-first windows, so keep the block
@@ -13794,6 +13797,58 @@ mod tests {
         let classic = run(BulkAndMode::Off);
         assert_eq!(run(BulkAndMode::On), classic);
         assert_eq!(run(BulkAndMode::Auto), classic);
+    }
+
+    #[test]
+    fn pairwise_runs_for_128_block_lists_only_with_impacts() {
+        let block_size = 128;
+        let posting_len = block_size * 2 + 3;
+        let num_clauses = 4usize;
+        let docs = CostOnlyDocuments {
+            total_docs: posting_len * 2,
+            visible_cost_upper_bound: posting_len * 2,
+        };
+        let run = |with_impacts: bool| {
+            let postings = (0..num_clauses)
+                .map(|term| {
+                    let mut list = generate_impact_posting_list_with_freqs_and_block_size(
+                        (0..posting_len as u32).collect(),
+                        vec![1; posting_len],
+                        vec![1; posting_len],
+                        block_size,
+                    );
+                    if !with_impacts && let PostingList::Compressed(list) = &mut list {
+                        list.impacts = None;
+                    }
+                    PostingIterator::with_query_weight(
+                        format!("t{term}"),
+                        term as u32,
+                        term as u32,
+                        1.0,
+                        list,
+                        docs.len(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
+                .with_bulk_and_mode(BulkAndMode::On);
+            let hits = wand
+                .search(
+                    &FtsSearchParams::default().with_limit(Some(10)),
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            let rows = hits
+                .into_iter()
+                .map(|hit| (hit.document, hit.freqs))
+                .collect::<Vec<_>>();
+            (rows, wand.and_window_stats.pairwise_intersections)
+        };
+        let (with_impacts, intersections) = run(true);
+        let (without_impacts, none) = run(false);
+        assert!(intersections > 0);
+        assert_eq!(none, 0);
+        assert_eq!(with_impacts, without_impacts);
     }
 
     #[rstest]
