@@ -14075,10 +14075,7 @@ mod tests {
         assert_eq!(hits.len(), 5);
         assert_eq!(
             wand.and_window_stats.pairwise_intersections > 0,
-            num_clauses >= 4
-                && block_size == MAX_POSTING_BLOCK_SIZE
-                && has_impacts
-                && !has_grouped_terms
+            num_clauses >= 4 && has_impacts && !has_grouped_terms
         );
         if has_grouped_terms {
             assert_eq!(wand.bulk_and_searches, 0);
@@ -15012,10 +15009,6 @@ mod tests {
         assert_eq!(run.rows.len(), 2);
     }
 
-    /// G-1: a balanced query (every follower as long as the lead) fails the
-    /// gate, so the wide dispatch never runs; an aligned but skewed query opens
-    /// the gate and still stays narrow, because the narrow window already
-    /// reaches the lead block end. Both must publish the classic rows.
     #[test]
     fn auto_wide_allowed_suppresses_only_auto() {
         assert!(!auto_wide_allowed(BulkAndMode::Auto, true, true));
@@ -15025,6 +15018,11 @@ mod tests {
         assert!(!auto_wide_allowed(BulkAndMode::Auto, false, false));
     }
 
+    /// G-1: a balanced query (every follower as long as the lead) fails the
+    /// gate, so the wide dispatch never runs; an aligned but skewed query opens
+    /// the gate and still stays narrow, because the narrow window already
+    /// reaches the lead block end. Both must publish the classic rows.
+    #[test]
     fn wide_gate_keeps_balanced_and_aligned_queries_narrow() {
         let num_docs = 2_048usize;
         let docs = unit_length_docs(num_docs);
