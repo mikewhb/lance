@@ -347,6 +347,30 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
 
+/// Diagnostic, never merged: Auto stays on the narrow window. `On` still
+/// follows the gate, so a forced-wide run can be paired against this switch.
+static NARROW_ONLY: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_BULK_AND_NARROW_ONLY")
+        .ok()
+        .is_some_and(|value| value == "1")
+});
+
+/// Diagnostic counts for one bulk search. Off unless the env is set, so the
+/// production path does not format a line.
+static NARROW_DIAG: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_NARROW_DIAG")
+        .ok()
+        .is_some_and(|value| value == "1")
+});
+
+/// `narrow_only` suppresses the wide window for Auto only. The gate result
+/// itself is unchanged for `On`.
+fn auto_wide_allowed(mode: BulkAndMode, gate: bool, narrow_only: bool) -> bool {
+    matches!(mode, BulkAndMode::Auto | BulkAndMode::On)
+        && gate
+        && !(narrow_only && matches!(mode, BulkAndMode::Auto))
+}
+
 /// Wide-window override, tests only: Off disables the window even when the
 /// gate opens; Always bypasses the gate. Production follows the gate.
 #[cfg(test)]
@@ -4342,16 +4366,19 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .unwrap_or(MAX_POSTING_BLOCK_SIZE) as u64;
         // A wide window needs a full heap and a lead block the narrow window
         // cannot span; both are checked per window below.
-        let gated = matches!(mode, BulkAndMode::Auto | BulkAndMode::On)
-            && self.lead.len() >= 2
-            && wide_gate(
-                self.lead[0].cost() as u64,
-                self.lead[1..]
-                    .iter()
-                    .map(|posting| posting.cost() as u64)
-                    .sum(),
-                block_size,
-            );
+        let gated = auto_wide_allowed(
+            mode,
+            self.lead.len() >= 2
+                && wide_gate(
+                    self.lead[0].cost() as u64,
+                    self.lead[1..]
+                        .iter()
+                        .map(|posting| posting.cost() as u64)
+                        .sum(),
+                    block_size,
+                ),
+            *NARROW_ONLY,
+        );
         // Tests may force the window on (Always) or off (Off); production
         // follows the gate and L1 only.
         #[cfg(test)]
@@ -5235,8 +5262,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         // Allocated only when a window really opens wide.
         let mut wide_state: Option<WideState> = None;
+        let narrow_diag = *NARROW_DIAG;
+        let mut diag_windows: usize = 0;
+        let mut diag_decodes: usize = 0;
 
         'window: loop {
+            if narrow_diag {
+                diag_windows += 1;
+            }
             #[cfg(test)]
             {
                 self.and_window_stats.windows_sliced += 1;
@@ -5366,6 +5399,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     unreachable!("bulk AND requires compressed postings");
                 };
                 let block_idx = posting.block_idx;
+                if narrow_diag {
+                    diag_decodes += 1;
+                }
                 let state = unsafe { &mut *posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
                 let doc_ids = state.doc_ids.as_slice();
                 let len = doc_ids.len();
@@ -5739,6 +5775,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
 
         metrics.record_comparisons(num_comparisons);
+        if narrow_diag {
+            #[allow(clippy::print_stderr)]
+            {
+                eprintln!("fts-narrow-diag windows={diag_windows} decodes={diag_decodes}");
+            }
+        }
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
@@ -14920,6 +14962,14 @@ mod tests {
     /// the gate and still stays narrow, because the narrow window already
     /// reaches the lead block end. Both must publish the classic rows.
     #[test]
+    fn auto_wide_allowed_suppresses_only_auto() {
+        assert!(!auto_wide_allowed(BulkAndMode::Auto, true, true));
+        assert!(auto_wide_allowed(BulkAndMode::Auto, true, false));
+        assert!(auto_wide_allowed(BulkAndMode::On, true, true));
+        assert!(!auto_wide_allowed(BulkAndMode::Off, true, false));
+        assert!(!auto_wide_allowed(BulkAndMode::Auto, false, false));
+    }
+
     fn wide_gate_keeps_balanced_and_aligned_queries_narrow() {
         let num_docs = 2_048usize;
         let docs = unit_length_docs(num_docs);
