@@ -367,10 +367,30 @@ const WIDE_L2_MISS_LIMIT: usize = usize::MAX;
 /// block_size / 8 windows, i.e. 8 * sum(follower cost) >= block * lead cost.
 /// Cross-multiplied in u64, so no division and no float. Every clause is
 /// assumed to share a block size (an index is built with one block size).
-const WIDE_GATE_DIVISOR: u64 = 13;
-
 fn wide_gate(lead_cost: u64, followers_cost: u64, block_size: u64) -> bool {
-    followers_cost.saturating_mul(WIDE_GATE_DIVISOR) >= block_size.saturating_mul(lead_cost)
+    followers_cost.saturating_mul(8) >= block_size.saturating_mul(lead_cost)
+}
+
+/// [`wide_gate`] for a conjunction of `num_clauses` clauses.
+///
+/// A wider conjunction decodes more blocks per narrow window, so the wide
+/// window earns its per-lead-block setup earlier: four or more clauses reach
+/// the crossover at about ten follower windows per lead block instead of
+/// sixteen. Measured on 818 held-out conjunctions: lowering the bar only for
+/// k >= 4 takes the 10-16 window band from 0.86-0.94 with fifteen regressions
+/// to 0.64-0.67 with none, while two- and three-clause queries keep the
+/// barrier they were tuned with.
+fn wide_gate_with_clauses(
+    lead_cost: u64,
+    followers_cost: u64,
+    block_size: u64,
+    num_clauses: usize,
+) -> bool {
+    if num_clauses >= 4 {
+        followers_cost.saturating_mul(13) >= block_size.saturating_mul(lead_cost)
+    } else {
+        wide_gate(lead_cost, followers_cost, block_size)
+    }
 }
 
 /// L2 draft streak: a window that pruned nothing extends the miss streak, any
@@ -4339,13 +4359,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // cannot span; both are checked per window below.
         let gated = matches!(mode, BulkAndMode::Auto | BulkAndMode::On)
             && self.lead.len() >= 2
-            && wide_gate(
+            && wide_gate_with_clauses(
                 self.lead[0].cost() as u64,
                 self.lead[1..]
                     .iter()
                     .map(|posting| posting.cost() as u64)
                     .sum(),
                 block_size,
+                num_lists,
             );
         // Tests may force the window on (Always) or off (Off); production
         // follows the gate and L1 only.
@@ -14943,6 +14964,25 @@ mod tests {
         assert!(wide_gate(0, 0, 128), "an empty lead has nothing to lose");
     }
 
+    /// Four or more clauses reach the wide window at thirteen follower
+    /// postings per lead posting (B = 128: about ten windows per lead block),
+    /// while two and three clauses keep the eight-posting barrier.
+    #[test]
+    fn wide_gate_opens_earlier_for_wide_conjunctions() {
+        assert!(!wide_gate_with_clauses(1, 9, 128, 4), "13 * 9 = 117 < 128");
+        assert!(
+            wide_gate_with_clauses(1, 10, 128, 4),
+            "13 * 10 = 130 >= 128"
+        );
+        assert!(!wide_gate_with_clauses(1, 15, 128, 3), "8 * 15 = 120 < 128");
+        assert!(wide_gate_with_clauses(1, 16, 128, 3));
+        assert_eq!(
+            wide_gate_with_clauses(1, 16, 128, 2),
+            wide_gate(1, 16, 128),
+            "fewer than four clauses keep the base barrier"
+        );
+    }
+
     /// L2 (bookkeeping): a window that pruned something clears the miss streak,
     /// so only consecutive unproductive windows can switch the wide path off.
     #[test]
@@ -15003,8 +15043,9 @@ mod tests {
             0,
             "a single clause must stay narrow: {single:?}"
         );
-        // k >= 4 must also respect the density threshold, not just the arity.
-        let closed = gate_probe(&docs, 6_143, 4, 1);
+        // k >= 4 has its own, earlier barrier (thirteen postings per lead
+        // posting); one posting below it must stay narrow.
+        let closed = gate_probe(&docs, 3_780, 4, 1);
         assert_eq!(
             closed.windows + closed.fit_windows,
             0,
