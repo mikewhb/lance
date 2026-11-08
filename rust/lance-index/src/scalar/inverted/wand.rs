@@ -5099,50 +5099,154 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         let scratch_len = scratch_docs.len();
                         let mut spos = 0usize;
                         let mut span_i = 0usize;
-                        for s in 0..n {
-                            let origin = st.sel[s] as usize;
-                            let doc = unsafe { *docs0_ptr.add(lead_lo + origin) };
-                            spos = unsafe { find_next_geq(ptr, spos, scratch_len, doc) };
-                            if spos >= scratch_len || unsafe { *ptr.add(spos) } != doc {
-                                continue;
-                            }
-                            while span_i + 1 < spans.len() && spans[span_i + 1].1 <= spos {
-                                span_i += 1;
-                            }
-                            let (span_block, span_start, freq_off, remainder) = spans[span_i];
-                            if !freq_ready[span_i] {
-                                let block = list.blocks.value(span_block);
-                                let mut tmp = Vec::new();
-                                if remainder != 0 && span_block + 1 == num_blocks {
-                                    decompress_posting_remainder_frequencies(
-                                        block,
-                                        freq_off,
-                                        remainder,
-                                        list.posting_tail_codec,
-                                        &mut tmp,
-                                    );
-                                } else {
-                                    decompress_posting_block_frequencies(
-                                        block,
-                                        freq_off,
-                                        &mut unpack,
-                                        &mut tmp,
-                                        block_size,
+                        // Each scratch span is one follower block, so its
+                        // length fits in u8. The 2-way kernel gallops both
+                        // sides; a longer scratch would truncate the offset.
+                        #[cfg(target_arch = "x86_64")]
+                        let simd_done = if *HAS_AVX2 {
+                            let mut cand = 0usize;
+                            for span_i in 0..spans.len() {
+                                let (span_block, span_start, freq_off, remainder) = spans[span_i];
+                                let span_end = spans
+                                    .get(span_i + 1)
+                                    .map(|span| span.1)
+                                    .unwrap_or(scratch_len);
+                                let mut lead_docs = [0u32; MAX_POSTING_BLOCK_SIZE];
+                                let mut origins = [0u8; MAX_POSTING_BLOCK_SIZE];
+                                let mut packed = 0usize;
+                                while cand < n {
+                                    let origin = st.sel[cand] as usize;
+                                    let doc = unsafe { *docs0_ptr.add(lead_lo + origin) };
+                                    if posting.block_idx_for_doc(list, span_block, doc)
+                                        != span_block
+                                    {
+                                        break;
+                                    }
+                                    lead_docs[packed] = doc;
+                                    origins[packed] = origin as u8;
+                                    packed += 1;
+                                    cand += 1;
+                                }
+                                if packed == 0 {
+                                    continue;
+                                }
+                                let windows = [
+                                    WindowList {
+                                        docs: lead_docs.as_ptr(),
+                                        freqs: std::ptr::null(),
+                                        pos: 0,
+                                        end: packed,
+                                        block_start: 0,
+                                    },
+                                    WindowList {
+                                        docs: unsafe { ptr.add(span_start) },
+                                        freqs: std::ptr::null(),
+                                        pos: 0,
+                                        end: span_end - span_start,
+                                        block_start: 0,
+                                    },
+                                ];
+                                let mut hit_docs = Vec::new();
+                                let mut hit_offs = Vec::new();
+                                unsafe {
+                                    merge_window_docs_2_avx2(
+                                        &windows,
+                                        &mut hit_docs,
+                                        &mut hit_offs,
                                     );
                                 }
-                                let end = span_start + tmp.len();
-                                scratch_freqs[span_start..end].copy_from_slice(&tmp);
-                                freq_ready[span_i] = true;
+                                if hit_offs.is_empty() {
+                                    continue;
+                                }
+                                if !freq_ready[span_i] {
+                                    let block = list.blocks.value(span_block);
+                                    let mut tmp = Vec::new();
+                                    if remainder != 0 && span_block + 1 == num_blocks {
+                                        decompress_posting_remainder_frequencies(
+                                            block,
+                                            freq_off,
+                                            remainder,
+                                            list.posting_tail_codec,
+                                            &mut tmp,
+                                        );
+                                    } else {
+                                        decompress_posting_block_frequencies(
+                                            block,
+                                            freq_off,
+                                            &mut unpack,
+                                            &mut tmp,
+                                            block_size,
+                                        );
+                                    }
+                                    let end = span_start + tmp.len();
+                                    scratch_freqs[span_start..end].copy_from_slice(&tmp);
+                                    freq_ready[span_i] = true;
+                                }
+                                for pair in hit_offs.as_chunks::<2>().0 {
+                                    let origin = origins[pair[0] as usize] as usize;
+                                    let local = pair[1] as usize;
+                                    st.freq[j * cap + origin] = scratch_freqs[span_start + local];
+                                    if phrase {
+                                        st.pidx[j * cap + origin] =
+                                            u32::try_from((span_block << shift) | local)
+                                                .unwrap_or(u32::MAX);
+                                    }
+                                    st.sel[out] = origin as u8;
+                                    out += 1;
+                                }
                             }
-                            let local = spos - span_start;
-                            st.freq[j * cap + origin] = scratch_freqs[spos];
-                            if phrase {
-                                st.pidx[j * cap + origin] =
-                                    u32::try_from((span_block << shift) | local)
-                                        .unwrap_or(u32::MAX);
+                            true
+                        } else {
+                            false
+                        };
+                        #[cfg(not(target_arch = "x86_64"))]
+                        let simd_done = false;
+                        if !simd_done {
+                            for s in 0..n {
+                                let origin = st.sel[s] as usize;
+                                let doc = unsafe { *docs0_ptr.add(lead_lo + origin) };
+                                spos = unsafe { find_next_geq(ptr, spos, scratch_len, doc) };
+                                if spos >= scratch_len || unsafe { *ptr.add(spos) } != doc {
+                                    continue;
+                                }
+                                while span_i + 1 < spans.len() && spans[span_i + 1].1 <= spos {
+                                    span_i += 1;
+                                }
+                                let (span_block, span_start, freq_off, remainder) = spans[span_i];
+                                if !freq_ready[span_i] {
+                                    let block = list.blocks.value(span_block);
+                                    let mut tmp = Vec::new();
+                                    if remainder != 0 && span_block + 1 == num_blocks {
+                                        decompress_posting_remainder_frequencies(
+                                            block,
+                                            freq_off,
+                                            remainder,
+                                            list.posting_tail_codec,
+                                            &mut tmp,
+                                        );
+                                    } else {
+                                        decompress_posting_block_frequencies(
+                                            block,
+                                            freq_off,
+                                            &mut unpack,
+                                            &mut tmp,
+                                            block_size,
+                                        );
+                                    }
+                                    let end = span_start + tmp.len();
+                                    scratch_freqs[span_start..end].copy_from_slice(&tmp);
+                                    freq_ready[span_i] = true;
+                                }
+                                let local = spos - span_start;
+                                st.freq[j * cap + origin] = scratch_freqs[spos];
+                                if phrase {
+                                    st.pidx[j * cap + origin] =
+                                        u32::try_from((span_block << shift) | local)
+                                            .unwrap_or(u32::MAX);
+                                }
+                                st.sel[out] = origin as u8;
+                                out += 1;
                             }
-                            st.sel[out] = origin as u8;
-                            out += 1;
                         }
                         let last_doc = unsafe { *docs0_ptr.add(lead_lo + st.sel[n - 1] as usize) };
                         spos = unsafe {
