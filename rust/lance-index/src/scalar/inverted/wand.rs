@@ -347,6 +347,21 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
 
+/// Diagnostic, never the delivery default. `all` forces every Auto/On bulk
+/// window onto the wide kernel, including windows the narrow path already
+/// covers. Unset leaves the gate alone.
+static WIDE_DIAG_ALL: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_BULK_AND_WIDE_DIAG")
+        .ok()
+        .is_some_and(|value| value == "all")
+});
+
+/// True when the diagnostic switch should force the wide window. `Off` in
+/// tests is applied by the caller before this, so a test can still disable it.
+fn wide_diag_forces(mode: BulkAndMode, clauses: usize, diag_all: bool) -> bool {
+    diag_all && matches!(mode, BulkAndMode::Auto | BulkAndMode::On) && clauses >= 2
+}
+
 /// Wide-window override, tests only: Off disables the window even when the
 /// gate opens; Always bypasses the gate. Production follows the gate.
 #[cfg(test)]
@@ -4352,16 +4367,23 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     .sum(),
                 block_size,
             );
-        // Tests may force the window on (Always) or off (Off); production
-        // follows the gate and L1 only.
+        // Tests may force the window on (Always) or off (Off). Off wins over
+        // the diagnostic force. Otherwise `all` sets always, which skips the
+        // fit check and the L2 shutdown.
+        let force_all = wide_diag_forces(mode, self.lead.len(), *WIDE_DIAG_ALL);
         #[cfg(test)]
         let (mut wide_enabled, always) = match self.wide_override {
             Some(WideOverride::Off) => (false, false),
             Some(WideOverride::Always) => (true, true),
+            _ if force_all => (true, true),
             _ => (gated, false),
         };
         #[cfg(not(test))]
-        let (mut wide_enabled, always) = (gated, false);
+        let (mut wide_enabled, always) = if force_all {
+            (true, true)
+        } else {
+            (gated, false)
+        };
         let wide_l2_limit = self.wide_l2_limit;
         let mut wide_misses: usize = 0;
         let use_pairwise_intersection = num_lists >= 4
@@ -14946,6 +14968,14 @@ mod tests {
     /// the gate and still stays narrow, because the narrow window already
     /// reaches the lead block end. Both must publish the classic rows.
     #[test]
+    fn wide_diag_forces_only_auto_and_on_with_two_clauses() {
+        assert!(wide_diag_forces(BulkAndMode::Auto, 2, true));
+        assert!(wide_diag_forces(BulkAndMode::On, 4, true));
+        assert!(!wide_diag_forces(BulkAndMode::Off, 2, true));
+        assert!(!wide_diag_forces(BulkAndMode::Auto, 1, true));
+        assert!(!wide_diag_forces(BulkAndMode::Auto, 2, false));
+    }
+
     fn wide_gate_keeps_balanced_and_aligned_queries_narrow() {
         let num_docs = 2_048usize;
         let docs = unit_length_docs(num_docs);
