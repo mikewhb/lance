@@ -367,8 +367,10 @@ const WIDE_L2_MISS_LIMIT: usize = usize::MAX;
 /// block_size / 8 windows, i.e. 8 * sum(follower cost) >= block * lead cost.
 /// Cross-multiplied in u64, so no division and no float. Every clause is
 /// assumed to share a block size (an index is built with one block size).
+const WIDE_GATE_DIVISOR: u64 = 13;
+
 fn wide_gate(lead_cost: u64, followers_cost: u64, block_size: u64) -> bool {
-    followers_cost.saturating_mul(8) >= block_size.saturating_mul(lead_cost)
+    followers_cost.saturating_mul(WIDE_GATE_DIVISOR) >= block_size.saturating_mul(lead_cost)
 }
 
 /// L2 draft streak: a window that pruned nothing extends the miss streak, any
@@ -2941,7 +2943,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         && self.lead.len() >= 4
                         && self.lead.iter().all(|posting| {
                             matches!(&posting.list, PostingList::Compressed(list)
-                                if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
+                                if list.impacts.is_some())
                         }))
             }
         {
