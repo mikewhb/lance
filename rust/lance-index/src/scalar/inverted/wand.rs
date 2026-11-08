@@ -371,6 +371,51 @@ fn wide_gate(lead_cost: u64, followers_cost: u64, block_size: u64) -> bool {
     followers_cost.saturating_mul(8) >= block_size.saturating_mul(lead_cost)
 }
 
+/// Window a bulk conjunction should use, decided from clause costs alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BulkWindow {
+    /// Neither bulk window pays: keep the classic leapfrog.
+    Classic,
+    /// Aligned lists: decode every clause's block once per window.
+    Narrow,
+    /// Lead-block window: followers are compacted and region-bounded.
+    Wide,
+}
+
+/// `r = followers / lead` is the number of follower windows one lead block is
+/// cut into: a lead block spans `block_size / lead` documents and a follower
+/// block `block_size / cost_j`, so the cuts add up to `sum(cost_j) / lead`.
+///
+/// The narrow merge kernel pays while those cuts are few (it decodes every
+/// clause's block per window, which only amortizes against a handful of
+/// windows), the wide window pays once they are many, and the band between the
+/// two stays on the classic leapfrog: the narrow window has already lost its
+/// alignment and the wide window does not yet earn back the follower
+/// compaction. Both thresholds scale with `block_size`, so a wider block keeps
+/// the same crossover in window counts.
+fn bulk_window_for(lead: &[Box<PostingIterator>]) -> BulkWindow {
+    let Some(head) = lead.first() else {
+        return BulkWindow::Classic;
+    };
+    let block_size = lead
+        .iter()
+        .map(|posting| match &posting.list {
+            PostingList::Compressed(list) => list.block_size,
+            _ => MAX_POSTING_BLOCK_SIZE,
+        })
+        .max()
+        .unwrap_or(MAX_POSTING_BLOCK_SIZE) as u64;
+    let lead_cost = head.cost() as u64;
+    let followers_cost: u64 = lead[1..].iter().map(|posting| posting.cost() as u64).sum();
+    if wide_gate(lead_cost, followers_cost, block_size) {
+        BulkWindow::Wide
+    } else if followers_cost.saturating_mul(16) < block_size.saturating_mul(lead_cost) {
+        BulkWindow::Narrow
+    } else {
+        BulkWindow::Classic
+    }
+}
+
 /// L2 draft streak: a window that pruned nothing extends the miss streak, any
 /// pruning clears it.
 fn l2_streak(streak: usize, ineffective: bool) -> usize {
@@ -2936,13 +2981,26 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let mode = self
                     .bulk_and_mode_override
                     .unwrap_or_else(|| *BULK_AND_MODE);
+                let has_impacts = self.lead.iter().all(|posting| {
+                    matches!(&posting.list, PostingList::Compressed(list)
+                        if list.impacts.is_some())
+                });
+                let all_max_block = self.lead.iter().all(|posting| {
+                    matches!(&posting.list, PostingList::Compressed(list)
+                        if list.block_size == MAX_POSTING_BLOCK_SIZE)
+                });
                 mode.enabled_for(self.lead.len())
                     || (matches!(mode, BulkAndMode::Auto | BulkAndMode::Narrow)
                         && self.lead.len() >= 4
-                        && self.lead.iter().all(|posting| {
-                            matches!(&posting.list, PostingList::Compressed(list)
-                                if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
-                        }))
+                        && has_impacts
+                        && (all_max_block
+                            // A smaller-block conjunction only pays for a bulk
+                            // window where the cost model puts it; otherwise
+                            // the classic leapfrog stays. Narrow keeps the
+                            // ungated routing so it remains a same-routing
+                            // control arm for the two windows.
+                            || matches!(mode, BulkAndMode::Narrow)
+                            || bulk_window_for(&self.lead) != BulkWindow::Classic))
             }
         {
             #[cfg(test)]
@@ -4324,27 +4382,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mode = self
             .bulk_and_mode_override
             .unwrap_or_else(|| *BULK_AND_MODE);
-        let block_size = self
-            .lead
-            .iter()
-            .map(|posting| match &posting.list {
-                PostingList::Compressed(list) => list.block_size,
-                _ => MAX_POSTING_BLOCK_SIZE,
-            })
-            .max()
-            .unwrap_or(MAX_POSTING_BLOCK_SIZE) as u64;
-        // A wide window needs a full heap and a lead block the narrow window
-        // cannot span; both are checked per window below.
+        // A wide window needs a lead block the narrow window cannot span; that
+        // is checked per window below. The decision comes from the same cost
+        // model as the routing decision above, so a bulk conjunction that the
+        // router kept on the classic path never opens one here.
         let gated = matches!(mode, BulkAndMode::Auto | BulkAndMode::On)
             && self.lead.len() >= 2
-            && wide_gate(
-                self.lead[0].cost() as u64,
-                self.lead[1..]
-                    .iter()
-                    .map(|posting| posting.cost() as u64)
-                    .sum(),
-                block_size,
-            );
+            && bulk_window_for(&self.lead) == BulkWindow::Wide;
         // Tests may force the window on (Always) or off (Off); production
         // follows the gate and L1 only.
         #[cfg(test)]
