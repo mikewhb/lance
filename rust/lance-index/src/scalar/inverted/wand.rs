@@ -371,6 +371,32 @@ fn wide_gate(lead_cost: u64, followers_cost: u64, block_size: u64) -> bool {
     followers_cost.saturating_mul(8) >= block_size.saturating_mul(lead_cost)
 }
 
+/// Query-level form of [`wide_gate`] over the conjunction's clauses.
+///
+/// The routing decision needs the same answer as `and_bulk_search`, because a
+/// conjunction that would run every window narrow is cheaper on the classic
+/// leapfrog path: the merge kernel decodes every clause's block once per
+/// window, which only pays when the lead block is dense enough to fill the
+/// window. Keeping the two call sites on one helper keeps them from drifting.
+fn bulk_window_gate(lead: &[Box<PostingIterator>]) -> bool {
+    let Some(head) = lead.first() else {
+        return false;
+    };
+    let block_size = lead
+        .iter()
+        .map(|posting| match &posting.list {
+            PostingList::Compressed(list) => list.block_size,
+            _ => MAX_POSTING_BLOCK_SIZE,
+        })
+        .max()
+        .unwrap_or(MAX_POSTING_BLOCK_SIZE) as u64;
+    wide_gate(
+        head.cost() as u64,
+        lead[1..].iter().map(|posting| posting.cost() as u64).sum(),
+        block_size,
+    )
+}
+
 /// L2 draft streak: a window that pruned nothing extends the miss streak, any
 /// pruning clears it.
 fn l2_streak(streak: usize, ineffective: bool) -> usize {
@@ -2936,13 +2962,26 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let mode = self
                     .bulk_and_mode_override
                     .unwrap_or_else(|| *BULK_AND_MODE);
+                let has_impacts = self.lead.iter().all(|posting| {
+                    matches!(&posting.list, PostingList::Compressed(list)
+                        if list.impacts.is_some())
+                });
+                let all_max_block = self.lead.iter().all(|posting| {
+                    matches!(&posting.list, PostingList::Compressed(list)
+                        if list.block_size == MAX_POSTING_BLOCK_SIZE)
+                });
                 mode.enabled_for(self.lead.len())
                     || (matches!(mode, BulkAndMode::Auto | BulkAndMode::Narrow)
                         && self.lead.len() >= 4
-                        && self.lead.iter().all(|posting| {
-                            matches!(&posting.list, PostingList::Compressed(list)
-                                if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
-                        }))
+                        && has_impacts
+                        && (all_max_block
+                            // A smaller-block conjunction only pays for the
+                            // merge kernel when a wide window will open;
+                            // otherwise the classic leapfrog stays. Narrow
+                            // keeps the ungated routing so it remains a
+                            // same-routing control arm for the wide path.
+                            || matches!(mode, BulkAndMode::Narrow)
+                            || bulk_window_gate(&self.lead)))
             }
         {
             #[cfg(test)]
@@ -4324,27 +4363,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mode = self
             .bulk_and_mode_override
             .unwrap_or_else(|| *BULK_AND_MODE);
-        let block_size = self
-            .lead
-            .iter()
-            .map(|posting| match &posting.list {
-                PostingList::Compressed(list) => list.block_size,
-                _ => MAX_POSTING_BLOCK_SIZE,
-            })
-            .max()
-            .unwrap_or(MAX_POSTING_BLOCK_SIZE) as u64;
-        // A wide window needs a full heap and a lead block the narrow window
-        // cannot span; both are checked per window below.
+        // A wide window needs a lead block the narrow window cannot span; that
+        // is checked per window below. The gate itself is shared with the
+        // routing decision, which already rejected conjunctions it would keep
+        // narrow.
         let gated = matches!(mode, BulkAndMode::Auto | BulkAndMode::On)
             && self.lead.len() >= 2
-            && wide_gate(
-                self.lead[0].cost() as u64,
-                self.lead[1..]
-                    .iter()
-                    .map(|posting| posting.cost() as u64)
-                    .sum(),
-                block_size,
-            );
+            && bulk_window_gate(&self.lead);
         // Tests may force the window on (Always) or off (Off); production
         // follows the gate and L1 only.
         #[cfg(test)]
