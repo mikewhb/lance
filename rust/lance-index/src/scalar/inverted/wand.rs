@@ -401,17 +401,6 @@ fn window_bounds(
     (lo, hi)
 }
 
-/// Doc-id width of one posting block. A rarer term covers more ids per block.
-fn block_id_span(list: &CompressedPostingList, block_idx: usize) -> u64 {
-    let start = u64::from(list.block_least_doc_id(block_idx));
-    let end = if block_idx + 1 < list.blocks.len() {
-        u64::from(list.block_least_doc_id(block_idx + 1))
-    } else {
-        u64::from(u32::MAX)
-    };
-    end.saturating_sub(start).max(1)
-}
-
 /// Wide-window override, tests only: Off disables the window even when the
 /// gate opens; Always bypasses the gate. Production follows the gate.
 #[cfg(test)]
@@ -5670,40 +5659,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         end: hi,
                         block_start: block_idx << list.block_shift(),
                     });
-                    // Intersect the two rarest first when their shorter slice should
-                    // not drive an n-way scan of a denser tail. A shorter
-                    // lead always does. A tie, or a longer lead whose next
-                    // slice is the short one, does when a later block is
-                    // denser in doc-id space and holds more docs than that
-                    // short slice. An empty pair leaves those blocks
-                    // compressed. The window end is unchanged.
-                    let seek_short = j == 1 && num_lists > 2 && window_started_with_floor && {
-                        let lead_span = wins[0].end - wins[0].pos;
-                        let second_span = wins[1].end - wins[1].pos;
-                        let lead_ids = match &self.lead[0].list {
-                            PostingList::Compressed(list) => {
-                                block_id_span(list, self.lead[0].block_idx)
-                            }
-                            PostingList::Plain(_) => 0,
-                        };
-                        let denser_than = |limit: usize| {
-                            lead_ids > 0
-                                && (2..num_lists).any(|fj| {
-                                    let posting = &self.lead[fj];
-                                    let PostingList::Compressed(list) = &posting.list else {
-                                        return false;
-                                    };
-                                    let span = block_id_span(list, posting.block_idx);
-                                    let start = posting.block_idx.saturating_mul(list.block_size);
-                                    let docs = (list.length as usize)
-                                        .saturating_sub(start)
-                                        .min(list.block_size);
-                                    span < lead_ids && docs > limit
-                                })
-                        };
-                        lead_span < second_span
-                            || (lead_span >= second_span && denser_than(second_span.min(lead_span)))
-                    };
+                    // With a third clause and a floor, intersect the two rarest
+                    // first and stop at the first later miss. An empty pair
+                    // leaves the remaining blocks compressed. The window end
+                    // is unchanged.
+                    let seek_short = j == 1 && num_lists > 2 && window_started_with_floor;
                     if seek_short {
                         if narrow_diag {
                             diag_short += 1;
