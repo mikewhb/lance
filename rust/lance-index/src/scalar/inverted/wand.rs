@@ -5322,26 +5322,35 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             debug_assert!(target <= u32::MAX as u64);
             let target32 = target as u32;
 
-            // Position every clause's block cursor at the block that can hold
-            // `target`, and end the window at the nearest next-block boundary.
-            let mut win_end = TERMINATED_DOC_ID;
-            for j in 0..num_lists {
-                let (block_idx, block_up_to) = {
-                    let posting = &self.lead[j];
-                    let PostingList::Compressed(ref list) = posting.list else {
-                        unreachable!("bulk AND requires compressed postings");
+            // A positive floor already positioned every clause in
+            // `and_advance_target` and stored the min block end in `up_to`.
+            // That end is the same nearest block boundary. Walking
+            // `block_idx_for_doc` again only repeats it.
+            let win_end = if window_started_with_floor {
+                self.up_to
+                    .expect("a competitive floor window has a block end")
+            } else {
+                let mut win_end = TERMINATED_DOC_ID;
+                for j in 0..num_lists {
+                    let (block_idx, block_up_to) = {
+                        let posting = &self.lead[j];
+                        let PostingList::Compressed(ref list) = posting.list else {
+                            unreachable!("bulk AND requires compressed postings");
+                        };
+                        let block_idx =
+                            posting.block_idx_for_doc(list, posting.block_idx, target32);
+                        let block_up_to = if block_idx + 1 < list.blocks.len() {
+                            u64::from(list.block_least_doc_id(block_idx + 1)).saturating_sub(1)
+                        } else {
+                            TERMINATED_DOC_ID
+                        };
+                        (block_idx, block_up_to.max(target))
                     };
-                    let block_idx = posting.block_idx_for_doc(list, posting.block_idx, target32);
-                    let block_up_to = if block_idx + 1 < list.blocks.len() {
-                        u64::from(list.block_least_doc_id(block_idx + 1)).saturating_sub(1)
-                    } else {
-                        TERMINATED_DOC_ID
-                    };
-                    (block_idx, block_up_to.max(target))
-                };
-                self.lead[j].block_idx = block_idx;
-                win_end = win_end.min(block_up_to);
-            }
+                    self.lead[j].block_idx = block_idx;
+                    win_end = win_end.min(block_up_to);
+                }
+                win_end
+            };
             let win_end32 = u32::try_from(win_end).unwrap_or(u32::MAX);
 
             // Wide-window dispatch. The narrow window ends at the nearest
