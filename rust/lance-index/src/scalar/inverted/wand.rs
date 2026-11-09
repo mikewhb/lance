@@ -4359,15 +4359,16 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // cannot span; both are checked per window below.
         let gated = matches!(mode, BulkAndMode::Auto | BulkAndMode::On)
             && self.lead.len() >= 2
-            && wide_gate_with_clauses(
+            && (self.lead.len() >= 4
+                || wide_gate_with_clauses(
                 self.lead[0].cost() as u64,
                 self.lead[1..]
                     .iter()
                     .map(|posting| posting.cost() as u64)
                     .sum(),
-                block_size,
-                num_lists,
-            );
+                    block_size,
+                    num_lists,
+                ));
         // Tests may force the window on (Always) or off (Off); production
         // follows the gate and L1 only.
         #[cfg(test)]
