@@ -5299,6 +5299,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut diag_windows: usize = 0;
         let mut diag_decodes: usize = 0;
         let mut diag_short: usize = 0;
+        let mut diag_one: usize = 0;
         let mut diag_nway: usize = 0;
 
         'window: loop {
@@ -5668,66 +5669,99 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         if narrow_diag {
                             diag_short += 1;
                         }
-                        let others_block_max: f64 = self.lead[1..]
-                            .iter()
-                            .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
-                            .sum();
-                        // Frequency 1 is the weakest positive bound. If it
-                        // still clears the floor, every real posting does too,
-                        // and decoding the lead frequencies cannot drop a doc.
-                        let bounds = freq_bounds
-                            .as_ref()
-                            .expect("positive threshold should initialize the frequency bound LUT");
-                        let screen_can_drop = bounds[1].is_finite()
-                            && score_sum_cannot_compete(
-                                bounds[1],
-                                others_block_max,
-                                self.threshold,
-                                score_sum_upper_bound_factor(num_lists),
-                                CompetitiveFloorMode::Exclusive,
-                            );
                         batch_docs.clear();
                         batch_offs.clear();
-                        if screen_can_drop {
-                            let key = (self.threshold.to_bits(), others_block_max.to_bits());
-                            if first_score_limit_key != Some(key) {
-                                first_score_limit = exclusive_partial_score_limit(
+                        let one_lead = wins[0].end - wins[0].pos == 1;
+                        if one_lead {
+                            if narrow_diag {
+                                diag_one += 1;
+                            }
+                            // One lead doc. Seek it directly. Pass B still
+                            // drops a hit the frequency screen would have
+                            // rejected, without decoding that frequency block
+                            // or calling the two-list merge.
+                            let doc = unsafe { *wins[0].docs.add(wins[0].pos) };
+                            let second_pos = unsafe {
+                                find_next_geq(wins[1].docs, wins[1].pos, wins[1].end, doc)
+                            };
+                            if second_pos < wins[1].end
+                                && unsafe { *wins[1].docs.add(second_pos) } == doc
+                            {
+                                batch_docs.push(doc);
+                                batch_offs.resize(num_lists, 0);
+                                batch_offs[0] = wins[0].pos as u8;
+                                batch_offs[1] = second_pos as u8;
+                            }
+                        } else {
+                            let others_block_max: f64 = self.lead[1..]
+                                .iter()
+                                .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+                                .sum();
+                            // Frequency 1 is the weakest positive bound. If it
+                            // still clears the floor, every real posting does too,
+                            // and decoding the lead frequencies cannot drop a doc.
+                            let bounds = freq_bounds.as_ref().expect(
+                                "positive threshold should initialize the frequency bound LUT",
+                            );
+                            let screen_can_drop = bounds[1].is_finite()
+                                && score_sum_cannot_compete(
+                                    bounds[1],
                                     others_block_max,
                                     self.threshold,
                                     score_sum_upper_bound_factor(num_lists),
+                                    CompetitiveFloorMode::Exclusive,
                                 );
-                                first_score_limit_key = Some(key);
-                            }
-                            if freq_cannot_beat_key != Some(key) {
-                                freq_cannot_beat = match first_score_limit {
-                                    Some(limit) => {
-                                        std::array::from_fn(|frequency| bounds[frequency] <= limit)
-                                    }
-                                    None => [false; FREQ_LUT_BUCKETS],
-                                };
-                                freq_cannot_beat_key = Some(key);
-                            }
-                            let freq_ptr = {
-                                let lead = &self.lead[0];
-                                let PostingList::Compressed(ref lead_list) = lead.list else {
-                                    unreachable!("bulk AND requires compressed postings");
-                                };
-                                let lead_state = unsafe {
-                                    &*lead.ensure_compressed_block_ptr(lead_list, lead.block_idx)
-                                };
-                                lead_state.freqs.as_ptr()
-                            };
-                            wins[0].freqs = freq_ptr;
-                            #[cfg(target_arch = "x86_64")]
-                            unsafe {
-                                if *HAS_AVX2 {
-                                    merge_window_2_avx2(
-                                        &wins,
-                                        &freq_cannot_beat,
-                                        &mut batch_docs,
-                                        &mut batch_offs,
+                            if screen_can_drop {
+                                let key = (self.threshold.to_bits(), others_block_max.to_bits());
+                                if first_score_limit_key != Some(key) {
+                                    first_score_limit = exclusive_partial_score_limit(
+                                        others_block_max,
+                                        self.threshold,
+                                        score_sum_upper_bound_factor(num_lists),
                                     );
-                                } else {
+                                    first_score_limit_key = Some(key);
+                                }
+                                if freq_cannot_beat_key != Some(key) {
+                                    freq_cannot_beat = match first_score_limit {
+                                        Some(limit) => std::array::from_fn(|frequency| {
+                                            bounds[frequency] <= limit
+                                        }),
+                                        None => [false; FREQ_LUT_BUCKETS],
+                                    };
+                                    freq_cannot_beat_key = Some(key);
+                                }
+                                let freq_ptr = {
+                                    let lead = &self.lead[0];
+                                    let PostingList::Compressed(ref lead_list) = lead.list else {
+                                        unreachable!("bulk AND requires compressed postings");
+                                    };
+                                    let lead_state = unsafe {
+                                        &*lead
+                                            .ensure_compressed_block_ptr(lead_list, lead.block_idx)
+                                    };
+                                    lead_state.freqs.as_ptr()
+                                };
+                                wins[0].freqs = freq_ptr;
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    if *HAS_AVX2 {
+                                        merge_window_2_avx2(
+                                            &wins,
+                                            &freq_cannot_beat,
+                                            &mut batch_docs,
+                                            &mut batch_offs,
+                                        );
+                                    } else {
+                                        merge_window_2(
+                                            &wins,
+                                            &freq_cannot_beat,
+                                            &mut batch_docs,
+                                            &mut batch_offs,
+                                        );
+                                    }
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                unsafe {
                                     merge_window_2(
                                         &wins,
                                         &freq_cannot_beat,
@@ -5735,48 +5769,42 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                         &mut batch_offs,
                                     );
                                 }
-                            }
-                            #[cfg(not(target_arch = "x86_64"))]
-                            unsafe {
-                                merge_window_2(
-                                    &wins,
-                                    &freq_cannot_beat,
-                                    &mut batch_docs,
-                                    &mut batch_offs,
-                                );
-                            }
-                        } else {
-                            #[cfg(target_arch = "x86_64")]
-                            unsafe {
-                                if *HAS_AVX2 {
-                                    merge_window_docs_2_avx2(
-                                        &wins,
-                                        &mut batch_docs,
-                                        &mut batch_offs,
-                                    );
-                                } else {
+                            } else {
+                                #[cfg(target_arch = "x86_64")]
+                                unsafe {
+                                    if *HAS_AVX2 {
+                                        merge_window_docs_2_avx2(
+                                            &wins,
+                                            &mut batch_docs,
+                                            &mut batch_offs,
+                                        );
+                                    } else {
+                                        merge_window_docs_2(
+                                            &wins,
+                                            &mut batch_docs,
+                                            &mut batch_offs,
+                                        );
+                                    }
+                                }
+                                #[cfg(not(target_arch = "x86_64"))]
+                                unsafe {
                                     merge_window_docs_2(&wins, &mut batch_docs, &mut batch_offs);
                                 }
                             }
-                            #[cfg(not(target_arch = "x86_64"))]
-                            unsafe {
-                                merge_window_docs_2(&wins, &mut batch_docs, &mut batch_offs);
+                            if !batch_docs.is_empty() {
+                                let survivor_count = batch_docs.len();
+                                batch_offs.resize(survivor_count * num_lists, 0);
+                                for i in (0..survivor_count).rev() {
+                                    let lead_off = batch_offs[i * 2];
+                                    let second_off = batch_offs[i * 2 + 1];
+                                    batch_offs[i * num_lists] = lead_off;
+                                    batch_offs[i * num_lists + 1] = second_off;
+                                }
                             }
                         }
                         if batch_docs.is_empty() {
                             skip_window = true;
                             break;
-                        }
-                        // Two-way offsets are packed at stride 2. Scoring
-                        // reads stride `num_lists`, so spread them before
-                        // appending one offset per later clause.
-                        let survivor_count = batch_docs.len();
-                        batch_offs.resize(survivor_count * num_lists, 0);
-                        for i in (0..survivor_count).rev() {
-                            let lead_off = batch_offs[i * 2];
-                            let second_off = batch_offs[i * 2 + 1];
-                            batch_offs[i * num_lists] = lead_off;
-                            batch_offs[i * num_lists + 1] = second_off;
                         }
                         let mut alive = true;
                         for fj in 2..num_lists {
@@ -6205,7 +6233,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             #[allow(clippy::print_stderr)]
             {
                 eprintln!(
-                    "fts-narrow-diag windows={diag_windows} decodes={diag_decodes} short={diag_short} nway={diag_nway}"
+                    "fts-narrow-diag windows={diag_windows} decodes={diag_decodes} short={diag_short} one={diag_one} nway={diag_nway}"
                 );
             }
         }
