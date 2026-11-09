@@ -5624,18 +5624,19 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         lo + doc_ids[lo..].partition_point(|&doc| doc <= win_end32)
                     };
                     slice_prev[j] = (block_idx, hi);
+                    // A later conjunction has to sit in every clause, so it
+                    // cannot start before the latest of these next docs.
+                    // The window end itself stays the nearest block boundary.
+                    let next_doc = if hi < len {
+                        u64::from(doc_ids[hi])
+                    } else if block_idx + 1 < list.blocks.len() {
+                        u64::from(list.block_least_doc_id(block_idx + 1))
+                    } else {
+                        TERMINATED_DOC_ID
+                    };
+                    jump_to = jump_to.max(next_doc);
                     if lo == hi {
-                        // No docs of this clause in the window: the whole window
-                        // has no conjunction match. If this was the clause's last
-                        // block and it is fully behind the target, the clause is
-                        // exhausted and the conjunction is done.
-                        if lo < state.doc_ids.len() {
-                            jump_to = u64::from(state.doc_ids[lo]);
-                        } else if block_idx + 1 < list.blocks.len() {
-                            jump_to = u64::from(list.block_least_doc_id(block_idx + 1));
-                        } else {
-                            exhausted = true;
-                        }
+                        exhausted = next_doc == TERMINATED_DOC_ID;
                         skip_window = true;
                         break;
                     }
@@ -5981,7 +5982,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
             }
 
-            if win_end == TERMINATED_DOC_ID {
+            if win_end == TERMINATED_DOC_ID || jump_to == TERMINATED_DOC_ID {
                 break;
             }
             target = (win_end + 1).max(jump_to);
