@@ -5670,13 +5670,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         end: hi,
                         block_start: block_idx << list.block_shift(),
                     });
-                    // The lead slice is the short side of this window, or it
-                    // ties the next clause while a later block is denser and
-                    // longer than this slice. Intersect the two rarest first.
-                    // An empty pair leaves the denser blocks compressed; a
-                    // short survivor list is filtered clause by clause.
-                    // A longer lead stays on the n-way kernel. The window end
-                    // is unchanged.
+                    // Intersect the two rarest first when their shorter slice should
+                    // not drive an n-way scan of a denser tail. A shorter
+                    // lead always does. A tie, or a longer lead whose next
+                    // slice is the short one, does when a later block is
+                    // denser in doc-id space and holds more docs than that
+                    // short slice. An empty pair leaves those blocks
+                    // compressed. The window end is unchanged.
                     let seek_short = j == 1 && num_lists > 2 && window_started_with_floor && {
                         let lead_span = wins[0].end - wins[0].pos;
                         let second_span = wins[1].end - wins[1].pos;
@@ -5686,9 +5686,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             }
                             PostingList::Plain(_) => 0,
                         };
-                        lead_span < second_span
-                            || (lead_span == second_span
-                                && lead_ids > 0
+                        let denser_than = |limit: usize| {
+                            lead_ids > 0
                                 && (2..num_lists).any(|fj| {
                                     let posting = &self.lead[fj];
                                     let PostingList::Compressed(list) = &posting.list else {
@@ -5699,8 +5698,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                     let docs = (list.length as usize)
                                         .saturating_sub(start)
                                         .min(list.block_size);
-                                    span < lead_ids && docs > lead_span
-                                }))
+                                    span < lead_ids && docs > limit
+                                })
+                        };
+                        lead_span < second_span
+                            || (lead_span >= second_span && denser_than(second_span.min(lead_span)))
                     };
                     if seek_short {
                         if narrow_diag {
