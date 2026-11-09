@@ -5432,7 +5432,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // `slice_prev`; that value is only a resume hint, never a cursor
             // that skips unread docs.
             let mut used_lazy = false;
-            if window_started_with_floor && num_lists >= 2 {
+            // The scalar per-follower walk is slower than the narrow-window
+            // merge kernel on the queries that dominate TOP_10 time. The
+            // kernel still drops a lead doc whose frequency bound loses to
+            // the floor. The window end stays the nearest block boundary.
+            let use_scalar_lazy = false;
+            if use_scalar_lazy && window_started_with_floor && num_lists >= 2 {
                 used_lazy = true;
                 batch_docs.clear();
                 batch_offs.clear();
