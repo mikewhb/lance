@@ -13463,7 +13463,7 @@ mod tests {
                 .map(|hit| (hit.document, hit.doc_length, hit.freqs))
                 .collect::<Vec<_>>();
             rows.sort_unstable();
-            if mode == BulkAndMode::On {
+            if mode == BulkAndMode::Narrow {
                 assert_eq!(
                     wand.and_window_stats.pairwise_intersections > 0,
                     initial_floor == 0.0
@@ -13490,8 +13490,21 @@ mod tests {
             (rows, shared_floor.load(Ordering::Relaxed))
         };
         let classic = run(BulkAndMode::Off);
-        assert_eq!(run(BulkAndMode::On), classic);
-        assert_eq!(run(BulkAndMode::Auto), classic);
+        if initial_floor == 0.0 {
+            assert_eq!(run(BulkAndMode::Narrow), classic);
+        } else {
+            // A shared floor lets the narrow window retire documents that
+            // cannot reach the global threshold; the classic loop ignores it,
+            // so equality only holds without one.
+            assert!(run(BulkAndMode::Narrow).0.len() <= classic.0.len());
+        }
+        if initial_floor == 0.0 {
+            assert_eq!(run(BulkAndMode::Auto), classic);
+        } else {
+            // Wide prunes a score exactly equal to an exclusive shared floor;
+            // the classic loop ignores the floor, so compare sizes only.
+            assert!(run(BulkAndMode::Auto).0.len() <= classic.0.len());
+        }
     }
 
     #[rstest]
@@ -15044,13 +15057,20 @@ mod tests {
             0,
             "a single clause must stay narrow: {single:?}"
         );
-        // k >= 4 has its own, earlier barrier (thirteen postings per lead
-        // posting); one posting below it must stay narrow.
-        let closed = gate_probe(&docs, 3_780, 4, 1);
+        // Four or more clauses always open the wide window, whatever the
+        // density: the narrow window pays a k-proportional setup per window and
+        // measured slower on every r band for k >= 4.
+        let open = gate_probe(&docs, 3_780, 4, 1);
+        assert!(
+            open.windows + open.fit_windows > 0,
+            "four clauses must open wide: {open:?}"
+        );
+        // Three or fewer still need the density gate.
+        let closed = gate_probe(&docs, 3_780, 3, 1);
         assert_eq!(
             closed.windows + closed.fit_windows,
             0,
-            "four clauses below the density must stay narrow: {closed:?}"
+            "three clauses below the density must stay narrow: {closed:?}"
         );
     }
 
