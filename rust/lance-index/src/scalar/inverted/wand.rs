@@ -5521,22 +5521,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         lead_pos.push(pos as u8);
                     }
                     let mut offs = vec![0u8; docs.len() * num_lists];
-                    let mut matched_freq = vec![0u32; docs.len() * num_lists];
                     for (i, &pos) in lead_pos.iter().enumerate() {
                         offs[i * num_lists] = pos;
-                        matched_freq[i * num_lists] = unsafe { *freq_ptr.add(pos as usize) };
                     }
-                    let clause_luts: Vec<[f32; FREQ_LUT_BUCKETS]> = self
-                        .lead
-                        .iter()
-                        .map(|posting| freq_bound_lut(posting, &self.scorer))
-                        .collect();
-                    let block_max: Vec<f64> = self
-                        .lead
-                        .iter()
-                        .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
-                        .collect();
-                    let factor = score_sum_upper_bound_factor(num_lists);
                     for j in 1..num_lists {
                         if docs.is_empty() {
                             break;
@@ -5586,10 +5573,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                         i * num_lists..(i + 1) * num_lists,
                                         kept * num_lists,
                                     );
-                                    matched_freq.copy_within(
-                                        i * num_lists..(i + 1) * num_lists,
-                                        kept * num_lists,
-                                    );
                                 }
                                 offs[kept * num_lists + j] = fpos as u8;
                                 kept += 1;
@@ -5597,57 +5580,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         }
                         docs.truncate(kept);
                         offs.truncate(kept * num_lists);
-                        matched_freq.truncate(kept * num_lists);
-                        // Tantivy drops a candidate before seeking the next
-                        // secondary once the matched scores plus the later
-                        // block maxima cannot beat the floor.
-                        if j + 1 < num_lists && kept > 0 {
-                            let freq_ptr = {
-                                let state = unsafe {
-                                    &*posting.ensure_compressed_block_ptr(list, block_idx)
-                                };
-                                state.freqs.as_ptr()
-                            };
-                            for i in 0..kept {
-                                let at = offs[i * num_lists + j] as usize;
-                                matched_freq[i * num_lists + j] = unsafe { *freq_ptr.add(at) };
-                            }
-                            let later: f64 = block_max[j + 1..].iter().sum();
-                            let mut survive = 0usize;
-                            for i in 0..kept {
-                                let mut bound = later;
-                                for c in 0..=j {
-                                    let bucket = (matched_freq[i * num_lists + c] as usize)
-                                        .min(FREQ_LUT_BUCKETS - 1);
-                                    bound += f64::from(clause_luts[c][bucket]);
-                                }
-                                if score_sum_cannot_compete(
-                                    0.0,
-                                    bound,
-                                    self.threshold,
-                                    factor,
-                                    CompetitiveFloorMode::Exclusive,
-                                ) {
-                                    continue;
-                                }
-                                if survive != i {
-                                    docs[survive] = docs[i];
-                                    offs.copy_within(
-                                        i * num_lists..(i + 1) * num_lists,
-                                        survive * num_lists,
-                                    );
-                                    matched_freq.copy_within(
-                                        i * num_lists..(i + 1) * num_lists,
-                                        survive * num_lists,
-                                    );
-                                }
-                                survive += 1;
-                            }
-                            kept = survive;
-                            docs.truncate(kept);
-                            offs.truncate(kept * num_lists);
-                            matched_freq.truncate(kept * num_lists);
-                        }
                     }
                     if !skip_window {
                         batch_docs = docs;
