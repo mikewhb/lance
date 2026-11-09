@@ -401,6 +401,17 @@ fn window_bounds(
     (lo, hi)
 }
 
+/// Doc-id width of one posting block. A rarer term covers more ids per block.
+fn block_id_span(list: &CompressedPostingList, block_idx: usize) -> u64 {
+    let start = u64::from(list.block_least_doc_id(block_idx));
+    let end = if block_idx + 1 < list.blocks.len() {
+        u64::from(list.block_least_doc_id(block_idx + 1))
+    } else {
+        u64::from(u32::MAX)
+    };
+    end.saturating_sub(start).max(1)
+}
+
 /// Wide-window override, tests only: Off disables the window even when the
 /// gate opens; Always bypasses the gate. Production follows the gate.
 #[cfg(test)]
@@ -5298,6 +5309,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let narrow_diag = *NARROW_DIAG;
         let mut diag_windows: usize = 0;
         let mut diag_decodes: usize = 0;
+        let mut diag_short: usize = 0;
+        let mut diag_nway: usize = 0;
 
         'window: loop {
             if narrow_diag {
@@ -5657,16 +5670,42 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         end: hi,
                         block_start: block_idx << list.block_shift(),
                     });
-                    // The lead slice is the short side of this window. Intersect
-                    // it with the next clause first. An empty pair leaves the
-                    // denser blocks compressed; a short survivor list is
-                    // filtered clause by clause. Equal or longer leads stay
-                    // on the n-way kernel. The window end is unchanged.
-                    if j == 1
-                        && num_lists > 2
-                        && window_started_with_floor
-                        && wins[0].end - wins[0].pos < wins[1].end - wins[1].pos
-                    {
+                    // The lead slice is the short side of this window, or it
+                    // ties the next clause while a later block is denser and
+                    // longer than this slice. Intersect the two rarest first.
+                    // An empty pair leaves the denser blocks compressed; a
+                    // short survivor list is filtered clause by clause.
+                    // A longer lead stays on the n-way kernel. The window end
+                    // is unchanged.
+                    let seek_short = j == 1 && num_lists > 2 && window_started_with_floor && {
+                        let lead_span = wins[0].end - wins[0].pos;
+                        let second_span = wins[1].end - wins[1].pos;
+                        let lead_ids = match &self.lead[0].list {
+                            PostingList::Compressed(list) => {
+                                block_id_span(list, self.lead[0].block_idx)
+                            }
+                            PostingList::Plain(_) => 0,
+                        };
+                        lead_span < second_span
+                            || (lead_span == second_span
+                                && lead_ids > 0
+                                && (2..num_lists).any(|fj| {
+                                    let posting = &self.lead[fj];
+                                    let PostingList::Compressed(list) = &posting.list else {
+                                        return false;
+                                    };
+                                    let span = block_id_span(list, posting.block_idx);
+                                    let start = posting.block_idx.saturating_mul(list.block_size);
+                                    let docs = (list.length as usize)
+                                        .saturating_sub(start)
+                                        .min(list.block_size);
+                                    span < lead_ids && docs > lead_span
+                                }))
+                    };
+                    if seek_short {
+                        if narrow_diag {
+                            diag_short += 1;
+                        }
                         let others_block_max: f64 = self.lead[1..]
                             .iter()
                             .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
@@ -5846,6 +5885,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     None
                 };
                 if !used_lazy && !one_doc_settled {
+                    if narrow_diag {
+                        diag_nway += 1;
+                    }
                     batch_docs.clear();
                     batch_offs.clear();
                     // Precompute the conservative decision once per frequency
@@ -6170,7 +6212,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         if narrow_diag {
             #[allow(clippy::print_stderr)]
             {
-                eprintln!("fts-narrow-diag windows={diag_windows} decodes={diag_decodes}");
+                eprintln!(
+                    "fts-narrow-diag windows={diag_windows} decodes={diag_decodes} short={diag_short} nway={diag_nway}"
+                );
             }
         }
 
