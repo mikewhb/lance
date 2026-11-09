@@ -2554,8 +2554,8 @@ impl PartialEq for TailPosting {
     }
 }
 
-#[cfg(test)]
 #[derive(Default)]
+#[allow(dead_code)]
 struct AndWindowStats {
     windows_wide: usize,
     windows_narrow: usize,
@@ -2573,6 +2573,8 @@ struct AndWindowStats {
     // Lead frequency decodes; a window retired by the whole-window bound must
     // not add one.
     wide_lead_freq_decodes: usize,
+    narrow_block_decodes: usize,
+    wide_block_decodes: usize,
 }
 
 impl Eq for TailPosting {}
@@ -2645,7 +2647,6 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Initialized only by a certified score-first candidate; cached `None`
     // avoids retrying unsupported norm tables on later candidates.
     score_first_and_norm_k: OnceCell<Option<NormKCache<'a>>>,
-    #[cfg(test)]
     and_window_stats: AndWindowStats,
     // Test-only override for comparing bulk and classic conjunctions without
     // mutating the process-wide environment.
@@ -2773,7 +2774,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             score_first_and_bounds_up_to: None,
             score_first_and_dense_range: None,
             score_first_and_norm_k: OnceCell::new(),
-            #[cfg(test)]
             and_window_stats: AndWindowStats::default(),
             bulk_and_mode_override: None,
             #[cfg(test)]
@@ -4243,10 +4243,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     score_contributions
                         .push(((self.lead[0].position, self.lead[0].token_id), contribution));
                     if self.score_first_and_cannot_compete(partial_score, 1) {
-                        #[cfg(test)]
-                        {
-                            self.and_window_stats.score_first_rejections += 1;
-                        }
+                                                    self.and_window_stats.score_first_rejections += 1;
+
                         let next_target = self.and_advance_target(self.and_next_target_after(doc)?);
                         if next_target == TERMINATED_DOC_ID {
                             return None;
@@ -4281,10 +4279,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     partial_score += contribution;
                     score_contributions.push(((posting.position, posting.token_id), contribution));
                     if self.score_first_and_cannot_compete(partial_score, index + 1) {
-                        #[cfg(test)]
-                        {
-                            self.and_window_stats.score_first_rejections += 1;
-                        }
+                                                    self.and_window_stats.score_first_rejections += 1;
+
                         let next_target = self.and_advance_target(self.and_next_target_after(doc)?);
                         if next_target == TERMINATED_DOC_ID {
                             return None;
@@ -4983,10 +4979,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     unreachable!("bulk AND requires compressed postings");
                 };
                 let state = unsafe { &*posting.ensure_compressed_block_ptr(list, lead_block) };
-                #[cfg(test)]
-                {
-                    wand.and_window_stats.wide_lead_freq_decodes += 1;
-                }
+                                    wand.and_window_stats.wide_lead_freq_decodes += 1;
+
                 for i in 0..n {
                     st.freq[i] = state.freqs[lead_lo + i];
                 }
@@ -5064,13 +5058,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         // Every candidate in this block is out of reach, so the
                         // block is not decoded and the cursor stays where it was:
                         // the bound already accounts for the whole block.
-                        #[cfg(test)]
-                        {
-                            wand.and_window_stats.wide_blocks_skipped += 1;
-                        }
+                                                    wand.and_window_stats.wide_blocks_skipped += 1;
+
                         i = i_end;
                         continue;
                     }
+                    wand.and_window_stats.wide_block_decodes += 1;
                     let (docs_b, len_b) = {
                         let state = unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, fb) };
                         (state.doc_ids.as_ptr(), state.doc_ids.len())
@@ -5253,10 +5246,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut wide_state: Option<WideState> = None;
 
         'window: loop {
-            #[cfg(test)]
-            {
-                self.and_window_stats.windows_sliced += 1;
-            }
+                            self.and_window_stats.windows_sliced += 1;
+
             self.raise_to_shared_floor(params.wand_factor);
             let window_started_with_floor = self.threshold > 0.0;
             if window_started_with_floor {
@@ -5317,10 +5308,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 // Always is the test-only worst case: it opens the window even
                 // when the narrow one already reaches the lead block end.
                 if always || win_end < wide_end {
-                    #[cfg(test)]
-                    {
-                        self.and_window_stats.wide_windows += 1;
-                    }
+                                            self.and_window_stats.wide_windows += 1;
+
                     let st = wide_state.get_or_insert_with(|| WideState::new(num_lists));
                     let (next_target, done, ineffective) = run_wide_window(
                         self,
@@ -5355,10 +5344,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     // Every follower already ends its block at or after the
                     // lead block end: the narrow window is the widest useful
                     // one, so the main path is kept byte for byte.
-                    #[cfg(test)]
-                    {
-                        self.and_window_stats.wide_fit_windows += 1;
-                    }
+                                            self.and_window_stats.wide_fit_windows += 1;
+
                 }
             }
 
@@ -5377,6 +5364,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     unreachable!("bulk AND requires compressed postings");
                 };
                 let block_idx = posting.block_idx;
+                self.and_window_stats.narrow_block_decodes += 1;
                 let state = unsafe { &mut *posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
                 let doc_ids = state.doc_ids.as_slice();
                 let len = doc_ids.len();
@@ -5506,10 +5494,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         merge_window_docs_3(&wins, &mut batch_docs, &mut batch_offs)
                     },
                     (_, _, false) if use_pairwise_intersection => {
-                        #[cfg(test)]
-                        {
-                            self.and_window_stats.pairwise_intersections += 1;
-                        }
+                                                    self.and_window_stats.pairwise_intersections += 1;
+
                         merge_window_docs_pairwise(
                             &wins,
                             &mut intersection_scratch,
@@ -5657,10 +5643,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             continue;
                         }
                     }
-                    #[cfg(test)]
-                    {
-                        self.and_window_stats.candidates_returned += 1;
-                    }
+                                            self.and_window_stats.candidates_returned += 1;
+
                     num_comparisons += 1;
 
                     let Some(document_key) = self.documents.document_key_for_doc_id(doc) else {
@@ -5751,6 +5735,22 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         metrics.record_comparisons(num_comparisons);
 
+        if std::env::var_os("LANCE_FTS_TRACE").is_some() {
+            let st = &self.and_window_stats;
+            eprintln!(
+                "BULK-TRACE sliced={} wide_windows={} wide_fit={} wide_skipped={} narrow_dec={} wide_dec={} cands={} floor={:.3} heap_full={}",
+                st.windows_sliced,
+                st.wide_windows,
+                st.wide_fit_windows,
+                st.wide_blocks_skipped,
+                st.narrow_block_decodes,
+                st.wide_block_decodes,
+                st.candidates_returned,
+                self.threshold,
+                candidates.kth_score_if_full().is_some(),
+            );
+        }
+
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
 
@@ -5795,10 +5795,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             self.up_to = Some(narrow_up_to);
             self.and_max_score = narrow_max_score;
             self.prepare_score_first_and_window();
-            #[cfg(test)]
-            {
-                self.and_window_stats.windows_narrow += 1;
-            }
+                            self.and_window_stats.windows_narrow += 1;
+
             return;
         }
 
@@ -5832,10 +5830,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             if wide_max_score < self.threshold {
                 self.up_to = Some(lead_up_to);
                 self.and_max_score = wide_max_score;
-                #[cfg(test)]
-                {
-                    self.and_window_stats.windows_wide += 1;
-                }
+                                    self.and_window_stats.windows_wide += 1;
+
                 return;
             }
         }
@@ -5843,10 +5839,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         self.up_to = Some(narrow_up_to);
         self.and_max_score = narrow_max_score;
         self.prepare_score_first_and_window();
-        #[cfg(test)]
-        {
-            self.and_window_stats.windows_narrow += 1;
-        }
+                    self.and_window_stats.windows_narrow += 1;
+
     }
 
     fn and_advance_target(&mut self, mut target: u64) -> u64 {
@@ -5861,10 +5855,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             if self.and_max_score >= self.threshold {
                 return target;
             }
-            #[cfg(test)]
-            {
-                self.and_window_stats.windows_skipped += 1;
-            }
+                            self.and_window_stats.windows_skipped += 1;
+
             if up_to == TERMINATED_DOC_ID {
                 return TERMINATED_DOC_ID;
             }
