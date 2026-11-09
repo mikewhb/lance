@@ -5441,6 +5441,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // `slice_prev`; that value is only a resume hint, never a cursor
             // that skips unread docs.
             let mut used_lazy = false;
+            let mut one_doc_settled = false;
             // The scalar per-follower walk is slower than the narrow-window
             // merge kernel on the queries that dominate TOP_10 time. The
             // kernel still drops a lead doc whose frequency bound loses to
@@ -5733,8 +5734,79 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             skip_window = true;
                             break;
                         }
+                        // One lead doc matched the next term. Walk the rest
+                        // one clause at a time and stop at the first miss,
+                        // instead of decoding every remaining block for an
+                        // n-way merge.
+                        let doc = batch_docs[0];
+                        let mut offs = std::mem::take(&mut batch_offs);
                         batch_docs.clear();
-                        batch_offs.clear();
+                        let mut matched = true;
+                        for fj in 2..num_lists {
+                            let posting = &self.lead[fj];
+                            let PostingList::Compressed(ref list) = posting.list else {
+                                unreachable!("bulk AND requires compressed postings");
+                            };
+                            let block_idx = posting.block_idx;
+                            if narrow_diag {
+                                diag_decodes += 1;
+                            }
+                            let state =
+                                unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
+                            let doc_ids = state.doc_ids.as_slice();
+                            let len = doc_ids.len();
+                            let (prev_block, prev_hi) = slice_prev[fj];
+                            let start = if prev_block == block_idx {
+                                prev_hi.min(len)
+                            } else {
+                                0
+                            };
+                            let flo = if start < len && doc_ids[start] >= doc {
+                                start
+                            } else {
+                                start + doc_ids[start..].partition_point(|&id| id < doc)
+                            };
+                            let fhi = if win_end32 == u32::MAX
+                                || len == 0
+                                || doc_ids[len - 1] <= win_end32
+                            {
+                                len
+                            } else {
+                                flo + doc_ids[flo..].partition_point(|&id| id <= win_end32)
+                            };
+                            slice_prev[fj] = (block_idx, fhi);
+                            let next_doc = if fhi < len {
+                                u64::from(doc_ids[fhi])
+                            } else if block_idx + 1 < list.blocks.len() {
+                                u64::from(list.block_least_doc_id(block_idx + 1))
+                            } else {
+                                TERMINATED_DOC_ID
+                            };
+                            jump_to = jump_to.max(next_doc);
+                            if flo == fhi || doc_ids[flo] != doc {
+                                matched = false;
+                                if next_doc == TERMINATED_DOC_ID {
+                                    exhausted = true;
+                                }
+                                break;
+                            }
+                            offs.push(flo as u8);
+                            wins.push(WindowList {
+                                docs: state.doc_ids.as_ptr(),
+                                freqs: std::ptr::null(),
+                                pos: flo,
+                                end: fhi,
+                                block_start: block_idx << list.block_shift(),
+                            });
+                        }
+                        if !matched || offs.len() != num_lists {
+                            skip_window = true;
+                            break;
+                        }
+                        batch_docs.push(doc);
+                        batch_offs = offs;
+                        one_doc_settled = true;
+                        break;
                     }
                 }
             }
@@ -5756,7 +5828,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 } else {
                     None
                 };
-                if !used_lazy {
+                if !used_lazy && !one_doc_settled {
                     batch_docs.clear();
                     batch_offs.clear();
                     // Precompute the conservative decision once per frequency
