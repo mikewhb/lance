@@ -5660,11 +5660,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         end: hi,
                         block_start: block_idx << list.block_shift(),
                     });
-                    // With a third clause and a floor, intersect the two rarest
-                    // first and stop at the first later miss. An empty pair
-                    // leaves the remaining blocks compressed. The window end
-                    // is unchanged.
-                    let seek_short = j == 1 && num_lists > 2 && window_started_with_floor;
+                    // With a third clause, intersect the two rarest first and stop
+                    // at the first later miss, including before the top-k
+                    // heap has a floor. An empty pair leaves the remaining
+                    // blocks compressed. The window end is unchanged.
+                    let seek_short = j == 1 && num_lists > 2;
                     if seek_short {
                         if narrow_diag {
                             diag_short += 1;
@@ -5693,25 +5693,31 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 batch_offs[1] = second_pos as u8;
                             }
                         } else {
-                            let others_block_max: f64 = self.lead[1..]
-                                .iter()
-                                .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
-                                .sum();
-                            // Frequency 1 is the weakest positive bound. If it
-                            // still clears the floor, every real posting does too,
-                            // and decoding the lead frequencies cannot drop a doc.
-                            let bounds = freq_bounds.as_ref().expect(
-                                "positive threshold should initialize the frequency bound LUT",
-                            );
-                            let screen_can_drop = bounds[1].is_finite()
-                                && score_sum_cannot_compete(
-                                    bounds[1],
-                                    others_block_max,
-                                    self.threshold,
-                                    score_sum_upper_bound_factor(num_lists),
-                                    CompetitiveFloorMode::Exclusive,
+                            let screen_can_drop = window_started_with_floor && {
+                                let others_block_max: f64 = self.lead[1..]
+                                    .iter()
+                                    .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+                                    .sum();
+                                let bounds = freq_bounds.as_ref().expect(
+                                    "positive threshold should initialize the frequency bound LUT",
                                 );
+                                bounds[1].is_finite()
+                                    && score_sum_cannot_compete(
+                                        bounds[1],
+                                        others_block_max,
+                                        self.threshold,
+                                        score_sum_upper_bound_factor(num_lists),
+                                        CompetitiveFloorMode::Exclusive,
+                                    )
+                            };
                             if screen_can_drop {
+                                let others_block_max: f64 = self.lead[1..]
+                                    .iter()
+                                    .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+                                    .sum();
+                                let bounds = freq_bounds.as_ref().expect(
+                                    "positive threshold should initialize the frequency bound LUT",
+                                );
                                 let key = (self.threshold.to_bits(), others_block_max.to_bits());
                                 if first_score_limit_key != Some(key) {
                                     first_score_limit = exclusive_partial_score_limit(
@@ -14223,8 +14229,8 @@ mod tests {
             rows.sort_unstable();
             if mode == BulkAndMode::On {
                 assert_eq!(
-                    wand.and_window_stats.pairwise_intersections > 0,
-                    initial_floor == 0.0
+                    wand.and_window_stats.pairwise_intersections, 0,
+                    "k>2 windows filter the two rarest clauses before pairwise"
                 );
                 if initial_floor == 0.0 && matches!(shape, "five" | "zero") {
                     assert_eq!(rows.len(), if shape == "five" { 5 } else { 0 });
@@ -14299,7 +14305,7 @@ mod tests {
         };
         let (with_impacts, intersections) = run(true);
         let (without_impacts, none) = run(false);
-        assert!(intersections > 0);
+        assert_eq!(intersections, 0);
         assert_eq!(none, 0);
         assert_eq!(with_impacts, without_impacts);
     }
@@ -14382,9 +14388,6 @@ mod tests {
                 .map(|hit| (hit.document, hit.freqs))
                 .collect::<Vec<_>>();
             hits.sort_unstable();
-            if mode == BulkAndMode::On {
-                assert!(wand.and_window_stats.pairwise_intersections > 0);
-            }
             assert_eq!(
                 hits.len(),
                 if phrase_slop.is_some() {
@@ -14526,10 +14529,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits.len(), 5);
-        assert_eq!(
-            wand.and_window_stats.pairwise_intersections > 0,
-            num_clauses >= 4 && has_impacts && !has_grouped_terms
-        );
+        assert_eq!(wand.and_window_stats.pairwise_intersections, 0);
         if has_grouped_terms {
             assert_eq!(wand.bulk_and_searches, 0);
         }
