@@ -5080,8 +5080,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     // no candidate lands in costs one doc-id decode only.
                     let mut freqs: Option<*const u32> = None;
                     #[allow(clippy::needless_range_loop)]
+                    let mut skip_until = i;
                     for x in i..i_end {
-                        if pruned[x] {
+                        if pruned[x] || x < skip_until {
                             continue;
                         }
                         fpos = unsafe { find_next_geq(docs_b, fpos, len_b, st.docs[x]) };
@@ -5112,6 +5113,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             }
                             debug_assert!(out <= x);
                             out += 1;
+                        } else if !prunable
+                            && fpos < len_b
+                            && x + 1 < i_end
+                            && st.docs[x + 1] < unsafe { *docs_b.add(fpos) }
+                        {
+                            // Nothing can be pruned in this window, and a miss
+                            // here means every candidate below the follower's
+                            // document misses this clause too; one search over
+                            // the candidates replaces one probe per candidate.
+                            let found = unsafe { *docs_b.add(fpos) };
+                            skip_until = x
+                                + st.docs[x..i_end].partition_point(|&doc| doc < found);
                         }
                     }
                     fpos = unsafe {
