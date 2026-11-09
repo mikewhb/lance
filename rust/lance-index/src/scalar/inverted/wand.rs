@@ -5656,6 +5656,82 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         end: hi,
                         block_start: block_idx << list.block_shift(),
                     });
+                    // Later clauses are the dense ones. If the two rarest
+                    // already miss inside this window, leave those blocks
+                    // compressed. The window end is unchanged.
+                    if j == 1 && num_lists > 2 && window_started_with_floor {
+                        let others_block_max: f64 = self.lead[1..]
+                            .iter()
+                            .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
+                            .sum();
+                        let key = (self.threshold.to_bits(), others_block_max.to_bits());
+                        if first_score_limit_key != Some(key) {
+                            first_score_limit = exclusive_partial_score_limit(
+                                others_block_max,
+                                self.threshold,
+                                score_sum_upper_bound_factor(num_lists),
+                            );
+                            first_score_limit_key = Some(key);
+                        }
+                        if freq_cannot_beat_key != Some(key) {
+                            let bounds = freq_bounds.as_ref().expect(
+                                "positive threshold should initialize the frequency bound LUT",
+                            );
+                            freq_cannot_beat = match first_score_limit {
+                                Some(limit) => {
+                                    std::array::from_fn(|frequency| bounds[frequency] <= limit)
+                                }
+                                None => [false; FREQ_LUT_BUCKETS],
+                            };
+                            freq_cannot_beat_key = Some(key);
+                        }
+                        let freq_ptr = {
+                            let lead = &self.lead[0];
+                            let PostingList::Compressed(ref lead_list) = lead.list else {
+                                unreachable!("bulk AND requires compressed postings");
+                            };
+                            let lead_state = unsafe {
+                                &*lead.ensure_compressed_block_ptr(lead_list, lead.block_idx)
+                            };
+                            lead_state.freqs.as_ptr()
+                        };
+                        wins[0].freqs = freq_ptr;
+                        batch_docs.clear();
+                        batch_offs.clear();
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            if *HAS_AVX2 {
+                                merge_window_2_avx2(
+                                    &wins,
+                                    &freq_cannot_beat,
+                                    &mut batch_docs,
+                                    &mut batch_offs,
+                                );
+                            } else {
+                                merge_window_2(
+                                    &wins,
+                                    &freq_cannot_beat,
+                                    &mut batch_docs,
+                                    &mut batch_offs,
+                                );
+                            }
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        unsafe {
+                            merge_window_2(
+                                &wins,
+                                &freq_cannot_beat,
+                                &mut batch_docs,
+                                &mut batch_offs,
+                            );
+                        }
+                        if batch_docs.is_empty() {
+                            skip_window = true;
+                            break;
+                        }
+                        batch_docs.clear();
+                        batch_offs.clear();
+                    }
                 }
             }
             if exhausted {
