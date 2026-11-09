@@ -5659,7 +5659,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     // Later clauses are the dense ones. If the two rarest
                     // already miss inside this window, leave those blocks
                     // compressed. The window end is unchanged.
-                    if j == 1 && num_lists > 2 && window_started_with_floor {
+                    if j == 1
+                        && num_lists > 2
+                        && window_started_with_floor
+                        && wins[0].end - wins[0].pos == 1
+                    {
                         let others_block_max: f64 = self.lead[1..]
                             .iter()
                             .map(|posting| f64::from(posting.block_max_score(&self.scorer)))
