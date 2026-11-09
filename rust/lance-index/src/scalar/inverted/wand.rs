@@ -5079,13 +5079,22 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     // Frequencies stay packed until the first hit: a block that
                     // no candidate lands in costs one doc-id decode only.
                     let mut freqs: Option<*const u32> = None;
-                    #[allow(clippy::needless_range_loop)]
-                    for x in i..i_end {
+                    // Candidates and the follower block are both sorted, so a
+                    // miss at the follower document also misses every later
+                    // candidate below it: jump the whole run instead of probing
+                    // each candidate in it.
+                    let mut x = i;
+                    while x < i_end {
                         if pruned[x] {
+                            x += 1;
                             continue;
                         }
                         fpos = unsafe { find_next_geq(docs_b, fpos, len_b, st.docs[x]) };
-                        if fpos < len_b && unsafe { *docs_b.add(fpos) } == st.docs[x] {
+                        if fpos >= len_b {
+                            break;
+                        }
+                        let found = unsafe { *docs_b.add(fpos) };
+                        if found == st.docs[x] {
                             let freqs = match freqs {
                                 Some(ptr) => ptr,
                                 None => {
@@ -5112,6 +5121,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             }
                             debug_assert!(out <= x);
                             out += 1;
+                            x += 1;
+                        } else {
+                            x += st.docs[x..i_end].partition_point(|&doc| doc < found);
                         }
                     }
                     fpos = unsafe {
