@@ -5657,13 +5657,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         end: hi,
                         block_start: block_idx << list.block_shift(),
                     });
-                    // Later clauses are the dense ones. If the two rarest
-                    // already miss inside this window, leave those blocks
-                    // compressed. The window end is unchanged.
+                    // The lead slice is the short side of this window. Intersect
+                    // it with the next clause first. An empty pair leaves the
+                    // denser blocks compressed; a short survivor list is
+                    // filtered clause by clause. Equal or longer leads stay
+                    // on the n-way kernel. The window end is unchanged.
                     if j == 1
                         && num_lists > 2
                         && window_started_with_floor
-                        && wins[0].end - wins[0].pos == 1
+                        && wins[0].end - wins[0].pos < wins[1].end - wins[1].pos
                     {
                         let others_block_max: f64 = self.lead[1..]
                             .iter()
@@ -5734,15 +5736,23 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             skip_window = true;
                             break;
                         }
-                        // One lead doc matched the next term. Walk the rest
-                        // one clause at a time and stop at the first miss,
-                        // instead of decoding every remaining block for an
-                        // n-way merge.
-                        let doc = batch_docs[0];
-                        let mut offs = std::mem::take(&mut batch_offs);
-                        batch_docs.clear();
-                        let mut matched = true;
+                        // Two-way offsets are packed at stride 2. Scoring
+                        // reads stride `num_lists`, so spread them before
+                        // appending one offset per later clause.
+                        let survivor_count = batch_docs.len();
+                        batch_offs.resize(survivor_count * num_lists, 0);
+                        for i in (0..survivor_count).rev() {
+                            let lead_off = batch_offs[i * 2];
+                            let second_off = batch_offs[i * 2 + 1];
+                            batch_offs[i * num_lists] = lead_off;
+                            batch_offs[i * num_lists + 1] = second_off;
+                        }
+                        let mut alive = true;
                         for fj in 2..num_lists {
+                            if batch_docs.is_empty() {
+                                alive = false;
+                                break;
+                            }
                             let posting = &self.lead[fj];
                             let PostingList::Compressed(ref list) = posting.list else {
                                 unreachable!("bulk AND requires compressed postings");
@@ -5755,25 +5765,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 unsafe { &*posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
                             let doc_ids = state.doc_ids.as_slice();
                             let len = doc_ids.len();
-                            let (prev_block, prev_hi) = slice_prev[fj];
-                            let start = if prev_block == block_idx {
-                                prev_hi.min(len)
-                            } else {
-                                0
-                            };
-                            let flo = if start < len && doc_ids[start] >= doc {
-                                start
-                            } else {
-                                start + doc_ids[start..].partition_point(|&id| id < doc)
-                            };
-                            let fhi = if win_end32 == u32::MAX
-                                || len == 0
-                                || doc_ids[len - 1] <= win_end32
-                            {
-                                len
-                            } else {
-                                flo + doc_ids[flo..].partition_point(|&id| id <= win_end32)
-                            };
+                            let (flo, fhi) = window_bounds(
+                                doc_ids,
+                                slice_prev[fj],
+                                block_idx,
+                                target32,
+                                win_end32,
+                            );
                             slice_prev[fj] = (block_idx, fhi);
                             let next_doc = if fhi < len {
                                 u64::from(doc_ids[fhi])
@@ -5783,14 +5781,11 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 TERMINATED_DOC_ID
                             };
                             jump_to = jump_to.max(next_doc);
-                            if flo == fhi || doc_ids[flo] != doc {
-                                matched = false;
-                                if next_doc == TERMINATED_DOC_ID {
-                                    exhausted = true;
-                                }
+                            if flo == fhi {
+                                alive = false;
+                                exhausted = next_doc == TERMINATED_DOC_ID;
                                 break;
                             }
-                            offs.push(flo as u8);
                             wins.push(WindowList {
                                 docs: state.doc_ids.as_ptr(),
                                 freqs: std::ptr::null(),
@@ -5798,13 +5793,35 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 end: fhi,
                                 block_start: block_idx << list.block_shift(),
                             });
+                            let ptr = doc_ids.as_ptr();
+                            let mut fpos = flo;
+                            let mut kept = 0usize;
+                            for i in 0..batch_docs.len() {
+                                let doc = batch_docs[i];
+                                fpos = unsafe { find_next_geq(ptr, fpos, fhi, doc) };
+                                if fpos < fhi && unsafe { *ptr.add(fpos) } == doc {
+                                    if kept != i {
+                                        batch_docs[kept] = doc;
+                                        batch_offs.copy_within(
+                                            i * num_lists..(i + 1) * num_lists,
+                                            kept * num_lists,
+                                        );
+                                    }
+                                    batch_offs[kept * num_lists + fj] = fpos as u8;
+                                    kept += 1;
+                                }
+                            }
+                            batch_docs.truncate(kept);
+                            batch_offs.truncate(kept * num_lists);
+                            if kept == 0 {
+                                alive = false;
+                                break;
+                            }
                         }
-                        if !matched || offs.len() != num_lists {
+                        if !alive || batch_docs.is_empty() {
                             skip_window = true;
                             break;
                         }
-                        batch_docs.push(doc);
-                        batch_offs = offs;
                         one_doc_settled = true;
                         break;
                     }
