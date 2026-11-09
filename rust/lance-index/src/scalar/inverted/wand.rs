@@ -4508,7 +4508,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // the clause sup), so every skipped doc would also fail the exact
         // per-candidate prune: results are unchanged, the work never happens.
         macro_rules! merge_kernels {
-            ($name2:ident, $name3:ident, $name_n:ident, $docs_name2:ident, $docs_name3:ident, $docs_name_n:ident, $geq:ident $(, #[$feat:meta])?) => {
+            ($name2:ident, $name3:ident, $name_n:ident, $docs_name2:ident, $docs_name3:ident, $geq:ident $(, #[$feat:meta])?) => {
                 $(#[$feat])?
                 unsafe fn $name2(
                     wins: &[WindowList],
@@ -4700,43 +4700,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         }
                     }
                 }
-
-                $(#[$feat])?
-                #[allow(clippy::too_many_arguments)]
-                unsafe fn $docs_name_n(
-                    wins: &[WindowList],
-                    cursors: &mut Vec<usize>,
-                    docs_out: &mut Vec<u32>,
-                    offs_out: &mut Vec<u8>,
-                ) {
-                    cursors.clear();
-                    cursors.extend(wins.iter().map(|win| win.pos));
-                    let (d0, mut p0, e0) = (wins[0].docs, wins[0].pos, wins[0].end);
-                    unsafe {
-                        'outer: while p0 < e0 {
-                            let doc = *d0.add(p0);
-                            for j in 1..wins.len() {
-                                let win = wins.get_unchecked(j);
-                                let pos = $geq(win.docs, *cursors.get_unchecked(j), win.end, doc);
-                                *cursors.get_unchecked_mut(j) = pos;
-                                if pos >= win.end {
-                                    return;
-                                }
-                                let clause_doc = *win.docs.add(pos);
-                                if clause_doc > doc {
-                                    p0 = $geq(d0, p0 + 1, e0, clause_doc);
-                                    continue 'outer;
-                                }
-                            }
-                            docs_out.push(doc);
-                            offs_out.push(p0 as u8);
-                            for j in 1..wins.len() {
-                                offs_out.push(*cursors.get_unchecked(j) as u8);
-                            }
-                            p0 += 1;
-                        }
-                    }
-                }
             };
         }
         merge_kernels!(
@@ -4745,7 +4708,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             merge_window_n,
             merge_window_docs_2,
             merge_window_docs_3,
-            merge_window_docs_n_scalar,
             find_next_geq_scalar
         );
         #[cfg(target_arch = "x86_64")]
@@ -4755,7 +4717,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             merge_window_n_avx2,
             merge_window_docs_2_avx2,
             merge_window_docs_3_avx2,
-            merge_window_docs_n_avx2,
             find_next_geq_avx2,
             #[target_feature(enable = "avx2")]
         );
@@ -4766,6 +4727,40 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             for pos in win.pos..win.end {
                 docs_out.push(unsafe { *win.docs.add(pos) });
                 offs_out.push(pos as u8);
+            }
+        }
+
+        #[inline]
+        fn merge_window_docs_n(
+            wins: &[WindowList],
+            cursors: &mut Vec<usize>,
+            docs_out: &mut Vec<u32>,
+            offs_out: &mut Vec<u8>,
+        ) {
+            cursors.clear();
+            cursors.extend(wins.iter().map(|win| win.pos));
+            'outer: while cursors[0] < wins[0].end {
+                let doc = unsafe { *wins[0].docs.add(cursors[0]) };
+                for j in 1..wins.len() {
+                    let win = &wins[j];
+                    let pos = unsafe { find_next_geq(win.docs, cursors[j], win.end, doc) };
+                    cursors[j] = pos;
+                    if pos >= win.end {
+                        return;
+                    }
+                    let clause_doc = unsafe { *win.docs.add(pos) };
+                    if clause_doc > doc {
+                        cursors[0] = unsafe {
+                            find_next_geq(wins[0].docs, cursors[0] + 1, wins[0].end, clause_doc)
+                        };
+                        continue 'outer;
+                    }
+                }
+                docs_out.push(doc);
+                for &pos in cursors.iter() {
+                    offs_out.push(pos as u8);
+                }
+                cursors[0] += 1;
             }
         }
 
@@ -5929,51 +5924,38 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     batch_offs.clear();
                     // Precompute the conservative decision once per frequency
                     // bucket so the scalar and SIMD merge kernels stay
-                    // floating-point-free. Frequency 1 is the weakest positive
-                    // bound: when it already clears the floor, the table would
-                    // be all false and the lead frequency block is not read.
-                    let mut use_freq_kernel = false;
+                    // floating-point-free.
                     if window_started_with_floor && num_lists >= 2 {
+                        let posting = &self.lead[0];
+                        let PostingList::Compressed(ref list) = posting.list else {
+                            unreachable!("bulk AND requires compressed postings");
+                        };
+                        let state = unsafe {
+                            &mut *posting.ensure_compressed_block_ptr(list, posting.block_idx)
+                        };
+                        wins[0].freqs = state.freqs.as_ptr();
                         let others_block_max =
                             others_block_max.expect("positive floor should initialize bounds");
-                        let bounds = freq_bounds
-                            .as_ref()
-                            .expect("positive threshold should initialize the frequency bound LUT");
-                        use_freq_kernel = bounds[1].is_finite()
-                            && score_sum_cannot_compete(
-                                bounds[1],
+                        let key = (self.threshold.to_bits(), others_block_max.to_bits());
+                        if first_score_limit_key != Some(key) {
+                            first_score_limit = exclusive_partial_score_limit(
                                 others_block_max,
                                 self.threshold,
                                 score_sum_upper_bound_factor(num_lists),
-                                CompetitiveFloorMode::Exclusive,
                             );
-                        if use_freq_kernel {
-                            let posting = &self.lead[0];
-                            let PostingList::Compressed(ref list) = posting.list else {
-                                unreachable!("bulk AND requires compressed postings");
+                            first_score_limit_key = Some(key);
+                        }
+                        if freq_cannot_beat_key != Some(key) {
+                            let freq_bounds = freq_bounds.as_ref().expect(
+                                "positive threshold should initialize the frequency bound LUT",
+                            );
+                            freq_cannot_beat = match first_score_limit {
+                                Some(limit) => {
+                                    std::array::from_fn(|frequency| freq_bounds[frequency] <= limit)
+                                }
+                                None => [false; FREQ_LUT_BUCKETS],
                             };
-                            let state = unsafe {
-                                &mut *posting.ensure_compressed_block_ptr(list, posting.block_idx)
-                            };
-                            wins[0].freqs = state.freqs.as_ptr();
-                            let key = (self.threshold.to_bits(), others_block_max.to_bits());
-                            if first_score_limit_key != Some(key) {
-                                first_score_limit = exclusive_partial_score_limit(
-                                    others_block_max,
-                                    self.threshold,
-                                    score_sum_upper_bound_factor(num_lists),
-                                );
-                                first_score_limit_key = Some(key);
-                            }
-                            if freq_cannot_beat_key != Some(key) {
-                                freq_cannot_beat = match first_score_limit {
-                                    Some(limit) => {
-                                        std::array::from_fn(|frequency| bounds[frequency] <= limit)
-                                    }
-                                    None => [false; FREQ_LUT_BUCKETS],
-                                };
-                                freq_cannot_beat_key = Some(key);
-                            }
+                            freq_cannot_beat_key = Some(key);
                         }
                     } else if freq_cannot_beat_key.is_some() {
                         freq_cannot_beat = [false; FREQ_LUT_BUCKETS];
@@ -5987,7 +5969,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     let use_avx2 = *HAS_AVX2;
                     #[cfg(not(target_arch = "x86_64"))]
                     let use_avx2 = false;
-                    match (num_lists, use_avx2, use_freq_kernel) {
+                    match (num_lists, use_avx2, window_started_with_floor) {
                         (1, _, _) => merge_window_1(&wins, &mut batch_docs, &mut batch_offs),
                         #[cfg(target_arch = "x86_64")]
                         (2, true, false) => unsafe {
@@ -6003,9 +5985,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         (3, _, false) => unsafe {
                             merge_window_docs_3(&wins, &mut batch_docs, &mut batch_offs)
                         },
-                        (_, _, false)
-                            if use_pairwise_intersection && !window_started_with_floor =>
-                        {
+                        (_, _, false) if use_pairwise_intersection => {
                             #[cfg(test)]
                             {
                                 self.and_window_stats.pairwise_intersections += 1;
@@ -6017,23 +5997,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                 &mut batch_offs,
                             )
                         }
-                        #[cfg(target_arch = "x86_64")]
-                        (_, true, false) if window_started_with_floor => unsafe {
-                            merge_window_docs_n_avx2(
-                                &wins,
-                                &mut cursor_scratch,
-                                &mut batch_docs,
-                                &mut batch_offs,
-                            )
-                        },
-                        (_, _, false) => unsafe {
-                            merge_window_docs_n_scalar(
-                                &wins,
-                                &mut cursor_scratch,
-                                &mut batch_docs,
-                                &mut batch_offs,
-                            )
-                        },
+                        (_, _, false) => merge_window_docs_n(
+                            &wins,
+                            &mut cursor_scratch,
+                            &mut batch_docs,
+                            &mut batch_offs,
+                        ),
                         #[cfg(target_arch = "x86_64")]
                         (2, true, true) => unsafe {
                             merge_window_2_avx2(
