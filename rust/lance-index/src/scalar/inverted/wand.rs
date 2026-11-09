@@ -5355,102 +5355,38 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         last_decoded = Some(fb);
                         // Frequencies stay packed until the first hit: a block that
                         // no candidate lands in costs one doc-id decode only.
+                        // Packing a segment into the 2-way AVX2 kernel lost to this
+                        // walk on TOP_10: the block bound above already dropped the
+                        // empty segments, and find_next_geq is itself AVX2.
                         let mut freqs: Option<*const u32> = None;
-                        // The floor is on, so this is the path TOP_10 actually
-                        // runs. A segment of at least one SIMD tile uses the same
-                        // 2-way kernel as the scratch path; shorter segments stay
-                        // on the scalar walk. Block-level skips above are unchanged.
-                        #[cfg(target_arch = "x86_64")]
-                        let merged = keep >= 4 && *HAS_AVX2;
-                        #[cfg(not(target_arch = "x86_64"))]
-                        let merged = false;
-                        #[cfg(target_arch = "x86_64")]
-                        if merged {
-                            let mut lead_docs = [0u32; MAX_POSTING_BLOCK_SIZE];
-                            let mut origins = [0u8; MAX_POSTING_BLOCK_SIZE];
-                            let mut packed = 0usize;
-                            #[allow(clippy::needless_range_loop)]
-                            for x in i..i_end {
-                                if pruned[x] {
-                                    continue;
-                                }
-                                let origin = st.sel[x] as usize;
-                                origins[packed] = origin as u8;
-                                lead_docs[packed] = unsafe { *docs0_ptr.add(lead_lo + origin) };
-                                packed += 1;
+                        #[allow(clippy::needless_range_loop)]
+                        for x in i..i_end {
+                            if pruned[x] {
+                                continue;
                             }
-                            let windows = [
-                                WindowList {
-                                    docs: lead_docs.as_ptr(),
-                                    freqs: std::ptr::null(),
-                                    pos: 0,
-                                    end: packed,
-                                    block_start: 0,
-                                },
-                                WindowList {
-                                    docs: docs_b,
-                                    freqs: std::ptr::null(),
-                                    pos: fpos,
-                                    end: len_b,
-                                    block_start: 0,
-                                },
-                            ];
-                            let mut hit_docs = Vec::new();
-                            let mut hit_offs = Vec::new();
-                            unsafe {
-                                merge_window_docs_2_avx2(&windows, &mut hit_docs, &mut hit_offs);
-                            }
-                            if !hit_offs.is_empty() {
-                                let freq_ptr = {
-                                    let state =
-                                        unsafe { &*posting.ensure_compressed_block_ptr(list, fb) };
-                                    let ptr = state.freqs.as_ptr();
-                                    freqs = Some(ptr);
-                                    ptr
+                            let origin = st.sel[x] as usize;
+                            let doc = unsafe { *docs0_ptr.add(lead_lo + origin) };
+                            fpos = unsafe { find_next_geq(docs_b, fpos, len_b, doc) };
+                            if fpos < len_b && unsafe { *docs_b.add(fpos) } == doc {
+                                let freqs = match freqs {
+                                    Some(ptr) => ptr,
+                                    None => {
+                                        let state = unsafe {
+                                            &*posting.ensure_compressed_block_ptr(list, fb)
+                                        };
+                                        let ptr = state.freqs.as_ptr();
+                                        freqs = Some(ptr);
+                                        ptr
+                                    }
                                 };
-                                for pair in hit_offs.as_chunks::<2>().0 {
-                                    let origin = origins[pair[0] as usize] as usize;
-                                    let f_at = pair[1] as usize;
-                                    st.freq[j * cap + origin] = unsafe { *freq_ptr.add(f_at) };
-                                    if phrase {
-                                        st.pidx[j * cap + origin] =
-                                            u32::try_from((fb << shift) | f_at).unwrap_or(u32::MAX);
-                                    }
-                                    st.sel[out] = origin as u8;
-                                    out += 1;
+                                st.freq[j * cap + origin] = unsafe { *freqs.add(fpos) };
+                                if phrase {
+                                    st.pidx[j * cap + origin] =
+                                        u32::try_from((fb << shift) | fpos).unwrap_or(u32::MAX);
                                 }
-                            }
-                        }
-                        if !merged {
-                            #[allow(clippy::needless_range_loop)]
-                            for x in i..i_end {
-                                if pruned[x] {
-                                    continue;
-                                }
-                                let origin = st.sel[x] as usize;
-                                let doc = unsafe { *docs0_ptr.add(lead_lo + origin) };
-                                fpos = unsafe { find_next_geq(docs_b, fpos, len_b, doc) };
-                                if fpos < len_b && unsafe { *docs_b.add(fpos) } == doc {
-                                    let freqs = match freqs {
-                                        Some(ptr) => ptr,
-                                        None => {
-                                            let state = unsafe {
-                                                &*posting.ensure_compressed_block_ptr(list, fb)
-                                            };
-                                            let ptr = state.freqs.as_ptr();
-                                            freqs = Some(ptr);
-                                            ptr
-                                        }
-                                    };
-                                    st.freq[j * cap + origin] = unsafe { *freqs.add(fpos) };
-                                    if phrase {
-                                        st.pidx[j * cap + origin] =
-                                            u32::try_from((fb << shift) | fpos).unwrap_or(u32::MAX);
-                                    }
-                                    st.sel[out] = origin as u8;
-                                    debug_assert!(out <= x);
-                                    out += 1;
-                                }
+                                st.sel[out] = origin as u8;
+                                debug_assert!(out <= x);
+                                out += 1;
                             }
                         }
                         fpos = unsafe {
