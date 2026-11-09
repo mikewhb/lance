@@ -5484,6 +5484,45 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 if n == 0 {
                     break;
                 }
+                // The two rarest terms are clauses 0 and 1. An exact phrase
+                // that cannot align them will not match the remaining terms,
+                // so those follower blocks stay decoded only for real candidates.
+                if phrase_slop == Some(0) && j == 1 && num_lists > 2 {
+                    let mut kept = 0usize;
+                    for i in 0..n {
+                        let origin = st.sel[i] as usize;
+                        let doc = unsafe { *docs0_ptr.add(lead_lo + origin) };
+                        let aligned = {
+                            let (first, rest) = wand
+                                .lead
+                                .split_first_mut()
+                                .expect("a phrase has a lead clause");
+                            let second = &mut rest[0];
+                            first.index = st.pidx[origin] as usize;
+                            first.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id: doc,
+                                frequency: st.freq[origin],
+                            }));
+                            second.index = st.pidx[cap + origin] as usize;
+                            second.current_doc = Some(DocInfo::Raw(RawDocInfo {
+                                doc_id: doc,
+                                frequency: st.freq[cap + origin],
+                            }));
+                            match (first.position_cursor(), second.position_cursor()) {
+                                (Ok(left), Ok(right)) => exact_phrase_pair_can_align(&left, &right),
+                                _ => true,
+                            }
+                        };
+                        if aligned {
+                            st.sel[kept] = st.sel[i];
+                            kept += 1;
+                        }
+                    }
+                    n = kept;
+                    if n == 0 {
+                        break;
+                    }
+                }
             }
 
             // (d) Score and collect in doc order, with the narrow path's
@@ -6813,6 +6852,25 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 /// Term frequency equals the position count, so a stopword on this document
 /// is decoded last. If the two rarest lists share no phrase base, the rest
 /// (typically `"the"` / `"of"`) are never unpacked.
+/// Two clauses of an exact phrase. A document that fails this cannot match
+/// the full phrase, so later clauses do not need to be decoded.
+fn exact_phrase_pair_can_align(left: &PositionCursor<'_>, right: &PositionCursor<'_>) -> bool {
+    let left_off = left.position_in_query as u32;
+    let right_off = right.position_in_query as u32;
+    for &anchor in left.positions.as_slice() {
+        let Some(base) = anchor.checked_sub(left_off) else {
+            continue;
+        };
+        let Some(target) = base.checked_add(right_off) else {
+            return false;
+        };
+        if right.contains_absolute(target) {
+            return true;
+        }
+    }
+    false
+}
+
 fn exact_phrase_positions_match<'a>(
     num_clauses: usize,
     frequency: impl Fn(usize) -> u32,
@@ -7105,6 +7163,10 @@ impl<'a> PositionCursor<'a> {
         }
         self.index += values[self.index..].partition_point(|&pos| pos < target);
         values.get(self.index).copied()
+    }
+
+    fn contains_absolute(&self, target: u32) -> bool {
+        self.positions.as_slice().binary_search(&target).is_ok()
     }
 
     fn advance_to_relative(&mut self, least_relative_pos: i32) {
