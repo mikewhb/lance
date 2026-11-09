@@ -2036,21 +2036,6 @@ pub(super) fn score_sum_upper_bound_factor(num_values: usize) -> f64 {
     }
 }
 
-/// One clause's BM25 term, using the same norm path as `window_bm25_score`.
-#[inline]
-fn clause_bm25_score<S: Scorer + ?Sized>(
-    posting: &PostingIterator,
-    freq: u32,
-    scorer: &S,
-    norm_addend: Option<f32>,
-    doc_length: u32,
-) -> f32 {
-    match norm_addend {
-        Some(addend) => posting.query_weight * bm25_doc_weight_with_norm(freq, addend),
-        None => posting.score(scorer, freq, doc_length),
-    }
-}
-
 #[inline]
 pub(super) fn score_sum_cannot_compete(
     partial_score: f32,
@@ -5501,17 +5486,22 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         );
                         first_score_limit_key = Some(key);
                     }
-                    // Real lead BM25 inside this narrow slice only. Doc length is
-                    // the same value Pass B scores with, so a drop here is a doc
-                    // the exact check would also reject. The window end stays
-                    // `win_end`.
-                    if !norm_k_initialized {
-                        norm_k = self.norm_k_cache();
-                        norm_k_initialized = true;
+                    if freq_cannot_beat_key != Some(key) {
+                        let bounds = freq_bounds
+                            .as_ref()
+                            .expect("positive threshold should initialize the frequency bound LUT");
+                        freq_cannot_beat = match first_score_limit {
+                            Some(limit) => {
+                                std::array::from_fn(|frequency| bounds[frequency] <= limit)
+                            }
+                            None => [false; FREQ_LUT_BUCKETS],
+                        };
+                        freq_cannot_beat_key = Some(key);
                     }
-                    let norm_pair = norm_k
-                        .as_ref()
-                        .map(|(norms, cache)| (*norms, cache.as_ref()));
+                    #[cfg(test)]
+                    if freq_cannot_beat.iter().any(|&pruned| pruned) {
+                        self.and_window_stats.windows_frequency_pruned += 1;
+                    }
                     wins.push(WindowList {
                         docs: docs_ptr,
                         freqs: std::ptr::null(),
@@ -5521,40 +5511,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     });
                     let mut docs = Vec::new();
                     let mut lead_pos = Vec::new();
-                    let mut dropped_lead = false;
                     for pos in lo..hi {
                         let freq = unsafe { *freq_ptr.add(pos) };
-                        let doc = unsafe { *docs_ptr.add(pos) };
-                        let (addend, doc_length) = match norm_pair {
-                            Some((norms, cache)) => {
-                                let code = norms[doc as usize];
-                                (Some(cache[code as usize]), dequantize_doc_length(code))
-                            }
-                            None => {
-                                let doc_length = match self.documents.scoring_norms() {
-                                    Some(norms) => dequantize_doc_length(norms[doc as usize]),
-                                    None => self.documents.scoring_num_tokens(doc),
-                                };
-                                (None, doc_length)
-                            }
-                        };
-                        let first_score = clause_bm25_score(
-                            &self.lead[0],
-                            freq,
-                            &self.scorer,
-                            addend,
-                            doc_length,
-                        );
-                        if first_score_limit.is_some_and(|limit| first_score <= limit) {
-                            dropped_lead = true;
+                        let bucket = (freq as usize).min(FREQ_LUT_BUCKETS - 1);
+                        if freq_cannot_beat[bucket] {
                             continue;
                         }
-                        docs.push(doc);
+                        docs.push(unsafe { *docs_ptr.add(pos) });
                         lead_pos.push(pos as u8);
-                    }
-                    #[cfg(test)]
-                    if dropped_lead {
-                        self.and_window_stats.windows_frequency_pruned += 1;
                     }
                     let mut offs = vec![0u8; docs.len() * num_lists];
                     for (i, &pos) in lead_pos.iter().enumerate() {
