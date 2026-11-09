@@ -347,6 +347,11 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
 
+/// Experiment: run every bulk conjunction with the lead-driven kernel over the
+/// narrow window (nearest follower block end) instead of the lead block.
+static NARROW_LAZY: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("LANCE_FTS_NARROW_LAZY").as_deref() == Ok("1"));
+
 /// Wide-window override, tests only: Off disables the window even when the
 /// gate opens, Always bypasses the gate and L1. Production follows the gate.
 #[cfg(test)]
@@ -4357,17 +4362,18 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .unwrap_or(MAX_POSTING_BLOCK_SIZE) as u64;
         // A wide window needs a full heap and a lead block the narrow window
         // cannot span; both are checked per window below.
-        let gated = matches!(mode, BulkAndMode::Auto | BulkAndMode::On)
-            && self.lead.len() >= 2
-            && wide_gate_with_clauses(
+        let gated = *NARROW_LAZY
+            || (matches!(mode, BulkAndMode::Auto | BulkAndMode::On)
+                && self.lead.len() >= 2
+                && wide_gate_with_clauses(
                 self.lead[0].cost() as u64,
                 self.lead[1..]
                     .iter()
                     .map(|posting| posting.cost() as u64)
                     .sum(),
-                block_size,
-                num_lists,
-            );
+                    block_size,
+                    num_lists,
+                ));
         // Tests may force the window on (Always) or off (Off); production
         // follows the gate and L1 only.
         #[cfg(test)]
@@ -5313,10 +5319,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         u64::from(u32::MAX)
                     }
                 };
-                let wide_end = lead_block_end.min(target.saturating_add(WIDE_MAX_SPAN - 1));
+                let wide_end = if *NARROW_LAZY {
+                    win_end
+                } else {
+                    lead_block_end.min(target.saturating_add(WIDE_MAX_SPAN - 1))
+                };
                 // Always is the test-only worst case: it opens the window even
                 // when the narrow one already reaches the lead block end.
-                if always || win_end < wide_end {
+                if always || *NARROW_LAZY || win_end < wide_end {
                     #[cfg(test)]
                     {
                         self.and_window_stats.wide_windows += 1;
