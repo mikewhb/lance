@@ -5301,6 +5301,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut diag_short: usize = 0;
         let mut diag_one: usize = 0;
         let mut diag_nway: usize = 0;
+        let mut diag_empty_lead: usize = 0;
+        let mut diag_miss_second: usize = 0;
+        let mut diag_empty_gap: u64 = 0;
 
         'window: loop {
             if narrow_diag {
@@ -5649,6 +5652,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     };
                     jump_to = jump_to.max(next_doc);
                     if lo == hi {
+                        if narrow_diag {
+                            if j == 0 {
+                                diag_empty_lead += 1;
+                                diag_empty_gap += next_doc.saturating_sub(target);
+                            } else if j == 1 {
+                                diag_miss_second += 1;
+                            }
+                        }
                         exhausted = next_doc == TERMINATED_DOC_ID;
                         skip_window = true;
                         break;
@@ -6239,7 +6250,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             #[allow(clippy::print_stderr)]
             {
                 eprintln!(
-                    "fts-narrow-diag windows={diag_windows} decodes={diag_decodes} short={diag_short} one={diag_one} nway={diag_nway}"
+                    "fts-narrow-diag windows={diag_windows} decodes={diag_decodes} short={diag_short} one={diag_one} nway={diag_nway} empty_lead={diag_empty_lead} miss_second={diag_miss_second} empty_gap={diag_empty_gap}"
                 );
             }
         }
