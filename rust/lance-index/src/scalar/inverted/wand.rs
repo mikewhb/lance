@@ -390,13 +390,15 @@ fn window_bounds(
     };
     let lo = if start < len && doc_ids[start] >= target32 {
         start
-    } else {
-        start + doc_ids[start..].partition_point(|&doc| doc < target32)
-    };
-    let hi = if win_end32 == u32::MAX || len == 0 || doc_ids[len - 1] <= win_end32 {
+    } else if start >= len {
         len
     } else {
-        lo + doc_ids[lo..].partition_point(|&doc| doc <= win_end32)
+        find_next_geq_in_block(doc_ids, start, target32)
+    };
+    let hi = if len == 0 || win_end32 == u32::MAX || doc_ids[len - 1] <= win_end32 {
+        len
+    } else {
+        find_next_geq_in_block(doc_ids, lo, win_end32 + 1)
     };
     (lo, hi)
 }
@@ -5332,12 +5334,17 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // `and_advance_target` and stored the min block end in `up_to`.
             // That end is the same nearest block boundary. Walking
             // `block_idx_for_doc` again only repeats it.
+            // Before the heap has a floor, a miss of the two rarest clauses
+            // does not need the later block ends. Those ends are applied only
+            // after the pair is non-empty, and the window end stays the min.
+            let defer_tail = !window_started_with_floor && !wide_enabled && num_lists > 2;
             let win_end = if window_started_with_floor {
                 self.up_to
                     .expect("a competitive floor window has a block end")
             } else {
+                let limit = if defer_tail { 2 } else { num_lists };
                 let mut win_end = TERMINATED_DOC_ID;
-                for j in 0..num_lists {
+                for j in 0..limit {
                     let (block_idx, block_up_to) = {
                         let posting = &self.lead[j];
                         let PostingList::Compressed(ref list) = posting.list else {
@@ -5357,7 +5364,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 win_end
             };
-            let win_end32 = u32::try_from(win_end).unwrap_or(u32::MAX);
+            let mut win_end = win_end;
+            let mut win_end32 = u32::try_from(win_end).unwrap_or(u32::MAX);
 
             // Wide-window dispatch. The narrow window ends at the nearest
             // follower block end, so it shrinks to one lead document whenever a
@@ -5609,7 +5617,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
             }
             if !used_lazy {
-                for (j, posting) in self.lead.iter().enumerate() {
+                let pair_prev = if num_lists >= 2 {
+                    [slice_prev[0], slice_prev[1]]
+                } else {
+                    [slice_prev[0], (0, 0)]
+                };
+                for j in 0..num_lists {
+                    let posting = &self.lead[j];
                     let PostingList::Compressed(ref list) = posting.list else {
                         unreachable!("bulk AND requires compressed postings");
                     };
@@ -5621,24 +5635,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         unsafe { &mut *posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
                     let doc_ids = state.doc_ids.as_slice();
                     let len = doc_ids.len();
-                    // Everything before the previous slice's end of this block is
-                    // below the current target, so resume from there.
-                    let (prev_block, prev_hi) = slice_prev[j];
-                    let start = if prev_block == block_idx {
-                        prev_hi.min(len)
-                    } else {
-                        0
-                    };
-                    let lo = if start < len && doc_ids[start] >= target32 {
-                        start
-                    } else {
-                        start + doc_ids[start..].partition_point(|&doc| doc < target32)
-                    };
-                    let hi = if win_end32 == u32::MAX || len == 0 || doc_ids[len - 1] <= win_end32 {
-                        len
-                    } else {
-                        lo + doc_ids[lo..].partition_point(|&doc| doc <= win_end32)
-                    };
+                    let (lo, hi) =
+                        window_bounds(doc_ids, slice_prev[j], block_idx, target32, win_end32);
                     slice_prev[j] = (block_idx, hi);
                     // A later conjunction has to sit in every clause, so it
                     // cannot start before the latest of these next docs.
@@ -5679,6 +5677,74 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     if seek_short {
                         if narrow_diag {
                             diag_short += 1;
+                        }
+                        if defer_tail {
+                            let provisional = win_end;
+                            let mut tight = provisional;
+                            for fj in 2..num_lists {
+                                let posting = &mut self.lead[fj];
+                                let PostingList::Compressed(ref list) = posting.list else {
+                                    unreachable!("bulk AND requires compressed postings");
+                                };
+                                let block_idx =
+                                    posting.block_idx_for_doc(list, posting.block_idx, target32);
+                                posting.block_idx = block_idx;
+                                let block_up_to = if block_idx + 1 < list.blocks.len() {
+                                    u64::from(list.block_least_doc_id(block_idx + 1))
+                                        .saturating_sub(1)
+                                } else {
+                                    TERMINATED_DOC_ID
+                                };
+                                tight = tight.min(block_up_to.max(target));
+                            }
+                            if tight < provisional {
+                                win_end = tight;
+                                win_end32 = u32::try_from(win_end).unwrap_or(u32::MAX);
+                                // The pair was sliced to a wider end. Re-slice
+                                // from the pre-window cursor so a doc that
+                                // belongs after the real block end is not skipped.
+                                jump_to = 0;
+                                let mut pair_empty = false;
+                                for pj in 0..2 {
+                                    let posting = &self.lead[pj];
+                                    let PostingList::Compressed(ref list) = posting.list else {
+                                        unreachable!("bulk AND requires compressed postings");
+                                    };
+                                    let block_idx = posting.block_idx;
+                                    let state = unsafe {
+                                        &*posting.ensure_compressed_doc_ids_ptr(list, block_idx)
+                                    };
+                                    let doc_ids = state.doc_ids.as_slice();
+                                    let len = doc_ids.len();
+                                    let (lo, hi) = window_bounds(
+                                        doc_ids,
+                                        pair_prev[pj],
+                                        block_idx,
+                                        target32,
+                                        win_end32,
+                                    );
+                                    slice_prev[pj] = (block_idx, hi);
+                                    let next_doc = if hi < len {
+                                        u64::from(doc_ids[hi])
+                                    } else if block_idx + 1 < list.blocks.len() {
+                                        u64::from(list.block_least_doc_id(block_idx + 1))
+                                    } else {
+                                        TERMINATED_DOC_ID
+                                    };
+                                    jump_to = jump_to.max(next_doc);
+                                    if lo == hi {
+                                        pair_empty = true;
+                                        exhausted = next_doc == TERMINATED_DOC_ID;
+                                    } else {
+                                        wins[pj].pos = lo;
+                                        wins[pj].end = hi;
+                                    }
+                                }
+                                if pair_empty {
+                                    skip_window = true;
+                                    break;
+                                }
+                            }
                         }
                         batch_docs.clear();
                         batch_offs.clear();
