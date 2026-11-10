@@ -6057,14 +6057,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
 
                 if !batch_docs.is_empty() {
-                    for (win, posting) in wins.iter_mut().zip(self.lead.iter()) {
-                        let PostingList::Compressed(ref list) = posting.list else {
-                            unreachable!("bulk AND requires compressed postings");
-                        };
-                        let state = unsafe {
-                            &mut *posting.ensure_compressed_block_ptr(list, posting.block_idx)
-                        };
-                        win.freqs = state.freqs.as_ptr();
+                    // A phrase with no heap floor is rejected by positions more
+                    // often than it is scored. Leave follower frequency blocks
+                    // packed until a match; the position cursor decodes a
+                    // clause only when that clause is actually scanned.
+                    if phrase_slop.is_none() || self.threshold > 0.0 {
+                        for (win, posting) in wins.iter_mut().zip(self.lead.iter()) {
+                            let PostingList::Compressed(ref list) = posting.list else {
+                                unreachable!("bulk AND requires compressed postings");
+                            };
+                            let state = unsafe {
+                                &mut *posting.ensure_compressed_block_ptr(list, posting.block_idx)
+                            };
+                            win.freqs = state.freqs.as_ptr();
+                        }
                     }
                     if !norm_k_initialized {
                         norm_k = self.norm_k_cache();
@@ -6183,13 +6189,26 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         // `position_cursor` reads the right posting entry. The
                         // window block is already decompressed; position blocks
                         // decode lazily and are cached per block.
-                        for ((win, posting), &off) in
-                            wins.iter().zip(self.lead.iter_mut()).zip(offs.iter())
+                        for (clause, ((win, posting), &off)) in wins
+                            .iter()
+                            .zip(self.lead.iter_mut())
+                            .zip(offs.iter())
+                            .enumerate()
                         {
                             posting.index = win.block_start + off as usize;
+                            // Frequency blocks stay packed until the phrase
+                            // matches. The lead is already rarest-df first, and
+                            // that index is unique, so the position scan keeps
+                            // a stable anchor. Zero would tie every clause and
+                            // let the unstable sort pick a stopword.
+                            let frequency = if win.freqs.is_null() {
+                                clause as u32
+                            } else {
+                                unsafe { *win.freqs.add(off as usize) }
+                            };
                             posting.current_doc = Some(DocInfo::Raw(RawDocInfo {
                                 doc_id: doc,
-                                frequency: unsafe { *win.freqs.add(off as usize) },
+                                frequency,
                             }));
                         }
                         let matched = if slop == 0 {
@@ -6199,6 +6218,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         };
                         if !matched {
                             continue;
+                        }
+                    }
+                    if phrase_slop.is_some() && wins.iter().any(|win| win.freqs.is_null()) {
+                        for (win, posting) in wins.iter_mut().zip(self.lead.iter()) {
+                            if !win.freqs.is_null() {
+                                continue;
+                            }
+                            let PostingList::Compressed(ref list) = posting.list else {
+                                unreachable!("bulk AND requires compressed postings");
+                            };
+                            let state = unsafe {
+                                &*posting.ensure_compressed_block_ptr(list, posting.block_idx)
+                            };
+                            win.freqs = state.freqs.as_ptr();
                         }
                     }
                     let score = early_score.unwrap_or_else(|| {
