@@ -390,13 +390,21 @@ fn window_bounds(
     };
     let lo = if start < len && doc_ids[start] >= target32 {
         start
-    } else {
-        start + doc_ids[start..].partition_point(|&doc| doc < target32)
-    };
-    let hi = if win_end32 == u32::MAX || len == 0 || doc_ids[len - 1] <= win_end32 {
+    } else if start >= len {
         len
     } else {
-        lo + doc_ids[lo..].partition_point(|&doc| doc <= win_end32)
+        find_next_geq_in_block(doc_ids, start, target32)
+    };
+    // An empty slice only needs the first doc past the window. Skip the
+    // second scan on that miss, which is the common high-skew case.
+    let hi = if len == 0 || lo >= len {
+        len
+    } else if doc_ids[lo] > win_end32 {
+        lo
+    } else if win_end32 == u32::MAX || doc_ids[len - 1] <= win_end32 {
+        len
+    } else {
+        find_next_geq_in_block(doc_ids, lo, win_end32 + 1)
     };
     (lo, hi)
 }
@@ -1070,7 +1078,7 @@ impl PostingIterator {
     ) -> *mut CompressedState {
         let compressed = unsafe { &mut *self.ensure_compressed_doc_ids_ptr(list, block_idx) };
         if compressed.frequency_block_idx != Some(block_idx) {
-            let block = list.blocks.value(block_idx);
+            let block = unsafe { list.blocks.value_unchecked(block_idx) };
             compressed.decompress_frequencies(
                 block,
                 block_idx,
@@ -1091,7 +1099,7 @@ impl PostingIterator {
     ) -> *mut CompressedState {
         let compressed = unsafe { &mut *self.compressed_state_ptr() };
         if compressed.block_idx != block_idx || compressed.doc_ids.is_empty() {
-            let block = list.blocks.value(block_idx);
+            let block = unsafe { list.blocks.value_unchecked(block_idx) };
             compressed.decompress_doc_ids(
                 block,
                 block_idx,
@@ -5621,24 +5629,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         unsafe { &mut *posting.ensure_compressed_doc_ids_ptr(list, block_idx) };
                     let doc_ids = state.doc_ids.as_slice();
                     let len = doc_ids.len();
-                    // Everything before the previous slice's end of this block is
-                    // below the current target, so resume from there.
-                    let (prev_block, prev_hi) = slice_prev[j];
-                    let start = if prev_block == block_idx {
-                        prev_hi.min(len)
-                    } else {
-                        0
-                    };
-                    let lo = if start < len && doc_ids[start] >= target32 {
-                        start
-                    } else {
-                        start + doc_ids[start..].partition_point(|&doc| doc < target32)
-                    };
-                    let hi = if win_end32 == u32::MAX || len == 0 || doc_ids[len - 1] <= win_end32 {
-                        len
-                    } else {
-                        lo + doc_ids[lo..].partition_point(|&doc| doc <= win_end32)
-                    };
+                    let (lo, hi) =
+                        window_bounds(doc_ids, slice_prev[j], block_idx, target32, win_end32);
                     slice_prev[j] = (block_idx, hi);
                     // A later conjunction has to sit in every clause, so it
                     // cannot start before the latest of these next docs.
