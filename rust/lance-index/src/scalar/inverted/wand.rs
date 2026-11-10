@@ -5617,8 +5617,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
             }
             if !used_lazy {
-                for j in 0..num_lists {
-                    let posting = &self.lead[j];
+                for (j, posting) in self.lead.iter().enumerate() {
                     let PostingList::Compressed(ref list) = posting.list else {
                         unreachable!("bulk AND requires compressed postings");
                     };
@@ -5655,75 +5654,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         }
                         exhausted = next_doc == TERMINATED_DOC_ID;
                         skip_window = true;
-                        break;
-                    }
-                    if j == 0 && num_lists > 2 && num_lists <= 32 && hi == lo + 1 {
-                        let doc = doc_ids[lo];
-                        let lead_ptr = state.doc_ids.as_ptr();
-                        let lead_block_start = block_idx << list.block_shift();
-                        let doc_u = u64::from(doc);
-                        let mut matched = true;
-                        let mut offs_tmp = [0u8; 32];
-                        offs_tmp[0] = lo as u8;
-                        for fj in 1..num_lists {
-                            let shift = match &self.lead[fj].list {
-                                PostingList::Compressed(flist) => flist.block_shift(),
-                                PostingList::Plain(_) => 0,
-                            };
-                            self.lead[fj].index = self.lead[fj].block_idx << shift;
-                            self.lead[fj].next_doc_id(doc_u, true);
-                            let found = self.lead[fj].current_doc_id();
-                            let posting = &self.lead[fj];
-                            let PostingList::Compressed(flist) = &posting.list else {
-                                unreachable!("bulk AND requires compressed postings");
-                            };
-                            let off = posting.index & flist.block_mask();
-                            slice_prev[fj] = (posting.block_idx, off);
-                            if found != Some(doc_u) {
-                                matched = false;
-                                jump_to = jump_to.max(found.unwrap_or(TERMINATED_DOC_ID));
-                                exhausted = found.is_none();
-                                break;
-                            }
-                            offs_tmp[fj] = off as u8;
-                        }
-                        if !matched {
-                            skip_window = true;
-                            break;
-                        }
-                        wins.push(WindowList {
-                            docs: lead_ptr,
-                            freqs: std::ptr::null(),
-                            pos: lo,
-                            end: hi,
-                            block_start: lead_block_start,
-                        });
-                        for fj in 1..num_lists {
-                            let posting = &self.lead[fj];
-                            let PostingList::Compressed(flist) = &posting.list else {
-                                unreachable!("bulk AND requires compressed postings");
-                            };
-                            let state = unsafe {
-                                &*posting.ensure_compressed_doc_ids_ptr(flist, posting.block_idx)
-                            };
-                            let off = offs_tmp[fj] as usize;
-                            wins.push(WindowList {
-                                docs: state.doc_ids.as_ptr(),
-                                freqs: std::ptr::null(),
-                                pos: off,
-                                end: off + 1,
-                                block_start: posting.block_idx << flist.block_shift(),
-                            });
-                        }
-                        batch_docs.clear();
-                        batch_offs.clear();
-                        batch_docs.push(doc);
-                        batch_offs.extend_from_slice(&offs_tmp[..num_lists]);
-                        one_doc_settled = true;
-                        if narrow_diag {
-                            diag_short += 1;
-                            diag_one += 1;
-                        }
                         break;
                     }
                     wins.push(WindowList {
