@@ -5254,6 +5254,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         // Allocated only when a window really opens wide.
         let mut wide_state: Option<WideState> = None;
+        // Per-clause block boundary cache for the window positioning above.
+        let mut block_cache_idx = vec![usize::MAX; num_lists];
+        let mut block_cache_up_to = vec![0u64; num_lists];
 
         'window: loop {
             #[cfg(test)]
@@ -5277,23 +5280,28 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             // Position every clause's block cursor at the block that can hold
             // `target`, and end the window at the nearest next-block boundary.
+            // Position every clause at the block that can hold `target` and
+            // end the window at the nearest next-block boundary. The block
+            // cursor only moves forward, so a clause already sitting on the
+            // block that covers `target` reuses its cached boundary instead
+            // of searching again.
             let mut win_end = TERMINATED_DOC_ID;
             for j in 0..num_lists {
-                let (block_idx, block_up_to) = {
+                if self.lead[j].block_idx != block_cache_idx[j] || target > block_cache_up_to[j] {
                     let posting = &self.lead[j];
                     let PostingList::Compressed(ref list) = posting.list else {
                         unreachable!("bulk AND requires compressed postings");
                     };
                     let block_idx = posting.block_idx_for_doc(list, posting.block_idx, target32);
-                    let block_up_to = if block_idx + 1 < list.blocks.len() {
+                    block_cache_idx[j] = block_idx;
+                    block_cache_up_to[j] = if block_idx + 1 < list.blocks.len() {
                         u64::from(list.block_least_doc_id(block_idx + 1)).saturating_sub(1)
                     } else {
                         TERMINATED_DOC_ID
                     };
-                    (block_idx, block_up_to.max(target))
-                };
-                self.lead[j].block_idx = block_idx;
-                win_end = win_end.min(block_up_to);
+                    self.lead[j].block_idx = block_idx;
+                }
+                win_end = win_end.min(block_cache_up_to[j].max(target));
             }
             let win_end32 = u32::try_from(win_end).unwrap_or(u32::MAX);
 
