@@ -4457,7 +4457,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 $(#[$feat])?
                 unsafe fn $name2(
                     wins: &[WindowList],
-                    freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
+                    freq_cutoff: u8,
                     docs_out: &mut Vec<u32>,
                     offs_out: &mut Vec<u8>,
                 ) {
@@ -4468,7 +4468,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         while p0 < e0 {
                             let doc = *d0.add(p0);
                             let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
-                            if freq_cannot_beat[freq] {
+                            if freq < freq_cutoff as usize {
                                 p0 += 1;
                                 continue;
                             }
@@ -4492,7 +4492,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 $(#[$feat])?
                 unsafe fn $name3(
                     wins: &[WindowList],
-                    freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
+                    freq_cutoff: u8,
                     docs_out: &mut Vec<u32>,
                     offs_out: &mut Vec<u8>,
                 ) {
@@ -4504,7 +4504,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         'outer: while p0 < e0 {
                             let doc = *d0.add(p0);
                             let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
-                            if freq_cannot_beat[freq] {
+                            if freq < freq_cutoff as usize {
                                 p0 += 1;
                                 continue 'outer;
                             }
@@ -4539,7 +4539,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 #[allow(clippy::too_many_arguments)]
                 unsafe fn $name_n(
                     wins: &[WindowList],
-                    freq_cannot_beat: &[bool; FREQ_LUT_BUCKETS],
+                    freq_cutoff: u8,
                     cursors: &mut Vec<usize>,
                     docs_out: &mut Vec<u32>,
                     offs_out: &mut Vec<u8>,
@@ -4552,7 +4552,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         'outer: while p0 < e0 {
                             let doc = *d0.add(p0);
                             let freq = (*f0.add(p0) as usize).min(FREQ_LUT_BUCKETS - 1);
-                            if freq_cannot_beat[freq] {
+                            if freq < freq_cutoff as usize {
                                 p0 += 1;
                                 continue 'outer;
                             }
@@ -4792,7 +4792,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut intersection_scratch: Vec<u32> = Vec::new();
         // The frequency-bucket prune decisions only depend on the floor and
         // the followers' block maxes, which rarely change between windows.
-        let mut freq_cannot_beat = [false; FREQ_LUT_BUCKETS];
+        // Frequencies below this bucket cannot beat the floor; 0 means no
+        // cutoff. The frequency bound table is monotone, so one cutoff
+        // replaces the 64-entry boolean table rebuilt per window.
+        let mut freq_cutoff: u8 = 0;
         // Keyed separately from the score limit: the per-candidate prune can
         // refresh the limit in the middle of a window without touching the
         // table, so an unchanged limit key does not mean the table is current.
@@ -5469,20 +5472,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         let freq_bounds = freq_bounds
                             .as_ref()
                             .expect("positive threshold should initialize the frequency bound LUT");
-                        freq_cannot_beat = match first_score_limit {
+                        freq_cutoff = match first_score_limit {
                             Some(limit) => {
-                                std::array::from_fn(|frequency| freq_bounds[frequency] <= limit)
+                                freq_bounds[..].partition_point(|&bound| bound <= limit) as u8
                             }
-                            None => [false; FREQ_LUT_BUCKETS],
+                            None => 0,
                         };
                         freq_cannot_beat_key = Some(key);
                     }
                 } else if freq_cannot_beat_key.is_some() {
-                    freq_cannot_beat = [false; FREQ_LUT_BUCKETS];
+                    freq_cutoff = 0;
                     freq_cannot_beat_key = None;
                 }
                 #[cfg(test)]
-                if freq_cannot_beat.iter().any(|&pruned| pruned) {
+                if freq_cutoff > 0 {
                     self.and_window_stats.windows_frequency_pruned += 1;
                 }
                 #[cfg(target_arch = "x86_64")]
@@ -5527,7 +5530,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     (2, true, true) => unsafe {
                         merge_window_2_avx2(
                             &wins,
-                            &freq_cannot_beat,
+                            freq_cutoff,
                             &mut batch_docs,
                             &mut batch_offs,
                         )
@@ -5536,22 +5539,22 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     (3, true, true) => unsafe {
                         merge_window_3_avx2(
                             &wins,
-                            &freq_cannot_beat,
+                            freq_cutoff,
                             &mut batch_docs,
                             &mut batch_offs,
                         )
                     },
                     (2, _, true) => unsafe {
-                        merge_window_2(&wins, &freq_cannot_beat, &mut batch_docs, &mut batch_offs)
+                        merge_window_2(&wins, freq_cutoff, &mut batch_docs, &mut batch_offs)
                     },
                     (3, _, true) => unsafe {
-                        merge_window_3(&wins, &freq_cannot_beat, &mut batch_docs, &mut batch_offs)
+                        merge_window_3(&wins, freq_cutoff, &mut batch_docs, &mut batch_offs)
                     },
                     #[cfg(target_arch = "x86_64")]
                     (_, true, true) => unsafe {
                         merge_window_n_avx2(
                             &wins,
-                            &freq_cannot_beat,
+                            freq_cutoff,
                             &mut cursor_scratch,
                             &mut batch_docs,
                             &mut batch_offs,
@@ -5560,7 +5563,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     (_, _, true) => unsafe {
                         merge_window_n(
                             &wins,
-                            &freq_cannot_beat,
+                            freq_cutoff,
                             &mut cursor_scratch,
                             &mut batch_docs,
                             &mut batch_offs,
