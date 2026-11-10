@@ -1068,33 +1068,17 @@ impl PostingIterator {
         list: &CompressedPostingList,
         block_idx: usize,
     ) -> *mut CompressedState {
-        // Doc ids and frequencies live in the same posted block. Decode both
-        // from one slice. A doc-id-only caller still goes through
-        // `ensure_compressed_doc_ids_ptr` and does not pay for frequencies.
-        let compressed = unsafe { &mut *self.compressed_state_ptr() };
-        let need_docs = compressed.block_idx != block_idx || compressed.doc_ids.is_empty();
-        if need_docs || compressed.frequency_block_idx != Some(block_idx) {
+        let compressed = unsafe { &mut *self.ensure_compressed_doc_ids_ptr(list, block_idx) };
+        if compressed.frequency_block_idx != Some(block_idx) {
             let block = list.blocks.value(block_idx);
-            if need_docs {
-                compressed.decompress_doc_ids(
-                    block,
-                    block_idx,
-                    list.blocks.len(),
-                    list.length,
-                    list.posting_tail_codec,
-                    list.block_size,
-                );
-            }
-            if compressed.frequency_block_idx != Some(block_idx) {
-                compressed.decompress_frequencies(
-                    block,
-                    block_idx,
-                    list.blocks.len(),
-                    list.length,
-                    list.posting_tail_codec,
-                    list.block_size,
-                );
-            }
+            compressed.decompress_frequencies(
+                block,
+                block_idx,
+                list.blocks.len(),
+                list.length,
+                list.posting_tail_codec,
+                list.block_size,
+            );
         }
         compressed as *mut CompressedState
     }
