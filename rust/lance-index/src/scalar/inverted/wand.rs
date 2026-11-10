@@ -347,6 +347,13 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
 
+static WINDOW_CAP: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_WINDOW_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+});
+
 /// Wide-window override, tests only: Off disables the window even when the
 /// gate opens, Always bypasses the gate and L1. Production follows the gate.
 #[cfg(test)]
@@ -5324,7 +5331,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         u64::from(u32::MAX)
                     }
                 };
-                let wide_end = lead_block_end.min(target.saturating_add(WIDE_MAX_SPAN - 1));
+                let span = if *WINDOW_CAP > 0 { (*WINDOW_CAP).min(WIDE_MAX_SPAN) } else { WIDE_MAX_SPAN };
+                let wide_end = lead_block_end.min(target.saturating_add(span - 1));
                 // Always is the test-only worst case: it opens the window even
                 // when the narrow one already reaches the lead block end.
                 if always || win_end < wide_end {
