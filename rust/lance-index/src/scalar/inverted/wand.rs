@@ -4912,6 +4912,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 st.docs.clear();
                 st.docs.extend_from_slice(&docs0[lo..hi]);
+                // Scratch arrays are sized for one MAX_POSTING_BLOCK_SIZE block.
+                debug_assert!(st.docs.len() <= cap);
                 // Only the position check reads posting offsets, so a plain
                 // conjunction never writes this column.
                 if phrase {
