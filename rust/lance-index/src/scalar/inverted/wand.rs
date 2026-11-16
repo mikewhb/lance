@@ -353,23 +353,29 @@ enum WideOverride {
     Always,
 }
 
+/// Empirical follower-density thresholds for the wide-window gate. They are
+/// tuned constants, not derived invariants; changing one needs an A/B rerun.
+const WIDE_GATE_K: u64 = 8;
+const WIDE_GATE_K_WIDE: u64 = 13;
+
 /// Wide-window gate: one lead block must make the narrow path open at least
-/// block_size / 8 windows, i.e. 8 * sum(follower cost) >= block * lead cost.
-/// Cross-multiplied in u64, so no division and no float. Every clause is
-/// assumed to share a block size (an index is built with one block size).
+/// block_size / WIDE_GATE_K windows, i.e.
+/// WIDE_GATE_K * sum(follower cost) >= block * lead cost. Cross-multiplied in
+/// u64, so no division and no float. Every clause is assumed to share a block
+/// size (an index is built with one block size).
 fn wide_gate(lead_cost: u64, followers_cost: u64, block_size: u64) -> bool {
-    followers_cost.saturating_mul(8) >= block_size.saturating_mul(lead_cost)
+    followers_cost.saturating_mul(WIDE_GATE_K) >= block_size.saturating_mul(lead_cost)
 }
 
 /// [`wide_gate`] for a conjunction of `num_clauses` clauses.
 ///
 /// A wider conjunction decodes more blocks per narrow window, so the wide
-/// window earns its per-lead-block setup earlier: four or more clauses reach
-/// the crossover at about ten follower windows per lead block instead of
-/// sixteen. Measured on 818 held-out conjunctions: lowering the bar only for
-/// k >= 4 takes the 10-16 window band from 0.86-0.94 with fifteen regressions
-/// to 0.64-0.67 with none, while two- and three-clause queries keep the
-/// barrier they were tuned with.
+/// window earns its per-lead-block setup earlier. `WIDE_GATE_K` applies to
+/// two/three clauses and `WIDE_GATE_K_WIDE` to four or more. With the
+/// 256-document posting block they correspond to roughly 32 and 20 narrow
+/// windows per lead block; the 8/16 figures in older notes assumed a
+/// 128-document block. Both are empirical thresholds rather than derived
+/// invariants, so a change must be validated with a same-policy A/B run.
 fn wide_gate_with_clauses(
     lead_cost: u64,
     followers_cost: u64,
@@ -377,7 +383,7 @@ fn wide_gate_with_clauses(
     num_clauses: usize,
 ) -> bool {
     if num_clauses >= 4 {
-        followers_cost.saturating_mul(13) >= block_size.saturating_mul(lead_cost)
+        followers_cost.saturating_mul(WIDE_GATE_K_WIDE) >= block_size.saturating_mul(lead_cost)
     } else {
         wide_gate(lead_cost, followers_cost, block_size)
     }
