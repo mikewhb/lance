@@ -2632,6 +2632,7 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     and_window_stats: AndWindowStats,
     // Test-only override for comparing bulk and classic conjunctions without
     // mutating the process-wide environment.
+    #[cfg(test)]
     bulk_and_mode_override: Option<BulkAndMode>,
     // Test-only wide-window override; None follows the gate.
     #[cfg(test)]
@@ -2756,6 +2757,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             score_first_and_norm_k: OnceCell::new(),
             #[cfg(test)]
             and_window_stats: AndWindowStats::default(),
+            #[cfg(test)]
             bulk_and_mode_override: None,
             #[cfg(test)]
             wide_override: None,
@@ -2777,6 +2779,20 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             scorer,
             shared_threshold: None,
             shared_norm_addends: None,
+        }
+    }
+
+    /// The process-wide bulk mode. Only the test hook can override it; in a
+    /// production build this reads the environment-backed default directly.
+    fn bulk_and_mode(&self) -> BulkAndMode {
+        #[cfg(test)]
+        {
+            self.bulk_and_mode_override
+                .unwrap_or_else(|| *BULK_AND_MODE)
+        }
+        #[cfg(not(test))]
+        {
+            *BULK_AND_MODE
         }
     }
 
@@ -2926,9 +2942,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 .iter()
                 .all(|posting| posting.is_compressed() && !posting.has_grouped_terms())
             && {
-                let mode = self
-                    .bulk_and_mode_override
-                    .unwrap_or_else(|| *BULK_AND_MODE);
+                let mode = self.bulk_and_mode();
                 mode.enabled_for(self.lead.len())
                     || (matches!(mode, BulkAndMode::Auto)
                         && self.lead.len() >= 4
@@ -4314,9 +4328,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // window at the nearest follower block end, so it opens about
         // sum(cost_j) / cost_0 windows inside one lead block; only a block cut
         // into block_size / 8 windows pays for the wide path.
-        let mode = self
-            .bulk_and_mode_override
-            .unwrap_or_else(|| *BULK_AND_MODE);
+        let mode = self.bulk_and_mode();
         let block_size = self
             .lead
             .iter()
