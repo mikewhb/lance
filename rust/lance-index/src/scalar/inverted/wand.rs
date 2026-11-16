@@ -15281,4 +15281,57 @@ mod tests {
             "Auto must open a wide window once the gate allows it"
         );
     }
+
+    /// An unbounded limit (COUNT-like) still terminates and agrees across paths.
+    #[test]
+    fn wide_paths_agree_without_a_limit() {
+        let docs = unit_length_docs(8_192);
+        let build = gate_fixture(8_192, 8_192, 4);
+        let params = FtsSearchParams::default();
+        let classic = run_wide_path(
+            &build,
+            &docs,
+            &|| UnitScorer,
+            &params,
+            BulkAndMode::Off,
+            WideOverride::Off,
+        );
+        let auto = run_wide_path(
+            &build,
+            &docs,
+            &|| UnitScorer,
+            &params,
+            BulkAndMode::On,
+            WideOverride::Auto,
+        );
+        assert_eq!(auto.rows, classic.rows);
+        assert_eq!(auto.floor, classic.floor);
+    }
+
+    /// The Inclusive floor mode must keep identical rows on the wide path.
+    #[test]
+    fn wide_paths_agree_with_inclusive_floor() {
+        let docs = unit_length_docs(8_192);
+        let build = gate_fixture(8_192, 8_192, 4);
+        let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+            .with_bulk_and_mode(BulkAndMode::On)
+            .with_bulk_and_wide(WideOverride::Auto)
+            .with_floor_mode(CompetitiveFloorMode::Inclusive);
+        let mut rows = wand
+            .search(&wide_params(10), &NoOpMetricsCollector)
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        let classic = run_wide_path(
+            &build,
+            &docs,
+            &|| UnitScorer,
+            &wide_params(10),
+            BulkAndMode::Off,
+            WideOverride::Off,
+        );
+        assert_eq!(rows, classic.rows);
+    }
 }
