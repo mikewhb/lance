@@ -2943,6 +2943,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 .all(|posting| posting.is_compressed() && !posting.has_grouped_terms())
             && {
                 let mode = self.bulk_and_mode();
+                // Auto also routes every impacted k>=4 conjunction into the
+                // bulk path, regardless of block size. This widens routing only
+                // (a performance choice); result correctness is unaffected.
                 mode.enabled_for(self.lead.len())
                     || (matches!(mode, BulkAndMode::Auto)
                         && self.lead.len() >= 4
