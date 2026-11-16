@@ -15230,4 +15230,37 @@ mod tests {
             posting.block_max_score_up_to_with_stats((35 * block_size - 1) as u64, &UnitScorer);
         assert!(inside.score >= wide.score);
     }
+
+    /// Production default (no mode/wide override) routes an impacted k>=4
+    /// conjunction into bulk and opens the wide window when the gate allows it.
+    #[test]
+    fn production_auto_opens_wide_window_for_impacted_k4_conjunction() {
+        let num_docs = MAX_POSTING_BLOCK_SIZE * 8;
+        let docs = unit_length_docs(num_docs);
+        let lead = (0..128u32).map(|doc| (doc, 1)).collect::<Vec<_>>();
+        let dense = (0..num_docs as u32).map(|doc| (doc, 1)).collect::<Vec<_>>();
+        let build = || {
+            vec![
+                wide_clause(0, 1.0, &lead, MAX_POSTING_BLOCK_SIZE, num_docs),
+                wide_clause(1, 1.0, &dense, MAX_POSTING_BLOCK_SIZE, num_docs),
+                wide_clause(2, 1.0, &dense, MAX_POSTING_BLOCK_SIZE, num_docs),
+                wide_clause(3, 1.0, &dense, MAX_POSTING_BLOCK_SIZE, num_docs),
+            ]
+        };
+        // Deliberately no `with_bulk_and_mode` / `with_bulk_and_wide`: this is
+        // the production default Auto path, driven by the k>=4 routing gate.
+        let mut wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer);
+        let hits = wand
+            .search(&wide_params(10), &NoOpMetricsCollector)
+            .unwrap();
+        assert_eq!(hits.len(), 10, "the fixture must produce ten matches");
+        assert!(
+            wand.bulk_and_searches > 0,
+            "Auto must route an impacted k>=4 conjunction into bulk"
+        );
+        assert!(
+            wand.and_window_stats.wide_windows > 0,
+            "Auto must open a wide window once the gate allows it"
+        );
+    }
 }
