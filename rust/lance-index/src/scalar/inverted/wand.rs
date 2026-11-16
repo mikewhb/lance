@@ -1740,7 +1740,6 @@ impl PostingIterator {
     /// by the cursor. The wide window walks follower blocks by number, so the
     /// cursor-anchored `block_max_score` / `impact_level0` memos cannot be used:
     /// they are keyed by `self.block_idx` and would answer for another block.
-    #[allow(dead_code)] // Only the wide-window traversal calls this.
     fn block_bound_at<S: Scorer + ?Sized>(&self, block: usize, scorer: &S) -> f32 {
         let PostingList::Compressed(ref list) = self.list else {
             return if self.use_scorer_upper_bound {
@@ -2792,7 +2791,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     /// Test hook: Off suppresses the wide window, Always bypasses the gate and
     /// L1, Auto follows the gate.
     #[cfg(test)]
-    #[allow(dead_code)]
     fn with_bulk_and_wide(mut self, wide: WideOverride) -> Self {
         self.wide_override = Some(wide);
         self
