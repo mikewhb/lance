@@ -13882,9 +13882,10 @@ mod tests {
         }
     }
 
-    /// The four paths — classic, bulk with the wide window off, auto and always
-    /// — must publish the same rows and the same k-th score bits. Returns the
-    /// always run so callers can assert on the wide counters.
+    /// Classic, bulk with the wide window off, and the two wide overrides
+    /// (Auto follows the gate, Always forces it) must publish the same rows and
+    /// the same k-th score bits. Returns the Always run so callers can assert
+    /// on the wide counters.
     fn assert_wide_paths_agree<S: Scorer>(
         build: &impl Fn() -> Vec<PostingIterator>,
         docs: &DocSet,
