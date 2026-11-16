@@ -15361,6 +15361,10 @@ mod tests {
         );
         assert_eq!(auto.rows, classic.rows);
         assert_eq!(auto.floor, classic.floor);
+        assert!(
+            auto.windows > 0,
+            "the wide path must execute for this parity check"
+        );
     }
 
     /// The Inclusive floor mode must keep identical rows on the wide path.
@@ -15379,14 +15383,20 @@ mod tests {
             .map(|hit| (hit.document, hit.doc_length, hit.freqs))
             .collect::<Vec<_>>();
         rows.sort_unstable();
-        let classic = run_wide_path(
-            &build,
-            &docs,
-            &|| UnitScorer,
-            &wide_params(10),
-            BulkAndMode::Off,
-            WideOverride::Off,
+        let mut classic_wand = Wand::new(Operator::And, build().into_iter(), &docs, UnitScorer)
+            .with_bulk_and_mode(BulkAndMode::Off)
+            .with_floor_mode(CompetitiveFloorMode::Inclusive);
+        let mut classic_rows = classic_wand
+            .search(&wide_params(10), &NoOpMetricsCollector)
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+            .collect::<Vec<_>>();
+        classic_rows.sort_unstable();
+        assert_eq!(rows, classic_rows);
+        assert!(
+            wand.and_window_stats.wide_windows > 0,
+            "the wide path must execute for this parity check"
         );
-        assert_eq!(rows, classic.rows);
     }
 }
