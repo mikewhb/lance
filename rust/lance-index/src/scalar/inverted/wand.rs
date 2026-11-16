@@ -2574,6 +2574,9 @@ struct AndWindowStats {
     // Lead frequency decodes; a window retired by the whole-window bound must
     // not add one.
     wide_lead_freq_decodes: usize,
+    // Wide windows retired before decoding (empty lead window or whole-window
+    // bound). Every wide window either decodes once or is retired once.
+    wide_retired_windows: usize,
 }
 
 impl Eq for TailPosting {}
@@ -4916,6 +4919,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 let lo = docs0.partition_point(|&doc| doc < target32);
                 let hi = lo + docs0[lo..].partition_point(|&doc| doc <= wide_end32);
                 if lo == hi {
+                    #[cfg(test)]
+                    {
+                        wand.and_window_stats.wide_retired_windows += 1;
+                    }
                     if hi < docs0.len() {
                         return Ok((u64::from(docs0[hi]), false));
                     }
@@ -4968,6 +4975,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
             if prunable {
                 if score_sum_cannot_compete(0.0, suffix[0], floor_w, factor, mode) {
+                    #[cfg(test)]
+                    {
+                        wand.and_window_stats.wide_retired_windows += 1;
+                    }
                     return Ok((wide_end + 1, wide_end >= u32::MAX as u64));
                 }
                 // Query-scoped: the bound only depends on the clause weights.
@@ -13243,6 +13254,13 @@ mod tests {
                 0,
                 "the classic path must not compute impact bounds for a disjoint conjunction"
             );
+        } else {
+            let stats = &wand.and_window_stats;
+            assert_eq!(
+                stats.wide_lead_freq_decodes + stats.wide_retired_windows,
+                stats.wide_windows,
+                "every wide window either decodes the lead frequencies once or is retired"
+            );
         }
     }
 
@@ -13326,6 +13344,14 @@ mod tests {
                 .sum::<usize>(),
             0
         );
+        if mode == BulkAndMode::On {
+            let stats = &wand.and_window_stats;
+            assert_eq!(
+                stats.wide_lead_freq_decodes + stats.wide_retired_windows,
+                stats.wide_windows,
+                "every wide window either decodes once or is retired"
+            );
+        }
     }
 
     /// A sparse lead over dense followers must drive the window traversal:
