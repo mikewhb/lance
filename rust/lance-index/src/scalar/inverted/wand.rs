@@ -796,6 +796,9 @@ impl BlockMaxWindow {
         let mut blocks_scanned = 0;
         let num_blocks = list.blocks.len();
         let impact_bounds = list.impacts.as_ref().map(|impacts| {
+            // level1 bounds are indexed by `num_blocks + group_idx`, which is
+            // only valid when the impact table covers exactly the block count.
+            debug_assert_eq!(num_blocks, impacts.level0_len());
             (
                 impacts,
                 impacts.doc_weight_bounds_cached(scorer, &mut self.impact_score_cache),
