@@ -349,6 +349,7 @@ static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_e
 enum WideOverride {
     #[default]
     Off,
+    /// Follows the gate; equivalent to not setting an override at all.
     Auto,
     Always,
 }
