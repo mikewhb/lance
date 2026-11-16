@@ -805,6 +805,10 @@ impl BlockMaxWindow {
         let impact_bounds = list.impacts.as_ref().map(|impacts| {
             // level1 bounds are indexed by `num_blocks + group_idx`, which is
             // only valid when the impact table covers exactly the block count.
+            // `level0_len()` is a test-only accessor, so this check is compiled
+            // only for test builds; release builds rely on the builder emitting
+            // one level0 entry per block.
+            #[cfg(test)]
             debug_assert_eq!(num_blocks, impacts.level0_len());
             (
                 impacts,
