@@ -4907,8 +4907,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
             let mut n = st.docs.len();
 
-            // (b) Bound every clause over the span the candidates really cover;
-            // a list-wide follower bound is too loose to ever reject.
+            // (b) Bound every clause for the wide window. The lead uses its
+            // per-block bound; followers use their list-wide upper bound, which
+            // is conservative but too loose to retire a whole window on its own.
             let mut suffix = SmallVec::<[f64; 8]>::new();
             // The wide window prunes against exactly the floor the narrow path
             // uses (the local k-th raised to the shared cross-partition floor
@@ -4932,9 +4933,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
             }
             if prunable {
-                if score_sum_cannot_compete(0.0, suffix[0], floor_w, factor, mode) {
-                    return Ok((wide_end + 1, wide_end >= u32::MAX as u64));
-                }
                 // Query-scoped: the bound only depends on the clause weights.
                 if st.lut.is_empty() {
                     st.lut.resize(num_lists * FREQ_LUT_BUCKETS, 0.0);
@@ -4945,8 +4943,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
             }
 
-            // (b') Decode the lead frequencies only now: a window retired by the
-            // whole-window bound must not touch the frequency block.
+            // (b') Decode the lead frequencies only after the per-window bounds
+            // are ready, so a window with no candidates does no decoding work.
             {
                 let posting = &wand.lead[0];
                 let PostingList::Compressed(ref list) = posting.list else {
