@@ -8847,6 +8847,8 @@ mod tests {
     #[case::on_legacy("1", Some(BulkAndMode::On))]
     #[case::off("off", Some(BulkAndMode::Off))]
     #[case::off_legacy("0", Some(BulkAndMode::Off))]
+    #[case::narrow_removed("narrow", None)]
+    #[case::narrow_case_removed(" NARROW ", None)]
     #[case::invalid("true", None)]
     #[case::empty("", None)]
     fn test_bulk_and_mode_parse(#[case] value: &str, #[case] expected: Option<BulkAndMode>) {
@@ -15288,6 +15290,25 @@ mod tests {
             wand.and_window_stats.wide_windows > 0,
             "Auto must open a wide window once the gate allows it"
         );
+        assert_eq!(
+            wand.bulk_and_mode(),
+            BulkAndMode::Auto,
+            "the production default path must be Auto, with no override set"
+        );
+        let mut rows = hits
+            .into_iter()
+            .map(|hit| (hit.document, hit.doc_length, hit.freqs))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        let classic = run_wide_path(
+            &build,
+            &docs,
+            &|| UnitScorer,
+            &wide_params(10),
+            BulkAndMode::Off,
+            WideOverride::Off,
+        );
+        assert_eq!(rows, classic.rows, "Auto must publish the classic rows");
     }
 
     /// An unbounded limit (COUNT-like) still terminates and agrees across paths.
