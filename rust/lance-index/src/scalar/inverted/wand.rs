@@ -5289,9 +5289,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             // follower block end, so it shrinks to one lead document whenever a
             // follower crosses a block boundary inside the lead block; opening
             // to the lead block end pays the per-window setup once per lead
-            // block instead. The lead-driven kernel also wins before this
-            // partition's heap fills, so the gate alone decides; pruning still
-            // waits for a positive floor inside run_wide_window.
+            // block instead. The gate alone decides whether to open a wide
+            // window; pruning itself still waits for a positive floor inside
+            // run_wide_window.
             if wide_enabled {
                 let lead_block = self.lead[0].block_idx;
                 let lead_block_end = {
@@ -5301,6 +5301,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     if lead_block + 1 < list.blocks.len() {
                         u64::from(list.block_least_doc_id(lead_block + 1)).saturating_sub(1)
                     } else {
+                        // u32::MAX is the wide-path end sentinel; the narrow
+                        // path uses TERMINATED_DOC_ID (u64::MAX). The wide loop
+                        // treats `wide_end >= u32::MAX` as done, so the two
+                        // sentinels agree after the u32 window conversion.
                         u64::from(u32::MAX)
                     }
                 };
