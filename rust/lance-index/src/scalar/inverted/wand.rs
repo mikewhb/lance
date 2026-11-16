@@ -13166,7 +13166,7 @@ mod tests {
     #[case::bulk_sixteen(BulkAndMode::On, 16)]
     #[case::classic_four(BulkAndMode::Off, 4)]
     #[case::classic_five(BulkAndMode::Off, 5)]
-    fn underfilled_disjoint_and_decodes_no_frequencies_or_bounds(
+    fn underfilled_disjoint_avoids_scoring_and_classic_decoding(
         #[case] mode: BulkAndMode,
         #[case] num_clauses: usize,
     ) {
@@ -13216,6 +13216,24 @@ mod tests {
 
         assert!(hits.is_empty());
         assert_eq!(scored.load(Ordering::Relaxed), 0);
+        if mode == BulkAndMode::Off {
+            assert_eq!(
+                wand.lead
+                    .iter()
+                    .map(|posting| posting.frequency_blocks_decoded())
+                    .sum::<usize>(),
+                0,
+                "the classic path must not decode frequency blocks for a disjoint conjunction"
+            );
+            assert_eq!(
+                wand.lead
+                    .iter()
+                    .map(|posting| posting.impact_bound_computations())
+                    .sum::<usize>(),
+                0,
+                "the classic path must not compute impact bounds for a disjoint conjunction"
+            );
+        }
     }
 
     #[rstest]
