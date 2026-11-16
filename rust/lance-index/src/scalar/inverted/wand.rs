@@ -286,18 +286,15 @@ impl CompetitiveFloorMode {
 // Bulk conjunction path for top-k AND / phrase queries: block-max window
 // skipping plus a slice-level merge over decompressed blocks, replacing the
 // per-doc `next()` leapfrog. Results are identical to the classic AND loop.
-// LANCE_FTS_BULK_AND accepts auto (default), on/1, off/0, or narrow. Auto
+// LANCE_FTS_BULK_AND accepts auto (default), on/1, or off/0. Auto
 // enables the bulk path for two and three clauses and for wider
-// current-format conjunctions. Narrow routes exactly like auto but never opens
-// a wide window, which makes it the same-binary control arm for the wide path.
+// current-format conjunctions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BulkAndMode {
     #[default]
     Auto,
     On,
     Off,
-    /// Same routing as Auto, never a wide window.
-    Narrow,
 }
 
 impl BulkAndMode {
@@ -309,8 +306,6 @@ impl BulkAndMode {
             Some(Self::On)
         } else if value.eq_ignore_ascii_case("off") || value == "0" {
             Some(Self::Off)
-        } else if value.eq_ignore_ascii_case("narrow") {
-            Some(Self::Narrow)
         } else {
             None
         }
@@ -318,7 +313,7 @@ impl BulkAndMode {
 
     const fn enabled_for(self, num_clauses: usize) -> bool {
         match self {
-            Self::Auto | Self::Narrow => matches!(num_clauses, 2 | 3),
+            Self::Auto => matches!(num_clauses, 2 | 3),
             Self::On => true,
             Self::Off => false,
         }
@@ -2937,7 +2932,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                     .bulk_and_mode_override
                     .unwrap_or_else(|| *BULK_AND_MODE);
                 mode.enabled_for(self.lead.len())
-                    || (matches!(mode, BulkAndMode::Auto | BulkAndMode::Narrow)
+                    || (matches!(mode, BulkAndMode::Auto)
                         && self.lead.len() >= 4
                         && self.lead.iter().all(|posting| {
                             matches!(&posting.list, PostingList::Compressed(list)
@@ -8813,8 +8808,6 @@ mod tests {
     #[case::on_legacy("1", Some(BulkAndMode::On))]
     #[case::off("off", Some(BulkAndMode::Off))]
     #[case::off_legacy("0", Some(BulkAndMode::Off))]
-    #[case::narrow("narrow", Some(BulkAndMode::Narrow))]
-    #[case::narrow_case(" NARROW ", Some(BulkAndMode::Narrow))]
     #[case::invalid("true", None)]
     #[case::empty("", None)]
     fn test_bulk_and_mode_parse(#[case] value: &str, #[case] expected: Option<BulkAndMode>) {
@@ -8830,9 +8823,6 @@ mod tests {
     #[case::on_five(BulkAndMode::On, 5, true)]
     #[case::off_two(BulkAndMode::Off, 2, false)]
     #[case::off_five(BulkAndMode::Off, 5, false)]
-    #[case::narrow_two(BulkAndMode::Narrow, 2, true)]
-    #[case::narrow_three(BulkAndMode::Narrow, 3, true)]
-    #[case::narrow_four(BulkAndMode::Narrow, 4, false)]
     fn test_bulk_and_mode_enabled_for(
         #[case] mode: BulkAndMode,
         #[case] num_clauses: usize,
@@ -14658,26 +14648,6 @@ mod tests {
             WideOverride::Always,
         );
         assert!(always.windows > 0, "Always must bypass the gate");
-        // The same binary through Narrow is the same-binary control arm.
-        let narrow = run_wide_path(
-            &aligned,
-            &docs,
-            &|| UnitScorer,
-            &wide_params(10),
-            BulkAndMode::Narrow,
-            WideOverride::Auto,
-        );
-        assert_eq!(narrow.windows, 0);
-        let classic = run_wide_path(
-            &aligned,
-            &docs,
-            &|| UnitScorer,
-            &wide_params(10),
-            BulkAndMode::Off,
-            WideOverride::Off,
-        );
-        assert_eq!(narrow.rows, classic.rows);
-        assert_eq!(narrow.floor, classic.floor);
         assert_wide_paths_agree(&aligned, &docs, &|| UnitScorer, &wide_params(10));
 
         // A skewed, gated query whose blocks are aligned stays narrow for the
@@ -15047,43 +15017,6 @@ mod tests {
         assert!(windows > 0, "the gate must open without a full heap");
         assert!(skipped > 0, "the shared floor must skip later blocks");
         assert_eq!(rows, classic, "the shared floor must prune like classic");
-    }
-
-    /// N-1: Narrow routes exactly like Auto but never opens a wide window, so it
-    /// is the same-binary control arm for the wide path.
-    #[test]
-    fn narrow_mode_matches_the_classic_path() {
-        let docs = unit_length_docs(8_192);
-        let build = gate_fixture(8_192, 8_192, 2);
-        let classic = run_wide_path(
-            &build,
-            &docs,
-            &|| UnitScorer,
-            &wide_params(10),
-            BulkAndMode::Off,
-            WideOverride::Off,
-        );
-        let auto = run_wide_path(
-            &build,
-            &docs,
-            &|| UnitScorer,
-            &wide_params(10),
-            BulkAndMode::On,
-            WideOverride::Auto,
-        );
-        assert!(auto.windows > 0, "the fixture must use the wide path");
-        let narrow = run_wide_path(
-            &build,
-            &docs,
-            &|| UnitScorer,
-            &wide_params(10),
-            BulkAndMode::Narrow,
-            WideOverride::Auto,
-        );
-        assert_eq!(narrow.windows, 0, "Narrow must never open a wide window");
-        assert_eq!(narrow.fit_windows, 0, "Narrow must skip the dispatch");
-        assert_eq!(narrow.rows, classic.rows);
-        assert_eq!(narrow.floor, classic.floor);
     }
 
     #[test]
