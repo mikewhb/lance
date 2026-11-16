@@ -15399,4 +15399,23 @@ mod tests {
             "the wide path must execute for this parity check"
         );
     }
+
+    /// The Inclusive floor accepts a score equal to the floor, so the bound
+    /// must be strictly below it to retire a window. This pins the boundary
+    /// that the row-parity test above cannot reach with its fixture.
+    #[test]
+    fn inclusive_floor_rejects_only_strictly_below_the_floor() {
+        let mode = CompetitiveFloorMode::Inclusive;
+        assert!(mode.rejects_upper_bound(1.0, 2.0), "1 < 2 rejects");
+        assert!(
+            !mode.rejects_upper_bound(2.0, 2.0),
+            "bound == floor must NOT reject under Inclusive"
+        );
+        assert!(!mode.rejects_upper_bound(3.0, 2.0), "3 > 2 must not reject");
+        let exclusive = CompetitiveFloorMode::Exclusive;
+        assert!(
+            exclusive.rejects_upper_bound(2.0, 2.0),
+            "Exclusive rejects at equality"
+        );
+    }
 }
