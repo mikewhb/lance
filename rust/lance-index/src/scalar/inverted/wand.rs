@@ -1751,9 +1751,13 @@ impl PostingIterator {
                 self.approximate_upper_bound
             };
         };
-        // Bulk routing already rejects grouped terms, which have no stored
-        // per-block bound of their own.
-        debug_assert!(!self.has_grouped_terms());
+        // Grouped terms have no stored per-block bound; fall back to the
+        // approximate list-wide bound. Bulk routing normally rejects them,
+        // but keep this defensive so a future routing change cannot silently
+        // under-estimate a bound and drop real candidates.
+        if self.has_grouped_terms() {
+            return self.approximate_upper_bound;
+        }
         // An out-of-range block holds no documents, but callers treat the result
         // as a bound: a finite answer would silently prune real candidates, and
         // reading the block header would panic.
