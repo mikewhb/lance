@@ -347,9 +347,9 @@ static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_e
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum WideOverride {
-    #[default]
     Off,
     /// Follows the gate; equivalent to not setting an override at all.
+    #[default]
     Auto,
     Always,
 }
@@ -2653,9 +2653,9 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // mutating the process-wide environment.
     #[cfg(test)]
     bulk_and_mode_override: Option<BulkAndMode>,
-    // Test-only wide-window override; None follows the gate.
+    // Test-only wide-window override; Auto follows the gate.
     #[cfg(test)]
-    wide_override: Option<WideOverride>,
+    wide_override: WideOverride,
     #[cfg(test)]
     bulk_and_searches: usize,
     #[cfg(test)]
@@ -2779,7 +2779,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             #[cfg(test)]
             bulk_and_mode_override: None,
             #[cfg(test)]
-            wide_override: None,
+            wide_override: Default::default(),
             #[cfg(test)]
             bulk_and_searches: 0,
             #[cfg(test)]
@@ -2827,7 +2827,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     /// L1, Auto follows the gate.
     #[cfg(test)]
     fn with_bulk_and_wide(mut self, wide: WideOverride) -> Self {
-        self.wide_override = Some(wide);
+        self.wide_override = wide;
         self
     }
 
@@ -4374,9 +4374,9 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // follows the gate and L1 only.
         #[cfg(test)]
         let (wide_enabled, always) = match self.wide_override {
-            Some(WideOverride::Off) => (false, false),
-            Some(WideOverride::Always) => (true, true),
-            _ => (gated, false),
+            WideOverride::Off => (false, false),
+            WideOverride::Always => (true, true),
+            WideOverride::Auto => (gated, false),
         };
         #[cfg(not(test))]
         let (wide_enabled, always) = (gated, false);
