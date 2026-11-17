@@ -372,11 +372,9 @@ fn wide_gate(lead_cost: u64, followers_cost: u64, block_size: u64) -> bool {
 ///
 /// A wider conjunction decodes more blocks per narrow window, so the wide
 /// window earns its per-lead-block setup earlier. `WIDE_GATE_K` applies to
-/// two/three clauses and `WIDE_GATE_K_WIDE` to four or more. With the
-/// 256-document posting block they correspond to roughly 32 and 20 narrow
-/// windows per lead block; the 8/16 figures in older notes assumed a
-/// 128-document block. Both are empirical thresholds rather than derived
-/// invariants, so a change must be validated with a same-policy A/B run.
+/// two/three clauses and `WIDE_GATE_K_WIDE` to four or more. Both are
+/// empirical thresholds rather than derived invariants, so a change must
+/// be validated with a same-policy A/B run.
 fn wide_gate_with_clauses(
     lead_cost: u64,
     followers_cost: u64,
@@ -2952,10 +2950,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             return self.maxscore_search(params, metrics);
         }
 
-        // Top-k conjunctions (AND and phrase) over compressed lists use the
-        // bulk path: the same block-max window pruning, but candidates come
-        // from a slice-level merge over decompressed blocks instead of per-doc
-        // `next()` leapfrogging through boxed iterators.
+        // Top-k AND/phrase conjunctions use the bulk path (see `BulkAndMode` above).
         if self.operator == Operator::And
             && !self.lead.is_empty()
             && self
@@ -13995,7 +13990,7 @@ mod tests {
         }
         // The shared floor records the rank-th best published score, so a
         // ladder over the limit compares every rank's f32 bits rather than
-        // only the k-th. Ranks beyond ten add little and cost four runs each.
+        // only the k-th. Ranks beyond ten add little and cost three runs each.
         let top = params.limit.unwrap_or(1).clamp(1, 10);
         for rank in 1..=top {
             let mut p = params.clone();

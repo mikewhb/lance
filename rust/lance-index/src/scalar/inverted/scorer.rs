@@ -390,7 +390,7 @@ mod tests {
                 let doc_weight = scorer.doc_weight(freq, doc_tokens);
                 assert!(
                     doc_weight.is_finite() && doc_weight >= previous_weight,
-                    "doc_weight must not decrease with the frequency:                      freq={freq} doc_tokens={doc_tokens} gives {doc_weight:e}"
+                    "doc_weight must not decrease with the frequency: freq={freq} doc_tokens={doc_tokens} gives {doc_weight:e}"
                 );
                 previous_weight = doc_weight;
             }
@@ -401,7 +401,7 @@ mod tests {
                 let doc_weight = scorer.doc_weight(freq, dequantize_doc_length(code));
                 assert!(
                     doc_weight <= previous_weight,
-                    "doc_weight must not increase with the document length:                      freq={freq} code={code} gives {doc_weight:e}"
+                    "doc_weight must not increase with the document length: freq={freq} code={code} gives {doc_weight:e}"
                 );
                 previous_weight = doc_weight;
             }
