@@ -52,6 +52,7 @@ mod maxscore;
 mod phrase;
 mod posting;
 mod search;
+mod wide_window;
 
 struct CostOnlyDocuments {
     total_docs: usize,
@@ -184,6 +185,15 @@ impl Scorer for VariedBm25ShapeScorer {
     fn doc_norm(&self, doc_tokens: u32) -> Option<f32> {
         Some(0.3 + doc_tokens as f32 * 0.1)
     }
+}
+
+#[cfg_attr(coverage, coverage(off))]
+fn unit_length_docs(num_docs: usize) -> DocSet {
+    let mut docs = DocSet::default();
+    for doc_id in 0..num_docs {
+        docs.append(doc_id as u64, 1);
+    }
+    docs
 }
 
 fn generate_posting_list(

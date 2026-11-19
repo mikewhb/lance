@@ -21,7 +21,7 @@ fn bulk_and_and_classic_publish_identical_query_order_score_bits(
         docs.append(doc_id, 1);
     }
 
-    let run = |mode| {
+    let run = |mode, wide| {
         let postings = contributions
             .iter()
             .copied()
@@ -42,6 +42,7 @@ fn bulk_and_and_classic_publish_identical_query_order_score_bits(
         let shared_floor = Arc::new(AtomicU32::new(0.0_f32.to_bits()));
         let mut wand = Wand::new(Operator::And, postings.into_iter(), &docs, UnitScorer)
             .with_bulk_and_mode(mode)
+            .with_bulk_and_wide(wide)
             .with_shared_threshold(shared_floor.clone());
         let hits = wand
             .search(
@@ -56,8 +57,8 @@ fn bulk_and_and_classic_publish_identical_query_order_score_bits(
         )
     };
 
-    let (bulk, bulk_score, bulk_used) = run(BulkAndMode::On);
-    let (classic, classic_score, classic_used) = run(BulkAndMode::Off);
+    let (bulk, bulk_score, bulk_used) = run(BulkAndMode::On, WideOverride::Off);
+    let (classic, classic_score, classic_used) = run(BulkAndMode::Off, WideOverride::Off);
     assert!(bulk_used);
     assert!(!classic_used);
     assert_eq!(bulk.len(), 1);
@@ -72,6 +73,10 @@ fn bulk_and_and_classic_publish_identical_query_order_score_bits(
             .to_bits()
     );
     assert_eq!(classic_score, bulk_score);
+    let (wide, wide_score, _) = run(BulkAndMode::On, WideOverride::Always);
+    assert_eq!(wide.len(), 1);
+    assert_eq!(wide[0].document, 0);
+    assert_eq!(wide_score, bulk_score);
 }
 
 /// The bulk conjunction path must return exactly the classic loop's

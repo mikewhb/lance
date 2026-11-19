@@ -20,6 +20,10 @@ pub struct DocCandidate<C> {
     /// (term_index, freq)
     pub freqs: Vec<(u32, u32)>,
     pub doc_length: u32,
+    /// The score that ranked the document, so tests can compare paths bit
+    /// for bit.
+    #[cfg(test)]
+    pub score: f32,
 }
 
 /// Document-side contract consumed by WAND.  Implementations fix candidate

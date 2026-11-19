@@ -33,6 +33,11 @@ use super::TERMINATED_DOC_ID;
 
 const LINEAR_BLOCK_SKIP_LIMIT: usize = 8;
 
+/// Buckets of the conjunction frequency prune table. Buckets below the last
+/// hold the score bound at that exact frequency; the last covers every larger
+/// frequency.
+pub(super) const FREQ_LUT_BUCKETS: usize = 64;
+
 /// First index in `[pos, end)` where `docs[index] >= target` (scalar).
 #[inline]
 pub(super) unsafe fn find_next_geq_scalar(
@@ -252,6 +257,16 @@ pub struct PostingIterator {
     pub(super) compressed: Option<UnsafeCell<CompressedState>>,
 }
 
+/// Position delta range of the posting at `index` and the delta total of its
+/// block, enough to seek a PackedDelta position block without its frequencies.
+#[derive(Clone, Copy)]
+struct PositionHint {
+    index: usize,
+    delta_start: usize,
+    delta_end: usize,
+    total_deltas: usize,
+}
+
 #[derive(Clone)]
 pub(super) struct CompressedState {
     pub(super) block_idx: usize,
@@ -280,6 +295,9 @@ pub(super) struct CompressedState {
     position_unpacked_group_idx: Option<usize>,
     position_tail: Vec<u32>,
     position_total_deltas: usize,
+    // A PackedDelta seek for one posting, recorded by a caller that decoded
+    // the block's frequencies and has since moved the block cursor.
+    position_hint: Option<PositionHint>,
     pub(super) block_max_window: BlockMaxWindow,
     // Lucene-style anchored impact score caches: one slot per level, keyed by
     // the entry the block cursor currently sits in. Each holds
@@ -309,6 +327,7 @@ impl CompressedState {
             position_unpacked_group_idx: None,
             position_tail: Vec::new(),
             position_total_deltas: 0,
+            position_hint: None,
             block_max_window: BlockMaxWindow::new(),
             level0_cache: None,
             level1_cache: None,
@@ -1012,6 +1031,26 @@ impl PostingIterator {
         self.current_doc = current_doc;
     }
 
+    /// Record the position delta range of the posting at `index` and the delta
+    /// total of its block, taken from the block's frequencies while they were
+    /// decoded. A later PackedDelta `position_cursor` for that posting then
+    /// seeks without decoding the block again.
+    pub(super) fn set_position_hint(
+        &self,
+        index: usize,
+        deltas: std::ops::Range<usize>,
+        total_deltas: usize,
+    ) {
+        if let Some(compressed) = self.compressed.as_ref() {
+            unsafe { &mut *compressed.get() }.position_hint = Some(PositionHint {
+                index,
+                delta_start: deltas.start,
+                delta_end: deltas.end,
+                total_deltas,
+            });
+        }
+    }
+
     pub(super) fn position_cursor(&self) -> Result<PositionCursor<'_>> {
         #[cfg(test)]
         {
@@ -1054,35 +1093,60 @@ impl PostingIterator {
                 CompressedPositionStorage::SharedStream(stream) => {
                     let block_idx = self.index >> list.block_shift();
                     let block_offset = self.index & list.block_mask();
-                    let compressed =
-                        unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
+                    let hint = if matches!(stream.codec(), PositionStreamCodec::PackedDelta) {
+                        unsafe { &*self.compressed_state_ptr() }
+                            .position_hint
+                            .filter(|hint| hint.index == self.index)
+                    } else {
+                        None
+                    };
+                    // A hinted seek needs neither the doc ids nor the
+                    // frequencies of the block.
+                    let compressed = match hint {
+                        Some(_) => unsafe { &mut *self.compressed_state_ptr() },
+                        None => unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) },
+                    };
                     match stream.codec() {
                         PositionStreamCodec::PackedDelta => {
                             // Seekable layout: decode only the candidate doc's
                             // positions. Per-block seek state resets when the
-                            // block cursor moves; the group header index and
-                            // varint tail fill in lazily as candidates touch
-                            // them.
+                            // position block changes; the group header index
+                            // and varint tail fill in lazily as candidates
+                            // touch them.
                             if compressed.position_block_idx != Some(block_idx) {
                                 compressed.position_group_offsets.clear();
                                 compressed.position_group_offsets.push(0);
                                 compressed.position_tail.clear();
                                 compressed.position_unpacked_group_idx = None;
                                 compressed.position_offsets.clear();
-                                compressed
-                                    .position_offsets
-                                    .reserve(compressed.freqs.len() + 1);
-                                compressed.position_offsets.push(0);
-                                let mut offset = 0usize;
-                                for &freq in &compressed.freqs {
-                                    offset += freq as usize;
-                                    compressed.position_offsets.push(offset);
-                                }
-                                compressed.position_total_deltas = offset;
                                 compressed.position_block_idx = Some(block_idx);
                             }
-                            let delta_start = compressed.position_offsets[block_offset];
-                            let delta_end = compressed.position_offsets[block_offset + 1];
+                            let (delta_start, delta_end) = match hint {
+                                Some(hint) => {
+                                    compressed.position_total_deltas = hint.total_deltas;
+                                    (hint.delta_start, hint.delta_end)
+                                }
+                                None => {
+                                    // A hinted seek may have set up this block
+                                    // without its offsets.
+                                    if compressed.position_offsets.is_empty() {
+                                        compressed
+                                            .position_offsets
+                                            .reserve(compressed.freqs.len() + 1);
+                                        compressed.position_offsets.push(0);
+                                        let mut offset = 0usize;
+                                        for &freq in &compressed.freqs {
+                                            offset += freq as usize;
+                                            compressed.position_offsets.push(offset);
+                                        }
+                                        compressed.position_total_deltas = offset;
+                                    }
+                                    (
+                                        compressed.position_offsets[block_offset],
+                                        compressed.position_offsets[block_offset + 1],
+                                    )
+                                }
+                            };
                             let mut position_values = self
                                 .position_scratch
                                 .borrow_mut()
@@ -1366,6 +1430,66 @@ impl PostingIterator {
             }
             PostingList::Plain(_) => self.approximate_upper_bound,
         }
+    }
+
+    /// [`Self::block_max_score`] for the block at index `block` instead of the
+    /// cursor's block. The wide conjunction window bounds follower blocks by
+    /// index, so the cursor-anchored level0 memo would answer for another block.
+    pub(super) fn block_bound_at<S: Scorer + ?Sized>(&self, block: usize, scorer: &S) -> f32 {
+        let PostingList::Compressed(ref list) = self.list else {
+            return self.block_max_score(scorer);
+        };
+        // Grouped terms have no per-block bound for their exact score.
+        if self.has_grouped_terms() {
+            return self.approximate_upper_bound;
+        }
+        // Callers prune with the answer, so a block past the list must not
+        // read as a finite bound.
+        if block >= list.blocks.len() {
+            return f32::INFINITY;
+        }
+        if let Some(impacts) = list.impacts.as_ref() {
+            let compressed = unsafe { &mut *self.compressed_state_ptr() };
+            let (level0, _) = impacts.doc_weight_bounds_by_level_cached(
+                scorer,
+                &mut compressed.block_max_window.impact_score_cache,
+            );
+            return match level0.get(block) {
+                Some(_) if self.query_weight <= 0.0 => 0.0,
+                Some(&doc_weight) => self.query_weight * doc_weight,
+                None => f32::INFINITY,
+            };
+        }
+        if self.use_scorer_upper_bound || list.block_size == MAX_POSTING_BLOCK_SIZE {
+            return scorer_upper_bound(self.query_weight, scorer);
+        }
+        list.block_max_score(block)
+    }
+
+    /// Score upper bounds by frequency with the document length dropped: entry
+    /// `f` bounds a posting with frequency `f`, and the last entry bounds every
+    /// larger frequency. Grouped terms ignore the frequency and a negative query
+    /// weight would make the table a lower bound, so neither may prune.
+    pub(super) fn frequency_bound_lut<S: Scorer + ?Sized>(
+        &self,
+        scorer: &S,
+    ) -> [f32; FREQ_LUT_BUCKETS] {
+        let mut lut = [f32::INFINITY; FREQ_LUT_BUCKETS];
+        if self.has_grouped_terms() || self.query_weight < 0.0 {
+            return lut;
+        }
+        for (freq, slot) in lut.iter_mut().enumerate().take(FREQ_LUT_BUCKETS - 1) {
+            *slot = self.score(scorer, freq as u32, 0);
+        }
+        // Impact lists store no frequency clamp; the scorer ceiling still bounds
+        // every frequency.
+        let clamp = self.frequency_clamp_upper_bound(scorer);
+        lut[FREQ_LUT_BUCKETS - 1] = if clamp.is_finite() {
+            clamp
+        } else {
+            scorer_upper_bound(self.query_weight, scorer)
+        };
+        lut
     }
 
     /// Tight max-score bound over `[current block, up_to]`. The common case —

@@ -15,12 +15,15 @@ use crate::scalar::inverted::query::FtsSearchParams;
 use crate::scalar::inverted::scorer::{Scorer, bm25_doc_weight_with_norm};
 use crate::scalar::inverted::{DocInfo, PostingList, RawDocInfo};
 
+#[cfg(test)]
+use super::WideOverride;
 use super::bounds::{exclusive_partial_score_limit, score_sum_upper_bound_factor};
 use super::collector::TopKCollector;
 use super::doc_source::{DocCandidate, WandDocuments};
 #[cfg(target_arch = "x86_64")]
 use super::posting::find_next_geq_avx2;
-use super::posting::{PostingIterator, find_next_geq, find_next_geq_scalar};
+use super::posting::{FREQ_LUT_BUCKETS, PostingIterator, find_next_geq, find_next_geq_scalar};
+use super::wide_window::{WIDE_MAX_SPAN, WideState, wide_gate};
 use super::{TERMINATED_DOC_ID, Wand, intersection};
 
 impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
@@ -41,6 +44,35 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             return Ok(vec![]);
         }
         let num_lists = self.lead.len();
+        // Decided once per query from the posting costs; see `wide_gate`.
+        let wide_enabled = num_lists >= 2 && {
+            let block_size = self
+                .lead
+                .iter()
+                .map(|posting| match &posting.list {
+                    PostingList::Compressed(list) => list.block_size,
+                    PostingList::Plain(_) => MAX_POSTING_BLOCK_SIZE,
+                })
+                .max()
+                .unwrap_or(MAX_POSTING_BLOCK_SIZE);
+            wide_gate(
+                self.lead[0].cost() as u64,
+                self.lead[1..]
+                    .iter()
+                    .map(|posting| posting.cost() as u64)
+                    .sum(),
+                block_size as u64,
+                num_lists,
+            )
+        };
+        #[cfg(test)]
+        let (wide_enabled, wide_always) = match self.wide_override {
+            WideOverride::Off => (false, false),
+            WideOverride::Auto => (wide_enabled, false),
+            WideOverride::Always => (true, true),
+        };
+        #[cfg(not(test))]
+        let wide_always = false;
         let use_pairwise_intersection = num_lists >= 4
             && self.lead.iter().all(|posting| {
                 matches!(&posting.list, PostingList::Compressed(list)
@@ -529,7 +561,6 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // The last bucket holds the frequency-independent sup, so clamping
         // stays a valid upper bound. Skips only avoid work; every emitted
         // candidate still goes through the exact per-candidate prune below.
-        const FREQ_LUT_BUCKETS: usize = 64;
         let mut freq_bound_lut: Option<[f32; FREQ_LUT_BUCKETS]> = None;
         // Exclusive limit on the first clause's partial score for the current
         // window: scores at or below it cannot beat the floor. Recomputed only
@@ -545,6 +576,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 None => return Ok(vec![]),
             }
         }
+        let mut wide_state: Option<WideState> = None;
 
         'window: loop {
             #[cfg(test)]
@@ -555,13 +587,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             let window_started_with_floor = self.threshold > 0.0;
             if window_started_with_floor {
                 if num_lists >= 2 && freq_bound_lut.is_none() {
-                    let mut lut = [f32::INFINITY; FREQ_LUT_BUCKETS];
-                    for (freq, slot) in lut.iter_mut().enumerate().take(FREQ_LUT_BUCKETS - 1) {
-                        *slot = self.lead[0].score(&self.scorer, freq as u32, 0);
-                    }
-                    lut[FREQ_LUT_BUCKETS - 1] =
-                        self.lead[0].frequency_clamp_upper_bound(&self.scorer);
-                    freq_bound_lut = Some(lut);
+                    freq_bound_lut = Some(self.lead[0].frequency_bound_lut(&self.scorer));
                 }
                 let advanced = self.and_advance_target(target);
                 if advanced == TERMINATED_DOC_ID {
@@ -593,6 +619,54 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 win_end = win_end.min(block_up_to);
             }
             let win_end32 = u32::try_from(win_end).unwrap_or(u32::MAX);
+
+            // A wide window runs to the lead block's end instead of the nearest
+            // follower block end, so the window setup is paid once per lead block.
+            if wide_enabled {
+                let lead_block = self.lead[0].block_idx;
+                let lead_block_end = {
+                    let PostingList::Compressed(ref list) = self.lead[0].list else {
+                        unreachable!("bulk AND requires compressed postings");
+                    };
+                    if lead_block + 1 < list.blocks.len() {
+                        u64::from(list.block_least_doc_id(lead_block + 1)).saturating_sub(1)
+                    } else {
+                        // The wide window ends the query once it reaches the
+                        // end of the u32 doc id space.
+                        u64::from(u32::MAX)
+                    }
+                };
+                let wide_end = lead_block_end.min(target.saturating_add(WIDE_MAX_SPAN - 1));
+                if wide_always || win_end < wide_end {
+                    #[cfg(test)]
+                    {
+                        self.and_window_stats.wide_windows += 1;
+                    }
+                    let state = wide_state
+                        .get_or_insert_with(|| WideState::new(num_lists, phrase_slop.is_some()));
+                    let (next_target, done) = self.run_wide_window(
+                        state,
+                        target,
+                        wide_end,
+                        lead_block,
+                        &score_order,
+                        &mut norm_k,
+                        &mut norm_k_initialized,
+                        &mut candidates,
+                        &mut num_comparisons,
+                        params,
+                    )?;
+                    if done {
+                        break 'window;
+                    }
+                    target = next_target;
+                    continue 'window;
+                }
+                #[cfg(test)]
+                {
+                    self.and_window_stats.wide_fit_windows += 1;
+                }
+            }
 
             // Decompress each clause's block and slice it to [target, win_end].
             wins.clear();

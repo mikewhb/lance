@@ -48,15 +48,6 @@ impl Scorer for NonFiniteBoundBm25ShapeScorer {
 }
 
 #[cfg_attr(coverage, coverage(off))]
-fn unit_length_docs(num_docs: usize) -> DocSet {
-    let mut docs = DocSet::default();
-    for doc_id in 0..num_docs {
-        docs.append(doc_id as u64, 1);
-    }
-    docs
-}
-
-#[cfg_attr(coverage, coverage(off))]
 fn unit_length_impact_posting(
     term: u32,
     doc_ids: Vec<u32>,

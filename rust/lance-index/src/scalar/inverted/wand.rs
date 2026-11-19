@@ -34,6 +34,7 @@ mod intersection;
 mod maxscore;
 mod phrase;
 mod posting;
+mod wide_window;
 
 pub(super) use bounds::{
     CompetitiveFloorMode, outward_f32_upper_bound, score_sum_cannot_compete,
@@ -94,7 +95,8 @@ static USE_MAXSCORE_SEARCH: LazyLock<bool> =
 // skipping plus a slice-level merge over decompressed blocks, replacing the
 // per-doc `next()` leapfrog. Results are identical to the classic AND loop.
 // LANCE_FTS_BULK_AND accepts auto (default), on/1, or off/0. Auto enables the
-// bulk path for two and three clauses and for wider current-format conjunctions.
+// bulk path for two and three clauses and for wider conjunctions over postings
+// with impact data.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BulkAndMode {
     #[default]
@@ -147,6 +149,17 @@ fn bulk_and_mode_from_env() -> BulkAndMode {
 }
 
 static BULK_AND_MODE: LazyLock<BulkAndMode> = LazyLock::new(bulk_and_mode_from_env);
+
+/// Test-only override of the bulk conjunction's wide window: `Off` never
+/// opens it, `Always` opens it for every window, `Auto` follows the gate.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WideOverride {
+    Off,
+    #[default]
+    Auto,
+    Always,
+}
 
 struct HeadPosting {
     // Iterators that are already positioned on or after the next candidate doc.
@@ -244,6 +257,12 @@ struct AndWindowStats {
     pairwise_intersections: usize,
     windows_sliced: usize,
     windows_frequency_pruned: usize,
+    wide_windows: usize,
+    // Gated windows whose narrow end already reaches the lead block end.
+    wide_fit_windows: usize,
+    // Follower blocks skipped because no candidate in them can compete.
+    wide_blocks_skipped: usize,
+    wide_lead_freq_decodes: usize,
 }
 
 impl Eq for TailPosting {}
@@ -321,6 +340,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Test-only override for comparing bulk and classic conjunctions without
     // mutating the process-wide environment.
     bulk_and_mode_override: Option<BulkAndMode>,
+    #[cfg(test)]
+    wide_override: WideOverride,
     #[cfg(test)]
     portable_merge_kernels: bool,
     #[cfg(test)]
@@ -445,6 +466,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             and_window_stats: AndWindowStats::default(),
             bulk_and_mode_override: None,
             #[cfg(test)]
+            wide_override: WideOverride::default(),
+            #[cfg(test)]
             portable_merge_kernels: false,
             #[cfg(test)]
             bulk_and_searches: 0,
@@ -472,6 +495,13 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     #[cfg(test)]
     fn with_bulk_and_mode(mut self, mode: BulkAndMode) -> Self {
         self.bulk_and_mode_override = Some(mode);
+        self
+    }
+
+    /// Test hook: force the bulk conjunction's wide window on or off.
+    #[cfg(test)]
+    fn with_bulk_and_wide(mut self, wide: WideOverride) -> Self {
+        self.wide_override = wide;
         self
     }
 
@@ -636,7 +666,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                         && self.lead.len() >= 4
                         && self.lead.iter().all(|posting| {
                             matches!(&posting.list, PostingList::Compressed(list)
-                                if list.block_size == MAX_POSTING_BLOCK_SIZE && list.impacts.is_some())
+                                if list.impacts.is_some())
                         }))
             }
         {

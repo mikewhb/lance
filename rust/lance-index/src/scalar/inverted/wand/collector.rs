@@ -166,6 +166,8 @@ impl TopKCollector {
                         posting_doc_id,
                         freqs: frequency_slots.take(frequency_slot)?,
                         doc_length,
+                        #[cfg(test)]
+                        score: doc.score.0,
                     })
                 },
             )
