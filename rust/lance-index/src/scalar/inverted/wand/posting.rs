@@ -478,23 +478,50 @@ impl BlockMaxWindow {
         self.next_block_idx = self.next_block_idx.max(start_block_idx);
         #[cfg(test)]
         let mut blocks_scanned = 0;
-        while self.next_block_idx < list.blocks.len()
+        let num_blocks = list.blocks.len();
+        let impact_bounds = list.impacts.as_ref().map(|impacts| {
+            let (level0, level1) =
+                impacts.doc_weight_bounds_by_level_cached(scorer, &mut self.impact_score_cache);
+            (impacts, level0, level1)
+        });
+        while self.next_block_idx < num_blocks
             && list.block_least_doc_id(self.next_block_idx) as u64 <= up_to
         {
-            let score = match list.impacts.as_ref() {
-                Some(impacts) => impacts.level0_score_cached(
-                    self.next_block_idx,
-                    query_weight,
-                    scorer,
-                    &mut self.impact_score_cache,
-                ),
+            let mut last_block_idx = self.next_block_idx;
+            let score = match impact_bounds {
+                Some((impacts, level0, level1)) => {
+                    // A level1 group that ends inside the window enters the
+                    // deque as one entry keyed by its last block. While a later
+                    // window starts inside that group the entry still covers its
+                    // earlier blocks, which only loosens the bound.
+                    let group_idx = self.next_block_idx / IMPACT_LEVEL1_BLOCKS;
+                    let doc_weight = if self.next_block_idx.is_multiple_of(IMPACT_LEVEL1_BLOCKS)
+                        && impacts
+                            .level1_doc_up_to(group_idx)
+                            .is_some_and(|doc_up_to| u64::from(doc_up_to) <= up_to)
+                    {
+                        last_block_idx =
+                            ((group_idx + 1) * IMPACT_LEVEL1_BLOCKS).min(num_blocks) - 1;
+                        level1[group_idx]
+                    } else {
+                        level0
+                            .get(self.next_block_idx)
+                            .copied()
+                            .unwrap_or(f32::INFINITY)
+                    };
+                    if query_weight <= 0.0 {
+                        0.0
+                    } else {
+                        query_weight * doc_weight
+                    }
+                }
                 None => list.block_max_score(self.next_block_idx),
             };
             while matches!(self.max_scores.back(), Some((_, old_score)) if *old_score <= score) {
                 self.max_scores.pop_back();
             }
-            self.max_scores.push_back((self.next_block_idx, score));
-            self.next_block_idx += 1;
+            self.max_scores.push_back((last_block_idx, score));
+            self.next_block_idx = last_block_idx + 1;
             #[cfg(test)]
             {
                 blocks_scanned += 1;

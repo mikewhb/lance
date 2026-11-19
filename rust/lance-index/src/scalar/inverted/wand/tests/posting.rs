@@ -195,6 +195,221 @@ fn test_block_max_score_up_to_slides_and_expires_old_max() {
 }
 
 #[test]
+fn test_block_max_score_up_to_folds_covered_level1_groups() {
+    let block_size = crate::scalar::inverted::LEGACY_BLOCK_SIZE;
+    let num_blocks = IMPACT_LEVEL1_BLOCKS + 8;
+    let doc_ids = (0..(num_blocks * block_size) as u32).collect::<Vec<_>>();
+    // Group 0 peaks at block 2; every other block scores 1.
+    let freqs = doc_ids
+        .iter()
+        .map(|&doc| if doc as usize / block_size == 2 { 9 } else { 1 })
+        .collect::<Vec<_>>();
+    let list = generate_impact_posting_list_with_freqs_and_block_size(
+        doc_ids.clone(),
+        freqs,
+        vec![1; doc_ids.len()],
+        block_size,
+    );
+    let new_posting = || {
+        PostingIterator::with_query_weight(
+            String::from("term"),
+            0,
+            0,
+            1.0,
+            list.clone(),
+            doc_ids.len(),
+        )
+    };
+
+    // A window ending inside group 0 scans its level0 entries.
+    let partial =
+        new_posting().block_max_score_up_to_with_stats((5 * block_size - 1) as u64, &UnitScorer);
+    assert_eq!((partial.score, partial.blocks_scanned), (9.0, 5));
+
+    // A window covering group 0 scans one level1 entry plus blocks 32..=34.
+    let up_to = ((IMPACT_LEVEL1_BLOCKS + 3) * block_size - 1) as u64;
+    let mut posting = new_posting();
+    let folded = posting.block_max_score_up_to_with_stats(up_to, &UnitScorer);
+    assert_eq!((folded.score, folded.blocks_scanned), (9.0, 1 + 3));
+
+    // Inside the folded group the entry still covers block 2, so the bound
+    // stays at the group maximum; past the group it drops to the remaining blocks.
+    posting.shallow_next((10 * block_size) as u64);
+    let inside = posting.block_max_score_up_to_with_stats(up_to, &UnitScorer);
+    assert_eq!((inside.score, inside.blocks_scanned), (9.0, 0));
+    posting.shallow_next((IMPACT_LEVEL1_BLOCKS * block_size) as u64);
+    let past = posting.block_max_score_up_to_with_stats(up_to, &UnitScorer);
+    assert_eq!((past.score, past.blocks_scanned), (1.0, 0));
+
+    // The final group has only 8 blocks; a window reaching the list end folds
+    // it as well.
+    let whole = new_posting().block_max_score_up_to_with_stats(u64::from(u32::MAX), &UnitScorer);
+    assert_eq!((whole.score, whole.blocks_scanned), (9.0, 2));
+}
+
+#[test]
+fn test_block_max_score_up_to_covers_exact_scores_across_level1_groups() {
+    let block_size = crate::scalar::inverted::LEGACY_BLOCK_SIZE;
+    // Two full level1 groups and a shorter final one, with document lengths
+    // that vary so the bounds depend on them.
+    let num_docs = (2 * IMPACT_LEVEL1_BLOCKS + 6) * block_size;
+    let freqs = (0..num_docs as u32)
+        .map(|doc| 1 + doc.wrapping_mul(2_654_435_761) % 7)
+        .collect::<Vec<_>>();
+    let doc_lengths = (0..num_docs as u32)
+        .map(|doc| 1 + doc.wrapping_mul(40_503) % 300)
+        .collect::<Vec<_>>();
+    let list = generate_impact_posting_list_with_freqs_and_block_size(
+        (0..num_docs as u32).collect(),
+        freqs.clone(),
+        doc_lengths.clone(),
+        block_size,
+    );
+    let PostingList::Compressed(ref compressed) = list else {
+        unreachable!("impact posting lists are compressed");
+    };
+    let impacts = compressed.impacts.clone().unwrap();
+    let mut cache = crate::scalar::inverted::impact::ImpactScoreCache::default();
+    let new_posting = |query_weight: f32| {
+        PostingIterator::with_query_weight(
+            String::from("term"),
+            0,
+            0,
+            query_weight,
+            list.clone(),
+            num_docs,
+        )
+    };
+    // The oracle independent of the impact code: impact entries score
+    // quantized lengths, and a window covers whole blocks. The reference
+    // implementation shares the cached entry bounds with the deque.
+    let doc_scores = (0..num_docs)
+        .map(|doc| {
+            let length = crate::scalar::inverted::index::dequantize_doc_length(
+                crate::scalar::inverted::index::quantize_doc_length(doc_lengths[doc]),
+            );
+            InverseDocLengthScorer.doc_weight(freqs[doc], length)
+        })
+        .collect::<Vec<_>>();
+    let num_blocks = num_docs / block_size;
+    let covered_max = |start_block: usize, up_to: u64| {
+        let end_block = (up_to as usize / block_size).min(num_blocks - 1);
+        doc_scores[start_block * block_size..(end_block + 1) * block_size]
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max)
+    };
+
+    // A fresh window is exactly the query weight times the maximum over the
+    // blocks it covers, or zero for a weight that is not positive, for windows
+    // inside one block, inside a group, across one or two groups, and into the
+    // final group. It folds exactly when it covers a whole group that starts at
+    // or after its first block.
+    for query_weight in [1.0_f32, 2.0, 0.5, 0.0, -1.0] {
+        for start_block in [
+            0,
+            5,
+            IMPACT_LEVEL1_BLOCKS - 1,
+            IMPACT_LEVEL1_BLOCKS,
+            IMPACT_LEVEL1_BLOCKS + 7,
+            2 * IMPACT_LEVEL1_BLOCKS,
+            num_blocks - 1,
+        ] {
+            for span in [
+                0,
+                1,
+                IMPACT_LEVEL1_BLOCKS - 1,
+                IMPACT_LEVEL1_BLOCKS,
+                2 * IMPACT_LEVEL1_BLOCKS + 3,
+                num_blocks,
+            ] {
+                for end_offset in [block_size / 2, block_size - 1] {
+                    let up_to =
+                        ((start_block + span) * block_size + end_offset).min(num_docs - 1) as u64;
+                    let mut posting = new_posting(query_weight);
+                    posting.shallow_next((start_block * block_size) as u64);
+                    let bound =
+                        posting.block_max_score_up_to_with_stats(up_to, &InverseDocLengthScorer);
+                    let reference = impacts.max_score_up_to_cached(
+                        start_block,
+                        up_to,
+                        query_weight,
+                        &InverseDocLengthScorer,
+                        &mut cache,
+                    );
+                    let expected = if query_weight > 0.0 {
+                        query_weight * covered_max(start_block, up_to)
+                    } else {
+                        0.0
+                    };
+                    assert_eq!(
+                        (bound.score, reference.score),
+                        (expected, expected),
+                        "weight {query_weight}, block {start_block} up to {up_to}"
+                    );
+                    let end_block = (up_to as usize / block_size).min(num_blocks - 1);
+                    if end_block > start_block {
+                        let covers_a_group = (start_block.div_ceil(IMPACT_LEVEL1_BLOCKS)..)
+                            .map(|group| {
+                                let last_block =
+                                    ((group + 1) * IMPACT_LEVEL1_BLOCKS).min(num_blocks) - 1;
+                                (group * IMPACT_LEVEL1_BLOCKS, last_block)
+                            })
+                            .take_while(|&(first_block, _)| first_block < num_blocks)
+                            .any(|(_, last_block)| {
+                                (((last_block + 1) * block_size - 1) as u64) <= up_to
+                            });
+                        let covered_blocks = end_block + 1 - start_block;
+                        assert_eq!(
+                            bound.blocks_scanned < covered_blocks,
+                            covers_a_group,
+                            "block {start_block} up to {up_to}: {} entries for {covered_blocks} blocks",
+                            bound.blocks_scanned
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let whole = new_posting(1.0)
+        .block_max_score_up_to_with_stats(u64::from(u32::MAX), &InverseDocLengthScorer);
+    assert_eq!(
+        (whole.score, whole.blocks_scanned),
+        (covered_max(0, u64::from(u32::MAX)), 3)
+    );
+
+    // A sliding window keeps a folded entry while it starts inside the group,
+    // so it may be looser than a fresh one: never below the blocks it covers,
+    // and never above the blocks from its group's start to the furthest end
+    // any window reached. Spans stay within two groups.
+    let spans = [
+        3,
+        2 * block_size,
+        IMPACT_LEVEL1_BLOCKS * block_size,
+        2 * IMPACT_LEVEL1_BLOCKS * block_size,
+    ];
+    let mut posting = new_posting(1.0);
+    let mut furthest_up_to = 0;
+    for step in 0..200 {
+        let target = step * num_docs / 200;
+        let up_to = (target + spans[step % spans.len()]).min(num_docs - 1) as u64;
+        furthest_up_to = furthest_up_to.max(up_to);
+        posting.shallow_next(target as u64);
+        let start_block = posting.block_idx;
+        let bound = posting
+            .block_max_score_up_to_with_stats(up_to, &InverseDocLengthScorer)
+            .score;
+        let lowest = covered_max(start_block, up_to);
+        let group_start = start_block / IMPACT_LEVEL1_BLOCKS * IMPACT_LEVEL1_BLOCKS;
+        let highest = covered_max(group_start, furthest_up_to);
+        assert!(
+            lowest <= bound && bound <= highest,
+            "block {start_block} up to {up_to}: bound {bound} outside [{lowest}, {highest}]"
+        );
+    }
+}
+
+#[test]
 fn test_impact_level1_skip_keeps_boundary_equality_in_group() {
     for block_size in [crate::scalar::inverted::LEGACY_BLOCK_SIZE, 256] {
         let total = (IMPACT_LEVEL1_BLOCKS + 1) * block_size;
