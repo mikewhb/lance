@@ -257,39 +257,74 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 window_max = window_max.max(window_min.saturating_add(min_window_size - 1));
             }
 
-            for clause in &mut clauses {
-                let doc = clause
-                    .posting
-                    .doc()
-                    .map(|doc| doc.doc_id())
-                    .expect("exhausted clauses were retained out");
-                clause.bound = if doc > window_max {
-                    0.0
-                } else {
-                    clause
-                        .posting
-                        .block_max_score_up_to_with_stats(window_max, &self.scorer)
-                        .score
-                };
-            }
             let mut clauses_in_query_order = true;
             let mut first_essential = 0;
-            let mut prefix = 0.0_f64;
-            if self.threshold > 0.0 {
-                clauses.sort_unstable_by(|a, b| a.bound.total_cmp(&b.bound));
-                clauses_in_query_order = clauses
-                    .windows(2)
-                    .all(|window| window[0].query_rank <= window[1].query_rank);
-                for (i, clause) in clauses.iter_mut().enumerate() {
-                    let next_prefix = prefix + f64::from(clause.bound);
-                    let widened = next_prefix * score_sum_upper_bound_factor(i + 1);
-                    if widened > f64::from(self.threshold) {
-                        break;
-                    }
-                    prefix = next_prefix;
-                    clause.prefix_bound = prefix;
-                    first_essential = i + 1;
+            let mut repair_round = 0u32;
+            loop {
+                for clause in &mut clauses {
+                    let doc = clause
+                        .posting
+                        .doc()
+                        .map(|doc| doc.doc_id())
+                        .expect("exhausted clauses were retained out");
+                    clause.bound = if doc > window_max {
+                        0.0
+                    } else {
+                        clause
+                            .posting
+                            .block_max_score_up_to_with_stats(window_max, &self.scorer)
+                            .score
+                    };
                 }
+                let mut prefix = 0.0_f64;
+                first_essential = 0;
+                if self.threshold > 0.0 {
+                    clauses.sort_unstable_by(|a, b| a.bound.total_cmp(&b.bound));
+                    clauses_in_query_order = clauses
+                        .windows(2)
+                        .all(|window| window[0].query_rank <= window[1].query_rank);
+                    for (i, clause) in clauses.iter_mut().enumerate() {
+                        let next_prefix = prefix + f64::from(clause.bound);
+                        let widened = next_prefix * score_sum_upper_bound_factor(i + 1);
+                        if widened > f64::from(self.threshold) {
+                            break;
+                        }
+                        prefix = next_prefix;
+                        clause.prefix_bound = prefix;
+                        first_essential = i + 1;
+                    }
+                }
+                // The window end is a stale guess: it came from the previous
+                // window's essential split. Once this window's split is known,
+                // no essential clause may need to read past its own block end,
+                // so the window can shrink to the tightest such end and the
+                // bounds be redone. It only ever shrinks, so the outer loop
+                // still advances, and repair_round caps the redone rounds.
+                if self.threshold <= 0.0 {
+                    break;
+                }
+                let mut new_max = window_max;
+                for clause in clauses[first_essential..].iter() {
+                    // Plain postings report the next posting minus one, which is
+                    // far too fine a unit: shrinking to it turns every posting
+                    // into its own window.
+                    if !clause.posting.is_compressed() {
+                        continue;
+                    }
+                    new_max = new_max.min(clause.posting.block_end_doc());
+                }
+                // Keep the adaptive-window floor: shrinking below it would undo
+                // the amortization that min_window_size exists to buy.
+                if clauses.len() > 1 {
+                    new_max = new_max
+                        .max(window_min.saturating_add(min_window_size - 1))
+                        .min(window_max);
+                }
+                if repair_round >= 2 || new_max >= window_max || new_max < window_min {
+                    break;
+                }
+                window_max = new_max;
+                repair_round += 1;
             }
             prev_first_essential = first_essential;
             num_windows += 1;
